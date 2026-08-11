@@ -4116,10 +4116,24 @@ function beginApprovalSend(id, sessionId) {
     attnKey: attentionApprovalKeyFor(id, sessionId),
     timer: null,
     poll: null,
+    // Flipped by markApprovalSendDelivered when the decision's transport
+    // ACKS receipt (the tunnel RPC's response). The fire-and-forget /ws
+    // lane never flips it.
+    delivered: false,
   };
   pending.timer = setTimeout(() => {
     // Identity check: a later send must never be killed by this timer.
     if (approvalSendPending !== pending) return;
+    if (pending.delivered) {
+      // The daemon acked receipt of the decision; only the resolution
+      // evidence (approval_resolved et al.) is late or lost. Retire the
+      // card WITHOUT the retry invitation — a re-click here is what mints
+      // duplicate decisions ("already resolved" daemon-side). If the
+      // decision found nothing pending, the daemon says so honestly on
+      // its own lane.
+      confirmApprovalSendDelivered();
+      return;
+    }
     if (pending.poll) clearInterval(pending.poll);
     approvalSendPending = null;
     setApprovalPanelSending(false);
@@ -4147,6 +4161,35 @@ function resolveApprovalSend() {
   if (approvalSendPending.poll) clearInterval(approvalSendPending.poll);
   approvalSendPending = null;
   setApprovalPanelSending(false);
+}
+
+// The decision's transport delivered it to the daemon (tunnel RPC ack).
+// Not resolution evidence by itself — the panel keeps waiting for that —
+// but it disarms the watchdog's "may not have reached the daemon — retry"
+// path, whose invited re-click double-sends one human decision.
+function markApprovalSendDelivered(id) {
+  if (approvalSendPending && approvalSendPending.id === String(id)) {
+    approvalSendPending.delivered = true;
+  }
+}
+
+// Transport loss, not resolution (the attention set's attentionClearAll
+// contract): local approval cards drop silently — the daemon-side pending
+// registries are the truth, and the reconnect bootstrap replays whatever
+// still stands (session-scoped and daemon-scoped alike), re-opening the
+// panel through the ordinary approval_required path. Without this, cards
+// whose daemon-side backing died with the process (pending sets are
+// process memory) rendered forever and invited decisions for dead ids.
+// Peer-hosted cards stay: their truth (peerPendingApprovals) survives a
+// local transport flap and retires on peer events instead.
+function clearLocalApprovalCardsOnTransportLoss() {
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i -= 1) {
+    if (!(approvalDisplayQueue[i].hostId || '')) approvalDisplayQueue.splice(i, 1);
+  }
+  if (pendingApprovalId !== null && !pendingApprovalHostId) {
+    hidePanel('approval-panel');
+  }
+  updateApprovalPendingCount();
 }
 
 function confirmApprovalSendDelivered() {
@@ -4293,11 +4336,14 @@ function showApproval(id, command, category, sessionId, hostId) {
     // local windows; the provenance line names the peer context instead.
     pendingApprovalSessionId = sessionId || '';
   } else {
-    pendingApprovalSessionId =
-      sessionId
-      || approvalSessionIds.get(String(id))
-      || currentSessionFullId
-      || '';
+    // Only a session the approval actually CARRIED. Daemon-scoped
+    // approvals (Vault installs, live-audio consent) ride sessionless by
+    // design — borrowing the focused session's identity here aimed the
+    // decision at an unrelated session and bought session-vocabulary
+    // errors for owners performing daemon-scoped acts. Sessionless
+    // main-loop approvals need no fallback either: the daemon resolves a
+    // sessionless decision against its active session itself.
+    pendingApprovalSessionId = sessionId || approvalSessionIds.get(String(id)) || '';
     if (pendingApprovalSessionId) {
       ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
       focusSessionWindow(pendingApprovalSessionId);

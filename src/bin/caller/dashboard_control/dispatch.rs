@@ -2678,6 +2678,18 @@ pub(crate) fn cached_bootstrap_events_response_frame(
             }
         }
     }
+    // Pending daemon-scoped approvals (sessionless `approval_required` —
+    // Vault installs, live-audio consent): the arming gates' pending sets
+    // are process memory, so this replay is how a reconnecting dashboard
+    // re-derives which approval cards still stand.
+    if let Ok(guard) = caches.daemon_approval_lines.lock() {
+        for line in guard.values() {
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => events.push(v),
+                Err(_) => malformed.push("daemon_approval"),
+            }
+        }
+    }
     events.retain(|event| {
         serde_json::to_string(event)
             .ok()

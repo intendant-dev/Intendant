@@ -61,7 +61,12 @@ window.sendApproval = function(action) {
     resolveApprovalSend();
     showControlToast('error', err?.message || 'Approval could not be sent — retry');
   };
-  const sent = dispatchSessionControlMsg(msg, { onError: failSend });
+  const sent = dispatchSessionControlMsg(msg, {
+    onError: failSend,
+    // Tunnel RPC ack: the daemon received THIS decision. Disarms the
+    // watchdog's retry invitation so one click stays one response.
+    onDelivered: () => markApprovalSendDelivered(msg.id),
+  });
   if (sent === false) failSend(new Error('Approval could not be sent — no daemon connection; retry'));
 };
 window.sendHumanResponse = function() {

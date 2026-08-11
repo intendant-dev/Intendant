@@ -251,6 +251,15 @@ function attentionApplyEvent(d, live) {
 function attentionOnServerState(connected) {
   if (!connected) {
     attentionClearAll();
+    // The bottom-panel approval card follows the same transport-loss
+    // contract as the attention set: drop local cards silently and let
+    // the reconnect bootstrap replay what still stands — the daemon
+    // replays pending approvals (session-scoped and daemon-scoped), and
+    // a card whose daemon died with its pending set stays gone instead
+    // of rendering forever (41-session-window-actions.js).
+    if (typeof clearLocalApprovalCardsOnTransportLoss === 'function') {
+      clearLocalApprovalCardsOnTransportLoss();
+    }
     return;
   }
   // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
