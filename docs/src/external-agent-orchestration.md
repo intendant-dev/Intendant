@@ -1439,7 +1439,7 @@ defaults, so a bare `[agent]` with just `default_backend` works.
 default_backend = "codex"
 
 [agent.codex]
-command          = "codex"            # binary on PATH or absolute path
+command          = "codex"            # bare name (resolved via PATH, then the known install dirs) or absolute path
 model            = "gpt-5.6-sol"      # optional; omit to use Codex's default
 approval_policy  = "on-request"       # untrusted | on-request | never
 sandbox          = "workspace-write"  # read-only | workspace-write | danger-full-access

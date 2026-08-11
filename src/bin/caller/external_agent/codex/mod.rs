@@ -1317,7 +1317,9 @@ impl ExternalAgent for CodexAgent {
         // before launch.
         let effective_web_port = web_port.unwrap_or(8765);
         let args = self.app_server_args(effective_web_port);
-        let mut command = crate::platform::spawn_command(&self.command);
+        // Detection's resolution ladder, not the daemon's inherited PATH:
+        // a CLI that reports installed must spawn.
+        let mut command = super::spawn_backend_command(&super::AgentBackend::Codex, &self.command);
         command
             .args(&args)
             .current_dir(&config.working_dir)
