@@ -1711,6 +1711,10 @@ pub(crate) async fn handle_api_key_status(
     write_api_response(stream, api_key_status_api_response(), cors, fleet_origin).await;
 }
 
+// Transport-edge handler: every param is one injected edge resolution
+// (stream/cors framing, the hermeticity roots, the explicit-refresh flag,
+// the broadcast bus) — distinct dependencies, not a bundle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_external_agents(
     stream: DemuxStream,
     project_root: Option<PathBuf>,
