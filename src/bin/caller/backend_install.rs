@@ -517,6 +517,13 @@ async fn install_gate_waiter(
     });
 
     let resolve = |action: &str| {
+        // Record the consumption BEFORE dropping the pending entry: the
+        // session supervisor observes the same decision broadcast
+        // concurrently and checks `install_pending` then the
+        // recently-resolved register — this order leaves no window where
+        // the id is in neither and a first, legitimate decision gets
+        // misreported as stale (routing.rs `resolve_approval`).
+        crate::event::record_approval_resolved(approval_id);
         if let Ok(mut set) = pending_install_approvals().lock() {
             set.remove(&approval_id);
         }
@@ -1112,6 +1119,11 @@ mod tests {
         }
         assert!(!installs_dir.exists(), "a declined install never executes");
         assert!(!install_pending(approval_id), "pending entry cleared");
+        assert!(
+            crate::event::approval_recently_resolved(approval_id),
+            "the consumed id lands in the recently-resolved register, so a \
+             duplicate decision reads as benign instead of stale"
+        );
         loop {
             match tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await

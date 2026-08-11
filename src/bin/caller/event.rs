@@ -53,6 +53,73 @@ pub(crate) fn ensure_approval_id_floor(persisted: u64) {
     NEXT_APPROVAL_ID.fetch_max(persisted + 1, Ordering::Relaxed);
 }
 
+/// Bounded memory of recently consumed approval-rail ids.
+///
+/// One `ControlMsg` approval decision has several concurrent consumers: the
+/// gate that armed the id (a session's approval registry, or a daemon-scoped
+/// bus waiter — install gate, live-audio consent, MCP ask, agenda ask)
+/// resolves it, while the session supervisor's `resolve_approval` observes
+/// the same broadcast and consults the pending sets. Once the id is
+/// consumed, a *second* response for it (a dashboard double-send, a re-click,
+/// or the supervisor simply losing the broadcast race to the waiter) matches
+/// no pending set anywhere — and used to be misreported in session
+/// vocabulary ("no active managed session") to owners performing
+/// daemon-scoped acts. This register lets the fallthrough tell the benign
+/// case ("already resolved") from the genuinely stale one.
+///
+/// Ids are minted once per process ([`next_approval_id`]) and resolved at
+/// most once, so membership here is definitive consumption — never a live
+/// pending id. Injectable so bound/edge tests never churn the process-wide
+/// instance other tests read.
+#[derive(Default)]
+pub(crate) struct ApprovalResolutionMemory {
+    ids: Mutex<std::collections::VecDeque<u64>>,
+}
+
+/// Enough to outlast any realistic duplicate/race window (entries are only
+/// ever queried moments after resolution) while staying trivially bounded.
+const APPROVAL_RESOLUTION_MEMORY_CAP: usize = 128;
+
+impl ApprovalResolutionMemory {
+    pub(crate) fn record(&self, id: u64) {
+        if let Ok(mut ids) = self.ids.lock() {
+            if ids.contains(&id) {
+                return;
+            }
+            ids.push_back(id);
+            while ids.len() > APPROVAL_RESOLUTION_MEMORY_CAP {
+                ids.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.ids
+            .lock()
+            .map(|ids| ids.contains(&id))
+            .unwrap_or(false)
+    }
+}
+
+fn approval_resolution_memory() -> &'static ApprovalResolutionMemory {
+    static MEMORY: std::sync::OnceLock<ApprovalResolutionMemory> = std::sync::OnceLock::new();
+    MEMORY.get_or_init(ApprovalResolutionMemory::default)
+}
+
+/// Record `id` as consumed. Called by the bus on every `ApprovalResolved`
+/// send (the single choke point every resolver already passes through), and
+/// directly by daemon-scoped gate waiters *before* they drop the id from
+/// their pending set — closing the window where a concurrent supervisor
+/// check would find the id in neither the pending set nor this register.
+pub(crate) fn record_approval_resolved(id: u64) {
+    approval_resolution_memory().record(id);
+}
+
+/// Whether `id` is an approval-rail id this process already resolved.
+pub(crate) fn approval_recently_resolved(id: u64) -> bool {
+    approval_resolution_memory().contains(id)
+}
+
 /// Source of a context injection item.
 ///
 /// Used by the agent loop to decide which queued injections to discard between
@@ -2823,6 +2890,14 @@ impl EventBus {
     }
 
     pub fn send(&self, event: AppEvent) {
+        // Every approval resolution — session registries, daemon-scoped gate
+        // waiters, MCP/agenda resolvers — announces through this event, so
+        // recording here keeps the recently-resolved register complete
+        // without each resolver knowing about it (see
+        // `record_approval_resolved`).
+        if let AppEvent::ApprovalResolved { id, .. } = &event {
+            record_approval_resolved(*id);
+        }
         if app_event_writes_to_session_log(&event) {
             // Stamped at the emit point so the session-log writer can
             // measure how long the item sat in the lane before it was
@@ -2856,6 +2931,11 @@ impl EventBus {
     /// SessionEnded/FileChanged) must keep using [`Self::send`] — that
     /// watcher consumes the same lane.
     pub fn send_already_persisted(&self, event: AppEvent) {
+        // Same recording as `send` — the register must see every
+        // resolution regardless of which send lane carried it.
+        if let AppEvent::ApprovalResolved { id, .. } = &event {
+            record_approval_resolved(*id);
+        }
         if app_event_rides_intent_lane(&event) {
             if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
@@ -7863,6 +7943,51 @@ mod tests {
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"budget_warning\""));
+    }
+
+    /// The injectable register: recording is idempotent, membership is
+    /// exact, and the bound evicts oldest-first (tested on a private
+    /// instance so the churn never touches the process-wide register other
+    /// tests read).
+    #[test]
+    fn approval_resolution_memory_records_and_bounds() {
+        let memory = ApprovalResolutionMemory::default();
+        assert!(!memory.contains(7));
+        memory.record(7);
+        memory.record(7);
+        assert!(memory.contains(7));
+
+        // Fill past the cap: the oldest entry (7) falls out, the newest
+        // survive.
+        for id in 0..APPROVAL_RESOLUTION_MEMORY_CAP as u64 {
+            memory.record(1_000_000 + id);
+        }
+        assert!(!memory.contains(7), "oldest id evicted at the bound");
+        assert!(memory.contains(1_000_000));
+        assert!(memory.contains(1_000_000 + APPROVAL_RESOLUTION_MEMORY_CAP as u64 - 1));
+    }
+
+    /// Both bus send lanes feed the process-wide register: after an
+    /// `ApprovalResolved` rides either one, the id reads as recently
+    /// resolved (fresh allocator ids so parallel tests never collide).
+    #[test]
+    fn bus_send_records_approval_resolutions() {
+        let bus = EventBus::new();
+        let via_send = next_approval_id();
+        let via_pre_logged = next_approval_id();
+        assert!(!approval_recently_resolved(via_send));
+        bus.send(AppEvent::ApprovalResolved {
+            session_id: None,
+            id: via_send,
+            action: "approve".to_string(),
+        });
+        bus.send_already_persisted(AppEvent::ApprovalResolved {
+            session_id: Some("sess-1".to_string()),
+            id: via_pre_logged,
+            action: "deny".to_string(),
+        });
+        assert!(approval_recently_resolved(via_send));
+        assert!(approval_recently_resolved(via_pre_logged));
     }
 
     #[test]

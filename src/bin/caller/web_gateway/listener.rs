@@ -1251,6 +1251,10 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // peer transport attaching) would otherwise never see state that last
     // changed before they connected. Pruned on session_ended.
     let session_state_lines = bootstrap_caches.session_state_lines.clone();
+    // Pending daemon-scoped approvals (no session), replayed for the same
+    // reason: the arming gates' pending sets are process memory the
+    // reconnecting dashboard must re-derive. Cleared on approval_resolved.
+    let daemon_approval_lines = bootstrap_caches.daemon_approval_lines.clone();
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
@@ -1594,6 +1598,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
             let session_state_lines = session_state_lines.clone();
+            let daemon_approval_lines = daemon_approval_lines.clone();
             let display_ready_cache = display_ready_cache.clone();
             let bootstrap_caches = bootstrap_caches.clone();
             let task_tx = task_tx.clone();
@@ -2720,6 +2725,21 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         let _ = direct_tx.send(line);
                     }
 
+                    // Re-send pending DAEMON-SCOPED approvals (no session —
+                    // Vault installs, live-audio consent): their pending
+                    // sets are process memory, so this replay is how a
+                    // reconnecting dashboard re-derives which approval
+                    // cards still stand — and after a daemon restart the
+                    // (correctly empty) cache is what keeps dead cards
+                    // dead. Cleared on approval_resolved, expiry included.
+                    let daemon_approval_replay: Vec<String> = daemon_approval_lines
+                        .lock()
+                        .map(|guard| guard.values().cloned().collect())
+                        .unwrap_or_default();
+                    for line in daemon_approval_replay {
+                        let _ = direct_tx.send(line);
+                    }
+
                     // Send cached autonomy after cached status so it wins
                     // when the latest status event is older than the user's
                     // most recent autonomy switch.
@@ -3195,12 +3215,34 @@ impl BootstrapCacheMaintainer {
             // Pending approvals/questions: the daemon-side registry survives
             // a page reload but the panel state does not — replay the ask so
             // a reconnecting operator can still answer. Cleared on
-            // ApprovalResolved below. Session-less asks were never cached by
-            // the wire sniffer (no `session_id` key on the line) — same here.
+            // ApprovalResolved below.
             E::ApprovalRequired {
                 session_id: Some(session_id),
                 ..
             } => self.cache_session_state_line("approval_required", session_id, event),
+            // Daemon-scoped approvals (no session — Vault installs,
+            // live-audio consent) get the same replay treatment in their
+            // own id-keyed cache: their arming gates hold the only pending
+            // state, and it is process memory. Bounded like the session
+            // map; ids are monotonic, so evicting the first key drops the
+            // oldest proposal.
+            E::ApprovalRequired {
+                session_id: None,
+                id,
+                ..
+            } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.caches.daemon_approval_lines.lock() {
+                        guard.insert(*id, line);
+                        while guard.len() > 64 {
+                            let Some(first) = guard.keys().next().copied() else {
+                                break;
+                            };
+                            guard.remove(&first);
+                        }
+                    }
+                }
+            }
             E::UserQuestionRequired {
                 session_id: Some(session_id),
                 ..
@@ -3226,22 +3268,26 @@ impl BootstrapCacheMaintainer {
                     }
                 }
             },
-            E::ApprovalResolved {
-                session_id: Some(session_id),
-                id,
-                ..
-            } => {
-                if let Ok(mut guard) = self.caches.session_state_lines.lock() {
-                    if let Some(kinds) = guard.get_mut(session_id) {
-                        for kind in ["approval_required", "user_question"] {
-                            let matches = kinds
-                                .get(kind)
-                                .and_then(|cached| {
-                                    serde_json::from_str::<serde_json::Value>(cached).ok()
-                                })
-                                .is_some_and(|cached| cached["id"].as_u64() == Some(*id));
-                            if matches {
-                                kinds.remove(kind);
+            E::ApprovalResolved { session_id, id, .. } => {
+                // Ids are process-unique, so clearing the daemon-scoped
+                // cache by id alone is exact regardless of which lane's
+                // resolution announced it.
+                if let Ok(mut guard) = self.caches.daemon_approval_lines.lock() {
+                    guard.remove(id);
+                }
+                if let Some(session_id) = session_id {
+                    if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                        if let Some(kinds) = guard.get_mut(session_id) {
+                            for kind in ["approval_required", "user_question"] {
+                                let matches = kinds
+                                    .get(kind)
+                                    .and_then(|cached| {
+                                        serde_json::from_str::<serde_json::Value>(cached).ok()
+                                    })
+                                    .is_some_and(|cached| cached["id"].as_u64() == Some(*id));
+                                if matches {
+                                    kinds.remove(kind);
+                                }
                             }
                         }
                     }
@@ -3303,6 +3349,9 @@ impl BootstrapCacheMaintainer {
             guard.clear();
         }
         if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.caches.daemon_approval_lines.lock() {
             guard.clear();
         }
     }
@@ -3448,6 +3497,76 @@ mod bootstrap_cache_tests {
         });
         assert!(
             !m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+    }
+
+    /// Daemon-scoped (sessionless) pending approvals — the Vault install /
+    /// live-audio consent family — ride their own id-keyed replay cache:
+    /// cached while pending so a reconnecting dashboard re-derives the
+    /// card, cleared on ANY resolution of the id (the gates emit
+    /// `ApprovalResolved` on every outcome, expiry included), bounded
+    /// oldest-first, and swept by `clear_on_gap` like every other section.
+    #[test]
+    fn daemon_scoped_pending_approvals_replay_until_resolved() {
+        let (m, _rx) = maintainer();
+        let armed = |id: u64| AppEvent::ApprovalRequired {
+            session_id: None,
+            id,
+            command_preview: "curl -fsSL https://example.invalid | bash".to_string(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        };
+        m.apply(&armed(51));
+        {
+            let guard = m.caches.daemon_approval_lines.lock().unwrap();
+            let line = guard.get(&51).expect("sessionless approval cached");
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["event"], "approval_required");
+            assert_eq!(parsed["id"], 51);
+        }
+
+        // A different id resolving leaves it pending; the matching id —
+        // sessionless or not — clears it.
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: None,
+            id: 50,
+            action: "approve".to_string(),
+        });
+        assert!(m
+            .caches
+            .daemon_approval_lines
+            .lock()
+            .unwrap()
+            .contains_key(&51));
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: None,
+            id: 51,
+            action: "timeout".to_string(),
+        });
+        assert!(
+            !m.caches
+                .daemon_approval_lines
+                .lock()
+                .unwrap()
+                .contains_key(&51),
+            "an expired proposal must not replay as a ghost card"
+        );
+
+        // Bounded: 65 pending ids keep only the newest 64 (ids are
+        // monotonic, so the first key is the oldest).
+        for id in 100..165 {
+            m.apply(&armed(id));
+        }
+        {
+            let guard = m.caches.daemon_approval_lines.lock().unwrap();
+            assert_eq!(guard.len(), 64);
+            assert!(!guard.contains_key(&100), "oldest evicted at the bound");
+            assert!(guard.contains_key(&164));
+        }
+
+        m.clear_on_gap();
+        assert!(
+            m.caches.daemon_approval_lines.lock().unwrap().is_empty(),
+            "a lagged maintainer must not replay ghost approvals"
         );
     }
 

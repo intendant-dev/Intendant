@@ -39277,7 +39277,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '3ba70a7850d9e6d8';
+const INTENDANT_APP_BUILD = '5ac59007638403f2';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -47786,7 +47786,13 @@ function dispatchSessionControlMsg(payload, options = {}) {
     daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
     }).then(resp => {
-      if (resp.ok) return;
+      if (resp.ok) {
+        // Delivered ack: the daemon received and dispatched this message.
+        // Callers with at-most-once semantics (the approval rail) use it
+        // to disarm their retry paths.
+        if (typeof options.onDelivered === 'function') options.onDelivered(resp);
+        return;
+      }
       // Delivered refusals (allowlist drift the parity pins make
       // near-impossible) surface instead of silently resolving; still no
       // /ws replay — the response was delivered.
@@ -56881,6 +56887,25 @@ async function main() {
         serverMsgStep(d, 'approval_resolved', () => {
           clearPendingQuestion();
           hidePanel('question-panel');
+        });
+      }
+      // The approval card truth-link: the daemon says this id is settled
+      // (decided here or elsewhere, or its waiter expired — the install
+      // gate's 600s wall). Clear the shown card so it cannot outlive its
+      // daemon-side backing and invite a decision for a dead id; peer
+      // cards retire on peer_approval_resolved instead.
+      if (d.event === 'approval_resolved' && d.id !== undefined && typeof pendingApprovalId !== 'undefined'
+          && pendingApprovalId !== null && !pendingApprovalHostId
+          && String(pendingApprovalId) === String(d.id)) {
+        serverMsgStep(d, 'approval_resolved_panel', () => {
+          const localSend = typeof approvalSendPending !== 'undefined' && approvalSendPending
+            && approvalSendPending.id === String(d.id);
+          hidePanel('approval-panel'); // clearPendingApproval + queue pump ride inside
+          if (!localSend && typeof showControlToast === 'function') {
+            showControlToast('info', d.action === 'timeout'
+              ? 'An approval expired without a decision — trigger the action again if it is still needed'
+              : 'An approval was resolved from another surface');
+          }
         });
       }
       if (d.event === 'autonomy_changed') {
@@ -77671,10 +77696,24 @@ function beginApprovalSend(id, sessionId) {
     attnKey: attentionApprovalKeyFor(id, sessionId),
     timer: null,
     poll: null,
+    // Flipped by markApprovalSendDelivered when the decision's transport
+    // ACKS receipt (the tunnel RPC's response). The fire-and-forget /ws
+    // lane never flips it.
+    delivered: false,
   };
   pending.timer = setTimeout(() => {
     // Identity check: a later send must never be killed by this timer.
     if (approvalSendPending !== pending) return;
+    if (pending.delivered) {
+      // The daemon acked receipt of the decision; only the resolution
+      // evidence (approval_resolved et al.) is late or lost. Retire the
+      // card WITHOUT the retry invitation — a re-click here is what mints
+      // duplicate decisions ("already resolved" daemon-side). If the
+      // decision found nothing pending, the daemon says so honestly on
+      // its own lane.
+      confirmApprovalSendDelivered();
+      return;
+    }
     if (pending.poll) clearInterval(pending.poll);
     approvalSendPending = null;
     setApprovalPanelSending(false);
@@ -77702,6 +77741,35 @@ function resolveApprovalSend() {
   if (approvalSendPending.poll) clearInterval(approvalSendPending.poll);
   approvalSendPending = null;
   setApprovalPanelSending(false);
+}
+
+// The decision's transport delivered it to the daemon (tunnel RPC ack).
+// Not resolution evidence by itself — the panel keeps waiting for that —
+// but it disarms the watchdog's "may not have reached the daemon — retry"
+// path, whose invited re-click double-sends one human decision.
+function markApprovalSendDelivered(id) {
+  if (approvalSendPending && approvalSendPending.id === String(id)) {
+    approvalSendPending.delivered = true;
+  }
+}
+
+// Transport loss, not resolution (the attention set's attentionClearAll
+// contract): local approval cards drop silently — the daemon-side pending
+// registries are the truth, and the reconnect bootstrap replays whatever
+// still stands (session-scoped and daemon-scoped alike), re-opening the
+// panel through the ordinary approval_required path. Without this, cards
+// whose daemon-side backing died with the process (pending sets are
+// process memory) rendered forever and invited decisions for dead ids.
+// Peer-hosted cards stay: their truth (peerPendingApprovals) survives a
+// local transport flap and retires on peer events instead.
+function clearLocalApprovalCardsOnTransportLoss() {
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i -= 1) {
+    if (!(approvalDisplayQueue[i].hostId || '')) approvalDisplayQueue.splice(i, 1);
+  }
+  if (pendingApprovalId !== null && !pendingApprovalHostId) {
+    hidePanel('approval-panel');
+  }
+  updateApprovalPendingCount();
 }
 
 function confirmApprovalSendDelivered() {
@@ -77848,11 +77916,14 @@ function showApproval(id, command, category, sessionId, hostId) {
     // local windows; the provenance line names the peer context instead.
     pendingApprovalSessionId = sessionId || '';
   } else {
-    pendingApprovalSessionId =
-      sessionId
-      || approvalSessionIds.get(String(id))
-      || currentSessionFullId
-      || '';
+    // Only a session the approval actually CARRIED. Daemon-scoped
+    // approvals (Vault installs, live-audio consent) ride sessionless by
+    // design — borrowing the focused session's identity here aimed the
+    // decision at an unrelated session and bought session-vocabulary
+    // errors for owners performing daemon-scoped acts. Sessionless
+    // main-loop approvals need no fallback either: the daemon resolves a
+    // sessionless decision against its active session itself.
+    pendingApprovalSessionId = sessionId || approvalSessionIds.get(String(id)) || '';
     if (pendingApprovalSessionId) {
       ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
       focusSessionWindow(pendingApprovalSessionId);
@@ -144117,6 +144188,15 @@ function attentionApplyEvent(d, live) {
 function attentionOnServerState(connected) {
   if (!connected) {
     attentionClearAll();
+    // The bottom-panel approval card follows the same transport-loss
+    // contract as the attention set: drop local cards silently and let
+    // the reconnect bootstrap replay what still stands — the daemon
+    // replays pending approvals (session-scoped and daemon-scoped), and
+    // a card whose daemon died with its pending set stays gone instead
+    // of rendering forever (41-session-window-actions.js).
+    if (typeof clearLocalApprovalCardsOnTransportLoss === 'function') {
+      clearLocalApprovalCardsOnTransportLoss();
+    }
     return;
   }
   // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
@@ -144686,7 +144766,12 @@ window.sendApproval = function(action) {
     resolveApprovalSend();
     showControlToast('error', err?.message || 'Approval could not be sent — retry');
   };
-  const sent = dispatchSessionControlMsg(msg, { onError: failSend });
+  const sent = dispatchSessionControlMsg(msg, {
+    onError: failSend,
+    // Tunnel RPC ack: the daemon received THIS decision. Disarms the
+    // watchdog's retry invitation so one click stays one response.
+    onDelivered: () => markApprovalSendDelivered(msg.id),
+  });
   if (sent === false) failSend(new Error('Approval could not be sent — no daemon connection; retry'));
 };
 window.sendHumanResponse = function() {
