@@ -477,6 +477,15 @@ impl Default for StationSessionsSummary {
     }
 }
 
+/// One entry of the daemon-served Kimi model catalog as the Controls pane
+/// renders it (card 01KZR0QP9A).
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct StationKimiModelChoice {
+    pub(crate) id: String,
+    pub(crate) label: String,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct StationControlsSummary {
@@ -491,6 +500,14 @@ pub(crate) struct StationControlsSummary {
     pub(crate) claude_model: String,
     pub(crate) claude_permission_mode: String,
     pub(crate) kimi_model: String,
+    /// Daemon-served Kimi model catalog for the model choice row (card
+    /// 01KZR0QP9A) — learned from live Kimi runs, never a hardcoded
+    /// vocabulary. Empty when unknown or legitimately empty; see
+    /// `kimi_model_catalog_known` for which.
+    pub(crate) kimi_model_choices: Vec<StationKimiModelChoice>,
+    /// Whether the daemon KNOWS Kimi's catalog (a fresh install's known
+    /// catalog is honestly empty — distinct from "no run observed yet").
+    pub(crate) kimi_model_catalog_known: bool,
     pub(crate) kimi_thinking: String,
     pub(crate) kimi_permission_mode: String,
     pub(crate) kimi_plan_mode: bool,
@@ -635,6 +652,8 @@ impl Default for StationControlsSummary {
             claude_model: String::new(),
             claude_permission_mode: String::new(),
             kimi_model: String::new(),
+            kimi_model_choices: Vec::new(),
+            kimi_model_catalog_known: false,
             kimi_thinking: String::new(),
             kimi_permission_mode: String::new(),
             kimi_plan_mode: false,

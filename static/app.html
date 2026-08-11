@@ -33766,7 +33766,7 @@ html.ui-v2 .daemon-relay-note {
                 <legend>Model</legend>
                 <div class="control-row">
                   <label for="control-kimi-model">Override</label>
-                  <input type="text" id="control-kimi-model" placeholder="e.g. kimi-code/kimi-for-coding (empty = Kimi default)">
+                  <input type="text" id="control-kimi-model" placeholder="model id from Kimi's catalog (empty = Kimi default)">
                 </div>
                 <div class="control-hint">
                   Applies when the next Kimi session process starts. Empty leaves the selected Kimi provider and account defaults in charge.
@@ -34720,17 +34720,17 @@ html.ui-v2 .daemon-relay-note {
                       </label>
                       <label class="sessions-new-session-field" for="new-session-kimi-model-select">
                         Kimi model
+                        <!-- Options are the daemon-learned Kimi catalog
+                             (populateNewSessionKimiModelSelect); no
+                             hardcoded model vocabulary lives here. -->
                         <select id="new-session-kimi-model-select" onchange="onNewSessionKimiModelSelectChange()" disabled>
                           <option value="">Global setting</option>
-                          <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-                          <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-                          <option value="kimi-code/k3">K3</option>
                           <option value="__custom__">Custom model id…</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field hidden" for="new-session-kimi-model" id="new-session-kimi-model-custom-row">
                         Custom model id
-                        <input id="new-session-kimi-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding" disabled>
+                        <input id="new-session-kimi-model" type="text" autocomplete="off" spellcheck="false" placeholder="model id from Kimi's catalog" disabled>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-kimi-thinking">
                         Kimi thinking
@@ -35480,17 +35480,17 @@ html.ui-v2 .daemon-relay-note {
               </div>
               <div class="settings-row">
                 <label for="set-kimi-model-select">Kimi model</label>
+                <!-- Options are the daemon-learned Kimi catalog
+                     (populateSettingsKimiModel); no hardcoded model
+                     vocabulary lives here. -->
                 <select id="set-kimi-model-select">
                   <option value="">Kimi account default</option>
-                  <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-                  <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-                  <option value="kimi-code/k3">K3</option>
                   <option value="__custom__">Custom model id…</option>
                 </select>
               </div>
               <div class="settings-row hidden" id="set-kimi-model-custom-row">
                 <label for="set-kimi-model-custom">Custom Kimi id</label>
-                <input id="set-kimi-model-custom" type="text" placeholder="e.g. kimi-code/kimi-for-coding" autocomplete="off" spellcheck="false">
+                <input id="set-kimi-model-custom" type="text" placeholder="model id from Kimi's catalog" autocomplete="off" spellcheck="false">
               </div>
               <div class="settings-row">
                 <label for="set-kimi-thinking">Kimi thinking</label>
@@ -36011,17 +36011,16 @@ html.ui-v2 .daemon-relay-note {
     </div>
     <div class="session-config-row" id="session-config-kimi-model-row">
       <label for="session-config-kimi-model">Kimi model</label>
+      <!-- Options are the daemon-learned Kimi catalog (rebuilt on modal
+           open); no hardcoded model vocabulary lives here. -->
       <select id="session-config-kimi-model" onchange="onSessionConfigKimiModelChange()">
         <option value="inherit">inherit Control default</option>
-        <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-        <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-        <option value="kimi-code/k3">K3</option>
         <option value="__custom__">Custom model id…</option>
       </select>
     </div>
     <div class="session-config-row" id="session-config-kimi-model-custom-row" style="display:none">
       <label for="session-config-kimi-model-custom">Custom id</label>
-      <input id="session-config-kimi-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding">
+      <input id="session-config-kimi-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="model id from Kimi's catalog">
     </div>
     <div class="session-config-row" id="session-config-kimi-thinking-row">
       <label for="session-config-kimi-thinking">Thinking</label>
@@ -39277,7 +39276,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '0c850c0554f24b9b';
+const INTENDANT_APP_BUILD = '095e24a8ed6acffa';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39988,6 +39987,102 @@ function applyExternalAgentAvailability(list) {
   // store; repaint its cards so a freshly detected CLI unmutes without
   // a tab re-entry. Renders are focus-guarded and cheap.
   if (typeof renderAgentSigninSection === 'function') renderAgentSigninSection();
+  // The daemon-served model catalogs ride the same rows (card
+  // 01KZR0QP9A): repaint every kimi model picker so a catalog learned
+  // mid-run (first Kimi spawn, config change) lands without a reload.
+  // Each populate preserves a still-valid current selection.
+  if (typeof populateNewSessionKimiModelSelect === 'function') {
+    populateNewSessionKimiModelSelect();
+  }
+  if (typeof refreshSettingsKimiModelOptions === 'function') {
+    refreshSettingsKimiModelOptions();
+  }
+  if (typeof stationScheduleUpdate === 'function') stationScheduleUpdate();
+}
+
+/* ── Per-backend model catalogs (card 01KZR0QP9A) ──
+   THE one SPA source for backend model vocabularies, derived from the
+   daemon-served availability rows above (`row.models`, learned from live
+   backend runs). Nothing here is ever fabricated: an unknown catalog
+   renders an honest empty state and every picker keeps its free-text
+   custom entry. The four historic hardcoded kimi model mirrors (session
+   launch, settings, agenda start sheet, Station controls) all derive
+   from here now — a daemon-side needle test pins the mirrors dead. */
+function backendModelCatalog(backendId) {
+  const rows = Array.isArray(externalAgentAvailability) ? externalAgentAvailability : null;
+  const row = rows ? rows.find(agent => agent && agent.id === backendId) : null;
+  const list = row && row.models && Array.isArray(row.models.list) ? row.models.list : null;
+  if (!list) {
+    return {
+      known: false,
+      models: [],
+      reason: row
+        ? (String(row.models_reason || '') ||
+           (row.installed === false ? 'not-installed' : 'no-run-observed'))
+        : 'unknown',
+    };
+  }
+  return {
+    known: true,
+    models: list.filter(m => m && typeof m.id === 'string' && m.id.trim()),
+    reason: null,
+  };
+}
+
+/* Honest one-liner for a kimi picker's current catalog state ('' when a
+   non-empty catalog is known). */
+function kimiModelCatalogNote(catalog) {
+  if (catalog.known) {
+    return catalog.models.length
+      ? ''
+      : 'Kimi reports no configured models — use the default or a custom id.';
+  }
+  return catalog.reason === 'not-installed'
+    ? 'Model list appears after Kimi Code is installed and a session runs.'
+    : 'Model list unavailable until the first Kimi Code run — use a custom id for a pin.';
+}
+
+/* Rebuild one kimi model <select> from the daemon-served catalog:
+   inherit option, catalog entries, an inline disabled note when the
+   catalog is unknown/empty, and the Custom escape hatch. Preserves the
+   current selection when it is still offered; returns the catalog so
+   callers can map a pinned model onto their own custom-input rows. */
+function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'Default' } = {}) {
+  const catalog = backendModelCatalog('kimi');
+  if (!select) return catalog;
+  const previous = select.value || inheritValue;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = inheritValue;
+  inherit.textContent = inheritLabel;
+  select.appendChild(inherit);
+  for (const model of catalog.models) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    const label = typeof model.display_name === 'string' ? model.display_name.trim() : '';
+    option.textContent = label && label !== model.id ? `${label} — ${model.id}` : model.id;
+    select.appendChild(option);
+  }
+  const note = kimiModelCatalogNote(catalog);
+  if (note) {
+    const hint = document.createElement('option');
+    hint.disabled = true;
+    hint.value = '__catalog_note__';
+    hint.textContent = `— ${note} —`;
+    select.appendChild(hint);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  select.title = note;
+  select.value =
+    previous === '__custom__' ||
+    previous === inheritValue ||
+    catalog.models.some(m => m.id === previous)
+      ? previous
+      : inheritValue;
+  return catalog;
 }
 let externalAgentAvailabilitySeq = 0;
 function refreshExternalAgentAvailability(options = {}) {
@@ -53167,17 +53262,14 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op.startsWith('kimi-model:')) {
+    // The token carries the full model id straight from the daemon-served
+    // catalog the Station pane rendered (card 01KZR0QP9A) — no hardcoded
+    // vocabulary map on the decode side either.
     const choice = op.slice('kimi-model:'.length).trim();
-    const models = {
-      default: null,
-      'k2.7': 'kimi-code/kimi-for-coding',
-      'k2.7-fast': 'kimi-code/kimi-for-coding-highspeed',
-      k3: 'kimi-code/k3',
-    };
-    if (!Object.prototype.hasOwnProperty.call(models, choice)) return;
-    const model = models[choice];
+    if (!choice) return;
+    const model = choice === 'default' ? null : choice;
     dispatchControlMsg({ action: 'set_kimi_model', model });
-    showControlToast?.('success', `Kimi model: ${choice}`);
+    showControlToast?.('success', `Kimi model: ${model || 'default'}`);
     return;
   }
   if (op.startsWith('kimi-thinking:')) {
@@ -54754,6 +54846,18 @@ function stationBuildControlsSummary() {
     claudeModel: controlClaudeConfig.model || '',
     claudePermissionMode: controlClaudeConfig.permission_mode || 'default',
     kimiModel: controlKimiConfig.model || '',
+    // The daemon-learned catalog feeds the pane's model choices (card
+    // 01KZR0QP9A); `known` distinguishes a fresh install's honestly empty
+    // catalog from "no Kimi run observed yet".
+    kimiModelChoices: (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi').models.map(m => ({
+          id: m.id,
+          label: (typeof m.display_name === 'string' && m.display_name.trim()) || m.id,
+        }))
+      : [],
+    kimiModelCatalogKnown: (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi').known
+      : false,
     kimiThinking: controlKimiConfig.thinking || '',
     kimiPermissionMode: controlKimiConfig.permission_mode || 'manual',
     kimiPlanMode: !!controlKimiConfig.plan_mode,
@@ -70448,20 +70552,22 @@ function openSessionConfigModal(sessionOrId) {
     if (row) row.style.display = isKimi ? '' : 'none';
   }
   if (isKimi) {
-    const knownModels = [
-      'kimi-code/kimi-for-coding',
-      'kimi-code/kimi-for-coding-highspeed',
-      'kimi-code/k3',
-    ];
+    // The model options are the daemon-served catalog (card 01KZR0QP9A);
+    // a pinned model outside it lands in the Custom row unchanged.
     const pinnedModel = String(meta.kimi_model || meta.kimiModel || '').trim();
     const modelSel = document.getElementById('session-config-kimi-model');
     const customInput = document.getElementById('session-config-kimi-model-custom');
+    const catalog = populateKimiModelSelect(modelSel, {
+      inheritValue: 'inherit',
+      inheritLabel: 'inherit Control default',
+    });
+    const pinnedInCatalog = catalog.models.some(m => m.id === pinnedModel);
     if (modelSel) {
       modelSel.value = !pinnedModel ? 'inherit'
-        : (knownModels.includes(pinnedModel) ? pinnedModel : '__custom__');
+        : (pinnedInCatalog ? pinnedModel : '__custom__');
     }
     if (customInput) {
-      customInput.value = pinnedModel && !knownModels.includes(pinnedModel) ? pinnedModel : '';
+      customInput.value = pinnedModel && !pinnedInCatalog ? pinnedModel : '';
     }
     const thinkingSel = document.getElementById('session-config-kimi-thinking');
     if (thinkingSel) {
@@ -97556,12 +97662,14 @@ function agendaStartExecutionSummary(mode) {
 }
 
 // The sheet's per-backend config vocabulary, from the daemon's served
-// settings (derive-don't-mirror: models and efforts come from the settings
-// payload where the daemon serves them; the static kimi/claude-alias lists
-// mirror the pinned settings-pane markup). `model`/`effort` are the daemon
-// DEFAULTS the selects inherit when left untouched. `backend` may override
-// the daemon default (the sheet's Backend select) — the same
-// AgentLaunchConfig vocabulary CreateSession uses.
+// settings (derive-don't-mirror: codex models/efforts come from the
+// settings payload, kimi models from the daemon-learned catalog on the
+// availability rows; the static claude-alias list is pinned to
+// project::CLAUDE_MODEL_ALIASES by a daemon-side parity test). `model`/
+// `effort` are the daemon DEFAULTS the selects inherit when left
+// untouched. `backend` may override the daemon default (the sheet's
+// Backend select) — the same AgentLaunchConfig vocabulary CreateSession
+// uses.
 function agendaStartBackendConfig(settings, backendOverride) {
   const d = settings || {};
   const dflt = (typeof normalizeAgentId === 'function')
@@ -97595,6 +97703,12 @@ function agendaStartBackendConfig(settings, backendOverride) {
     };
   }
   if (backend === 'kimi') {
+    // Model vocabulary from the daemon-learned catalog (card 01KZR0QP9A)
+    // — the availability rows, not a hardcoded list; unknown catalogs
+    // honestly offer only the daemon default (plus any configured pin,
+    // appended by the renderer below).
+    const kimiCatalog = (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi') : { models: [] };
     return {
       backend,
       label: 'Kimi Code',
@@ -97602,7 +97716,7 @@ function agendaStartBackendConfig(settings, backendOverride) {
       effortKey: 'kimi_thinking',
       effortLabel: 'Thinking',
       model: backend === dflt ? String(d.kimi_model || '') : '',
-      models: ['kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed', 'kimi-code/k3'],
+      models: kimiCatalog.models.map((m) => m.id),
       effort: backend === dflt ? String(d.kimi_thinking || '') : '',
       efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     };
@@ -124513,18 +124627,34 @@ function updateSettingsKimiCustomModelRow() {
   document.getElementById('set-kimi-model-custom-row')?.classList.toggle('hidden', !custom);
 }
 
+// The option list is the daemon-served catalog (card 01KZR0QP9A) —
+// rebuilt on every settings load and on availability broadcasts; a
+// configured model outside it shows honestly in the Custom row.
 function populateSettingsKimiModel(configuredModel) {
   const select = document.getElementById('set-kimi-model-select');
   const customInput = document.getElementById('set-kimi-model-custom');
   if (!select) return;
   const model = String(configuredModel || '').trim();
-  const known = [
-    'kimi-code/kimi-for-coding',
-    'kimi-code/kimi-for-coding-highspeed',
-    'kimi-code/k3',
-  ];
-  select.value = !model ? '' : (known.includes(model) ? model : '__custom__');
-  if (customInput) customInput.value = model && !known.includes(model) ? model : '';
+  const catalog = populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: 'Kimi account default',
+  });
+  const known = catalog.models.some(m => m.id === model);
+  select.value = !model ? '' : (known ? model : '__custom__');
+  if (customInput) customInput.value = model && !known ? model : '';
+  updateSettingsKimiCustomModelRow();
+}
+
+// Availability-broadcast repaint: rebuild the options in place, keeping
+// the user's current (still-valid) selection — never clobbering an
+// unsaved edit back to the persisted config.
+function refreshSettingsKimiModelOptions() {
+  const select = document.getElementById('set-kimi-model-select');
+  if (!select) return;
+  populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: 'Kimi account default',
+  });
   updateSettingsKimiCustomModelRow();
 }
 
@@ -134433,6 +134563,7 @@ function onNewSessionCodexModelSelectChange() {
 window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
 populateControlCodexReasoningEfforts();
 populateNewSessionCodexModelSelect();
+populateNewSessionKimiModelSelect();
 
 // The Claude model picker offers version-safe aliases (the CLI resolves
 // them to the latest model); the free-text id input only appears behind
@@ -134448,6 +134579,22 @@ function onNewSessionClaudeModelSelectChange() {
   updateNewSessionClaudeCustomModelRow();
 }
 window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
+
+// The option list is the daemon-learned catalog from the availability
+// rows (card 01KZR0QP9A) — the codex select's pattern, minus any static
+// fallback vocabulary: an unknown catalog offers only the global default
+// plus the free-text Custom row.
+function populateNewSessionKimiModelSelect() {
+  const select = document.getElementById('new-session-kimi-model-select');
+  if (!select) return;
+  populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: newSessionKimiGlobalModel
+      ? `Global setting (${newSessionKimiGlobalModel})`
+      : 'Global / Kimi default',
+  });
+  updateNewSessionKimiCustomModelRow();
+}
 
 function updateNewSessionKimiCustomModelRow() {
   const select = document.getElementById('new-session-kimi-model-select');
@@ -134693,6 +134840,7 @@ function setNewSessionAgentDefaults(settings) {
   if (configuredEfforts.length) newSessionCodexReasoningEfforts = configuredEfforts;
   populateControlCodexReasoningEfforts();
   populateNewSessionCodexModelSelect();
+  populateNewSessionKimiModelSelect();
   newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);

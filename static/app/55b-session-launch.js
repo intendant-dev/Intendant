@@ -115,6 +115,7 @@ function onNewSessionCodexModelSelectChange() {
 window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
 populateControlCodexReasoningEfforts();
 populateNewSessionCodexModelSelect();
+populateNewSessionKimiModelSelect();
 
 // The Claude model picker offers version-safe aliases (the CLI resolves
 // them to the latest model); the free-text id input only appears behind
@@ -130,6 +131,22 @@ function onNewSessionClaudeModelSelectChange() {
   updateNewSessionClaudeCustomModelRow();
 }
 window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
+
+// The option list is the daemon-learned catalog from the availability
+// rows (card 01KZR0QP9A) — the codex select's pattern, minus any static
+// fallback vocabulary: an unknown catalog offers only the global default
+// plus the free-text Custom row.
+function populateNewSessionKimiModelSelect() {
+  const select = document.getElementById('new-session-kimi-model-select');
+  if (!select) return;
+  populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: newSessionKimiGlobalModel
+      ? `Global setting (${newSessionKimiGlobalModel})`
+      : 'Global / Kimi default',
+  });
+  updateNewSessionKimiCustomModelRow();
+}
 
 function updateNewSessionKimiCustomModelRow() {
   const select = document.getElementById('new-session-kimi-model-select');
@@ -375,6 +392,7 @@ function setNewSessionAgentDefaults(settings) {
   if (configuredEfforts.length) newSessionCodexReasoningEfforts = configuredEfforts;
   populateControlCodexReasoningEfforts();
   populateNewSessionCodexModelSelect();
+  populateNewSessionKimiModelSelect();
   newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);

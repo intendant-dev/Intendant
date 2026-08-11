@@ -170,20 +170,22 @@ function openSessionConfigModal(sessionOrId) {
     if (row) row.style.display = isKimi ? '' : 'none';
   }
   if (isKimi) {
-    const knownModels = [
-      'kimi-code/kimi-for-coding',
-      'kimi-code/kimi-for-coding-highspeed',
-      'kimi-code/k3',
-    ];
+    // The model options are the daemon-served catalog (card 01KZR0QP9A);
+    // a pinned model outside it lands in the Custom row unchanged.
     const pinnedModel = String(meta.kimi_model || meta.kimiModel || '').trim();
     const modelSel = document.getElementById('session-config-kimi-model');
     const customInput = document.getElementById('session-config-kimi-model-custom');
+    const catalog = populateKimiModelSelect(modelSel, {
+      inheritValue: 'inherit',
+      inheritLabel: 'inherit Control default',
+    });
+    const pinnedInCatalog = catalog.models.some(m => m.id === pinnedModel);
     if (modelSel) {
       modelSel.value = !pinnedModel ? 'inherit'
-        : (knownModels.includes(pinnedModel) ? pinnedModel : '__custom__');
+        : (pinnedInCatalog ? pinnedModel : '__custom__');
     }
     if (customInput) {
-      customInput.value = pinnedModel && !knownModels.includes(pinnedModel) ? pinnedModel : '';
+      customInput.value = pinnedModel && !pinnedInCatalog ? pinnedModel : '';
     }
     const thinkingSel = document.getElementById('session-config-kimi-thinking');
     if (thinkingSel) {

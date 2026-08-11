@@ -1079,6 +1079,18 @@ function stationBuildControlsSummary() {
     claudeModel: controlClaudeConfig.model || '',
     claudePermissionMode: controlClaudeConfig.permission_mode || 'default',
     kimiModel: controlKimiConfig.model || '',
+    // The daemon-learned catalog feeds the pane's model choices (card
+    // 01KZR0QP9A); `known` distinguishes a fresh install's honestly empty
+    // catalog from "no Kimi run observed yet".
+    kimiModelChoices: (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi').models.map(m => ({
+          id: m.id,
+          label: (typeof m.display_name === 'string' && m.display_name.trim()) || m.id,
+        }))
+      : [],
+    kimiModelCatalogKnown: (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi').known
+      : false,
     kimiThinking: controlKimiConfig.thinking || '',
     kimiPermissionMode: controlKimiConfig.permission_mode || 'manual',
     kimiPlanMode: !!controlKimiConfig.plan_mode,

@@ -839,49 +839,54 @@ impl StationInner {
             ));
         }
         if controls.backend == "kimi" || controls.launch_agent == "kimi" {
+            // The model choices are the daemon-served catalog learned from
+            // live Kimi runs (card 01KZR0QP9A) — never a hardcoded
+            // vocabulary; the action token carries the full model id.
             let model = controls.kimi_model.trim();
-            surface.rows.push(PanelRow::choices(
-                "model",
-                C_SKY_CSS,
-                [
-                    (
-                        "default".to_string(),
-                        model.is_empty(),
-                        HitAction::ControlsAction {
-                            action: "kimi-model:default".into(),
-                        },
-                    ),
-                    (
-                        "k2.7".to_string(),
-                        model == "kimi-code/kimi-for-coding",
-                        HitAction::ControlsAction {
-                            action: "kimi-model:k2.7".into(),
-                        },
-                    ),
-                    (
-                        "k2.7 fast".to_string(),
-                        model == "kimi-code/kimi-for-coding-highspeed",
-                        HitAction::ControlsAction {
-                            action: "kimi-model:k2.7-fast".into(),
-                        },
-                    ),
-                    (
-                        "k3".to_string(),
-                        model == "kimi-code/k3",
-                        HitAction::ControlsAction {
-                            action: "kimi-model:k3".into(),
-                        },
-                    ),
-                ]
-                .to_vec(),
-            ));
+            let mut choices = vec![(
+                "default".to_string(),
+                model.is_empty(),
+                HitAction::ControlsAction {
+                    action: "kimi-model:default".into(),
+                },
+            )];
+            for choice in &controls.kimi_model_choices {
+                let id = choice.id.trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let label = choice.label.trim();
+                choices.push((
+                    if label.is_empty() {
+                        id.to_string()
+                    } else {
+                        label.to_string()
+                    },
+                    model == id,
+                    HitAction::ControlsAction {
+                        action: format!("kimi-model:{id}"),
+                    },
+                ));
+            }
+            surface.rows.push(PanelRow::choices("model", C_SKY_CSS, choices));
+            if controls.kimi_model_choices.is_empty() {
+                // Honest empty state: a fresh install's KNOWN catalog has no
+                // configured models; before any run the catalog is unknown.
+                surface.rows.push(PanelRow::new(
+                    "model".to_string(),
+                    if controls.kimi_model_catalog_known {
+                        "no models configured in Kimi".to_string()
+                    } else {
+                        "catalog unknown until a Kimi run".to_string()
+                    },
+                    C_SKY_CSS,
+                ));
+            }
             if !model.is_empty()
-                && ![
-                    "kimi-code/kimi-for-coding",
-                    "kimi-code/kimi-for-coding-highspeed",
-                    "kimi-code/k3",
-                ]
-                .contains(&model)
+                && !controls
+                    .kimi_model_choices
+                    .iter()
+                    .any(|choice| choice.id.trim() == model)
             {
                 surface.rows.push(PanelRow::new(
                     "model".to_string(),
