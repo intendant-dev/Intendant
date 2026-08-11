@@ -1191,6 +1191,16 @@ fn external_agents_probe(
                         serde_json::Value::String(reason.to_string()),
                     );
                 }
+                // The compiled-baseline suggestions ride beside the learned
+                // catalog (card 01KZR67RHT), already minus every learned id
+                // — a fresh install's picker gets real, clearly-suggestion-
+                // labeled choices while compiled entries never masquerade
+                // as observed truth inside `models`.
+                if let Some(suggestions) =
+                    crate::backend_model_catalog::row_compiled_suggestions_json(state_root, &id)
+                {
+                    obj.insert("compiled_suggestions".to_string(), suggestions);
+                }
             }
         }
     }
@@ -2918,13 +2928,22 @@ mod tests {
         assert_eq!(kimi["models_reason"], "not-installed");
 
         // CLI present but still no observed run: the reason flips to the
-        // no-run one — a fresh install honestly has no catalog yet.
+        // no-run one — a fresh install honestly has no catalog yet — and
+        // the compiled baseline serves in full (card 01KZR67RHT): the
+        // fresh-install picker's real choices, labeled as suggestions.
         install_fixture_binary(&kimi_bin);
         let rows = rows_for(state_root.path());
         let kimi = rows.iter().find(|row| row["id"] == "kimi").unwrap();
         assert!(kimi["models"].is_null(), "{kimi}");
         assert_eq!(kimi["installed"], true);
         assert_eq!(kimi["models_reason"], "no-run-observed");
+        let suggestions = kimi["compiled_suggestions"].as_array().unwrap();
+        let baseline = crate::backend_model_catalog::KIMI_COMPILED_MODEL_SUGGESTIONS;
+        assert_eq!(suggestions.len(), baseline.len());
+        for (served, declared) in suggestions.iter().zip(baseline) {
+            assert_eq!(served["id"], declared.id);
+            assert_eq!(served["display_name"], declared.label);
+        }
         // Non-catalog-capable backends carry NO catalog fields — an
         // always-null catalog would misread as "a run will fill this in".
         for row in &rows {
@@ -2935,6 +2954,11 @@ mod tests {
                     "{id} must not advertise a catalog lane"
                 );
             }
+            assert!(
+                crate::backend_model_catalog::compiled_model_suggestions(id).is_empty()
+                    == row.get("compiled_suggestions").is_none(),
+                "{id}: compiled_suggestions must ride exactly the declared baselines"
+            );
         }
 
         // A live Kimi run records its catalog → the rows serve it with
@@ -2959,6 +2983,27 @@ mod tests {
         assert_eq!(kimi["models"]["list"][0]["display_name"], "K3");
         assert_eq!(kimi["models"]["server_version"], "0.34.0");
         assert!(kimi["models"]["captured_secs_ago"].is_u64());
+        // Learned overlay (card 01KZR67RHT): a learned id leaves the
+        // suggestions — origins stay labeled, an id is offered as observed
+        // truth or unverified suggestion, never both.
+        let suggestions = kimi["compiled_suggestions"].as_array().unwrap();
+        let learned = kimi["models"]["list"].as_array().unwrap();
+        for suggestion in suggestions {
+            assert!(
+                learned.iter().all(|entry| entry["id"] != suggestion["id"]),
+                "{} served as both learned and suggested",
+                suggestion["id"]
+            );
+        }
+        if baseline
+            .iter()
+            .any(|declared| declared.id == "kimi-code/k3")
+        {
+            assert_eq!(suggestions.len(), baseline.len() - 1);
+            assert!(suggestions
+                .iter()
+                .all(|entry| entry["id"] != "kimi-code/k3"));
+        }
     }
 
     /// A model-catalog capture between probes is a repaint-worthy change:

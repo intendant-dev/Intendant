@@ -346,7 +346,7 @@ function populateSettingsKimiModel(configuredModel) {
     inheritValue: '',
     inheritLabel: 'Kimi account default',
   });
-  const known = catalog.models.some(m => m.id === model);
+  const known = kimiCatalogOffers(catalog, model);
   select.value = !model ? '' : (known ? model : '__custom__');
   if (customInput) customInput.value = model && !known ? model : '';
   updateSettingsKimiCustomModelRow();

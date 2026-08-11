@@ -2126,9 +2126,13 @@ mod tests {
     /// assembled dashboard or the Station pane producer — every picker
     /// derives from the daemon-served catalog through the one shared
     /// helper. (`~/.kimi-code/…` path copy is not a model id and stays.)
+    /// The ONE permitted compiled vocabulary is the daemon-side
+    /// `backend_model_catalog::KIMI_COMPILED_MODEL_SUGGESTIONS`
+    /// declaration (card 01KZR67RHT), which reaches pickers only through
+    /// the served `compiled_suggestions` field — never as SPA literals.
     #[test]
     fn kimi_model_vocabulary_mirrors_are_dead() {
-        for needle in ["'kimi-code/", "\"kimi-code/"] {
+        for needle in ["'kimi-code/", "\"kimi-code/", "`kimi-code/"] {
             assert!(
                 !APP_HTML.contains(needle),
                 "app.html re-grew a hardcoded kimi model-id literal ({needle}…): \
@@ -2148,6 +2152,14 @@ mod tests {
         assert!(APP_HTML.contains("function populateNewSessionKimiModelSelect("));
         assert!(APP_HTML.contains("function refreshSettingsKimiModelOptions("));
         assert!(APP_HTML.contains("kimiModelChoices:"));
+        // Card 01KZR67RHT: the compiled-baseline suggestions flow through
+        // the SAME shared source — the served field is consumed, suggested
+        // entries render as their own labeled group, and pinned-model →
+        // Custom-row mapping recognizes suggestions. A regression here
+        // returns fresh installs to Default+Custom-only pickers.
+        assert!(APP_HTML.contains("compiled_suggestions"));
+        assert!(APP_HTML.contains("function kimiCatalogOffers("));
+        assert!(APP_HTML.contains("Suggested models"));
     }
 
     /// The Claude model-alias vocabulary is a deliberate static mirror

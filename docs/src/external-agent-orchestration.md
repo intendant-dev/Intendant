@@ -114,15 +114,23 @@ Backends that don't model a field ignore it.
 **Kimi model catalog** (`backend_model_catalog.rs`): every successful Kimi
 spawn records the harness's own `listModels` catalog (memory + `<state
 root>/external-agents/model-catalogs.json`). It is the only truth source for
-Kimi's model vocabulary — a fresh install legitimately reports an empty
-configured-model list — and three consumers derive from it: the
+Kimi's *observed* model vocabulary — a fresh install legitimately reports an
+empty configured-model list — and three consumers derive from it: the
 `/api/external-agents` availability rows serve it (with capture provenance,
 or an honest `models: null` + `models_reason` before any run), the session
 launch path refuses a model pin outside a *known* catalog before spawning,
 and if a stale pin still reaches Kimi (catalog unknowable pre-spawn), the
 adapter degrades once — drops the pin, retries the create/profile step on
 Kimi's default model, and surfaces a warn note — instead of letting the
-spawned session die on Kimi's "model not configured" refusal.
+spawned session die on Kimi's "model not configured" refusal. Beside the
+learned catalog, the same module vendors a **compiled baseline**
+(`KIMI_COMPILED_MODEL_SUGGESTIONS` — the managed `kimi-code` lineup a
+signed-in install exposes) served on the row as `compiled_suggestions`,
+minus every learned id: fresh installs get real, suggestion-labeled picker
+choices instead of Default + Custom only. Compiled entries never appear
+inside `models` (they are unverified, not observed), the launch gate always
+passes them, and a pick the install refuses rides the same degrade-once to
+Kimi's default with the visible note.
 
 The supported backend identities are the `AgentBackend` enum (`Codex`,
 `ClaudeCode`, `Kimi`, `Pi`). `from_str_loose()` accepts the canonical short
