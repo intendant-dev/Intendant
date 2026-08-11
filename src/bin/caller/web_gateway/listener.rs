@@ -3531,14 +3531,23 @@ mod bootstrap_cache_tests {
             id: 50,
             action: "approve".to_string(),
         });
-        assert!(m.caches.daemon_approval_lines.lock().unwrap().contains_key(&51));
+        assert!(m
+            .caches
+            .daemon_approval_lines
+            .lock()
+            .unwrap()
+            .contains_key(&51));
         m.apply(&AppEvent::ApprovalResolved {
             session_id: None,
             id: 51,
             action: "timeout".to_string(),
         });
         assert!(
-            !m.caches.daemon_approval_lines.lock().unwrap().contains_key(&51),
+            !m.caches
+                .daemon_approval_lines
+                .lock()
+                .unwrap()
+                .contains_key(&51),
             "an expired proposal must not replay as a ghost card"
         );
 

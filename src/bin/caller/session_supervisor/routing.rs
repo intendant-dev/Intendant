@@ -4529,11 +4529,15 @@ mod tests {
             1,
             "exactly one honest 'already resolved' line: {lines:?}"
         );
-        assert_eq!(benign[0].0, "info", "the duplicate case is benign, not a warning");
+        assert_eq!(
+            benign[0].0, "info",
+            "the duplicate case is benign, not a warning"
+        );
         assert!(
-            lines.iter().all(|(_, content)| !content
-                .contains("no active managed session")
-                && !content.contains("managed session")),
+            lines.iter().all(
+                |(_, content)| !content.contains("no active managed session")
+                    && !content.contains("managed session")
+            ),
             "session vocabulary must never describe a daemon-scoped duplicate: {lines:?}"
         );
     }
@@ -4550,9 +4554,10 @@ mod tests {
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
         {
             let mut state = supervisor.state.lock().await;
-            state
-                .sessions
-                .insert("sess-live".to_string(), managed_session("sess-live", "intendant"));
+            state.sessions.insert(
+                "sess-live".to_string(),
+                managed_session("sess-live", "intendant"),
+            );
         }
         let mut bus_rx = bus.subscribe();
 
