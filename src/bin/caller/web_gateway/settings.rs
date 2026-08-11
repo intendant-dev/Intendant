@@ -1135,8 +1135,14 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
 /// first-run nudge claim an unfueled daemon can't do anything. `home`
 /// arrives from the transport edge (last-run recency and local-login
 /// probes read under it), so tests inject a tempdir instead of reading
-/// the live account (the CLAUDE.md tests-are-hermetic convention).
-fn external_agents_probe(project_root: Option<&Path>, home: &Path) -> serde_json::Value {
+/// the live account (the CLAUDE.md tests-are-hermetic convention);
+/// `state_root` arrives the same way for the daemon-learned model
+/// catalogs.
+fn external_agents_probe(
+    project_root: Option<&Path>,
+    home: &Path,
+    state_root: &Path,
+) -> serde_json::Value {
     let agent_config = project_root
         .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
         .map(|project| project.config.agent)
@@ -1161,8 +1167,32 @@ fn external_agents_probe(project_root: Option<&Path>, home: &Path) -> serde_json
                 continue;
             };
             let install = crate::backend_install::install_status_json(&registry, &backend);
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("install".to_string(), install);
+            let id = id.to_string();
+            let Some(obj) = row.as_object_mut() else {
+                continue;
+            };
+            obj.insert("install".to_string(), install);
+            // The daemon-learned model catalog rides the same row (card
+            // 01KZR0QP9A): present when a live run reported one, honest
+            // null + reason when not — never a fabricated list. Only
+            // catalog-capable backends carry the fields at all; every SPA
+            // model picker derives from THIS payload.
+            if crate::backend_model_catalog::CATALOG_CAPABLE_BACKEND_IDS
+                .contains(&id.as_str())
+            {
+                let installed = obj
+                    .get("installed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let (models, reason) =
+                    crate::backend_model_catalog::row_models_json(state_root, &id, installed);
+                obj.insert("models".to_string(), models);
+                if let Some(reason) = reason {
+                    obj.insert(
+                        "models_reason".to_string(),
+                        serde_json::Value::String(reason.to_string()),
+                    );
+                }
             }
         }
     }
@@ -1183,15 +1213,17 @@ const EXTERNAL_AGENTS_PROBE_TTL: std::time::Duration = std::time::Duration::from
 struct ExternalAgentsProbeEntry {
     probed_at: std::time::Instant,
     body: String,
-    /// `(backend id, installed)` fingerprint of the served rows — the
-    /// change signal the repaint event keys on. Deliberately only the
-    /// `installed` flips: last-used stamps and compatibility digests
-    /// churn without meaning "the picker's grey-out is now wrong".
-    installed: Vec<(String, bool)>,
+    /// `(backend id, installed, model-catalog capture stamp)` fingerprint
+    /// of the served rows — the change signal the repaint event keys on.
+    /// Deliberately only the flips that make an open picker WRONG: the
+    /// `installed` grey-out and the model-catalog vocabulary (card
+    /// 01KZR0QP9A). Last-used stamps and compatibility digests churn
+    /// without either meaning.
+    fingerprint: Vec<(String, bool, Option<u64>)>,
 }
 
 type ExternalAgentsProbeCache =
-    Mutex<HashMap<(Option<PathBuf>, PathBuf), ExternalAgentsProbeEntry>>;
+    Mutex<HashMap<(Option<PathBuf>, PathBuf, PathBuf), ExternalAgentsProbeEntry>>;
 
 fn external_agents_probe_cache() -> &'static ExternalAgentsProbeCache {
     static CACHE: OnceLock<ExternalAgentsProbeCache> = OnceLock::new();
@@ -1222,10 +1254,15 @@ fn external_agents_serve_in(
     cache: &ExternalAgentsProbeCache,
     project_root: Option<&Path>,
     home: &Path,
+    state_root: &Path,
     refresh: bool,
     now: std::time::Instant,
 ) -> ExternalAgentsServed {
-    let key = (project_root.map(Path::to_path_buf), home.to_path_buf());
+    let key = (
+        project_root.map(Path::to_path_buf),
+        home.to_path_buf(),
+        state_root.to_path_buf(),
+    );
     // Held across the probe on purpose: concurrent stale requests would
     // all stat the same artifacts, so serializing them costs nothing and
     // keeps exactly one change event per observed flip.
@@ -1240,20 +1277,25 @@ fn external_agents_serve_in(
             }
         }
     }
-    let agents = external_agents_probe(project_root, home);
-    let installed: Vec<(String, bool)> = agents
+    let agents = external_agents_probe(project_root, home, state_root);
+    let fingerprint: Vec<(String, bool, Option<u64>)> = agents
         .as_array()
         .map(|rows| {
             rows.iter()
                 .map(|row| {
+                    let id = row
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let catalog_stamp =
+                        crate::backend_model_catalog::catalog_fingerprint(state_root, &id);
                     (
-                        row.get("id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
+                        id,
                         row.get("installed")
                             .and_then(|i| i.as_bool())
                             .unwrap_or(false),
+                        catalog_stamp,
                     )
                 })
                 .collect()
@@ -1266,7 +1308,7 @@ fn external_agents_serve_in(
     })
     .to_string();
     let changed = match cache.get(&key) {
-        Some(previous) if previous.installed != installed => Some(agents),
+        Some(previous) if previous.fingerprint != fingerprint => Some(agents),
         _ => None,
     };
     cache.insert(
@@ -1274,7 +1316,7 @@ fn external_agents_serve_in(
         ExternalAgentsProbeEntry {
             probed_at: now,
             body: body.clone(),
-            installed,
+            fingerprint,
         },
     );
     ExternalAgentsServed { body, changed }
@@ -1570,11 +1612,13 @@ pub(crate) fn project_root_api_response(project_root: Option<&Path>) -> ApiRespo
 /// bounded-TTL serving cache. `refresh` is the request's explicit
 /// re-probe flag (`?refresh=1` / the tunnel param — the picker-open and
 /// Vault-tab-open lanes); `bus` broadcasts the repaint event when a probe
-/// observes an `installed` flip (`None` only in bus-less tests). `home`
-/// arrives from the transport edge (hermeticity convention).
+/// observes an `installed` or model-catalog flip (`None` only in bus-less
+/// tests). `home` and `state_root` arrive from the transport edge
+/// (hermeticity convention).
 pub(crate) fn external_agents_api_response(
     project_root: Option<&Path>,
     home: &Path,
+    state_root: &Path,
     refresh: bool,
     bus: Option<&EventBus>,
 ) -> ApiResponse {
@@ -1582,6 +1626,7 @@ pub(crate) fn external_agents_api_response(
         external_agents_probe_cache(),
         project_root,
         home,
+        state_root,
         refresh,
         std::time::Instant::now(),
     );
@@ -1672,13 +1717,19 @@ pub(crate) async fn handle_external_agents(
     stream: DemuxStream,
     project_root: Option<PathBuf>,
     home: PathBuf,
+    state_root: PathBuf,
     refresh: bool,
     bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response =
-        external_agents_api_response(project_root.as_deref(), &home, refresh, Some(&bus));
+    let response = external_agents_api_response(
+        project_root.as_deref(),
+        &home,
+        &state_root,
+        refresh,
+        Some(&bus),
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -2703,10 +2754,12 @@ mod tests {
         // an injected temp home (no live-account reads) and spliced —
         // the canonical 200 framing is the byte-exact pin.
         let home = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
         let body = external_agents_serve_in(
             &ExternalAgentsProbeCache::default(),
             None,
             home.path(),
+            state_root.path(),
             false,
             std::time::Instant::now(),
         )
@@ -2718,10 +2771,20 @@ mod tests {
         );
         let cors = settings_route_cors("GET", "/api/external-agents");
         let home_path = home.path().to_path_buf();
+        let state_root_path = state_root.path().to_path_buf();
         let bus = EventBus::new();
         let handler_bus = bus.clone();
         let response = collect_settings_handler_response(|stream| {
-            handle_external_agents(stream, None, home_path, false, handler_bus, cors, None)
+            handle_external_agents(
+                stream,
+                None,
+                home_path,
+                state_root_path,
+                false,
+                handler_bus,
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -2736,14 +2799,25 @@ mod tests {
             &ExternalAgentsProbeCache::default(),
             Some(root.path()),
             home.path(),
+            state_root.path(),
             false,
             std::time::Instant::now(),
         )
         .body;
         let root_path = root.path().to_path_buf();
         let home_path = home.path().to_path_buf();
+        let state_root_path = state_root.path().to_path_buf();
         let response = collect_settings_handler_response(|stream| {
-            handle_external_agents(stream, Some(root_path), home_path, false, bus, cors, None)
+            handle_external_agents(
+                stream,
+                Some(root_path),
+                home_path,
+                state_root_path,
+                false,
+                bus,
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -2762,10 +2836,12 @@ mod tests {
     #[test]
     fn served_external_agents_rows_carry_the_install_matrix() {
         let home = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
         let body = external_agents_serve_in(
             &ExternalAgentsProbeCache::default(),
             None,
             home.path(),
+            state_root.path(),
             false,
             std::time::Instant::now(),
         )
@@ -2795,6 +2871,152 @@ mod tests {
         assert!(rows.iter().any(
             |row| row["id"] == "pi" && row["install"]["available"] == serde_json::json!(false)
         ));
+    }
+
+    /// The daemon-learned model catalog on the availability rows (card
+    /// 01KZR0QP9A): absent-with-reason before any run reported one, the
+    /// stored list (with provenance) afterwards — and only catalog-capable
+    /// backends carry the fields at all. This payload is THE source every
+    /// SPA model picker derives from; nothing here is ever fabricated.
+    #[test]
+    fn served_rows_carry_model_catalogs_present_or_absent_with_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        // Pin kimi's installedness hermetically (the same absolute-path
+        // trick as `availability_flip_fixture` — a bare command name would
+        // resolve on the live PATH and make the reason machine-dependent).
+        let root = tempfile::tempdir().unwrap();
+        let kimi_bin = root.path().join("kimi-probe.exe");
+        std::fs::write(
+            root.path().join("intendant.toml"),
+            format!("[agent.kimi]\ncommand = '{}'\n", kimi_bin.display()),
+        )
+        .unwrap();
+        let rows_for = |state_root: &Path| -> Vec<serde_json::Value> {
+            let body = external_agents_serve_in(
+                &ExternalAgentsProbeCache::default(),
+                Some(root.path()),
+                home.path(),
+                state_root,
+                false,
+                std::time::Instant::now(),
+            )
+            .body;
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["external_agents"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        // No catalog captured, CLI missing: honest null + not-installed.
+        let rows = rows_for(state_root.path());
+        let kimi = rows.iter().find(|row| row["id"] == "kimi").unwrap();
+        assert!(kimi["models"].is_null(), "{kimi}");
+        assert_eq!(kimi["installed"], false);
+        assert_eq!(kimi["models_reason"], "not-installed");
+
+        // CLI present but still no observed run: the reason flips to the
+        // no-run one — a fresh install honestly has no catalog yet.
+        install_fixture_binary(&kimi_bin);
+        let rows = rows_for(state_root.path());
+        let kimi = rows.iter().find(|row| row["id"] == "kimi").unwrap();
+        assert!(kimi["models"].is_null(), "{kimi}");
+        assert_eq!(kimi["installed"], true);
+        assert_eq!(kimi["models_reason"], "no-run-observed");
+        // Non-catalog-capable backends carry NO catalog fields — an
+        // always-null catalog would misread as "a run will fill this in".
+        for row in &rows {
+            let id = row["id"].as_str().unwrap();
+            if !crate::backend_model_catalog::CATALOG_CAPABLE_BACKEND_IDS.contains(&id) {
+                assert!(
+                    row.get("models").is_none() && row.get("models_reason").is_none(),
+                    "{id} must not advertise a catalog lane"
+                );
+            }
+        }
+
+        // A live Kimi run records its catalog → the rows serve it with
+        // provenance and drop the reason.
+        crate::backend_model_catalog::record_backend_models_at(
+            state_root.path(),
+            "kimi",
+            vec![crate::backend_model_catalog::CatalogModel {
+                id: "kimi-code/k3".to_string(),
+                display_name: Some("K3".to_string()),
+                max_context_size: Some(1_048_576),
+                support_efforts: Some(vec!["low".into(), "high".into(), "max".into()]),
+                default_effort: Some("high".to_string()),
+            }],
+            Some("0.34.0".to_string()),
+            1_700_000_000,
+        );
+        let rows = rows_for(state_root.path());
+        let kimi = rows.iter().find(|row| row["id"] == "kimi").unwrap();
+        assert!(kimi.get("models_reason").is_none(), "{kimi}");
+        assert_eq!(kimi["models"]["list"][0]["id"], "kimi-code/k3");
+        assert_eq!(kimi["models"]["list"][0]["display_name"], "K3");
+        assert_eq!(kimi["models"]["server_version"], "0.34.0");
+        assert!(kimi["models"]["captured_secs_ago"].is_u64());
+    }
+
+    /// A model-catalog capture between probes is a repaint-worthy change:
+    /// the stale-vocabulary picker was exactly as wrong as a stale
+    /// grey-out (the 2026-08-11 dead-session incident), so the re-probe
+    /// broadcasts fresh rows once and then stays silent.
+    #[test]
+    fn model_catalog_capture_reports_a_change_on_reprobe() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let cache = ExternalAgentsProbeCache::default();
+        let t0 = std::time::Instant::now();
+
+        let first = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            false,
+            t0,
+        );
+        assert!(first.changed.is_none());
+
+        // A Kimi session initializes mid-run and records the live catalog.
+        crate::backend_model_catalog::record_backend_models_at(
+            state_root.path(),
+            "kimi",
+            Vec::new(),
+            Some("0.34.0".to_string()),
+            1_700_000_000,
+        );
+
+        let reprobed = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            false,
+            t0 + EXTERNAL_AGENTS_PROBE_TTL + std::time::Duration::from_secs(1),
+        );
+        let changed = reprobed.changed.expect("catalog capture must repaint");
+        let kimi = changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "kimi")
+            .unwrap();
+        assert_eq!(kimi["models"]["list"], serde_json::json!([]));
+
+        // Steady state: no new capture, no further broadcast.
+        let steady = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            false,
+            t0 + (EXTERNAL_AGENTS_PROBE_TTL * 2) + std::time::Duration::from_secs(2),
+        );
+        assert!(steady.changed.is_none());
     }
 
     /// Fixture for the availability-cache pins: a project whose codex
@@ -2846,7 +3068,15 @@ mod tests {
         let cache = ExternalAgentsProbeCache::default();
         let t0 = std::time::Instant::now();
 
-        let first = external_agents_serve_in(&cache, Some(root.path()), home.path(), false, t0);
+        let state_root = tempfile::tempdir().unwrap();
+        let first = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            false,
+            t0,
+        );
         assert!(!codex_installed(&first.body));
         assert!(
             first.changed.is_none(),
@@ -2862,6 +3092,7 @@ mod tests {
             &cache,
             Some(root.path()),
             home.path(),
+            state_root.path(),
             false,
             t0 + std::time::Duration::from_secs(10),
         );
@@ -2874,6 +3105,7 @@ mod tests {
             &cache,
             Some(root.path()),
             home.path(),
+            state_root.path(),
             false,
             t0 + EXTERNAL_AGENTS_PROBE_TTL + std::time::Duration::from_secs(1),
         );
@@ -2895,6 +3127,7 @@ mod tests {
             &cache,
             Some(root.path()),
             home.path(),
+            state_root.path(),
             false,
             t0 + (EXTERNAL_AGENTS_PROBE_TTL * 2) + std::time::Duration::from_secs(2),
         );
@@ -2910,7 +3143,15 @@ mod tests {
         let cache = ExternalAgentsProbeCache::default();
         let t0 = std::time::Instant::now();
 
-        let first = external_agents_serve_in(&cache, Some(root.path()), home.path(), false, t0);
+        let state_root = tempfile::tempdir().unwrap();
+        let first = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            false,
+            t0,
+        );
         assert!(!codex_installed(&first.body));
 
         install_fixture_binary(&bin);
@@ -2918,6 +3159,7 @@ mod tests {
             &cache,
             Some(root.path()),
             home.path(),
+            state_root.path(),
             true,
             t0 + std::time::Duration::from_secs(1),
         );
@@ -2934,6 +3176,7 @@ mod tests {
             &cache,
             Some(root.path()),
             home.path(),
+            state_root.path(),
             false,
             t0 + std::time::Duration::from_secs(2),
         );
@@ -2950,7 +3193,14 @@ mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
 
-        let first = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        let state_root = tempfile::tempdir().unwrap();
+        let first = external_agents_api_response(
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            true,
+            Some(&bus),
+        );
         assert!(matches!(first, ApiResponse::Json { status: 200, .. }));
         assert!(
             rx.try_recv().is_err(),
@@ -2958,7 +3208,13 @@ mod tests {
         );
 
         install_fixture_binary(&bin);
-        let _ = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        let _ = external_agents_api_response(
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            true,
+            Some(&bus),
+        );
         let event = rx.try_recv().expect("the installed flip broadcasts");
         let outbound = crate::event::app_event_to_outbound(&event)
             .expect("availability changes reach external consumers");
@@ -2974,7 +3230,13 @@ mod tests {
         );
 
         // No flip → no second broadcast, even on explicit refresh.
-        let _ = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        let _ = external_agents_api_response(
+            Some(root.path()),
+            home.path(),
+            state_root.path(),
+            true,
+            Some(&bus),
+        );
         assert!(rx.try_recv().is_err(), "steady state stays silent");
     }
 

@@ -545,6 +545,26 @@ pub(crate) fn external(message: impl Into<String>) -> CallerError {
     CallerError::ExternalAgent(message.into())
 }
 
+/// Whether an error from this wire is Kimi's "model not configured"
+/// refusal (card 01KZR0QP9A — the profile/create rejection that killed
+/// fresh-install launches whose model pin predated the install's real
+/// catalog). Matched next to [`decode_response`], the formatter that
+/// shapes these messages: Kimi rejects an unconfigured model alias with
+/// wire code 50001 and prose naming the model, e.g.
+/// `Kimi /sessions/…/profile failed (HTTP 200, code 50001): Model
+/// "kimi-code/k3" is not configured in config.toml.` The prose match is
+/// kept as a fallback for a re-coded future build; both forms must
+/// mention a model so an unrelated config refusal never triggers the
+/// launch degrade.
+pub(crate) fn model_not_configured_refusal(error: &CallerError) -> bool {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("model") {
+        return false;
+    }
+    message.contains("code 50001") || lower.contains("not configured")
+}
+
 pub(crate) fn validate_meta(value: &Value) -> Result<String, CallerError> {
     let version = value
         .get("server_version")
@@ -708,6 +728,34 @@ mod tests {
             "http://127.0.0.1:51035"
         );
         assert!(normalize_loopback_origin("http://example.com:51035").is_err());
+    }
+
+    #[test]
+    fn model_not_configured_recognizer_matches_the_incident_shape_only() {
+        // The live 2026-08-11 incident string (Kimi 0.34.0, fresh install).
+        let incident = external(
+            "Kimi /sessions/sess_x/profile failed (HTTP 200, code 50001): \
+             Model \"kimi-code/k3\" is not configured in config.toml.",
+        );
+        assert!(model_not_configured_refusal(&incident));
+        // A re-coded build keeping the prose still matches.
+        let reworded = external(
+            "Kimi /sessions/sess_x/profile failed (HTTP 200, code 51234): \
+             model \"kimi-code/k9\" is not configured for this workspace",
+        );
+        assert!(model_not_configured_refusal(&reworded));
+        // Unrelated wire failures never trigger the launch degrade.
+        assert!(!model_not_configured_refusal(&external(
+            "Kimi /sessions/sess_x/profile failed (HTTP 200, code 40001): bad request",
+        )));
+        assert!(!model_not_configured_refusal(&external(
+            "Kimi /sessions/sess_x/profile failed (HTTP 200, code 50001): \
+             thinking level is not supported",
+        )));
+        assert!(!model_not_configured_refusal(&external(
+            "Kimi /sessions/sess_x/profile failed (HTTP 200, code 40909): \
+             search service is not configured",
+        )));
     }
 
     #[test]

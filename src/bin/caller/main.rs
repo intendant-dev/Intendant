@@ -11,6 +11,7 @@ pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod backend_install;
+mod backend_model_catalog;
 mod background_tasks;
 mod boot_readopt;
 mod browser_workspace;

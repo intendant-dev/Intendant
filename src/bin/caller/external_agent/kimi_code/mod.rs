@@ -385,6 +385,19 @@ impl KimiCodeAgent {
         Value::Object(config)
     }
 
+    /// Launch degrade for the stale-model-catalog death (card 01KZR0QP9A):
+    /// when Kimi refuses the launch's model pin as not configured, drop the
+    /// pin (so [`Self::session_agent_config`] stops sending it) and return
+    /// the requested id for the retry-once + visible-note flow in
+    /// `start_thread`. `None` = the error is not this refusal, or no model
+    /// pin remains to drop — the caller propagates the original error.
+    fn degradable_launch_model(&mut self, error: &CallerError) -> Option<String> {
+        if !wire::model_not_configured_refusal(error) {
+            return None;
+        }
+        self.launch.model.take()
+    }
+
     async fn submit_content(
         &mut self,
         thread: &AgentThread,
@@ -1659,7 +1672,7 @@ impl ExternalAgent for KimiCodeAgent {
             return Err(error);
         }
         if let Some(watch) = self.protocol_watch.as_ref() {
-            watch.mark_observed(Some(meta));
+            watch.mark_observed(Some(meta.clone()));
         }
 
         let stdout_handle = tokio::spawn(drain_silently(stdout_reader));
@@ -1698,12 +1711,42 @@ impl ExternalAgent for KimiCodeAgent {
         self.emit(AgentEvent::CwdAnnounced {
             cwd: config.working_dir.to_string_lossy().to_string(),
         });
+        // Stale-model-catalog session death (card 01KZR0QP9A): learn Kimi's
+        // configured-model catalog from THE live harness — the only truth
+        // source (a fresh install legitimately reports an empty list). The
+        // record feeds the daemon's launch gate and every dashboard model
+        // picker. Non-fatal on failure: the daemon simply keeps not knowing,
+        // and the mid-launch degrade below still protects the session.
+        match self.rpc()?.models().await {
+            Ok(models) => {
+                crate::backend_model_catalog::record_backend_models(
+                    &crate::platform::intendant_home(),
+                    super::AgentBackend::Kimi.as_short_str(),
+                    models.iter().map(catalog_model_from_rpc).collect(),
+                    Some(meta),
+                );
+            }
+            Err(error) => {
+                self.emit(AgentEvent::Log {
+                    level: "info".to_string(),
+                    message: format!(
+                        "Kimi model-catalog probe failed ({error}); the daemon's model picker \
+                         keeps its last known catalog"
+                    ),
+                });
+            }
+        }
         self.emit_config_facts(false);
         Ok(event_rx)
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
         let disposable = self.resume_session.is_none() || self.fork_resume;
+        // Set when Kimi refused the launch's model pin as not configured and
+        // the launch degraded to the backend default instead of dying
+        // post-spawn (card 01KZR0QP9A). Carries the requested id for the
+        // visible session note below.
+        let mut degraded_model: Option<String> = None;
         let session = if let Some(resume) = self.resume_session.clone() {
             if self.fork_resume {
                 self.fork_resumed_session(&resume).await?
@@ -1713,11 +1756,28 @@ impl ExternalAgent for KimiCodeAgent {
         } else {
             let working_dir = self
                 .working_dir
-                .as_deref()
+                .clone()
                 .ok_or_else(|| external("Kimi working directory is unavailable"))?;
-            self.api()?
-                .create_session(working_dir, self.session_agent_config())
-                .await?
+            match self
+                .api()?
+                .create_session(&working_dir, self.session_agent_config())
+                .await
+            {
+                Ok(session) => session,
+                // Kimi 0.27-0.29 validate `agent_config` at creation, so a
+                // stale model pin can die here before the profile step.
+                // Degrade once: drop the pin and re-create on the backend's
+                // default model.
+                Err(error) => match self.degradable_launch_model(&error) {
+                    Some(requested) => {
+                        degraded_model = Some(requested);
+                        self.api()?
+                            .create_session(&working_dir, self.session_agent_config())
+                            .await?
+                    }
+                    None => return Err(error),
+                },
+            }
         };
         let session_id = session
             .get("id")
@@ -1740,10 +1800,27 @@ impl ExternalAgent for KimiCodeAgent {
         // authoritative live mutation path, so apply launch pins here for new,
         // resumed, and forked sessions before publication/subscription.
         let configured: Result<Value, CallerError> = async {
-            let session = self
+            let session = match self
                 .api()?
                 .update_profile(&session_id, self.session_agent_config())
-                .await?;
+                .await
+            {
+                Ok(session) => session,
+                // The owner incident (2026-08-11, fresh Kimi 0.34.0): the
+                // session spawned, then this profile PUT was refused with
+                // "Model … is not configured" and the whole session died.
+                // A spawned-then-dead session is the defect — degrade once
+                // to the backend's own default and surface a note below.
+                Err(error) => match self.degradable_launch_model(&error) {
+                    Some(requested) => {
+                        degraded_model = Some(requested);
+                        self.api()?
+                            .update_profile(&session_id, self.session_agent_config())
+                            .await?
+                    }
+                    None => return Err(error),
+                },
+            };
             if let Some(names) = self.launch.allowed_tools.clone() {
                 let names = self
                     .resolve_launch_tool_names(&session_id, KIMI_MAIN_AGENT_ID, &names)
@@ -1769,6 +1846,20 @@ impl ExternalAgent for KimiCodeAgent {
                 return Err(error);
             }
         };
+        if let Some(requested) = degraded_model.take() {
+            // Visible on the session (activity log + session log): the pin
+            // was dropped, not silently rewritten. The profile-facts refresh
+            // above already reported the model actually in effect.
+            self.emit(AgentEvent::Log {
+                level: "warn".to_string(),
+                message: format!(
+                    "Kimi does not have model {requested:?} configured in this install \
+                     (stale pick or fresh install); the session continues on Kimi's default \
+                     model. Pick a model from the live catalog or update Kimi's config.toml \
+                     to restore the pin."
+                ),
+            });
+        }
         self.emit_session_warnings(&session_id).await;
         crate::background_tasks::clear_session(&session_id);
         self.shared.set_session_id(Some(session_id.clone()));
@@ -2726,6 +2817,19 @@ fn validate_requested_tool_names(
     }
 }
 
+/// Project one live `listModels` entry into the daemon's stored catalog
+/// vocabulary (card 01KZR0QP9A). The stored id is the exact alias Kimi
+/// accepts as a model selection.
+fn catalog_model_from_rpc(model: &KimiRpcModel) -> crate::backend_model_catalog::CatalogModel {
+    crate::backend_model_catalog::CatalogModel {
+        id: model.model.clone(),
+        display_name: model.display_name.clone(),
+        max_context_size: Some(model.max_context_size),
+        support_efforts: model.support_efforts.clone(),
+        default_effort: model.default_effort.clone(),
+    }
+}
+
 fn resolve_catalog_model<'a>(
     models: &'a [KimiRpcModel],
     requested: &str,
@@ -3116,6 +3220,168 @@ mod tests {
         assert_eq!(
             clear_line,
             "POST /api/v2/session/session-parent/agent/agent-0/agentRPCService/clearContext HTTP/1.1"
+        );
+        server.await.unwrap();
+    }
+
+    /// The launch degrade seam (card 01KZR0QP9A): only the model-not-
+    /// configured refusal takes the pin, it takes it exactly once, and an
+    /// unrelated failure leaves the pin alone for the caller to propagate.
+    #[test]
+    fn degradable_launch_model_takes_the_pin_once_for_the_refusal_only() {
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.launch.model = Some("kimi-code/k3".to_string());
+
+        let unrelated = external("Kimi /sessions/x/profile failed (HTTP 200, code 40001): bad");
+        assert_eq!(agent.degradable_launch_model(&unrelated), None);
+        assert_eq!(agent.launch.model.as_deref(), Some("kimi-code/k3"));
+
+        let refusal = external(
+            "Kimi /sessions/x/profile failed (HTTP 200, code 50001): \
+             Model \"kimi-code/k3\" is not configured in config.toml.",
+        );
+        assert_eq!(
+            agent.degradable_launch_model(&refusal).as_deref(),
+            Some("kimi-code/k3")
+        );
+        assert_eq!(agent.launch.model, None);
+        // Once degraded there is nothing left to drop — the retry's own
+        // failure propagates instead of looping.
+        assert_eq!(agent.degradable_launch_model(&refusal), None);
+        // And the launch config stops sending the dead pin.
+        assert!(agent.session_agent_config().get("model").is_none());
+    }
+
+    /// The 2026-08-11 owner incident end to end: a fresh Kimi install
+    /// refuses the launch's model pin at the profile step (wire code
+    /// 50001) AFTER the session spawned. The launch must degrade to the
+    /// backend default — retry the profile once without the pin — and
+    /// surface a visible warn note instead of dying post-spawn.
+    #[tokio::test]
+    async fn start_thread_degrades_a_refused_model_pin_instead_of_dying() {
+        let (origin, requests, server) = sequential_mock_server(vec![
+            // create_session (Kimi 0.34 accepts the config at creation).
+            serde_json::json!({"code": 0, "data": {"id": "session_degrade"}}),
+            // The authoritative profile apply refuses the stale pin.
+            serde_json::json!({
+                "code": 50001,
+                "msg": "Model \"kimi-code/k3\" is not configured in config.toml.",
+                "data": null
+            }),
+            // The degraded (pin-less) retry succeeds.
+            serde_json::json!({"code": 0, "data": {"id": "session_degrade"}}),
+            // refresh_profile_facts: profile data, then the tool inventory.
+            serde_json::json!({
+                "code": 0,
+                "data": {
+                    "modelAlias": "kimi-for-coding",
+                    "thinkingLevel": "high",
+                    "activeToolNames": ["Read"]
+                }
+            }),
+            serde_json::json!({
+                "code": 0,
+                "data": [{
+                    "name": "Read",
+                    "description": "read files",
+                    "active": true,
+                    "source": "builtin"
+                }]
+            }),
+            // emit_session_warnings.
+            serde_json::json!({"code": 0, "data": {"warnings": []}}),
+        ])
+        .await;
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.launch.model = Some("kimi-code/k3".to_string());
+        agent.launch.allowed_tools = None;
+        agent.working_dir = Some(PathBuf::from("/tmp/kimi-degrade-test"));
+        agent.api = Some(KimiApi::new(origin.clone(), "test-token".into()).unwrap());
+        agent.rpc = Some(KimiRpcApi::new(origin, "test-token".into()).unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        agent.event_tx = Some(event_tx);
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+        agent.ws_tx = Some(ws_tx);
+
+        let thread = agent.start_thread().await.expect("launch must survive");
+        assert_eq!(thread.thread_id, "session_degrade");
+        // The pin degraded to the backend's own default, and the profile
+        // refresh reported the model actually in effect.
+        assert_eq!(agent.launch.model.as_deref(), Some("kimi-for-coding"));
+
+        let requests = requests.await.unwrap();
+        let (create_line, create_body) = request_line_and_body(&requests[0]);
+        assert_eq!(create_line, "POST /api/v1/sessions HTTP/1.1");
+        assert_eq!(create_body["agent_config"]["model"], "kimi-code/k3");
+        let (first_profile_line, first_profile) = request_line_and_body(&requests[1]);
+        assert_eq!(
+            first_profile_line,
+            "POST /api/v1/sessions/session_degrade/profile HTTP/1.1"
+        );
+        assert_eq!(first_profile["agent_config"]["model"], "kimi-code/k3");
+        let (retry_line, retry) = request_line_and_body(&requests[2]);
+        assert_eq!(
+            retry_line,
+            "POST /api/v1/sessions/session_degrade/profile HTTP/1.1"
+        );
+        assert!(
+            retry["agent_config"].get("model").is_none(),
+            "the retry must drop the refused pin: {retry}"
+        );
+        assert_eq!(
+            retry["agent_config"]["permission_mode"], "manual",
+            "the rest of the launch config still applies: {retry}"
+        );
+
+        // The degradation is visible on the session, not silent.
+        let mut saw_warn = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::Log { level, message } = event {
+                if level == "warn" && message.contains("kimi-code/k3") {
+                    assert!(message.contains("default model"), "{message}");
+                    saw_warn = true;
+                }
+            }
+        }
+        assert!(saw_warn, "the dropped pin must surface a warn note");
+        assert!(
+            matches!(ws_rx.try_recv(), Ok(WsCommand::Subscribe { session_id, .. }) if session_id == "session_degrade")
+        );
+        server.await.unwrap();
+    }
+
+    /// An unrelated profile failure must NOT degrade: the launch dies with
+    /// the real error and the just-created session is archived (the
+    /// pre-existing disposable-session contract).
+    #[tokio::test]
+    async fn start_thread_propagates_non_model_profile_failures_unchanged() {
+        let (origin, requests, server) = sequential_mock_server(vec![
+            serde_json::json!({"code": 0, "data": {"id": "session_dead"}}),
+            serde_json::json!({"code": 40001, "msg": "bad request", "data": null}),
+            // The disposable-session archive after the failure.
+            serde_json::json!({"code": 0, "data": {"archived": true}}),
+        ])
+        .await;
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.launch.model = Some("kimi-code/k3".to_string());
+        agent.launch.allowed_tools = None;
+        agent.working_dir = Some(PathBuf::from("/tmp/kimi-degrade-test"));
+        agent.api = Some(KimiApi::new(origin.clone(), "test-token".into()).unwrap());
+        agent.rpc = Some(KimiRpcApi::new(origin, "test-token".into()).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        agent.event_tx = Some(event_tx);
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        agent.ws_tx = Some(ws_tx);
+
+        let error = agent.start_thread().await.unwrap_err();
+        assert!(error.to_string().contains("code 40001"), "{error}");
+        assert_eq!(agent.launch.model.as_deref(), Some("kimi-code/k3"));
+
+        let requests = requests.await.unwrap();
+        let (archive_line, _) = request_line_and_body(&requests[2]);
+        assert_eq!(
+            archive_line,
+            "POST /api/v1/sessions/session_dead:archive HTTP/1.1"
         );
         server.await.unwrap();
     }

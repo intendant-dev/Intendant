@@ -3174,18 +3174,31 @@ mod tests {
 
     #[tokio::test]
     async fn parity_external_agents_shares_the_availability_body() {
-        // Injected temp home on both lanes (a fixture must never scan
-        // the live account's last-run state); the tunnel frames the
-        // one neutral fn body-only.
+        // Injected temp home and state root on both lanes (a fixture must
+        // never scan the live account's last-run state or catalog store);
+        // the tunnel frames the one neutral fn body-only.
         let home = tempfile::tempdir().expect("temp home");
+        let state_root = tempfile::tempdir().expect("temp state root");
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::external_agents_api_response(None, home.path(), false, None),
+            crate::web_gateway::external_agents_api_response(
+                None,
+                home.path(),
+                state_root.path(),
+                false,
+                None,
+            ),
         );
         assert_eq!(status, 200);
         assert!(http_body["external_agents"].is_array(), "{http_body}");
         let frame = frame_api_json_body_response(
             "parity-external-agents".to_string(),
-            crate::web_gateway::external_agents_api_response(None, home.path(), false, None),
+            crate::web_gateway::external_agents_api_response(
+                None,
+                home.path(),
+                state_root.path(),
+                false,
+                None,
+            ),
             "external agents",
         );
         assert_eq!(frame["ok"], true);
