@@ -1041,8 +1041,13 @@ function ui2CapacityChipSync() {
       : stage === 'defer'
         ? 'Memory pressure: new session admissions queue until headroom returns; resident work continues.'
         : 'Sessions are at the resident bound: new admissions queue until a slot frees.',
-    `Residents ${view.resident} of ${view.bound}.`,
   ];
+  // The daemon's own reasons strings name the firing signal(s) — the
+  // client renders them verbatim, no threshold knowledge here.
+  if (Array.isArray(view.reasons) && view.reasons.length) {
+    lines.push(`Why: ${view.reasons.join('; ')}.`);
+  }
+  lines.push(`Residents ${view.resident} of ${view.bound}.`);
   if (queued > 0) lines.push(`${queued} admission(s) queued — they fire when headroom returns.`);
   if (view.probe_ok === false) lines.push('No memory probe on this host: staging is fail-open; only the resident bound applies.');
   chip.title = lines.join(' ');
