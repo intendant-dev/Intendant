@@ -3179,15 +3179,14 @@ mod tests {
         // the tunnel frames the one neutral fn body-only.
         let home = tempfile::tempdir().expect("temp home");
         let state_root = tempfile::tempdir().expect("temp state root");
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::external_agents_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::external_agents_api_response(
                 None,
                 home.path(),
                 state_root.path(),
                 false,
                 None,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         assert!(http_body["external_agents"].is_array(), "{http_body}");
         let frame = frame_api_json_body_response(

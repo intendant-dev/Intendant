@@ -140,7 +140,13 @@ pub(crate) fn record_backend_models(
     models: Vec<CatalogModel>,
     server_version: Option<String>,
 ) -> bool {
-    record_backend_models_at(state_root, backend_id, models, server_version, now_epoch_secs())
+    record_backend_models_at(
+        state_root,
+        backend_id,
+        models,
+        server_version,
+        now_epoch_secs(),
+    )
 }
 
 pub(crate) fn record_backend_models_at(
@@ -352,10 +358,7 @@ mod tests {
             None,
             42,
         );
-        store()
-            .lock()
-            .unwrap()
-            .remove(&root.path().to_path_buf());
+        store().lock().unwrap().remove(&root.path().to_path_buf());
         let stored = backend_catalog(root.path(), "kimi").unwrap();
         assert_eq!(stored.models[0].id, "kimi-code/kimi-for-coding");
         assert_eq!(stored.captured_at_epoch_secs, 42);
@@ -406,10 +409,7 @@ mod tests {
     fn unknown_catalog_never_refuses_a_launch() {
         assert_eq!(launch_model_refusal(None, "Kimi", "kimi-code/k3"), None);
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(
-            kimi_launch_model_refusal(root.path(), "kimi-code/k3"),
-            None
-        );
+        assert_eq!(kimi_launch_model_refusal(root.path(), "kimi-code/k3"), None);
     }
 
     #[test]
@@ -425,7 +425,10 @@ mod tests {
         let refusal =
             launch_model_refusal(Some(&catalog), "Kimi", "kimi-code/kimi-for-coding").unwrap();
         assert!(refusal.contains("kimi-code/kimi-for-coding"), "{refusal}");
-        assert!(refusal.contains("kimi-code/k3, kimi-code/k3-256k"), "{refusal}");
+        assert!(
+            refusal.contains("kimi-code/k3, kimi-code/k3-256k"),
+            "{refusal}"
+        );
         assert!(refusal.contains("0.34.0"), "{refusal}");
         assert!(refusal.contains("without a model pin"), "{refusal}");
     }

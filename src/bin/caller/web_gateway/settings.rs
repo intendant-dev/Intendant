@@ -1177,9 +1177,7 @@ fn external_agents_probe(
             // null + reason when not — never a fabricated list. Only
             // catalog-capable backends carry the fields at all; every SPA
             // model picker derives from THIS payload.
-            if crate::backend_model_catalog::CATALOG_CAPABLE_BACKEND_IDS
-                .contains(&id.as_str())
-            {
+            if crate::backend_model_catalog::CATALOG_CAPABLE_BACKEND_IDS.contains(&id.as_str()) {
                 let installed = obj
                     .get("installed")
                     .and_then(serde_json::Value::as_bool)

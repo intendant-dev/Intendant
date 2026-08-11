@@ -868,7 +868,9 @@ impl StationInner {
                     },
                 ));
             }
-            surface.rows.push(PanelRow::choices("model", C_SKY_CSS, choices));
+            surface
+                .rows
+                .push(PanelRow::choices("model", C_SKY_CSS, choices));
             if controls.kimi_model_choices.is_empty() {
                 // Honest empty state: a fresh install's KNOWN catalog has no
                 // configured models; before any run the catalog is unknown.
