@@ -849,7 +849,10 @@ async fn run_passthrough(command: &str, args: &[String]) -> Result<(), String> {
     let mut cloud_args = vec!["cloud".to_string(), command.to_string()];
     cloud_args.extend(args.iter().cloned());
     let working_dir = codex_working_dir()?;
-    let mut child = crate::platform::spawn_command(&codex_command());
+    let mut child = crate::external_agent::spawn_backend_command(
+        &crate::external_agent::AgentBackend::Codex,
+        &codex_command(),
+    );
     let status = child
         .args(cloud_args)
         .current_dir(working_dir.path())
@@ -2544,7 +2547,12 @@ async fn run_codex_with_stdin(
     use tokio::io::AsyncWriteExt as _;
 
     let working_dir = codex_working_dir()?;
-    let mut command = crate::platform::spawn_command(program);
+    // The codex CLI through detection's resolution ladder — the daemon's
+    // inherited PATH commonly lacks the native installer's bin dir.
+    let mut command = crate::external_agent::spawn_backend_command(
+        &crate::external_agent::AgentBackend::Codex,
+        program,
+    );
     command
         .args(args)
         .current_dir(working_dir.path())

@@ -309,7 +309,8 @@ fn spawn_ceremony_process(id: u64, command: &str, primary_home: PathBuf) -> Resu
             pixel_height: 0,
         })
         .map_err(|error| format!("openpty: {error}"))?;
-    let (program, mut args) = pty_program_invocation(command);
+    let (program, mut args) =
+        pty_program_invocation(&crate::external_agent::AgentBackend::Kimi, command);
     args.push("login".to_string());
     let mut cmd = portable_pty::CommandBuilder::new(&program);
     cmd.args(&args);

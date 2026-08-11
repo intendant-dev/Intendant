@@ -39272,7 +39272,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '89f0818a4a3c7497';
+const INTENDANT_APP_BUILD = '798ca131451bbe49';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -45808,13 +45808,16 @@ function agentInstallSection(card, spec, missing, note, actionsRow) {
   }
   if (state === 'succeeded') {
     // Still on the not-installed card after a finished install: the
-    // PATH-inheritance footgun — the daemon inherited PATH at launch, so
-    // a fresh install dir may not resolve until PATH carries it.
+    // daemon resolves through its PATH, the installer's declared
+    // destination, and the well-known install dirs — so reaching this
+    // state means the CLI landed somewhere genuinely custom. Known
+    // locations flip the card automatically on the next probe.
     const el = note(
-      'The installer finished, but the CLI still does not resolve on the ' +
-        "daemon's PATH. The daemon inherited its PATH at launch — add the " +
-        'install directory to PATH and restart the daemon, or restart your ' +
-        'terminal session, then this card will pick it up.',
+      'The installer finished, but the CLI still does not resolve — it is ' +
+        "not on the daemon's PATH, at the installer's usual destination, or " +
+        'in any install location the daemon checks (those are picked up ' +
+        'automatically, no restart needed). If it landed somewhere custom, ' +
+        "add that directory to the daemon's PATH and restart the daemon.",
       'vault-warning'
     );
     if (install.log_dir) el.title = `Full installer output: ${install.log_dir}`;
@@ -45993,11 +45996,11 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
-    // PATH-inheritance honesty: the daemon found the CLI in a known
-    // install directory its inherited PATH doesn't carry (installed
-    // mid-run — the Windows npm-shim footgun). Surface the exact
-    // where-and-why instead of leaving "install it" to gaslight a user
-    // who just did.
+    // Genuinely-not-found honesty: the daemon already resolved through
+    // its PATH, the installer's declared destination, and the well-known
+    // install dirs (a CLI in any of those reports installed — no restart
+    // needed), so the surviving hint names where it looked and the
+    // custom-location remedy.
     if (missing.path_hint) note(String(missing.path_hint));
     agentInstallSection(card, spec, missing, note, actionsRow);
     return card;
