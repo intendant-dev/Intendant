@@ -473,6 +473,55 @@ pub(crate) fn install_kimi_credential_if_unchanged(
     result
 }
 
+/// Seed a fresh, private ceremony home with a copy of the primary home's
+/// current credential, so `kimi login` starts with `hadToken=true`: kimi's
+/// own login then refreshes the token and re-runs its config provisioning
+/// WITHOUT a device-code round trip (its device flow is the fallback for a
+/// revoked/invalid token, in which case the ceremony proceeds interactively
+/// exactly as an unseeded one). This is what turns the sign-in ceremony into
+/// the "finish setup" lane for a signed-in-but-unonboarded home (card
+/// 01KZR9YHTX): the account holder's existing authority completes
+/// onboarding, usually with zero interaction.
+///
+/// `Ok(false)` = no primary credential exists (nothing to seed; the ceremony
+/// runs the normal device flow). The ceremony home is freshly created and
+/// owner-private before this runs, and the whole ceremony directory is
+/// deleted on every terminal ceremony state, so the copy's lifetime is the
+/// ceremony's.
+pub(crate) fn seed_kimi_ceremony_credential(
+    primary_home: &Path,
+    ceremony_home: &Path,
+) -> io::Result<bool> {
+    require_real_directory(ceremony_home, "Kimi ceremony home")?;
+    let primary_path = primary_home.join(KIMI_CREDENTIAL_PATH);
+    match fs::symlink_metadata(&primary_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let mut credential = read_regular_credential(&primary_path, "Kimi primary credential")?;
+    let result = (|| {
+        let ceremony_path = ceremony_home.join(KIMI_CREDENTIAL_PATH);
+        let parent = ceremony_path
+            .parent()
+            .ok_or_else(|| io::Error::other("Kimi ceremony credential has no parent"))?;
+        fs::create_dir_all(parent)?;
+        require_real_directory(parent, "Kimi ceremony credential directory")?;
+        set_private_dir_permissions(parent)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ceremony_path)?;
+        file.write_all(&credential)?;
+        file.sync_all()?;
+        drop(file);
+        set_private_file_permissions(&ceremony_path)?;
+        Ok(true)
+    })();
+    credential.fill(0);
+    result
+}
+
 fn credential_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -2343,6 +2392,39 @@ mod tests {
             fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
             b"synthetic-new-login"
         );
+    }
+
+    #[test]
+    fn ceremony_seeding_copies_only_an_existing_primary_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        let ceremony = temp.path().join("ceremony");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&ceremony).unwrap();
+
+        // Signed-out primary: nothing to seed, the device flow runs as-is.
+        assert!(!seed_kimi_ceremony_credential(&primary, &ceremony).unwrap());
+        assert!(!ceremony.join(KIMI_CREDENTIAL_PATH).exists());
+
+        fs::create_dir_all(primary.join("credentials")).unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-login").unwrap();
+        assert!(seed_kimi_ceremony_credential(&primary, &ceremony).unwrap());
+        assert_eq!(
+            fs::read(ceremony.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-login"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(ceremony.join(KIMI_CREDENTIAL_PATH))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
     }
 
     #[test]

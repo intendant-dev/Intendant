@@ -565,6 +565,25 @@ pub(crate) fn model_not_configured_refusal(error: &CallerError) -> bool {
     message.contains("code 50001") || lower.contains("not configured")
 }
 
+/// Whether an error from this wire is Kimi's "no provider configured"
+/// onboarding refusal (card 01KZR9YHTX — the signed-in-but-unonboarded
+/// session death). `AuthSummaryService.ensureReady` throws it whenever
+/// `config.toml`'s provider table is empty; through [`decode_response`]'s
+/// formatter the incident wire form (captured live, kimi 0.34.0,
+/// 2026-08-11) is `Kimi /sessions/…/prompts failed (HTTP 200, code 40110):
+/// no provider configured; complete onboarding via /login or the providers
+/// endpoint`. The prose match is kept as a fallback for a re-coded future
+/// build; both forms must mention a provider so an unrelated refusal never
+/// triggers the onboarding remediation.
+pub(crate) fn provider_onboarding_refusal(error: &CallerError) -> bool {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("provider") {
+        return false;
+    }
+    message.contains("code 40110") || lower.contains("no provider configured")
+}
+
 pub(crate) fn validate_meta(value: &Value) -> Result<String, CallerError> {
     let version = value
         .get("server_version")
@@ -756,6 +775,43 @@ mod tests {
             "Kimi /sessions/sess_x/profile failed (HTTP 200, code 40909): \
              search service is not configured",
         )));
+    }
+
+    #[test]
+    fn provider_onboarding_recognizer_matches_the_incident_shape_only() {
+        // The live 2026-08-11 incident wire form (kimi 0.34.0, credentials
+        // present + the fresh-install config.toml stub), exactly as
+        // decode_response formats the captured envelope {"code":40110,
+        // "msg":"no provider configured; complete onboarding via /login or
+        // the providers endpoint","data":null}.
+        let incident = external(
+            "Kimi /sessions/session_x/prompts failed (HTTP 200, code 40110): \
+             no provider configured; complete onboarding via /login or the providers endpoint",
+        );
+        assert!(provider_onboarding_refusal(&incident));
+        // A re-coded build keeping the prose still matches.
+        let reworded = external(
+            "Kimi /sessions/session_x/prompts failed (HTTP 200, code 41234): \
+             No provider configured for this session",
+        );
+        assert!(provider_onboarding_refusal(&reworded));
+        // A future 40110 that stopped mentioning providers must not match.
+        assert!(!provider_onboarding_refusal(&external(
+            "Kimi /sessions/session_x/prompts failed (HTTP 200, code 40110): request rejected",
+        )));
+        // Unrelated provider-adjacent failures never trigger remediation.
+        assert!(!provider_onboarding_refusal(&external(
+            "Kimi /sessions/session_x/prompts failed (HTTP 200, code 40001): \
+             provider request rejected",
+        )));
+        // The model-not-configured refusal stays a disjoint recognizer
+        // (its degrade path must keep winning for 50001).
+        let model_refusal = external(
+            "Kimi /sessions/session_x/profile failed (HTTP 200, code 50001): \
+             Model \"kimi-code/k3\" is not configured in config.toml.",
+        );
+        assert!(!provider_onboarding_refusal(&model_refusal));
+        assert!(!model_not_configured_refusal(&incident));
     }
 
     #[test]

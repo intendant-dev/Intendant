@@ -39317,7 +39317,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '3c990bcbcef90a64';
+const INTENDANT_APP_BUILD = '6d56e0405251018b';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40199,8 +40199,11 @@ function installedExternalAgents() {
 function readyExternalAgents() {
   // "Ready" = usable with no further credential step: fueled by a
   // subscription lease, or signed in on the daemon with its own account.
+  // A signed-in backend whose onboarding never finished (login_incomplete
+  // — kimi's credential-without-providers state) is NOT ready: its
+  // sessions die at the first prompt until setup is finished.
   return installedExternalAgents().filter(
-    agent => agent.leased || agent.local_login === true
+    agent => agent.leased || (agent.local_login === true && agent.login_incomplete !== true)
   );
 }
 function applyExternalAgentAvailabilityToNewSessionPicker() {
@@ -40374,7 +40377,12 @@ function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
   const installed = installedExternalAgents();
   const names = agents => joinAgentNames(agents.map(agent => agent.label || agent.id));
   const leased = installed.filter(agent => agent.leased);
-  const signedIn = installed.filter(agent => !agent.leased && agent.local_login === true);
+  const signedIn = installed.filter(
+    agent => !agent.leased && agent.local_login === true && agent.login_incomplete !== true
+  );
+  const incomplete = installed.filter(
+    agent => !agent.leased && agent.local_login === true && agent.login_incomplete === true
+  );
   const signedOut = installed.filter(agent => !agent.leased && agent.local_login === false);
   const ownLogin = installed.filter(
     agent => !agent.leased && agent.local_login !== true && agent.local_login !== false
@@ -40389,6 +40397,13 @@ function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
     parts.push(signedIn.length === 1
       ? `${names(signedIn)} is signed in on the daemon and needs no fuel`
       : `${names(signedIn)} are signed in on the daemon and need no fuel`);
+  }
+  if (incomplete.length) {
+    // Signed in but unonboarded (kimi's credential-without-providers
+    // state): sessions die at their first prompt until setup finishes.
+    parts.push(incomplete.length === 1
+      ? `${names(incomplete)} is signed in but its setup never finished — use Finish setup on its Vault card`
+      : `${names(incomplete)} are signed in but their setup never finished — use Finish setup on their Vault cards`);
   }
   if (signedOut.length) {
     parts.push(signedOut.length === 1
@@ -45957,6 +45972,22 @@ function agentSigninMissingAvailability(spec) {
   return entry && entry.installed === false ? entry : null;
 }
 
+/* The signed-in-but-unonboarded partial state (today only Kimi reports it):
+   the availability row's `login_incomplete === true` means the backend's
+   credential exists while its config declares no provider — sign-in
+   finished, onboarding didn't (kimi's own login writes both), and every
+   session dies at its first prompt (wire code 40110) until setup is
+   finished. The affordance is the SAME sign-in ceremony: the daemon seeds
+   the isolated login with the existing credential, so the backend
+   re-provisions on the current account, usually with no browser step. */
+function agentSigninIncompleteAvailability(spec) {
+  if (!Array.isArray(externalAgentAvailability)) return null;
+  const entry = externalAgentAvailability.find(
+    agent => agent && agent.id === spec.sessionKind
+  );
+  return entry && entry.login_incomplete === true ? entry : null;
+}
+
 /* The approval-gated Install lane on a not-installed card. Everything
    renders from the availability row's `install` object, which the daemon
    derives from its install-command matrix (`available` + the exact
@@ -46250,6 +46281,23 @@ function agentSigninProviderCard(provider) {
       const other = AGENT_SIGNIN_PROVIDERS[busyWith]?.label || busyWith;
       note(
         `A ${other} sign-in ceremony is running — one credential ceremony at a time on this daemon.`
+      );
+      return card;
+    }
+    if (phase === 'idle' && agentSigninIncompleteAvailability(spec)) {
+      const setupChip = document.createElement('span');
+      setupChip.className = 'vault-chip warn';
+      setupChip.textContent = 'setup incomplete';
+      head.appendChild(setupChip);
+      note(
+        `Sign-in incomplete — finish setup. ${spec.label} is signed in on this machine, but ` +
+          'onboarding never finished: its config has no provider entries (the sign-in normally ' +
+          'writes them), so sessions fail at their first prompt until setup completes. Finish ' +
+          'setup completes onboarding on the existing account — usually with no browser step.',
+        'vault-warning'
+      );
+      actionsRow(
+        vaultButton('Finish setup', () => agentSigninStart(provider), { primary: true })
       );
       return card;
     }

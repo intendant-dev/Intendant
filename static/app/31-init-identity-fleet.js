@@ -895,8 +895,11 @@ function installedExternalAgents() {
 function readyExternalAgents() {
   // "Ready" = usable with no further credential step: fueled by a
   // subscription lease, or signed in on the daemon with its own account.
+  // A signed-in backend whose onboarding never finished (login_incomplete
+  // — kimi's credential-without-providers state) is NOT ready: its
+  // sessions die at the first prompt until setup is finished.
   return installedExternalAgents().filter(
-    agent => agent.leased || agent.local_login === true
+    agent => agent.leased || (agent.local_login === true && agent.login_incomplete !== true)
   );
 }
 function applyExternalAgentAvailabilityToNewSessionPicker() {
@@ -1070,7 +1073,12 @@ function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
   const installed = installedExternalAgents();
   const names = agents => joinAgentNames(agents.map(agent => agent.label || agent.id));
   const leased = installed.filter(agent => agent.leased);
-  const signedIn = installed.filter(agent => !agent.leased && agent.local_login === true);
+  const signedIn = installed.filter(
+    agent => !agent.leased && agent.local_login === true && agent.login_incomplete !== true
+  );
+  const incomplete = installed.filter(
+    agent => !agent.leased && agent.local_login === true && agent.login_incomplete === true
+  );
   const signedOut = installed.filter(agent => !agent.leased && agent.local_login === false);
   const ownLogin = installed.filter(
     agent => !agent.leased && agent.local_login !== true && agent.local_login !== false
@@ -1085,6 +1093,13 @@ function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
     parts.push(signedIn.length === 1
       ? `${names(signedIn)} is signed in on the daemon and needs no fuel`
       : `${names(signedIn)} are signed in on the daemon and need no fuel`);
+  }
+  if (incomplete.length) {
+    // Signed in but unonboarded (kimi's credential-without-providers
+    // state): sessions die at their first prompt until setup finishes.
+    parts.push(incomplete.length === 1
+      ? `${names(incomplete)} is signed in but its setup never finished — use Finish setup on its Vault card`
+      : `${names(incomplete)} are signed in but their setup never finished — use Finish setup on their Vault cards`);
   }
   if (signedOut.length) {
     parts.push(signedOut.length === 1
