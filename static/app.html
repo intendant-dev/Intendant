@@ -39317,7 +39317,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '98691dc32280a28e';
+const INTENDANT_APP_BUILD = '3c990bcbcef90a64';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40053,33 +40053,60 @@ function backendModelCatalog(backendId) {
   const rows = Array.isArray(externalAgentAvailability) ? externalAgentAvailability : null;
   const row = rows ? rows.find(agent => agent && agent.id === backendId) : null;
   const list = row && row.models && Array.isArray(row.models.list) ? row.models.list : null;
+  const models = list ? list.filter(m => m && typeof m.id === 'string' && m.id.trim()) : [];
+  /* Compiled-baseline suggestions (card 01KZR67RHT): the daemon-vendored
+     public-lineup entries the learned catalog does not already contain,
+     served in `compiled_suggestions` — never inside `models`, so compiled
+     entries never masquerade as observed. The daemon already subtracts
+     learned ids; the re-filter here keeps the never-both invariant even
+     against a stale cached body. */
+  const learnedIds = new Set(models.map(m => m.id));
+  const suggestions = row && Array.isArray(row.compiled_suggestions)
+    ? row.compiled_suggestions.filter(m =>
+        m && typeof m.id === 'string' && m.id.trim() && !learnedIds.has(m.id))
+    : [];
   if (!list) {
     return {
       known: false,
       models: [],
+      suggestions,
       reason: row
         ? (String(row.models_reason || '') ||
            (row.installed === false ? 'not-installed' : 'no-run-observed'))
         : 'unknown',
     };
   }
-  return {
-    known: true,
-    models: list.filter(m => m && typeof m.id === 'string' && m.id.trim()),
-    reason: null,
-  };
+  return { known: true, models, suggestions, reason: null };
+}
+
+/* True when a model id is offered by the picker vocabulary — the learned
+   catalog OR the compiled suggestions. Callers mapping a pinned model onto
+   select-vs-Custom-row use this so a suggested pin selects its own option
+   instead of duplicating into the Custom row. */
+function kimiCatalogOffers(catalog, id) {
+  return catalog.models.some(m => m.id === id)
+    || catalog.suggestions.some(m => m.id === id);
 }
 
 /* Honest one-liner for a kimi picker's current catalog state ('' when a
-   non-empty catalog is known). */
+   non-empty catalog is known). With compiled suggestions present the copy
+   says they exist but are unverified — a refused pick falls back to Kimi's
+   default (the daemon's degrade-once), never a dead session. */
 function kimiModelCatalogNote(catalog) {
+  const suggested = catalog.suggestions.length > 0;
   if (catalog.known) {
-    return catalog.models.length
-      ? ''
+    if (catalog.models.length) return '';
+    return suggested
+      ? 'Kimi reports no configured models — suggested models are unverified; a refused pick falls back to Kimi’s default.'
       : 'Kimi reports no configured models — use the default or a custom id.';
   }
-  return catalog.reason === 'not-installed'
-    ? 'Model list appears after Kimi Code is installed and a session runs.'
+  if (catalog.reason === 'not-installed') {
+    return suggested
+      ? 'Suggested models are unverified until Kimi Code is installed and a session runs.'
+      : 'Model list appears after Kimi Code is installed and a session runs.';
+  }
+  return suggested
+    ? 'Suggested models are unverified until the first Kimi Code run; a refused pick falls back to Kimi’s default.'
     : 'Model list unavailable until the first Kimi Code run — use a custom id for a pin.';
 }
 
@@ -40097,12 +40124,26 @@ function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'De
   inherit.value = inheritValue;
   inherit.textContent = inheritLabel;
   select.appendChild(inherit);
-  for (const model of catalog.models) {
+  const modelOption = (model) => {
     const option = document.createElement('option');
     option.value = model.id;
     const label = typeof model.display_name === 'string' ? model.display_name.trim() : '';
     option.textContent = label && label !== model.id ? `${label} — ${model.id}` : model.id;
-    select.appendChild(option);
+    return option;
+  };
+  for (const model of catalog.models) {
+    select.appendChild(modelOption(model));
+  }
+  if (catalog.suggestions.length) {
+    /* Compiled-baseline entries render as their own clearly-labeled group
+       (card 01KZR67RHT) — real fresh-install choices, visually apart from
+       the learned catalog above. */
+    const group = document.createElement('optgroup');
+    group.label = 'Suggested models';
+    for (const model of catalog.suggestions) {
+      group.appendChild(modelOption(model));
+    }
+    select.appendChild(group);
   }
   const note = kimiModelCatalogNote(catalog);
   if (note) {
@@ -40120,7 +40161,7 @@ function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'De
   select.value =
     previous === '__custom__' ||
     previous === inheritValue ||
-    catalog.models.some(m => m.id === previous)
+    kimiCatalogOffers(catalog, previous)
       ? previous
       : inheritValue;
   return catalog;
@@ -54906,9 +54947,11 @@ function stationBuildControlsSummary() {
   const launchReadiness = stationBuildLaunchReadiness();
   // The daemon-learned Kimi catalog feeds the Controls pane's model
   // choices (card 01KZR0QP9A); `known` distinguishes a fresh install's
-  // honestly empty catalog from "no Kimi run observed yet".
+  // honestly empty catalog from "no Kimi run observed yet". Compiled-
+  // baseline suggestions (card 01KZR67RHT) ride the same choice list,
+  // labeled — the pane's fresh-install choices.
   const kimiCatalog = (typeof backendModelCatalog === 'function')
-    ? backendModelCatalog('kimi') : { known: false, models: [] };
+    ? backendModelCatalog('kimi') : { known: false, models: [], suggestions: [] };
   return {
     backend: backend || 'none',
     command,
@@ -54931,7 +54974,10 @@ function stationBuildControlsSummary() {
     kimiModelChoices: kimiCatalog.models.map(m => ({
       id: m.id,
       label: (typeof m.display_name === 'string' && m.display_name.trim()) || m.id,
-    })),
+    })).concat((kimiCatalog.suggestions || []).map(m => ({
+      id: m.id,
+      label: `${(typeof m.display_name === 'string' && m.display_name.trim()) || m.id} (suggested)`,
+    }))),
     kimiModelCatalogKnown: kimiCatalog.known,
     kimiThinking: controlKimiConfig.thinking || '',
     kimiPermissionMode: controlKimiConfig.permission_mode || 'manual',
@@ -70655,7 +70701,7 @@ function openSessionConfigModal(sessionOrId) {
       inheritValue: 'inherit',
       inheritLabel: 'inherit Control default',
     });
-    const pinnedInCatalog = catalog.models.some(m => m.id === pinnedModel);
+    const pinnedInCatalog = kimiCatalogOffers(catalog, pinnedModel);
     if (modelSel) {
       modelSel.value = !pinnedModel ? 'inherit'
         : (pinnedInCatalog ? pinnedModel : '__custom__');
@@ -97844,11 +97890,11 @@ function agendaStartBackendConfig(settings, backendOverride) {
   }
   if (backend === 'kimi') {
     // Model vocabulary from the daemon-learned catalog (card 01KZR0QP9A)
-    // — the availability rows, not a hardcoded list; unknown catalogs
-    // honestly offer only the daemon default (plus any configured pin,
-    // appended by the renderer below).
+    // — the availability rows, not a hardcoded list — plus the compiled-
+    // baseline suggestions after it (card 01KZR67RHT: the fresh-install
+    // choices; a refused pick degrades to Kimi's default, never dies).
     const kimiCatalog = (typeof backendModelCatalog === 'function')
-      ? backendModelCatalog('kimi') : { models: [] };
+      ? backendModelCatalog('kimi') : { models: [], suggestions: [] };
     return {
       backend,
       label: 'Kimi Code',
@@ -97856,7 +97902,7 @@ function agendaStartBackendConfig(settings, backendOverride) {
       effortKey: 'kimi_thinking',
       effortLabel: 'Thinking',
       model: backend === dflt ? String(d.kimi_model || '') : '',
-      models: kimiCatalog.models.map((m) => m.id),
+      models: kimiCatalog.models.concat(kimiCatalog.suggestions || []).map((m) => m.id),
       effort: backend === dflt ? String(d.kimi_thinking || '') : '',
       efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     };
@@ -124779,7 +124825,7 @@ function populateSettingsKimiModel(configuredModel) {
     inheritValue: '',
     inheritLabel: 'Kimi account default',
   });
-  const known = catalog.models.some(m => m.id === model);
+  const known = kimiCatalogOffers(catalog, model);
   select.value = !model ? '' : (known ? model : '__custom__');
   if (customInput) customInput.value = model && !known ? model : '';
   updateSettingsKimiCustomModelRow();

@@ -749,33 +749,60 @@ function backendModelCatalog(backendId) {
   const rows = Array.isArray(externalAgentAvailability) ? externalAgentAvailability : null;
   const row = rows ? rows.find(agent => agent && agent.id === backendId) : null;
   const list = row && row.models && Array.isArray(row.models.list) ? row.models.list : null;
+  const models = list ? list.filter(m => m && typeof m.id === 'string' && m.id.trim()) : [];
+  /* Compiled-baseline suggestions (card 01KZR67RHT): the daemon-vendored
+     public-lineup entries the learned catalog does not already contain,
+     served in `compiled_suggestions` — never inside `models`, so compiled
+     entries never masquerade as observed. The daemon already subtracts
+     learned ids; the re-filter here keeps the never-both invariant even
+     against a stale cached body. */
+  const learnedIds = new Set(models.map(m => m.id));
+  const suggestions = row && Array.isArray(row.compiled_suggestions)
+    ? row.compiled_suggestions.filter(m =>
+        m && typeof m.id === 'string' && m.id.trim() && !learnedIds.has(m.id))
+    : [];
   if (!list) {
     return {
       known: false,
       models: [],
+      suggestions,
       reason: row
         ? (String(row.models_reason || '') ||
            (row.installed === false ? 'not-installed' : 'no-run-observed'))
         : 'unknown',
     };
   }
-  return {
-    known: true,
-    models: list.filter(m => m && typeof m.id === 'string' && m.id.trim()),
-    reason: null,
-  };
+  return { known: true, models, suggestions, reason: null };
+}
+
+/* True when a model id is offered by the picker vocabulary — the learned
+   catalog OR the compiled suggestions. Callers mapping a pinned model onto
+   select-vs-Custom-row use this so a suggested pin selects its own option
+   instead of duplicating into the Custom row. */
+function kimiCatalogOffers(catalog, id) {
+  return catalog.models.some(m => m.id === id)
+    || catalog.suggestions.some(m => m.id === id);
 }
 
 /* Honest one-liner for a kimi picker's current catalog state ('' when a
-   non-empty catalog is known). */
+   non-empty catalog is known). With compiled suggestions present the copy
+   says they exist but are unverified — a refused pick falls back to Kimi's
+   default (the daemon's degrade-once), never a dead session. */
 function kimiModelCatalogNote(catalog) {
+  const suggested = catalog.suggestions.length > 0;
   if (catalog.known) {
-    return catalog.models.length
-      ? ''
+    if (catalog.models.length) return '';
+    return suggested
+      ? 'Kimi reports no configured models — suggested models are unverified; a refused pick falls back to Kimi’s default.'
       : 'Kimi reports no configured models — use the default or a custom id.';
   }
-  return catalog.reason === 'not-installed'
-    ? 'Model list appears after Kimi Code is installed and a session runs.'
+  if (catalog.reason === 'not-installed') {
+    return suggested
+      ? 'Suggested models are unverified until Kimi Code is installed and a session runs.'
+      : 'Model list appears after Kimi Code is installed and a session runs.';
+  }
+  return suggested
+    ? 'Suggested models are unverified until the first Kimi Code run; a refused pick falls back to Kimi’s default.'
     : 'Model list unavailable until the first Kimi Code run — use a custom id for a pin.';
 }
 
@@ -793,12 +820,26 @@ function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'De
   inherit.value = inheritValue;
   inherit.textContent = inheritLabel;
   select.appendChild(inherit);
-  for (const model of catalog.models) {
+  const modelOption = (model) => {
     const option = document.createElement('option');
     option.value = model.id;
     const label = typeof model.display_name === 'string' ? model.display_name.trim() : '';
     option.textContent = label && label !== model.id ? `${label} — ${model.id}` : model.id;
-    select.appendChild(option);
+    return option;
+  };
+  for (const model of catalog.models) {
+    select.appendChild(modelOption(model));
+  }
+  if (catalog.suggestions.length) {
+    /* Compiled-baseline entries render as their own clearly-labeled group
+       (card 01KZR67RHT) — real fresh-install choices, visually apart from
+       the learned catalog above. */
+    const group = document.createElement('optgroup');
+    group.label = 'Suggested models';
+    for (const model of catalog.suggestions) {
+      group.appendChild(modelOption(model));
+    }
+    select.appendChild(group);
   }
   const note = kimiModelCatalogNote(catalog);
   if (note) {
@@ -816,7 +857,7 @@ function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'De
   select.value =
     previous === '__custom__' ||
     previous === inheritValue ||
-    catalog.models.some(m => m.id === previous)
+    kimiCatalogOffers(catalog, previous)
       ? previous
       : inheritValue;
   return catalog;

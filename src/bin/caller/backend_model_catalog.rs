@@ -42,6 +42,62 @@ use serde::{Deserialize, Serialize};
 /// this in".
 pub(crate) const CATALOG_CAPABLE_BACKEND_IDS: &[&str] = &["kimi"];
 
+/// One compiled-baseline model suggestion: an alias the backend's current
+/// public lineup is known to use, with a short human label. Suggestions are
+/// picker vocabulary only — they are never recorded as observed catalog
+/// truth, and a launch that pins one the install refuses degrades to the
+/// backend default (the card-01KZR0QP9A mid-launch degrade).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompiledModelSuggestion {
+    /// The exact alias the backend accepts as a model selection.
+    pub(crate) id: &'static str,
+    /// Short human label for pickers.
+    pub(crate) label: &'static str,
+}
+
+/// Kimi's compiled baseline (card 01KZR67RHT): the managed `kimi-code`
+/// lineup a signed-in install exposes, so a fresh install's picker offers
+/// real choices instead of Default + Custom only. THE one declaration —
+/// every serving surface and picker derives from it; update the lineup
+/// here and the parity tests keep every consumer honest.
+///
+/// Provenance (validated live, kimi 0.34.0, 2026-08-11): Kimi resolves
+/// model aliases strictly through `config.toml`'s `[models."<id>"]` tables
+/// — `kimi login` populates the managed lineup ("Login will populate
+/// managed Kimi provider and model entries" per the CLI's own materialized
+/// config header), and `modelResolver.listModels` on a populated install
+/// reports exactly these ids and display names. A pre-login install
+/// refuses every alias form (code 50001), which the adapter's degrade-once
+/// turns into a default-model launch with a visible note — so a stale or
+/// premature suggestion can never kill a session. Order: the managed
+/// default (`config.toml` `default_model`) first.
+pub(crate) const KIMI_COMPILED_MODEL_SUGGESTIONS: &[CompiledModelSuggestion] = &[
+    CompiledModelSuggestion {
+        id: "kimi-code/k3",
+        label: "K3",
+    },
+    CompiledModelSuggestion {
+        id: "kimi-code/k3-256k",
+        label: "K3-256k",
+    },
+    CompiledModelSuggestion {
+        id: "kimi-code/kimi-for-coding",
+        label: "K2.7 Coding",
+    },
+    CompiledModelSuggestion {
+        id: "kimi-code/kimi-for-coding-highspeed",
+        label: "K2.7 Coding Highspeed",
+    },
+];
+
+/// The compiled baseline for one backend id (empty when none is vendored).
+pub(crate) fn compiled_model_suggestions(backend_id: &str) -> &'static [CompiledModelSuggestion] {
+    match backend_id {
+        "kimi" => KIMI_COMPILED_MODEL_SUGGESTIONS,
+        _ => &[],
+    }
+}
+
 /// One model choice as the backend itself reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CatalogModel {
@@ -242,6 +298,44 @@ pub(crate) fn row_models_json_at(
     }
 }
 
+/// The availability-row `compiled_suggestions` projection: the compiled
+/// baseline minus every id the learned catalog already contains (a learned
+/// catalog, once observed, overrides/extends the baseline — an id must
+/// never be offered as both observed truth and unverified suggestion).
+/// `None` for backends without a compiled baseline; `Some` — possibly an
+/// empty array, when the learned catalog covers the whole baseline — keeps
+/// the field shape stable for consumers.
+pub(crate) fn row_compiled_suggestions_json(
+    state_root: &Path,
+    backend_id: &str,
+) -> Option<serde_json::Value> {
+    let compiled = compiled_model_suggestions(backend_id);
+    if compiled.is_empty() {
+        return None;
+    }
+    let learned = backend_catalog(state_root, backend_id)
+        .map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    Some(serde_json::Value::Array(
+        compiled
+            .iter()
+            .filter(|suggestion| !learned.contains(suggestion.id))
+            .map(|suggestion| {
+                serde_json::json!({
+                    "id": suggestion.id,
+                    "display_name": suggestion.label,
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Fingerprint of one backend's stored catalog for change detection on the
 /// serving side (`None` = no catalog captured).
 pub(crate) fn catalog_fingerprint(state_root: &Path, backend_id: &str) -> Option<u64> {
@@ -249,20 +343,32 @@ pub(crate) fn catalog_fingerprint(state_root: &Path, backend_id: &str) -> Option
 }
 
 /// Launch-gate verdict for a Kimi model pin: `Some(refusal message)` when
-/// the daemon KNOWS Kimi's catalog and the pin is not in it. An unknown
-/// catalog returns `None` — the daemon must never refuse (or approve) from
-/// invented knowledge; the adapter's mid-launch degrade covers that case.
+/// the daemon KNOWS Kimi's catalog and the pin is neither in it nor in the
+/// compiled baseline. A compiled suggestion always passes — the pickers
+/// offer it, so refusing it here would break the daemon's own offering;
+/// it is unverified, and the adapter's mid-launch degrade covers a
+/// harness refusal. An unknown catalog returns `None` — the daemon must
+/// never refuse (or approve) from invented knowledge.
 pub(crate) fn kimi_launch_model_refusal(state_root: &Path, model: &str) -> Option<String> {
-    launch_model_refusal(backend_catalog(state_root, "kimi").as_ref(), "Kimi", model)
+    launch_model_refusal(
+        backend_catalog(state_root, "kimi").as_ref(),
+        KIMI_COMPILED_MODEL_SUGGESTIONS,
+        "Kimi",
+        model,
+    )
 }
 
 fn launch_model_refusal(
     catalog: Option<&BackendModelCatalog>,
+    compiled: &[CompiledModelSuggestion],
     backend_label: &str,
     model: &str,
 ) -> Option<String> {
     let catalog = catalog?;
     if catalog.models.iter().any(|entry| entry.id == model) {
+        return None;
+    }
+    if compiled.iter().any(|suggestion| suggestion.id == model) {
         return None;
     }
     let provenance = match catalog.server_version.as_deref() {
@@ -407,7 +513,10 @@ mod tests {
 
     #[test]
     fn unknown_catalog_never_refuses_a_launch() {
-        assert_eq!(launch_model_refusal(None, "Kimi", "kimi-code/k3"), None);
+        assert_eq!(
+            launch_model_refusal(None, &[], "Kimi", "kimi-code/k3"),
+            None
+        );
         let root = tempfile::tempdir().unwrap();
         assert_eq!(kimi_launch_model_refusal(root.path(), "kimi-code/k3"), None);
     }
@@ -419,11 +528,11 @@ mod tests {
             Some("0.34.0"),
         );
         assert_eq!(
-            launch_model_refusal(Some(&catalog), "Kimi", "kimi-code/k3"),
+            launch_model_refusal(Some(&catalog), &[], "Kimi", "kimi-code/k3"),
             None
         );
         let refusal =
-            launch_model_refusal(Some(&catalog), "Kimi", "kimi-code/kimi-for-coding").unwrap();
+            launch_model_refusal(Some(&catalog), &[], "Kimi", "kimi-code/kimi-for-coding").unwrap();
         assert!(refusal.contains("kimi-code/kimi-for-coding"), "{refusal}");
         assert!(
             refusal.contains("kimi-code/k3, kimi-code/k3-256k"),
@@ -436,10 +545,120 @@ mod tests {
     #[test]
     fn empty_known_catalog_refuses_every_pin_with_fresh_install_copy() {
         let catalog = catalog(Vec::new(), Some("0.34.0"));
-        let refusal = launch_model_refusal(Some(&catalog), "Kimi", "kimi-code/k3").unwrap();
+        let refusal = launch_model_refusal(Some(&catalog), &[], "Kimi", "kimi-code/k3").unwrap();
         assert!(refusal.contains("empty"), "{refusal}");
         assert!(refusal.contains("fresh install"), "{refusal}");
         assert!(refusal.contains("without a model pin"), "{refusal}");
+    }
+
+    /// Card 01KZR67RHT: the compiled declaration is the pickers' fresh-
+    /// install vocabulary — malformed entries would ship straight into
+    /// every select. One declaration, structurally sound.
+    #[test]
+    fn compiled_declaration_is_well_formed() {
+        assert!(!KIMI_COMPILED_MODEL_SUGGESTIONS.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for suggestion in KIMI_COMPILED_MODEL_SUGGESTIONS {
+            assert_eq!(suggestion.id.trim(), suggestion.id);
+            assert!(!suggestion.id.is_empty());
+            assert!(!suggestion.label.trim().is_empty());
+            assert!(seen.insert(suggestion.id), "duplicate {}", suggestion.id);
+        }
+        // Only catalog-capable backends may carry a compiled baseline —
+        // suggestions ride the catalog lane's row fields.
+        assert_eq!(
+            compiled_model_suggestions("kimi"),
+            KIMI_COMPILED_MODEL_SUGGESTIONS
+        );
+        assert!(compiled_model_suggestions("codex").is_empty());
+        assert!(compiled_model_suggestions("claude-code").is_empty());
+        assert!(compiled_model_suggestions("pi").is_empty());
+        assert!(CATALOG_CAPABLE_BACKEND_IDS.contains(&"kimi"));
+    }
+
+    /// A compiled suggestion the pickers offer must pass the launch gate in
+    /// every catalog state — the gate refusing the daemon's own offering
+    /// would dead-end the picker; the adapter's degrade-once covers a
+    /// harness that refuses the unverified alias (validated live: a
+    /// pre-login Kimi 0.34.0 refuses every alias with code 50001).
+    #[test]
+    fn compiled_suggestion_pins_always_pass_the_launch_gate() {
+        let compiled = KIMI_COMPILED_MODEL_SUGGESTIONS;
+        let suggested = compiled[0].id;
+        // Known-empty catalog (fresh install observed): suggestion passes,
+        // a non-compiled pin still refuses with the fresh-install copy.
+        let empty = catalog(Vec::new(), Some("0.34.0"));
+        assert_eq!(
+            launch_model_refusal(Some(&empty), compiled, "Kimi", suggested),
+            None
+        );
+        assert!(
+            launch_model_refusal(Some(&empty), compiled, "Kimi", "kimi-code/retired").is_some()
+        );
+        // Known non-empty catalog lacking the suggestion: still passes.
+        let known = catalog(vec![model("kimi-code/custom-house-model")], Some("0.34.0"));
+        assert_eq!(
+            launch_model_refusal(Some(&known), compiled, "Kimi", suggested),
+            None
+        );
+        let refusal =
+            launch_model_refusal(Some(&known), compiled, "Kimi", "kimi-code/retired").unwrap();
+        assert!(
+            refusal.contains("kimi-code/custom-house-model"),
+            "{refusal}"
+        );
+        // The public entry point carries the compiled baseline.
+        let root = tempfile::tempdir().unwrap();
+        record_backend_models_at(root.path(), "kimi", Vec::new(), Some("0.34.0".into()), 1);
+        assert_eq!(kimi_launch_model_refusal(root.path(), suggested), None);
+        assert!(kimi_launch_model_refusal(root.path(), "kimi-code/retired").is_some());
+    }
+
+    /// The row projection serves the compiled baseline minus learned ids —
+    /// an id is offered as observed truth OR unverified suggestion, never
+    /// both; a fully-learned baseline serves an honest empty array.
+    #[test]
+    fn row_compiled_suggestions_serve_the_baseline_minus_learned() {
+        // Backends without a baseline carry no field at all.
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(row_compiled_suggestions_json(root.path(), "codex"), None);
+
+        // Fresh root: the full baseline, declaration order, labeled.
+        let fresh = row_compiled_suggestions_json(root.path(), "kimi").unwrap();
+        let fresh = fresh.as_array().unwrap();
+        assert_eq!(fresh.len(), KIMI_COMPILED_MODEL_SUGGESTIONS.len());
+        for (served, declared) in fresh.iter().zip(KIMI_COMPILED_MODEL_SUGGESTIONS) {
+            assert_eq!(served["id"], declared.id);
+            assert_eq!(served["display_name"], declared.label);
+        }
+
+        // Learned overlap: the learned id leaves the suggestions.
+        let overlap_id = KIMI_COMPILED_MODEL_SUGGESTIONS[0].id;
+        record_backend_models_at(
+            root.path(),
+            "kimi",
+            vec![model(overlap_id), model("kimi-code/custom-house-model")],
+            Some("0.34.0".into()),
+            1,
+        );
+        let overlaid = row_compiled_suggestions_json(root.path(), "kimi").unwrap();
+        let overlaid = overlaid.as_array().unwrap();
+        assert_eq!(overlaid.len(), KIMI_COMPILED_MODEL_SUGGESTIONS.len() - 1);
+        assert!(overlaid.iter().all(|entry| entry["id"] != overlap_id));
+
+        // Learned covering the whole baseline: present-but-empty.
+        record_backend_models_at(
+            root.path(),
+            "kimi",
+            KIMI_COMPILED_MODEL_SUGGESTIONS
+                .iter()
+                .map(|suggestion| model(suggestion.id))
+                .collect(),
+            Some("0.34.0".into()),
+            2,
+        );
+        let covered = row_compiled_suggestions_json(root.path(), "kimi").unwrap();
+        assert_eq!(covered, serde_json::json!([]));
     }
 
     #[test]

@@ -179,7 +179,7 @@ function openSessionConfigModal(sessionOrId) {
       inheritValue: 'inherit',
       inheritLabel: 'inherit Control default',
     });
-    const pinnedInCatalog = catalog.models.some(m => m.id === pinnedModel);
+    const pinnedInCatalog = kimiCatalogOffers(catalog, pinnedModel);
     if (modelSel) {
       modelSel.value = !pinnedModel ? 'inherit'
         : (pinnedInCatalog ? pinnedModel : '__custom__');

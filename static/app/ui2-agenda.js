@@ -1699,11 +1699,11 @@ function agendaStartBackendConfig(settings, backendOverride) {
   }
   if (backend === 'kimi') {
     // Model vocabulary from the daemon-learned catalog (card 01KZR0QP9A)
-    // — the availability rows, not a hardcoded list; unknown catalogs
-    // honestly offer only the daemon default (plus any configured pin,
-    // appended by the renderer below).
+    // — the availability rows, not a hardcoded list — plus the compiled-
+    // baseline suggestions after it (card 01KZR67RHT: the fresh-install
+    // choices; a refused pick degrades to Kimi's default, never dies).
     const kimiCatalog = (typeof backendModelCatalog === 'function')
-      ? backendModelCatalog('kimi') : { models: [] };
+      ? backendModelCatalog('kimi') : { models: [], suggestions: [] };
     return {
       backend,
       label: 'Kimi Code',
@@ -1711,7 +1711,7 @@ function agendaStartBackendConfig(settings, backendOverride) {
       effortKey: 'kimi_thinking',
       effortLabel: 'Thinking',
       model: backend === dflt ? String(d.kimi_model || '') : '',
-      models: kimiCatalog.models.map((m) => m.id),
+      models: kimiCatalog.models.concat(kimiCatalog.suggestions || []).map((m) => m.id),
       effort: backend === dflt ? String(d.kimi_thinking || '') : '',
       efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     };
