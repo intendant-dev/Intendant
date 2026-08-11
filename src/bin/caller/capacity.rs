@@ -999,7 +999,10 @@ mod tests {
         assert_eq!(resolve_staging(None, Some("off")), StagingMode::Off);
         assert_eq!(resolve_staging(Some("nope"), Some("off")), StagingMode::Off);
         // Garbage everywhere reads as the default.
-        assert_eq!(resolve_staging(Some("nope"), Some("also-nope")), StagingMode::Normal);
+        assert_eq!(
+            resolve_staging(Some("nope"), Some("also-nope")),
+            StagingMode::Normal
+        );
         assert_eq!(resolve_staging(None, Some("")), StagingMode::Normal);
     }
 
