@@ -2259,10 +2259,15 @@ impl IntendantServer {
             if let Some(controller) = crate::capacity::published_capacity_controller() {
                 let view = controller.view();
                 if view.admissions_deferred {
+                    let why = if view.reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", view.reasons.join(", "))
+                    };
                     return format!(
                         "ok (new session dispatched — capacity is deferring admissions \
-                         (stage {}, {} of {} resident, {} queued): it queues and fires \
-                         when headroom returns; see `capacity` in get_status)",
+                         (stage {}, {} of {} resident, {} queued{why}): it queues and \
+                         fires when headroom returns; see `capacity` in get_status)",
                         view.stage.as_str(),
                         view.resident,
                         view.bound,

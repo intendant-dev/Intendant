@@ -347,16 +347,22 @@ honest named positions (forks, delegation-tagged scheduled fires, and
 sub-agent spawns refuse with the bound named; their retry custody stays
 with the caller) and fire when headroom returns; under the **park**
 stage the longest-idle root sessions additionally carry a visible
-parked chip — a census, never a kill. The current view rides
-`get_status` (`capacity`) and the dashboard's oversight-bar chip.
-Fail-open: a missing or failing probe reads as "no signal" (staging
-idles; the count bound still applies), and disabling the section is
-exactly pre-slice behavior.
+parked chip — a census, never a kill. On macOS, pressure-**warn** alone
+never stages — warn is a chronic state on healthy-busy Macs; it defers
+only when corroborated by elevated compressor occupancy or low
+available memory, while **critical** parks on its own. The current view
+rides `get_status` (`capacity`) and the dashboard's oversight-bar chip,
+and carries honest `reasons` strings naming the firing signal(s) — the
+same strings capacity refusals and queue notices quote. Fail-open: a
+missing or failing probe reads as "no signal" (staging idles; the count
+bound still applies), and disabling the section is exactly pre-slice
+behavior.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | `false` disables the capacity controller entirely: no probe, no staging, no admission bound |
 | `max_resident_sessions` | int | derived | Resident-session bound. Default derives one session per GiB of physical memory, clamped 8..=64 (32 when memory size is unreadable). `INTENDANT_CAPACITY_MAX_RESIDENT` overrides the derivation (not this key) |
+| `staging` | string | `"normal"` | Staging aggressiveness — one coarse knob: `normal` (defer and park per the watermarks), `defer-only` (pressure signals cap at defer — admissions queue, nothing parks), `off` (pressure staging disabled; the resident-session bound still gates). Unrecognized values read as `normal`. `INTENDANT_CAPACITY_STAGING` fills in when this key is unset |
 
 ### `[readopt]`
 

@@ -218,6 +218,7 @@ impl SessionSupervisor {
             let resident = self.state.lock().await.sessions.len();
             if let crate::capacity::AdmissionCheck::Gate {
                 stage,
+                reasons,
                 bound,
                 resident,
                 queued,
@@ -226,6 +227,7 @@ impl SessionSupervisor {
                 return Err(crate::capacity::refusal_text(
                     "sub-agent spawn",
                     stage,
+                    &reasons,
                     resident,
                     bound,
                     queued,
