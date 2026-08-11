@@ -4290,7 +4290,13 @@ function dispatchSessionControlMsg(payload, options = {}) {
     daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
     }).then(resp => {
-      if (resp.ok) return;
+      if (resp.ok) {
+        // Delivered ack: the daemon received and dispatched this message.
+        // Callers with at-most-once semantics (the approval rail) use it
+        // to disarm their retry paths.
+        if (typeof options.onDelivered === 'function') options.onDelivered(resp);
+        return;
+      }
       // Delivered refusals (allowlist drift the parity pins make
       // near-impossible) surface instead of silently resolving; still no
       // /ws replay — the response was delivered.
