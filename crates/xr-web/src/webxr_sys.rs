@@ -35,8 +35,9 @@ extern "C" {
     pub type XrSession;
 
     /// `updateRenderState({ baseLayer?, layers?, depthNear?, depthFar? })`.
-    #[wasm_bindgen(method, js_name = updateRenderState)]
-    pub fn update_render_state(this: &XrSession, state: &JsValue);
+    /// Throws on a layer from another session or an ended session.
+    #[wasm_bindgen(method, js_name = updateRenderState, catch)]
+    pub fn update_render_state(this: &XrSession, state: &JsValue) -> Result<(), JsValue>;
 
     /// `Promise<XRReferenceSpace>`.
     #[wasm_bindgen(method, js_name = requestReferenceSpace)]
@@ -130,9 +131,13 @@ extern "C" {
     pub type XrWebGlLayer;
 
     /// `new XRWebGLLayer(session, gl, init)` — `gl` is the XR-compatible
-    /// WebGL2 context, `init` e.g. `{ antialias: true }`.
-    #[wasm_bindgen(constructor, js_class = "XRWebGLLayer")]
-    pub fn new(session: &XrSession, gl: &JsValue, init: &JsValue) -> XrWebGlLayer;
+    /// WebGL2 context, `init` e.g. `{ antialias: true }`. Throws
+    /// InvalidStateError when the UA judges the context not XR-compatible
+    /// (observed on Horizon Browser) — `catch` keeps that a Result instead
+    /// of a wasm abort that strands the browser in its immersive
+    /// transition.
+    #[wasm_bindgen(constructor, js_class = "XRWebGLLayer", catch)]
+    pub fn new(session: &XrSession, gl: &JsValue, init: &JsValue) -> Result<XrWebGlLayer, JsValue>;
 
     /// The opaque framebuffer to render into (None only for inline
     /// sessions, which this crate never creates).

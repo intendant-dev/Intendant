@@ -98,16 +98,87 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
 
     let (session, space_kind) = request_session_with_floor(&xr_sys, &mode).await?;
 
-    // Layer + render state.
+    // Everything after the grant runs fallibly: the browser enters its
+    // immersive transition the moment the session is created and stays
+    // there until the page presents frames — a failure that leaves the
+    // session alive strands the operator on the headset's loading screen
+    // with the error text unreadable behind it. Ending the session drops
+    // them back onto the page where the status line speaks.
+    match configure_and_arm(&inner, &session, mode, space_kind).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = session.end();
+            Err(err)
+        }
+    }
+}
+
+/// `{ antialias: true }` layer construction against the encoder context.
+fn create_layer(session: &xr::XrSession, gl_js: &JsValue) -> Result<xr::XrWebGlLayer, JsValue> {
     let layer_init = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&layer_init, &"antialias".into(), &JsValue::TRUE);
+    xr::XrWebGlLayer::new(session, gl_js, &layer_init.into())
+}
+
+/// Best-effort `gl.makeXRCompatible()`, raced against a timeout. Only the
+/// layer-creation RETRY path calls this: with a live session the promise
+/// resolves promptly, while awaiting it unconditionally is the known
+/// desktop hang (device-less Chrome parks it forever). The race keeps
+/// even a regressed runtime from re-stranding entry.
+async fn make_xr_compatible_with_timeout(gl_js: &JsValue, timeout_ms: i32) {
+    let Ok(func) = js_sys::Reflect::get(gl_js, &"makeXRCompatible".into()) else {
+        return;
+    };
+    let Ok(func) = func.dyn_into::<js_sys::Function>() else {
+        return;
+    };
+    let Ok(ret) = func.call0(gl_js) else {
+        return;
+    };
+    let Ok(compat) = ret.dyn_into::<js_sys::Promise>() else {
+        return;
+    };
+    let timeout = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            let _ =
+                window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, timeout_ms);
+        }
+    });
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&compat, &timeout));
+    let _ = wasm_bindgen_futures::JsFuture::from(race).await;
+}
+
+/// Post-grant session setup: layer, render state, reference space, input
+/// listeners, state install, frame loop. Fallible end to end; the caller
+/// ends the session on any error.
+async fn configure_and_arm(
+    inner: &Rc<RefCell<Inner>>,
+    session: &xr::XrSession,
+    mode: String,
+    space_kind: &'static str,
+) -> Result<(), JsValue> {
     let gl_js = inner
         .borrow()
         .encoder
         .as_ref()
         .map(|e| e.gl_context_js())
-        .expect("encoder built above");
-    let layer = xr::XrWebGlLayer::new(&session, &gl_js, &layer_init.into());
+        .expect("encoder built before session request");
+    let layer = match create_layer(session, &gl_js) {
+        Ok(layer) => layer,
+        Err(first_error) => {
+            // Horizon Browser has been observed refusing a context whose
+            // XR-compatible bit was only requested at creation; honor
+            // makeXRCompatible now that a device is present, then retry
+            // once.
+            make_xr_compatible_with_timeout(&gl_js, 5_000).await;
+            create_layer(session, &gl_js).map_err(|second_error| {
+                JsValue::from_str(&format!(
+                    "xr-web: XRWebGLLayer creation failed twice \
+                     (before makeXRCompatible: {first_error:?}; after: {second_error:?})"
+                ))
+            })?
+        }
+    };
     // Quest-only knob (harmless elsewhere): trade peripheral shading for
     // frame budget. Mid-strength keeps HUD-free scenes crisp.
     layer.set_fixed_foveation(0.4);
@@ -116,7 +187,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
     let _ = js_sys::Reflect::set(&render_state, &"baseLayer".into(), layer.as_ref());
     let _ = js_sys::Reflect::set(&render_state, &"depthNear".into(), &JsValue::from_f64(0.05));
     let _ = js_sys::Reflect::set(&render_state, &"depthFar".into(), &JsValue::from_f64(60.0));
-    session.update_render_state(&render_state.into());
+    session.update_render_state(&render_state.into())?;
 
     let ref_space: xr::XrReferenceSpace =
         wasm_bindgen_futures::JsFuture::from(session.request_reference_space(space_kind))
@@ -133,7 +204,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
     // Input events: selectstart arms a hold on the hovered target,
     // selectend resolves clicks / cancels unfinished confirms. The
     // per-frame ray/hover pass lives in the frame loop.
-    let ss_inner = Rc::clone(&inner);
+    let ss_inner = Rc::clone(inner);
     let on_selectstart = Closure::new(move |_event: web_sys::Event| {
         let now = web_sys::window()
             .and_then(|w| w.performance())
@@ -143,7 +214,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
     });
     session
         .add_event_listener_with_callback("selectstart", on_selectstart.as_ref().unchecked_ref())?;
-    let se_inner = Rc::clone(&inner);
+    let se_inner = Rc::clone(inner);
     let on_selectend = Closure::new(move |_event: web_sys::Event| {
         crate::input::on_select_end(&mut se_inner.borrow_mut());
     });
@@ -151,7 +222,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
 
     // 'end' fires for every termination path (our exit(), the system
     // gesture, runtime shutdown) — single cleanup seam.
-    let end_inner = Rc::clone(&inner);
+    let end_inner = Rc::clone(inner);
     let on_end = Closure::new(move |_event: web_sys::Event| {
         let callback = {
             let mut inner = end_inner.borrow_mut();
@@ -171,7 +242,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
 
     let raf_slot: RafSlot = Rc::new(RefCell::new(None));
     let state = ActiveSession {
-        session: session.clone().unchecked_into(),
+        session: AsRef::<JsValue>::as_ref(session).clone().unchecked_into(),
         ref_space,
         layer,
         passthrough,
@@ -193,7 +264,7 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
     }
 
     // Arm the self-rescheduling frame callback.
-    let loop_inner = Rc::clone(&inner);
+    let loop_inner = Rc::clone(inner);
     let loop_slot = Rc::clone(&raf_slot);
     *raf_slot.borrow_mut() = Some(Closure::new(move |time: f64, frame: xr::XrFrame| {
         let mut inner_mut = loop_inner.borrow_mut();
