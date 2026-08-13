@@ -17,6 +17,7 @@
 //! loop, `gl.rs` owns the WebGL2 encoder, `math.rs` the linear algebra,
 //! `webxr_sys.rs` the hand-written WebXR externs.
 
+mod agenda;
 mod atlas;
 pub mod gl;
 mod input;
@@ -171,6 +172,13 @@ fn debug_state_json(inner: &Inner) -> String {
         "scene": {
             "panels": inner.panels_count,
             "texts": inner.texts_count,
+            // Agenda-rail cards in the BUILT scene (each rail card is a
+            // hit target) — the validator's rail assertion.
+            "agendaItems": inner
+                .hit_targets
+                .iter()
+                .filter(|h| h.id.starts_with("agenda:"))
+                .count(),
             "hitTargets": inner.hit_targets.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
             "sceneGeneration": inner.scene_generation,
             "builtGeneration": inner.built_generation,
@@ -406,6 +414,7 @@ mod tests {
         assert!(parsed["supported"]["ar"].is_null());
         assert_eq!(parsed["snapshotGeneration"], 0);
         assert_eq!(parsed["hasActionCallback"], false);
+        assert_eq!(parsed["scene"]["agendaItems"], 0);
         assert_eq!(parsed["engine"]["framesRendered"], 0);
         assert_eq!(parsed["engine"]["views"], 0);
         assert!(parsed["engine"]["passthrough"].is_null());

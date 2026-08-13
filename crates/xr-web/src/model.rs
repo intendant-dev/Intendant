@@ -18,6 +18,10 @@ pub(crate) struct XrSnapshot {
     /// live log events, ≤80). The workbench transcript filters these by
     /// the focused agent — no XR-only feed exists.
     pub(crate) events: Vec<XrEvent>,
+    /// Daemon Agenda summary the `ui2-xr.js` pump attaches beside the
+    /// Station snapshot (`xrAgendaSummary()`). Absent/null on feeds that
+    /// don't carry it — the rail simply doesn't render.
+    pub(crate) agenda: Option<XrAgenda>,
 }
 
 /// One activity-feed line (the dashboard's bounded event shape).
@@ -43,6 +47,39 @@ impl XrEvent {
             self.session_id.is_empty() && self.agent_id == agent.id
         }
     }
+}
+
+/// The Agenda rail's feed: a capped list of open items plus the total
+/// open count (for the honest overflow line), or an error string when
+/// the dashboard could not reach the agenda at all. Composed by the JS
+/// seam from the Agenda tab's own client state (or its bounded
+/// `api_agenda_list` fallback) — the rail adds no fetch path of its own.
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct XrAgenda {
+    /// Non-empty → the agenda is unavailable; rendered as in-scene text,
+    /// never a silent blank.
+    pub(crate) error: String,
+    /// Total open items on the daemon (the rail shows at most a few).
+    pub(crate) open: u32,
+    pub(crate) items: Vec<XrAgendaItem>,
+}
+
+/// One agenda item, pre-digested for the medium: the title (JS caps it),
+/// the kind word (task / note / question), a preformatted due label
+/// ("due in 2h" / "overdue 3h" — relative time needs the browser clock,
+/// so it's minted where the flat tab's formatter lives), and the served
+/// state flags the flat tab's chips render.
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct XrAgendaItem {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) kind: String,
+    pub(crate) due: String,
+    pub(crate) overdue: bool,
+    pub(crate) blocked: bool,
+    pub(crate) answered: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -224,5 +261,48 @@ mod tests {
         let snap: XrSnapshot = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(snap.hosts.is_empty());
         assert!(snap.agents.is_empty());
+        assert!(snap.agenda.is_none(), "absent agenda reads as no rail");
+    }
+
+    #[test]
+    fn agenda_parses_with_tolerant_defaults() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "agenda": {
+                "open": 5,
+                "items": [
+                    {"id": "01H", "title": "fix the boiler", "kind": "task",
+                     "due": "overdue 3h", "overdue": true, "blocked": true,
+                     "answered": false, "someFutureField": 1},
+                    // Sparse row: every missing field folds to a default.
+                    {"title": "which color?", "kind": "question"}
+                ]
+            }
+        }))
+        .unwrap();
+        let agenda = snap.agenda.expect("agenda present");
+        assert_eq!(agenda.open, 5);
+        assert!(agenda.error.is_empty());
+        assert_eq!(agenda.items.len(), 2);
+        let first = &agenda.items[0];
+        assert_eq!(first.due, "overdue 3h");
+        assert!(first.overdue && first.blocked && !first.answered);
+        let sparse = &agenda.items[1];
+        assert_eq!(sparse.kind, "question");
+        assert!(sparse.id.is_empty() && sparse.due.is_empty());
+        assert!(!sparse.overdue && !sparse.blocked && !sparse.answered);
+    }
+
+    #[test]
+    fn agenda_null_and_error_shapes_parse() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({"agenda": null})).unwrap();
+        assert!(snap.agenda.is_none(), "null agenda reads as no rail");
+
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "agenda": {"error": "agenda unavailable (503)"}
+        }))
+        .unwrap();
+        let agenda = snap.agenda.expect("error shape still parses");
+        assert_eq!(agenda.error, "agenda unavailable (503)");
+        assert!(agenda.items.is_empty());
     }
 }

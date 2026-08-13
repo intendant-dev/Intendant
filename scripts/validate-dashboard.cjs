@@ -199,6 +199,21 @@ const XR_PROBE_SNAPSHOT = {
     ts: '12:00',
     msg: `probe thread line ${i}: the deliberate confirm hold keeps approvals off stray pinches`,
   })),
+  // Agenda rail: two open items (a question and an overdue blocked task)
+  // plus a total that forces the honest "+1 more" overflow line.
+  agenda: {
+    open: 3,
+    items: [
+      {
+        id: 'xr-ag-q1', title: 'Which palette should the rail use?', kind: 'question',
+        due: '', overdue: false, blocked: false, answered: false,
+      },
+      {
+        id: 'xr-ag-t1', title: 'Water the office plants', kind: 'task',
+        due: 'overdue 2h', overdue: true, blocked: true, answered: false,
+      },
+    ],
+  },
 };
 
 const BROWSER_EXECUTABLE_ENVS = [
@@ -2513,11 +2528,36 @@ class BrowserHarness {
       'xrProbe.debugJson().then((d) => d.terminal.open === false)',
       timeoutMs,
     );
+    // Agenda rail: the injected snapshot carries two open items — the
+    // scene must build both rail cards (each is a hit target), and a
+    // pinch-select must expand one locally (read-only; no action fires).
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.agendaItems === 2 && d.scene.hitTargets.includes('agenda:xr-ag-q1'))",
+      timeoutMs,
+    );
+    const agendaSelected = await this.evaluate("xrProbe.activate('agenda:xr-ag-t1')");
+    if (agendaSelected !== true) {
+      throw new Error('xr probe: agenda card activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'agenda:xr-ag-t1')",
+      timeoutMs,
+    );
+    // Hand focus back to the session card so the closing summary reads
+    // the transcript-bearing scene, not the agenda expansion.
+    const reselected = await this.evaluate("xrProbe.activate('card:xr-probe-a2')");
+    if (reselected !== true) {
+      throw new Error('xr probe: session re-selection after the agenda pass was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.transcript.rows > 0)",
+      timeoutMs,
+    );
     const terminalSummary = await this.evaluate(
       'xrProbe.debugJson().then((d) => JSON.stringify(d.terminal))',
     );
     const summary = await this.evaluate(
-      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, transcriptRows: d.scene.transcript.rows, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
+      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, transcriptRows: d.scene.transcript.rows, agendaItems: d.scene.agendaItems, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
     );
     // Release the synthetic-state hold only after every assertion has
     // read from it — the page's own 300 ms pump (real, mostly-empty
