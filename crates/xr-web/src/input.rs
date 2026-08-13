@@ -29,6 +29,7 @@ pub(crate) const CONFIRM_HOLD_MS: f64 = 900.0;
 /// in the same frame.
 pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
     let mut best: Option<(f32, String)> = None;
+    let mut rays: Vec<(Ray, Option<f32>)> = Vec::new();
     if let Some(state) = inner.session_state.as_ref() {
         let sources = state.session.input_sources();
         if let Ok(Some(iter)) = js_sys::try_iter(&sources) {
@@ -41,16 +42,22 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
                     continue;
                 };
                 let ray = Ray::from_rigid(&mat);
+                let mut nearest: Option<f32> = None;
                 for hit in &inner.hit_targets {
                     if let Some((t, _, _)) = hit.panel.raycast(&ray) {
+                        if nearest.is_none_or(|n| t < n) {
+                            nearest = Some(t);
+                        }
                         if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                             best = Some((t, hit.id.clone()));
                         }
                     }
                 }
+                rays.push((ray, nearest));
             }
         }
     }
+    inner.pointer_rays = rays;
 
     let new_hover = best.map(|(_, id)| id);
     if new_hover != inner.hover_id {

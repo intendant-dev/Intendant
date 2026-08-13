@@ -342,14 +342,50 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
     // `inner.session_state`, the encoder is `inner.encoder`.
     let needs_scene =
         !inner.scene_uploaded || inner.built_generation != inner.scene_generation || inner.ui_dirty;
-    // Video frames advance regardless of scene rebuilds.
+    // Video frames advance regardless of scene rebuilds; so does the
+    // pointer overlay (ray beams + hit markers rebuilt every frame from
+    // the input pass — without a drawn ray, aiming in a headset is
+    // guesswork, the first on-device finding).
     let video_sources: Vec<(String, web_sys::HtmlVideoElement)> = inner
         .displays
         .iter()
         .map(|d| (d.source_id.clone(), d.video.clone()))
         .collect();
+    let mut pointer = crate::gl::SceneFrame::default();
+    for (ray, hit) in &inner.pointer_rays {
+        let length = hit.unwrap_or(2.5);
+        let start = ray.origin + ray.dir.scale(0.08);
+        let end = ray.origin + ray.dir.scale(length);
+        let beam = if hit.is_some() {
+            [0.65, 0.72, 1.0, 0.95]
+        } else {
+            [0.49, 0.55, 0.98, 0.5]
+        };
+        pointer.push_line(start, end, beam);
+        if hit.is_some() {
+            // Hit marker: a small three-axis star at the landing point.
+            let m = 0.012;
+            let star = [0.88, 0.92, 1.0, 1.0];
+            pointer.push_line(
+                crate::math::v3(end.x - m, end.y, end.z),
+                crate::math::v3(end.x + m, end.y, end.z),
+                star,
+            );
+            pointer.push_line(
+                crate::math::v3(end.x, end.y - m, end.z),
+                crate::math::v3(end.x, end.y + m, end.z),
+                star,
+            );
+            pointer.push_line(
+                crate::math::v3(end.x, end.y, end.z - m),
+                crate::math::v3(end.x, end.y, end.z + m),
+                star,
+            );
+        }
+    }
     if let Some(encoder) = inner.encoder.as_mut() {
         encoder.update_video_textures(&video_sources);
+        encoder.upload_pointer(&pointer.lines);
     }
 
     if needs_scene {

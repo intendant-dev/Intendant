@@ -72,6 +72,9 @@ pub(crate) struct Inner {
     /// Live display streams registered by the dashboard (same sources
     /// the other rendered surface paints); shown as floating monitors.
     pub(crate) displays: Vec<DisplaySource>,
+    /// Per-frame controller/hand rays with their nearest hit distance —
+    /// rendered as visible beams + hit markers (the pointer).
+    pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
     /// Live pinch-hold on a confirm target (approve/deny).
     pub(crate) hold_target: Option<String>,
     pub(crate) hold_started_ms: f64,
@@ -108,6 +111,7 @@ impl Inner {
             hover_id: None,
             hit_targets: Vec::new(),
             displays: Vec::new(),
+            pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
             confirm_progress: None,
@@ -152,6 +156,7 @@ fn debug_state_json(inner: &Inner) -> String {
             "parseErrors": inner.parse_errors,
             "selected": inner.selected_id,
             "hover": inner.hover_id,
+            "pointerRays": inner.pointer_rays.len(),
             "confirm": inner.confirm_progress.as_ref().map(|(id, p)| {
                 serde_json::json!({ "target": id, "progress": p })
             }),

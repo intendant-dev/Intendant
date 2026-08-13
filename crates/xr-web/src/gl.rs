@@ -300,9 +300,11 @@ pub struct GlEncoder {
     vbo_lines: WebGlBuffer,
     vbo_text: WebGlBuffer,
     vbo_unit: WebGlBuffer,
+    vbo_pointer: WebGlBuffer,
     tri_count: i32,
     line_count: i32,
     text_count: i32,
+    pointer_count: i32,
     panels: Vec<PanelInstance>,
     monitors: Vec<MonitorInstance>,
     video_textures: std::collections::HashMap<String, web_sys::WebGlTexture>,
@@ -373,6 +375,7 @@ impl GlEncoder {
         let vbo_lines = make_buffer()?;
         let vbo_text = make_buffer()?;
         let vbo_unit = make_buffer()?;
+        let vbo_pointer = make_buffer()?;
 
         // Static unit quad for the panel program.
         gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo_unit));
@@ -404,9 +407,11 @@ impl GlEncoder {
             vbo_lines,
             vbo_text,
             vbo_unit,
+            vbo_pointer,
             tri_count: 0,
             line_count: 0,
             text_count: 0,
+            pointer_count: 0,
             panels: Vec::new(),
             monitors: Vec::new(),
             video_textures: std::collections::HashMap::new(),
@@ -520,6 +525,16 @@ impl GlEncoder {
         self.text_count = (text_vertices.len() / TEXT_VERTEX_STRIDE) as i32;
     }
 
+    /// Upload the per-frame pointer overlay (controller ray beams + hit
+    /// markers). Refreshed every XR frame — a few dozen vertices.
+    pub(crate) fn upload_pointer(&mut self, lines: &[f32]) {
+        let gl = &self.gl;
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_pointer));
+        let data = js_sys::Float32Array::from(lines);
+        gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &data, Gl::DYNAMIC_DRAW);
+        self.pointer_count = (lines.len() / VERTEX_STRIDE) as i32;
+    }
+
     /// Upload only the raw line/tri streams (the hardware smoke path).
     pub fn upload_streams(&mut self, frame: &SceneFrame) {
         let gl = &self.gl;
@@ -630,7 +645,7 @@ impl GlEncoder {
             }
         }
 
-        if self.tri_count > 0 || self.line_count > 0 {
+        if self.tri_count > 0 || self.line_count > 0 || self.pointer_count > 0 {
             gl.use_program(Some(&self.solid.program));
             gl.uniform_matrix4fv_with_f32_array(Some(&self.solid.u_view_proj), false, &view_proj.0);
             if self.tri_count > 0 {
@@ -642,6 +657,11 @@ impl GlEncoder {
                 gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_lines));
                 bind_pos_color_layout(gl);
                 gl.draw_arrays(Gl::LINES, 0, self.line_count);
+            }
+            if self.pointer_count > 0 {
+                gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_pointer));
+                bind_pos_color_layout(gl);
+                gl.draw_arrays(Gl::LINES, 0, self.pointer_count);
             }
         }
 

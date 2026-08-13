@@ -270,12 +270,14 @@ fn card(
     let hover_key = format!("card:{}", agent.id);
     let is_hover = hover_id == Some(hover_key.as_str());
 
+    // Hover reads at 2 m only if it's loud: full-iris border, not the
+    // soft wash (on-device finding — the subtle variant was invisible).
     let border = if is_selected {
         kit::IRIS
     } else if agent.needs_approval {
         kit::AMBER
     } else if is_hover {
-        kit::IRIS_SOFT
+        kit::IRIS
     } else {
         kit::LINE_2
     };
