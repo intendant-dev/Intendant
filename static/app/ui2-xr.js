@@ -12,8 +12,8 @@
 // event-driven; top level declares only lets/consts/functions
 // (deep-link TDZ rule).
 
-let xrWasmModule = null; // module namespace after first ensureXr()
-let xrInstance = null;   // XrWeb handle after first ensureXr()
+let xrEnsurePromise = null; // single-flight init; cleared on failure
+let xrInstance = null;      // XrWeb handle after first ensureXr()
 let xrChipEl = null;
 let xrSupport = { ar: false, vr: false };
 let xrSnapshotTimer = null;
@@ -45,12 +45,24 @@ async function xrProbeSupportLight() {
 }
 
 async function ensureXr() {
+  // Single-flight: the chip-mount preload and a click-time call race
+  // otherwise — the loser constructed XrWeb against a module whose
+  // wasm init had not resolved ("reading 'xrweb_new'" TypeError). The
+  // PROMISE is the memo; a failed init clears it so retry restarts.
   if (xrInstance) return xrInstance;
-  if (!xrWasmModule) {
-    xrWasmModule = await import('/wasm-xr/xr_web.js');
-    await xrWasmModule.default({ module_or_path: '/wasm-xr/xr_web_bg.wasm' });
+  if (!xrEnsurePromise) {
+    xrEnsurePromise = xrBootModule().catch((err) => {
+      xrEnsurePromise = null;
+      throw err;
+    });
   }
-  xrInstance = new xrWasmModule.XrWeb();
+  return xrEnsurePromise;
+}
+
+async function xrBootModule() {
+  const mod = await import('/wasm-xr/xr_web.js');
+  await mod.default({ module_or_path: '/wasm-xr/xr_web_bg.wasm' });
+  xrInstance = new mod.XrWeb();
   xrInstance.setActionCallback((action) => {
     // Same dispatch seam as the other rendered surface: the emitted
     // objects carry the dashboard's action vocabulary and route through
