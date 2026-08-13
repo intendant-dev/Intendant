@@ -23,6 +23,10 @@ set -eu
 # fails closed on mismatch. Its own bytes are covered by the release
 # manifest committed to the transparency log, so the custody chain is
 # log -> installer bytes -> pinned commit -> the tree that gets built.
+# On the binary fast path the build is replaced by the same release's
+# prebuilt pair, sha256-verified against sidecars published by that
+# release and covered by the same logged manifest; --from-source keeps
+# the fully source-built path.
 INSTALLER_RELEASE_TAG=""
 INSTALLER_RELEASE_COMMIT=""
 
@@ -32,7 +36,7 @@ Intendant installer
 
   curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh -s -- \
     [--service] [--connect <rendezvous-url>] \
-    [--daemon-id <id>] [--no-run]
+    [--daemon-id <id>] [--no-run] [--from-source]
 
 Options:
   --service       Keep the daemon running unattended: installs a boot
@@ -54,6 +58,11 @@ Options:
                   head only while no release exists. An explicit ref you
                   choose skips the release-pin verification.
   --no-run        Build and link only; print how to start it.
+  --from-source   Always build from source, skipping the prebuilt-binary
+                  fast path (the fully source-verified install). Without
+                  it, installing a release downloads the release's
+                  sha256-verified binary pair when one is published for
+                  this platform, and builds from source otherwise.
 
 Environment overrides:
   INTENDANT_REPO         git URL   (default: https://github.com/intendant-dev/Intendant)
@@ -69,6 +78,7 @@ DAEMON_ID="${INTENDANT_CONNECT_DAEMON_ID:-}"
 REF="${INTENDANT_REF:-}"
 RUN=1
 SERVICE=0
+FROM_SOURCE=0
 
 say() { printf '\033[1m[intendant install]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[intendant install]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -88,6 +98,8 @@ while [ $# -gt 0 ]; do
       SERVICE=1; shift ;;
     --no-run)
       RUN=0; shift ;;
+    --from-source)
+      FROM_SOURCE=1; shift ;;
     -h|--help)
       usage
       exit 0 ;;
@@ -267,10 +279,145 @@ if [ -n "$INSTALLER_RELEASE_COMMIT" ] && [ "$REF" = "$INSTALLER_RELEASE_TAG" ]; 
   say "release pin verified: $REF is commit $ACTUAL_COMMIT"
 fi
 
+# ── Binary fast path (stage) ──
+# When the resolved ref IS a release tag, that release may publish a
+# prebuilt `intendant` + `intendant-runtime` pair for this platform
+# (Linux x86_64/aarch64: Intendant-<version>-linux-<arch>.tar.gz — a
+# tar.gz so the executable bits survive): downloading it replaces the
+# 12+ minute source compile. The trust story is unchanged — the checkout
+# above stays pin-verified to the release commit, and the pair is
+# sha256-verified against the .sha256 sidecar published by the same
+# release, every asset of which is PGP-signed and committed to the
+# public transparency log. --from-source opts out and keeps the fully
+# source-verified build. Old releases without the pair, other
+# architectures, a non-GitHub INTENDANT_REPO, or any verification
+# failure fall back to the source build. macOS stays source-built here:
+# no paired unix binary asset is published for it (the packaged app
+# bundle carries the macOS binaries).
+#
+# Staging and smoke are two phases: the pair is downloaded, verified,
+# and extracted HERE, but only run AFTER dependency setup below — on a
+# fresh box the binaries need the runtime shared libraries setup
+# installs (libvpx, pipewire, xcb) before they can execute at all.
+
+# Owner/repo path of a github.com HTTPS remote (the only host the
+# release-asset fast path can construct download URLs for); any other
+# remote returns non-zero and the caller takes the source build.
+github_repo_path() {
+  case "$1" in
+    https://github.com/*)
+      _path="${1#https://github.com/}"
+      _path="${_path%.git}"
+      _path="${_path%/}"
+      case "$_path" in
+        */*/*) return 1 ;;
+        */*) printf '%s\n' "$_path"; return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# Lowercase sha256 of a file, via whichever tool this box has
+# (sha256sum on Linux coreutils, shasum on macOS/BSD).
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}' | tr 'A-F' 'a-f'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}' | tr 'A-F' 'a-f'
+  else
+    return 1
+  fi
+}
+
+# First hex field of a `sha256sum`-format sidecar, lowercased.
+sidecar_sha256() {
+  awk 'NR==1 {print $1}' "$1" | tr 'A-F' 'a-f'
+}
+
+fetch_url() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$2" "$1"
+  else
+    return 1
+  fi
+}
+
+# Download <asset> (+ its .sha256 sidecar) from the release <tag> of
+# github repo <path>, verify the digest, and leave the verified file at
+# $FAST_TMP/<asset>. Non-zero = not available / failed verification; the
+# caller takes the source build. A digest MISMATCH is the loud case: the
+# download is deleted and the mismatch named.
+fetch_release_asset() {
+  _repo_path="$1"; _tag="$2"; _asset="$3"
+  _base="https://github.com/${_repo_path}/releases/download/${_tag}"
+  say "binary fast path: fetching ${_asset} from the ${_tag} release"
+  if ! fetch_url "${_base}/${_asset}" "$FAST_TMP/${_asset}"; then
+    return 1
+  fi
+  if ! fetch_url "${_base}/${_asset}.sha256" "$FAST_TMP/${_asset}.sha256"; then
+    rm -f "$FAST_TMP/${_asset}"
+    return 1
+  fi
+  _want="$(sidecar_sha256 "$FAST_TMP/${_asset}.sha256")"
+  _got="$(file_sha256 "$FAST_TMP/${_asset}")" || _got=""
+  if [ -z "$_want" ] || [ -z "$_got" ] || [ "$_want" != "$_got" ]; then
+    rm -f "$FAST_TMP/${_asset}" "$FAST_TMP/${_asset}.sha256"
+    say "WARNING: ${_asset} did not match its .sha256 sidecar (expected ${_want:-<none>}, got ${_got:-<none>}) — discarding the download and building from source instead"
+    return 1
+  fi
+  say "verified ${_asset} against its .sha256 sidecar"
+  return 0
+}
+
+stage_release_binaries() {
+  [ "$FROM_SOURCE" = "0" ] || return 1
+  [ "$PLATFORM" = "Linux" ] || return 1
+  case "$REF" in v[0-9]*) ;; *) return 1 ;; esac
+  FAST_ARCH="$(uname -m)"
+  case "$FAST_ARCH" in x86_64|aarch64) ;; *) return 1 ;; esac
+  FAST_REPO_PATH="$(github_repo_path "$REPO")" || return 1
+  FAST_ASSET="Intendant-${REF#v}-linux-${FAST_ARCH}.tar.gz"
+  FAST_TMP="$(mktemp -d)" || return 1
+  if ! fetch_release_asset "$FAST_REPO_PATH" "$REF" "$FAST_ASSET"; then
+    rm -rf "$FAST_TMP"
+    say "note: no verified prebuilt binary pair for $REF on linux-$FAST_ARCH (releases before v0.2.0-alpha.6 ship none) — building from source"
+    return 1
+  fi
+  mkdir -p "$INSTALL_DIR/target/release"
+  if ! tar -xzf "$FAST_TMP/$FAST_ASSET" -C "$INSTALL_DIR/target/release" intendant intendant-runtime; then
+    rm -f "$INSTALL_DIR/target/release/intendant" "$INSTALL_DIR/target/release/intendant-runtime"
+    rm -rf "$FAST_TMP"
+    say "WARNING: could not extract $FAST_ASSET — building from source instead"
+    return 1
+  fi
+  rm -rf "$FAST_TMP"
+  # tar preserves the executable bits; chmod defensively anyway.
+  chmod +x "$INSTALL_DIR/target/release/intendant" "$INSTALL_DIR/target/release/intendant-runtime" 2>/dev/null || true
+  return 0
+}
+
+BINARY_STAGED=0
+if stage_release_binaries; then
+  BINARY_STAGED=1
+  say "staged the release's prebuilt binary pair — it is smoke-tested after dependency setup (--from-source forces a source build)"
+fi
+
 # ── System dependencies ──
 if [ "$PLATFORM" = "Linux" ] && command -v apt-get >/dev/null 2>&1 && [ -x scripts/setup-linux.sh ]; then
-  say "installing system dependencies (scripts/setup-linux.sh)"
-  ./scripts/setup-linux.sh || die "system dependency setup failed"
+  if [ "$BINARY_STAGED" = "1" ]; then
+    # The setup run still matters on the binary path — it installs the
+    # runtime shared libraries the prebuilt binaries load (libvpx,
+    # pipewire, xcb) — but its build phase would waste the fast path, so
+    # skip exactly that with the script's own --no-build flag.
+    say "installing system dependencies (scripts/setup-linux.sh --no-build)"
+    ./scripts/setup-linux.sh --no-build || die "system dependency setup failed"
+  else
+    say "installing system dependencies (scripts/setup-linux.sh)"
+    ./scripts/setup-linux.sh || die "system dependency setup failed"
+  fi
 elif [ "$PLATFORM" = "Linux" ]; then
   say "note: no apt-get here — if the build fails on a missing native dep, install your distro's equivalents of the APT_PACKAGES list in scripts/setup-linux.sh (pkg-config, libclang, libvpx, libpipewire-0.3, libxcb + shm/randr)."
 elif [ "$PLATFORM" = "Darwin" ] && [ -x scripts/setup-macos.sh ]; then
@@ -278,26 +425,45 @@ elif [ "$PLATFORM" = "Darwin" ] && [ -x scripts/setup-macos.sh ]; then
   ./scripts/setup-macos.sh || die "system dependency setup failed"
 fi
 
-# setup-linux.sh installs rustup when cargo is missing, but into its own
-# shell — pick the env up here before insisting.
-if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
-  . "$HOME/.cargo/env"
+# ── Binary fast path (smoke) ──
+# The staged pair must actually run here before it is trusted: an
+# old-glibc box ("GLIBC_x.y not found"), a wrong-architecture download,
+# or a corrupt file all fail --version, and the honest answer is to say
+# so, remove the pair, and build from source.
+if [ "$BINARY_STAGED" = "1" ]; then
+  if "$INSTALL_DIR/target/release/intendant" --version >/dev/null 2>&1; then
+    say "prebuilt binaries verified and working — the source build is skipped"
+  else
+    say "WARNING: the prebuilt intendant binary does not run on this system (old glibc, wrong architecture, or a corrupt download) — removing it and building from source instead"
+    rm -f "$INSTALL_DIR/target/release/intendant" "$INSTALL_DIR/target/release/intendant-runtime"
+    BINARY_STAGED=0
+  fi
 fi
-command -v cargo >/dev/null 2>&1 || die "Rust is required. Install via https://rustup.rs then re-run:
+
+# Only the source build requires the Rust toolchain: the whole block is
+# skipped when the verified prebuilt pair is in place.
+if [ "$BINARY_STAGED" = "0" ]; then
+  # setup-linux.sh installs rustup when cargo is missing, but into its own
+  # shell — pick the env up here before insisting.
+  if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
+  fi
+  command -v cargo >/dev/null 2>&1 || die "Rust is required. Install via https://rustup.rs then re-run:
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
 
-# ── Build ──
-# --locked: build exactly the committed Cargo.lock — a resolution that
-# differs from what CI tested is a failure, not a fallback.
-# Named bins mirror the release lane's proven build shape (release.yml's
-# binary jobs): a daemon install needs `intendant` + `intendant-runtime`
-# only, and naming them skips the wasm workspace members and
-# station-web's native graphics stack (~71 packages) that a bare
-# workspace build would compile — a configuration no CI leg gates —
-# while shrinking the install build. intendant-connect is the hosted
-# rendezvous service and is not part of a daemon install.
-say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release --locked --bin intendant --bin intendant-runtime
+  # ── Build ──
+  # --locked: build exactly the committed Cargo.lock — a resolution that
+  # differs from what CI tested is a failure, not a fallback.
+  # Named bins mirror the release lane's proven build shape (release.yml's
+  # binary jobs): a daemon install needs `intendant` + `intendant-runtime`
+  # only, and naming them skips the wasm workspace members and
+  # station-web's native graphics stack (~71 packages) that a bare
+  # workspace build would compile — a configuration no CI leg gates —
+  # while shrinking the install build. intendant-connect is the hosted
+  # rendezvous service and is not part of a daemon install.
+  say "building release binaries (this takes a few minutes on a fresh box)"
+  cargo build --release --locked --bin intendant --bin intendant-runtime
+fi
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
