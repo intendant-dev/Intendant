@@ -2465,6 +2465,57 @@ class BrowserHarness {
       'xrProbe.debugJson().then((d) => d.scene.transcript.scroll === 0)',
       timeoutMs,
     );
+    // Terminal pane (slice 1, read-only watching). The summon pill is a
+    // standing hit target; a headless page never armed the flat tab's
+    // shell, so opening must land on the honest empty state
+    // (present=false → "no terminals" in-scene).
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('terminal:toggle'))",
+      timeoutMs,
+    );
+    const termOpened = await this.evaluate("xrProbe.activate('terminal:toggle')");
+    if (termOpened !== true) {
+      throw new Error('xr probe: terminal toggle activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.terminal && d.terminal.open === true"
+        + " && d.terminal.present === false"
+        + " && d.scene.hitTargets.includes('terminal:close'))",
+      timeoutMs,
+    );
+    // Canvas seam end to end: register a painted canvas through the
+    // facade (the same calls the page painter makes), mark it dirty, and
+    // the pane must adopt it — hasCanvas plus an advancing generation.
+    await this.evaluate(`(() => {
+      const c = document.createElement('canvas');
+      c.width = 64; c.height = 32;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 64, 32);
+      xrProbe.terminal.registerCanvas('probe-term', c);
+      xrProbe.terminal.update({
+        present: true, live: true, label: 'shell-0 · probe',
+        status: 'Connected to probe', statusKind: 'ok', aspect: 0.5,
+      });
+      xrProbe.terminal.markDirty('probe-term');
+      return true;
+    })()`);
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.terminal.present === true'
+        + ' && d.terminal.hasCanvas === true && d.terminal.canvasGeneration >= 2'
+        + ' && d.terminal.parseErrors === 0)',
+      timeoutMs,
+    );
+    const termClosed = await this.evaluate("xrProbe.activate('terminal:close')");
+    if (termClosed !== true) {
+      throw new Error('xr probe: terminal close activation was refused');
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.terminal.open === false)',
+      timeoutMs,
+    );
+    const terminalSummary = await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.terminal))',
+    );
     const summary = await this.evaluate(
       "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, transcriptRows: d.scene.transcript.rows, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
     );
@@ -2479,6 +2530,7 @@ class BrowserHarness {
       throw new Error(`xr probe: snapshot parse errors: ${report.parseErrors}`);
     }
     report.action = parsedAction;
+    report.terminal = JSON.parse(String(terminalSummary || 'null'));
     report.ok = true;
     return report;
   }

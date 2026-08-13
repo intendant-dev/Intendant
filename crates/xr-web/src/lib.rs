@@ -24,6 +24,7 @@ mod kit;
 pub mod math;
 mod model;
 mod session;
+mod terminal;
 mod ui;
 pub mod webxr_sys;
 
@@ -72,6 +73,9 @@ pub(crate) struct Inner {
     /// Live display streams registered by the dashboard (same sources
     /// the other rendered surface paints); shown as floating monitors.
     pub(crate) displays: Vec<DisplaySource>,
+    /// In-scene terminal pane (read-only mirror of the dashboard's
+    /// standalone shell; see `terminal.rs`).
+    pub(crate) terminal: terminal::TerminalPane,
     /// Per-frame controller/hand rays with their nearest hit distance —
     /// rendered as visible beams + hit markers (the pointer).
     pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
@@ -96,7 +100,7 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             supported_ar: None,
             supported_vr: None,
@@ -116,6 +120,7 @@ impl Inner {
             hover_id: None,
             hit_targets: Vec::new(),
             displays: Vec::new(),
+            terminal: terminal::TerminalPane::default(),
             pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
@@ -153,6 +158,15 @@ fn debug_state_json(inner: &Inner) -> String {
             "passthrough": inner.session_state.as_ref().map(|s| s.passthrough),
             "floorY": inner.session_state.as_ref().map(|s| s.floor_y),
             "sceneUploaded": inner.scene_uploaded,
+        },
+        "terminal": {
+            "open": inner.terminal.open,
+            "present": inner.terminal.view.present,
+            "live": inner.terminal.view.live,
+            "label": inner.terminal.view.label,
+            "hasCanvas": inner.terminal.canvas.is_some(),
+            "canvasGeneration": inner.terminal.canvas_generation,
+            "parseErrors": inner.terminal.parse_errors,
         },
         "scene": {
             "panels": inner.panels_count,
@@ -296,6 +310,35 @@ impl XrWeb {
         }
     }
 
+    /// Ingest the dashboard-derived terminal pane state (label, status,
+    /// presence — see `terminal.rs`). Tolerant like `updateSnapshot`:
+    /// malformed pushes are dropped and counted, never fatal.
+    #[wasm_bindgen(js_name = updateTerminal)]
+    pub fn update_terminal(&self, state: JsValue) {
+        terminal::apply_update(&mut self.inner.borrow_mut(), state);
+    }
+
+    /// Register (or replace) the offscreen canvas the dashboard's
+    /// terminal painter keeps fresh — the canvas-source variant of the
+    /// display registration seam. Registration counts as painted.
+    #[wasm_bindgen(js_name = registerTerminalCanvas)]
+    pub fn register_terminal_canvas(&self, source_id: String, canvas: web_sys::HtmlCanvasElement) {
+        terminal::register_canvas(&mut self.inner.borrow_mut(), source_id, canvas);
+    }
+
+    /// New painted content on the registered canvas; the encoder
+    /// re-uploads on the next frame (uploads are generation-gated so an
+    /// idle terminal costs no texture bandwidth).
+    #[wasm_bindgen(js_name = markTerminalCanvasDirty)]
+    pub fn mark_terminal_canvas_dirty(&self, source_id: String) {
+        terminal::mark_canvas_dirty(&mut self.inner.borrow_mut(), &source_id);
+    }
+
+    #[wasm_bindgen(js_name = unregisterTerminalCanvas)]
+    pub fn unregister_terminal_canvas(&self, source_id: String) {
+        terminal::unregister_canvas(&mut self.inner.borrow_mut(), &source_id);
+    }
+
     /// Ingest one coalesced dashboard state snapshot (same feed schema the
     /// other rendered surface consumes). Parse failures keep the previous
     /// scene and count in `debug_json` — the feed must never take the
@@ -314,7 +357,8 @@ impl XrWeb {
     }
 
     /// Activate a scene target by hit-target id (`card:<agent>`,
-    /// `pill:<agent>:<op>`, `banner:<agent>`), the same
+    /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
+    /// `terminal:close`), the same
     /// activation-by-name contract the other rendered surface gives the
     /// validator and accessibility layers. Runs the exact dispatch path
     /// a completed ray interaction runs — activation by name IS the
@@ -380,5 +424,27 @@ mod tests {
         assert_eq!(parsed["engine"]["framesRendered"], 42);
         assert_eq!(parsed["engine"]["views"], 2);
         assert_eq!(parsed["engine"]["sceneUploaded"], true);
+    }
+
+    #[test]
+    fn debug_json_reports_terminal_pane_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["terminal"]["open"], false);
+        assert_eq!(parsed["terminal"]["present"], false);
+        assert_eq!(parsed["terminal"]["hasCanvas"], false);
+        assert_eq!(parsed["terminal"]["canvasGeneration"], 0);
+        assert_eq!(parsed["terminal"]["parseErrors"], 0);
+
+        inner.terminal.open = true;
+        inner.terminal.view.present = true;
+        inner.terminal.view.live = true;
+        inner.terminal.view.label = "shell-0 · This daemon".into();
+        inner.terminal.canvas_generation = 4;
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["terminal"]["open"], true);
+        assert_eq!(parsed["terminal"]["live"], true);
+        assert_eq!(parsed["terminal"]["label"], "shell-0 · This daemon");
+        assert_eq!(parsed["terminal"]["canvasGeneration"], 4);
     }
 }

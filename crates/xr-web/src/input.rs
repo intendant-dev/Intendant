@@ -113,6 +113,11 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
             // Paging is a light, reversible act — it fires on release
             // like a card, never through the confirm hold.
             HitKind::ScrollOlder | HitKind::ScrollNewer => page_transcript(inner, hit.kind),
+            // Terminal pane affordances (summon/dismiss) are light acts
+            // too: they resolve on release, never a hold.
+            HitKind::TerminalToggle | HitKind::TerminalClose => {
+                crate::terminal::handle_release(inner, hit.kind);
+            }
             HitKind::Approve | HitKind::Deny => {}
         }
     }
@@ -163,6 +168,9 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
         HitKind::ScrollOlder | HitKind::ScrollNewer => {
             page_transcript(inner, hit.kind);
             true
+        }
+        HitKind::TerminalToggle | HitKind::TerminalClose => {
+            crate::terminal::handle_release(inner, hit.kind)
         }
         HitKind::Approve | HitKind::Deny => {
             let decision = if hit.kind == HitKind::Approve {
