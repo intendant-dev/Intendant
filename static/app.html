@@ -39401,7 +39401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '845ff6c080987ecd';
+const INTENDANT_APP_BUILD = 'cd1b92b97ed3b290';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146189,8 +146189,8 @@ function handleDisplayRequestResolved(d) {
 // event-driven; top level declares only lets/consts/functions
 // (deep-link TDZ rule).
 
-let xrWasmModule = null; // module namespace after first ensureXr()
-let xrInstance = null;   // XrWeb handle after first ensureXr()
+let xrEnsurePromise = null; // single-flight init; cleared on failure
+let xrInstance = null;      // XrWeb handle after first ensureXr()
 let xrChipEl = null;
 let xrSupport = { ar: false, vr: false };
 let xrSnapshotTimer = null;
@@ -146222,12 +146222,24 @@ async function xrProbeSupportLight() {
 }
 
 async function ensureXr() {
+  // Single-flight: the chip-mount preload and a click-time call race
+  // otherwise — the loser constructed XrWeb against a module whose
+  // wasm init had not resolved ("reading 'xrweb_new'" TypeError). The
+  // PROMISE is the memo; a failed init clears it so retry restarts.
   if (xrInstance) return xrInstance;
-  if (!xrWasmModule) {
-    xrWasmModule = await import('/wasm-xr/xr_web.js');
-    await xrWasmModule.default({ module_or_path: '/wasm-xr/xr_web_bg.wasm' });
+  if (!xrEnsurePromise) {
+    xrEnsurePromise = xrBootModule().catch((err) => {
+      xrEnsurePromise = null;
+      throw err;
+    });
   }
-  xrInstance = new xrWasmModule.XrWeb();
+  return xrEnsurePromise;
+}
+
+async function xrBootModule() {
+  const mod = await import('/wasm-xr/xr_web.js');
+  await mod.default({ module_or_path: '/wasm-xr/xr_web_bg.wasm' });
+  xrInstance = new mod.XrWeb();
   xrInstance.setActionCallback((action) => {
     // Same dispatch seam as the other rendered surface: the emitted
     // objects carry the dashboard's action vocabulary and route through
@@ -146430,6 +146442,280 @@ globalThis.xrProbe = {
   activate: (name) => (xrInstance ? xrInstance.activate(name) : false),
   captureOnly: (on) => { xrCaptureOnly = !!on; },
   lastAction: null,
+};
+
+// ── XR terminal pane (slice 1: read-only watching) ──
+//
+// Appended section: mirrors the flat Terminal tab's standalone shell
+// into the XR scene. The dashboard machinery (44-shell-frames.js) owns
+// the PTY attach and the xterm buffer; this section only *watches* —
+// it paints that buffer onto an offscreen canvas and registers it
+// through the WASM facade's canvas seam. XR never sends terminal_open
+// (the daemon's open_or_attach would SPAWN a shell when none exists —
+// a watch surface must not create PTYs), so a page with no terminal
+// session gets the honest in-scene empty state instead. Everything here
+// is fail-soft: a painter error degrades the pane, never the session.
+
+const XR_TERM_SOURCE_ID = 'term:shell';
+const XR_TERM_FONT_PX = 17;
+let xrTermCanvas = null;
+let xrTermCtx = null;
+let xrTermCellW = 0;
+let xrTermCellH = 0;
+let xrTermAspect = 0;      // canvas height/width after the first paint
+let xrTermDirty = false;   // buffer advanced since the last paint
+let xrTermBound = false;   // onWriteParsed/onResize hooks installed
+let xrTermRegistered = false;
+let xrTermLastPushedKey = '';
+let xrTermWarned = false;
+let xrTermPaletteCache = null;
+let xrTermPaletteKey = '';
+
+// ui-v2 fallback palette for the degenerate case where the token theme
+// is unavailable (mirrors ui2ShellTheme()'s source tokens).
+function xrTermFallbackTheme() {
+  return {
+    background: '#0B0D12', foreground: '#EAECF2',
+    black: '#232834', red: '#EC6A85', green: '#58C08C', yellow: '#E4A85B',
+    blue: '#7E8CFA', magenta: '#9B7CF2', cyan: '#5DA9E6', white: '#A7AEBE',
+    brightBlack: '#7E8896', brightRed: '#EC6A85', brightGreen: '#58C08C',
+    brightYellow: '#E4A85B', brightBlue: '#A6AEFF', brightMagenta: '#9B7CF2',
+    brightCyan: '#5DA9E6', brightWhite: '#EAECF2',
+  };
+}
+
+// ANSI-256 palette: the 16 theme colors (same token mapping the flat
+// terminal resolves), then the 6x6x6 cube and the grayscale ramp.
+function xrTermPalette(theme) {
+  const key = [theme.background, theme.foreground, theme.black, theme.white].join('|');
+  if (xrTermPaletteCache && xrTermPaletteKey === key) return xrTermPaletteCache;
+  const p = [
+    theme.black, theme.red, theme.green, theme.yellow,
+    theme.blue, theme.magenta, theme.cyan, theme.white,
+    theme.brightBlack, theme.brightRed, theme.brightGreen, theme.brightYellow,
+    theme.brightBlue, theme.brightMagenta, theme.brightCyan, theme.brightWhite,
+  ];
+  const lv = [0, 95, 135, 175, 215, 255];
+  for (let i = 16; i < 232; i++) {
+    const j = i - 16;
+    p.push(`rgb(${lv[(j / 36) | 0]},${lv[((j / 6) | 0) % 6]},${lv[j % 6]})`);
+  }
+  for (let i = 232; i < 256; i++) {
+    const v = 8 + (i - 232) * 10;
+    p.push(`rgb(${v},${v},${v})`);
+  }
+  xrTermPaletteCache = p;
+  xrTermPaletteKey = key;
+  return p;
+}
+
+// Derive the pane's state from the flat tab's own machinery: presence,
+// the PTY's real id + host label, and the status line verbatim (the
+// status vocabulary is the flat tab's, ported — never re-invented).
+function xrTermPageState() {
+  let present = false;
+  let live = false;
+  let label = 'terminal';
+  let status = '';
+  let statusKind = '';
+  try {
+    present = typeof shellInitialized !== 'undefined' && shellInitialized === true;
+    live = present && typeof shellOpenAcked !== 'undefined' && shellOpenAcked === true;
+    if (present) {
+      const termId = (typeof SHELL_TERMINAL_ID !== 'undefined' && SHELL_TERMINAL_ID) || 'shell-0';
+      const host = (typeof shellHostLabel === 'function' && shellHostLabel()) || 'this daemon';
+      label = `${termId} · ${host}`;
+    }
+    const el = document.getElementById('shell-host-status');
+    if (el) {
+      status = (el.textContent || '').trim();
+      if (el.classList.contains('ok')) statusKind = 'ok';
+      else if (el.classList.contains('warn')) statusKind = 'warn';
+      else if (el.classList.contains('error')) statusKind = 'error';
+    }
+  } catch (_) { /* partial state is fine — fail-soft */ }
+  return { present, live, label, status, statusKind, aspect: xrTermAspect };
+}
+
+// Hook the live xterm instance once it exists: buffer writes and
+// resizes mark the painter dirty (xterm keeps its buffer current even
+// while the flat tab is hidden, so the mirror stays live off-tab).
+function xrTermBind() {
+  if (xrTermBound || typeof shellTerm === 'undefined' || !shellTerm) return;
+  xrTermBound = true;
+  xrTermDirty = true;
+  try {
+    shellTerm.onWriteParsed(() => { xrTermDirty = true; });
+    shellTerm.onResize(() => { xrTermDirty = true; });
+    // Theme flips repaint with the freshly resolved tokens.
+    new MutationObserver(() => { xrTermDirty = true; })
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  } catch (err) {
+    console.warn('[xr] terminal hook failed; falling back to timed repaints', err);
+  }
+}
+
+// Paint the live tail of the shell buffer (the bottom screen — watching
+// follows the PTY, not the dashboard user's scrollback position) onto
+// the offscreen canvas: cell backgrounds, glyphs with the cell's SGR
+// attributes, and a hollow cursor block (read-only — not an input
+// caret). Registers the canvas on first paint, then marks dirty so the
+// encoder re-uploads exactly once per painted frame.
+function xrTermPaint() {
+  if (typeof shellTerm === 'undefined' || !shellTerm || !xrInstance) return;
+  const buf = shellTerm.buffer && shellTerm.buffer.active;
+  if (!buf) return;
+  const cols = shellTerm.cols || 80;
+  const rows = shellTerm.rows || 24;
+  const theme = (typeof ui2ShellTheme === 'function' && ui2ShellTheme()) || xrTermFallbackTheme();
+  const palette = xrTermPalette(theme);
+
+  if (!xrTermCanvas) {
+    xrTermCanvas = document.createElement('canvas');
+    xrTermCtx = xrTermCanvas.getContext('2d');
+    if (!xrTermCtx) { xrTermCanvas = null; return; }
+  }
+  const mono = (getComputedStyle(document.documentElement).getPropertyValue('--mono') || '').trim()
+    || "'JetBrains Mono', ui-monospace, Menlo, monospace";
+  const baseFont = `${XR_TERM_FONT_PX}px ${mono}`;
+  if (!xrTermCellW) {
+    xrTermCtx.font = baseFont;
+    xrTermCellW = xrTermCtx.measureText('M').width || XR_TERM_FONT_PX * 0.6;
+    xrTermCellH = Math.ceil(XR_TERM_FONT_PX * 1.4);
+  }
+  const wantW = Math.round(cols * xrTermCellW);
+  const wantH = rows * xrTermCellH;
+  if (xrTermCanvas.width !== wantW || xrTermCanvas.height !== wantH) {
+    xrTermCanvas.width = wantW;
+    xrTermCanvas.height = wantH;
+  }
+  const ctx = xrTermCtx;
+  ctx.font = baseFont;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = theme.background;
+  ctx.fillRect(0, 0, wantW, wantH);
+
+  const nullCell = typeof buf.getNullCell === 'function' ? buf.getNullCell() : undefined;
+  for (let y = 0; y < rows; y++) {
+    const line = buf.getLine(buf.baseY + y);
+    if (!line) continue;
+    const cy = y * xrTermCellH + xrTermCellH / 2;
+    for (let x = 0; x < cols; x++) {
+      const cell = nullCell ? line.getCell(x, nullCell) : line.getCell(x);
+      if (!cell) continue;
+      const width = cell.getWidth();
+      if (width === 0) continue; // continuation of a wide glyph
+      const cx = x * xrTermCellW;
+
+      let fg;
+      let fgIdx = -1;
+      if (cell.isFgDefault()) fg = theme.foreground;
+      else if (cell.isFgRGB()) {
+        const v = cell.getFgColor();
+        fg = `rgb(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255})`;
+      } else {
+        fgIdx = cell.getFgColor();
+        fg = palette[fgIdx] || theme.foreground;
+      }
+      let bg = null;
+      if (cell.isBgRGB()) {
+        const v = cell.getBgColor();
+        bg = `rgb(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255})`;
+      } else if (!cell.isBgDefault()) {
+        bg = palette[cell.getBgColor()] || null;
+      }
+      const bold = cell.isBold && cell.isBold() !== 0;
+      if (bold && fgIdx >= 0 && fgIdx < 8) fg = palette[fgIdx + 8] || fg;
+      if (cell.isInverse && cell.isInverse() !== 0) {
+        const swapped = bg || theme.background;
+        bg = fg;
+        fg = swapped;
+      }
+      if (bg) {
+        ctx.fillStyle = bg;
+        ctx.fillRect(cx, y * xrTermCellH, xrTermCellW * width, xrTermCellH);
+      }
+      const chars = cell.getChars();
+      const invisible = cell.isInvisible && cell.isInvisible() !== 0;
+      const underline = cell.isUnderline && cell.isUnderline() !== 0;
+      const drawGlyph = !!chars && chars !== ' ' && !invisible;
+      if (!drawGlyph && !underline) continue;
+      const italic = cell.isItalic && cell.isItalic() !== 0;
+      const dim = cell.isDim && cell.isDim() !== 0;
+      if (bold || italic) {
+        ctx.font = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${baseFont}`;
+      }
+      if (dim) ctx.globalAlpha = 0.55;
+      ctx.fillStyle = fg;
+      if (drawGlyph) ctx.fillText(chars, cx, cy);
+      if (underline) {
+        // Underline spans the cell (spaces included), like the flat
+        // terminal's renderer.
+        ctx.fillRect(cx, y * xrTermCellH + xrTermCellH - 2, xrTermCellW * width, 1);
+      }
+      if (dim) ctx.globalAlpha = 1;
+      if (bold || italic) ctx.font = baseFont;
+    }
+  }
+
+  // Hollow cursor block: the session is being watched, not driven.
+  if (typeof shellOpenAcked !== 'undefined' && shellOpenAcked
+      && buf.cursorY >= 0 && buf.cursorY < rows && buf.cursorX < cols) {
+    ctx.strokeStyle = theme.foreground;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(
+      buf.cursorX * xrTermCellW + 0.5,
+      buf.cursorY * xrTermCellH + 0.5,
+      xrTermCellW - 1,
+      xrTermCellH - 1,
+    );
+  }
+
+  xrTermAspect = wantW > 0 ? wantH / wantW : 0;
+  if (!xrTermRegistered) {
+    // Registration counts as painted — no extra dirty mark needed.
+    xrInstance.registerTerminalCanvas(XR_TERM_SOURCE_ID, xrTermCanvas);
+    xrTermRegistered = true;
+  } else {
+    xrInstance.markTerminalCanvasDirty(XR_TERM_SOURCE_ID);
+  }
+}
+
+// Terminal sync pump: push pane state on change (cheap key compare —
+// change-only pushes also keep probe-injected state stable), and paint
+// at most ~4 Hz while immersive and dirty. Painting lives on the page
+// interval, never inside the XR frame loop.
+setInterval(() => {
+  try {
+    if (!xrInstance || typeof xrInstance.updateTerminal !== 'function') return;
+    xrTermBind();
+    const state = xrTermPageState();
+    const key = JSON.stringify(state);
+    if (key !== xrTermLastPushedKey) {
+      xrTermLastPushedKey = key;
+      xrInstance.updateTerminal(state);
+    }
+    const immersive = !!(xrChipEl && xrChipEl.dataset.state === 'active');
+    if (immersive && xrTermDirty && typeof shellTerm !== 'undefined' && shellTerm) {
+      xrTermDirty = false;
+      xrTermPaint();
+    }
+  } catch (err) {
+    if (!xrTermWarned) {
+      xrTermWarned = true;
+      console.warn('[xr] terminal sync error', err);
+    }
+  }
+}, 250);
+
+// QA facade extension (same conventions as the base xrProbe surface):
+// direct pushes through the terminal seam for deterministic probes.
+globalThis.xrProbe.terminal = {
+  update: (state) => { if (xrInstance) xrInstance.updateTerminal(state); },
+  registerCanvas: (id, canvas) => { if (xrInstance) xrInstance.registerTerminalCanvas(id, canvas); },
+  markDirty: (id) => { if (xrInstance) xrInstance.markTerminalCanvasDirty(id); },
+  unregister: (id) => { if (xrInstance) xrInstance.unregisterTerminalCanvas(id); },
+  repaint: () => { xrTermDirty = true; },
 };
 /* ── static/app/ui2-composer-peek.js ── */
 // ── composer conversation peek ─────────────────────────────────────────
