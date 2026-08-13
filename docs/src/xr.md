@@ -92,11 +92,11 @@ every other frontend. Deferred deliberately: the voice composer toggle (no
 existing action seam to reuse; needs a designed one, not a hack) and
 compositor media layers (below).
 
-### Dev gate
+### Availability
 
-Until milestone 1 is validated on hardware, the entry chip is gated behind
-`?xr=dev` (same convention as `?station_panes=on`). The gate drops once the
-Quest pass confirms the experience.
+The entry chip ships on by default for any browser reporting immersive
+support (milestone 1 graduated on the owner's Quest 3, 2026-08-13);
+`?xr=off` is the opt-out escape hatch.
 
 ## Testing
 
@@ -110,7 +110,7 @@ developer loop sidesteps both:
    USB-C, accept the debug prompt.
 2. `adb reverse tcp:8765 tcp:8765` (after `adb devices` shows the headset;
    works over Wi-Fi adb after a one-time USB bootstrap).
-3. In Horizon Browser: `http://localhost:8765/?xr=dev` — localhost is a
+3. In Horizon Browser: `http://localhost:8765/` — localhost is a
    secure context, and the daemon sees a loopback client (local-presence
    lane; no cert ceremony).
 4. Tap the **XR** chip in the header. Passthrough is the default premise —

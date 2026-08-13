@@ -6,11 +6,11 @@
 // second brain. This fragment owns only the browser-side seam: feature
 // detection, the entry chip, lazy module load, and session entry.
 //
-// DEV GATE: until milestone 1 completes, the chip appears only with
-// `?xr=dev` in the URL (same convention as `?station_panes=on`) — the
-// scaffold's enter() intentionally rejects. Everything below is
-// boot-callback or event-driven; top level declares only lets/consts/
-// functions (deep-link TDZ rule).
+// SHIPPED DEFAULT: the chip appears on any browser reporting immersive
+// support (milestone 1 graduated on the owner's Quest 3, 2026-08-13);
+// `?xr=off` is the opt-out escape. Everything below is boot-callback or
+// event-driven; top level declares only lets/consts/functions
+// (deep-link TDZ rule).
 
 let xrWasmModule = null; // module namespace after first ensureXr()
 let xrInstance = null;   // XrWeb handle after first ensureXr()
@@ -19,11 +19,11 @@ let xrSupport = { ar: false, vr: false };
 let xrSnapshotTimer = null;
 let xrCaptureOnly = false; // probe mode: record actions, don't route
 
-function xrDevGateOn() {
+function xrEnabled() {
   try {
-    return new URLSearchParams(location.search).get('xr') === 'dev';
+    return new URLSearchParams(location.search).get('xr') !== 'off';
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -225,7 +225,7 @@ function xrMountChip() {
 }
 
 (async () => {
-  if (!xrDevGateOn()) return;
+  if (!xrEnabled()) return;
   xrSupport = await xrProbeSupportLight();
   if (!xrSupport.ar && !xrSupport.vr) return;
   xrMountChip();
@@ -242,7 +242,7 @@ function xrMountChip() {
 // QA facade, mirroring the stationProbe convention: the validator's
 // --xr-probe drives the surface through here.
 globalThis.xrProbe = {
-  devGate: xrDevGateOn,
+  enabled: xrEnabled,
   support: () => ({ ...xrSupport }),
   chip: () => xrChipEl,
   ensure: ensureXr,
