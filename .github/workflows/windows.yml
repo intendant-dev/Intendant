@@ -457,6 +457,21 @@ jobs:
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
 
+      # The dev doctrine's bare `cargo build` and (historically) the install
+      # scripts compile the FULL workspace natively with no `--target` — a
+      # unit-graph / feature-unification configuration none of the
+      # package-scoped steps above cover (the wasm workspace members are
+      # included, and dropping `--target` also changes host/target unit
+      # sharing), and the only other workspace-wide native compile in the
+      # gate is the Linux clippy leg — so Windows-native breakage in
+      # workspace members shipped dark until a user's installer build hit
+      # it. Merge-group-only (~4 minutes warm on the fleet); deliberately
+      # NOT on the macOS leg — the shared Mac is capacity-contended, and
+      # Linux clippy plus this closes the practical gap.
+      - name: cargo check (full workspace, no --target)
+        if: github.event_name == 'merge_group' && runner.os == 'Windows' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: cargo check --workspace --locked
+
       # ── Linux gate tail: keyless smokes + dashboard-boot ──────────────
       # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
       # rationale preserved in its git history): the live-fire subset of
