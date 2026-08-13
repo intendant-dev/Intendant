@@ -11,7 +11,8 @@ export class XrWeb {
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
      * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`), the same
+     * `terminal:close`, `voice:talk` — toggles the capture —
+     * `voice:use`, `voice:discard`), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -86,6 +87,27 @@ export class XrWeb {
      * malformed pushes are dropped and counted, never fatal.
      */
     updateTerminal(state: any): void;
+    /**
+     * The capture attempt ended without a transcript (mic denied, no
+     * speech recognized, lane down): back to idle with the reason
+     * rendered under the pill.
+     */
+    voiceFailed(message: string): void;
+    /**
+     * A captured utterance transcript from the JS capture lane. Lands
+     * as the preview strip's pending result — reviewed and committed by
+     * a deliberate pinch, NEVER auto-sent.
+     */
+    voiceResult(text: string): void;
+    /**
+     * Standing voice-input availability from the JS glue, which owns
+     * the truth (daemon transcription config, transport posture, mic
+     * permission): `{available: bool, detail: string}`. While
+     * unavailable the talk pill renders `detail` as a visible status
+     * line — never a silent no-op. Malformed pushes are dropped and
+     * counted, never fatal.
+     */
+    voiceStatus(status: any): void;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -108,6 +130,9 @@ export interface InitOutput {
     readonly xrweb_unregisterTerminalCanvas: (a: number, b: number, c: number) => void;
     readonly xrweb_updateSnapshot: (a: number, b: any) => void;
     readonly xrweb_updateTerminal: (a: number, b: any) => void;
+    readonly xrweb_voiceFailed: (a: number, b: number, c: number) => void;
+    readonly xrweb_voiceResult: (a: number, b: number, c: number) => void;
+    readonly xrweb_voiceStatus: (a: number, b: any) => void;
     readonly wasm_bindgen__closure__destroy__h95fa55e82713b162: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hb9ef122cd6bafce1: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h80d27238e69792d0: (a: number, b: number, c: number, d: any) => void;
