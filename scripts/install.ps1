@@ -47,9 +47,10 @@
 .PARAMETER Ref
     Pin the fresh clone to a tag, branch, or commit. Default: the release
     this installer was stamped with (when fetched as a release asset); an
-    unstamped copy falls back to the newest published release tag
-    (vX.Y.Z), and to the default branch head only while no release
-    exists. An explicit ref you choose skips the release-pin
+    unstamped copy falls back to the newest published release tag by
+    semver precedence (vX.Y.Z or vX.Y.Z-<prerelease> -- prerelease
+    releases count), and to the default branch head only while no
+    release exists. An explicit ref you choose skips the release-pin
     verification.
 
 .PARAMETER Service
@@ -116,6 +117,58 @@ if ($InstallerReleaseCommit) {
 $elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# -- Release-tag picking --
+# Highest-precedence release tag under semver 2.0 ordering: version core
+# first, then release > prerelease, then prerelease identifiers
+# (dot-separated; numeric identifiers compare numerically and rank below
+# alphanumeric ones, alphanumeric compare ASCII-lexically, the shorter
+# identifier set loses ties). Earlier copies filtered prerelease tags out
+# entirely (and [version] cannot parse them anyway) -- but the published
+# alphas ARE the product releases (GitHub marks them Latest), so an
+# unstamped copy was silently regressing fresh installs to the stale
+# v0.1.0. Windows PowerShell 5.1 has no [semver] type, hence the
+# explicit comparer.
+function Compare-IntendantReleaseTag([string]$A, [string]$B) {
+    $coreA, $preA = ($A.Substring(1) -split '-', 2)
+    $coreB, $preB = ($B.Substring(1) -split '-', 2)
+    $numsA = $coreA -split '\.'
+    $numsB = $coreB -split '\.'
+    for ($i = 0; $i -lt 3; $i++) {
+        $d = [long]$numsA[$i] - [long]$numsB[$i]
+        if ($d -ne 0) { return [math]::Sign($d) }
+    }
+    if (-not $preA -and -not $preB) { return 0 }
+    if (-not $preA) { return 1 }   # a release outranks any prerelease of the same core
+    if (-not $preB) { return -1 }
+    $idsA = $preA -split '\.'
+    $idsB = $preB -split '\.'
+    $n = [math]::Min($idsA.Count, $idsB.Count)
+    for ($i = 0; $i -lt $n; $i++) {
+        $x = $idsA[$i]; $y = $idsB[$i]
+        $xNum = $x -match '^[0-9]+$'
+        $yNum = $y -match '^[0-9]+$'
+        if ($xNum -and $yNum) {
+            $d = [long]$x - [long]$y
+            if ($d -ne 0) { return [math]::Sign($d) }
+        } elseif ($xNum -ne $yNum) {
+            if ($xNum) { return -1 } else { return 1 }
+        } else {
+            $d = [string]::CompareOrdinal($x, $y)
+            if ($d -ne 0) { return [math]::Sign($d) }
+        }
+    }
+    return [math]::Sign($idsA.Count - $idsB.Count)
+}
+
+function Select-IntendantReleaseTag([string[]]$Tags) {
+    $best = $null
+    foreach ($tag in $Tags) {
+        if (-not $tag) { continue }
+        if ($null -eq $best -or (Compare-IntendantReleaseTag $tag $best) -gt 0) { $best = $tag }
+    }
+    return $best
+}
+
 # -- Toolchain --
 # git is needed before anything else -- the clone is how the repo's own
 # setup scripts (scripts\setup-windows.ps1) arrive, so they cannot
@@ -166,17 +219,19 @@ if (Test-Path (Join-Path $InstallDir ".git")) {
             Say "installing the stamped release: $Ref"
         } else {
             # Unstamped copy: default fresh installs to the newest published
-            # release tag (vX.Y.Z only -- pre-releases and peeled refs are
-            # filtered) so even this path delivers an immutable, released
-            # tree. Falling back to the mutable default-branch head happens
-            # only while no release exists, and says so out loud. -Ref
-            # overrides either way.
+            # release tag by semver precedence so even this path delivers an
+            # immutable, released tree. Prerelease tags count (see the
+            # picker above -- the old vX.Y.Z-only filter regressed fresh
+            # installs to v0.1.0); peeled ^{} refs stay excluded by the
+            # $-anchored match. Falling back to the mutable default-branch
+            # head happens only while no release exists, and says so out
+            # loud. -Ref overrides either way.
             $tagLines = git ls-remote --tags $Repo "v*"
             if ($LASTEXITCODE -eq 0 -and $tagLines) {
-                $Ref = @($tagLines) |
-                    ForEach-Object { if ($_ -match 'refs/tags/(v\d+\.\d+(\.\d+){0,2})$') { $Matches[1] } } |
-                    Sort-Object { [version]$_.Substring(1) } |
-                    Select-Object -Last 1
+                $candidates = @(@($tagLines) | ForEach-Object {
+                    if ($_ -match 'refs/tags/(v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') { $Matches[1] }
+                })
+                $Ref = Select-IntendantReleaseTag $candidates
             }
             if ($Ref) {
                 Say "pinning to the latest release tag: $Ref (override with -Ref)"
@@ -235,8 +290,15 @@ if ($elevated -and (Test-Path $setup)) {
 # -- Build --
 # --locked: build exactly the committed Cargo.lock -- a resolution that
 # differs from what CI tested is a failure, not a fallback.
+# Named bins mirror the release lane's proven build shape (release.yml's
+# binary jobs): a daemon install needs intendant.exe +
+# intendant-runtime.exe only, and naming them skips the wasm workspace
+# members and station-web's native graphics stack (~71 packages) that a
+# bare workspace build would compile -- a configuration no CI leg gates --
+# while shrinking the install build. intendant-connect is the hosted
+# rendezvous service and is not part of a daemon install.
 Say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release --locked
+cargo build --release --locked --bin intendant --bin intendant-runtime
 if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
 $daemonExe = Join-Path $InstallDir "target\release\intendant.exe"
 
