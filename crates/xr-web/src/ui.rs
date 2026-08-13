@@ -113,6 +113,7 @@ pub(crate) fn build_scene(
                 selected_id,
                 hover_id,
                 floor_y,
+                measure,
                 out,
             );
         }
@@ -251,6 +252,228 @@ fn backdrop(passthrough: bool, floor_y: f32, out: &mut SceneBatches) {
     }
 }
 
+// ---- card helpers -------------------------------------------------------
+//
+// The careful port, chip by chip: every treatment below carries a
+// decision from the flat dashboard's session windows (fragment 41's
+// header anatomy under the ui-v2 chrome) into shelf typography. Colors
+// follow the ui-v2 tint recipe — fill 8–16%, border ~26%, text full
+// (`16-styles-v2-tokens.css`).
+
+/// Card chip metrics: one text size for every pill on a card (the
+/// 2 m legibility floor), pill proportions derived from it.
+const CHIP_TEXT_H: f32 = 0.016;
+const CHIP_HALF_H: f32 = 0.0135;
+const CHIP_PAD: f32 = 0.012;
+/// Card inner padding (left/right text margin).
+const CARD_PAD: f32 = 0.024;
+
+/// Alpha-only tint of a palette color — the `rgba(var(--x-rgb), a)`
+/// CSS recipe re-expressed for the kit's float colors.
+fn tint(c: [f32; 4], alpha: f32) -> [f32; 4] {
+    [c[0], c[1], c[2], alpha]
+}
+
+/// RGB lerp toward `b` keeping `a`'s alpha — the selected card's iris
+/// wash over the surface fill.
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3],
+    ]
+}
+
+/// The vitals chips arrive pre-formatted with the dashboard's glyph
+/// vocabulary (⎇ ● ▮ ↻ …) — outside the ASCII atlas, which would render
+/// every one as '?'. Fold each known glyph to an ASCII spelling and
+/// collapse the leftover spacing; characters outside the map pass
+/// through to the atlas's honest '?' fallback.
+fn ascii_fold_vitals(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '⎇' | '▮' | '⚡' | '⏳' | '·' => {}
+            '↻' => folded.push_str("resets "),
+            '●' => folded.push('*'),
+            '−' => folded.push('-'),
+            '⚠' => folded.push('!'),
+            '⛔' => folded.push_str("!!"),
+            '✓' => folded.push_str("ok"),
+            '✗' => folded.push('x'),
+            '⇡' => folded.push('^'),
+            _ => folded.push(c),
+        }
+    }
+    let mut out = String::with_capacity(folded.len());
+    for token in folded.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
+/// The git chip text with the parity glyphs spelled out: the dashboard's
+/// "⚠" (would-conflict) becomes the word a shelf card can shout, "✓"
+/// the quiet "ok".
+fn git_line(agent: &XrAgent) -> String {
+    ascii_fold_vitals(
+        &agent
+            .vitals_git
+            .replace('⚠', "conflict!")
+            .replace('✓', "ok"),
+    )
+}
+
+/// The session-window status pill, ported: (label, accent) from the
+/// feed's status/phase vocabulary under the ui-v2 chrome's exact accent
+/// decisions (`.session-window-status` in ui2-grid.css) — active family
+/// iris, waiting amber, done/idle green, errors rose; a recent card
+/// reads "recent", muted. Labels stay short — the workbench carries the
+/// long-form phrasing.
+fn status_chip(agent: &XrAgent) -> (String, [f32; 4]) {
+    if agent.recent {
+        return ("recent".into(), kit::TEXT_3);
+    }
+    let status = agent.status.to_ascii_lowercase();
+    let phase = agent.phase.to_ascii_lowercase();
+    let any = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|n| status.contains(n) || phase.contains(n))
+    };
+    if agent.needs_approval || any(&["approv"]) {
+        return ("approval".into(), kit::AMBER);
+    }
+    if any(&["error", "fail", "halt"]) {
+        return ("error".into(), kit::RED);
+    }
+    if any(&["wait", "pend"]) {
+        return ("waiting".into(), kit::AMBER);
+    }
+    if any(&["think"]) {
+        return ("thinking".into(), kit::IRIS_2);
+    }
+    if any(&["progress", "run", "work", "active", "orchestr"]) {
+        return ("running".into(), kit::IRIS_2);
+    }
+    if any(&["done", "complete"]) {
+        return ("done".into(), kit::GREEN);
+    }
+    if any(&["idle", "closed"]) {
+        return ("idle".into(), kit::GREEN);
+    }
+    (if status.is_empty() { phase } else { status }, kit::TEXT_2)
+}
+
+/// Chip coloring: text at full strength, tinted fill and border.
+struct ChipStyle {
+    text: [f32; 4],
+    fill: [f32; 4],
+    border: [f32; 4],
+}
+
+impl ChipStyle {
+    /// The ui-v2 tint recipe around one accent: ~10–12% fill, ~26–30%
+    /// border, full-strength text.
+    fn tinted(color: [f32; 4], fill_alpha: f32, border_alpha: f32) -> Self {
+        Self {
+            text: color,
+            fill: tint(color, fill_alpha),
+            border: tint(color, border_alpha),
+        }
+    }
+}
+
+/// Backend badge tint, matching the sessions-tab source badges
+/// (ui2-sessions.css): claude-code amber, kimi sky, native iris,
+/// codex — and any unrecognized external — the neutral chip.
+fn source_badge_style(source: &str) -> ChipStyle {
+    match source {
+        "claude-code" => ChipStyle::tinted(kit::AMBER, 0.12, 0.26),
+        "kimi" => ChipStyle::tinted(kit::SKY, 0.12, 0.26),
+        "intendant" => ChipStyle {
+            text: kit::IRIS_2,
+            fill: tint(kit::IRIS, 0.12),
+            border: tint(kit::IRIS, 0.26),
+        },
+        _ => ChipStyle {
+            text: kit::TEXT_2,
+            fill: kit::SURFACE_3,
+            border: tint(kit::TEXT_3, 0.20),
+        },
+    }
+}
+
+/// Goal chip accent by goal status — the session-window goal pill's
+/// palette: complete/budget-limited green; everything else (active,
+/// paused, usage-limited) amber, exactly as the flat chip's yellow and
+/// peach both alias to amber under the ui-v2 tokens.
+fn goal_chip_color(status: &str) -> [f32; 4] {
+    match status {
+        "complete" | "budget-limited" => kit::GREEN,
+        _ => kit::AMBER,
+    }
+}
+
+fn chip_half_w(label: &str, measure: &dyn TextMeasure) -> f32 {
+    (measure.measure(label, CHIP_TEXT_H) / 2.0 + CHIP_PAD).max(0.026)
+}
+
+/// One rounded chip: tinted fill, tinted border, centered label. The
+/// baseline drop centers the cap height on the pill axis.
+#[allow(clippy::too_many_arguments)]
+fn draw_chip(
+    label: &str,
+    style: &ChipStyle,
+    dimf: f32,
+    center: Vec3,
+    half_w: f32,
+    right: Vec3,
+    up: Vec3,
+    floor_y: f32,
+    out: &mut SceneBatches,
+) {
+    out.panels.push(PanelInstance {
+        center: lift(center, right, up, LIFT_DECOR, floor_y),
+        right,
+        up,
+        half_w,
+        half_h: CHIP_HALF_H,
+        radius: CHIP_HALF_H,
+        fill: dim(style.fill, dimf),
+        border: dim(style.border, dimf),
+        border_w: 0.0016,
+    });
+    out.texts.push(TextRun {
+        origin: lift(
+            center - up.scale(0.0058),
+            right,
+            up,
+            LIFT_TEXT + LIFT_DECOR,
+            floor_y,
+        ),
+        right,
+        up,
+        height: CHIP_TEXT_H,
+        color: dim(style.text, dimf),
+        align: TextAlign::Center,
+        max_width: half_w * 2.0 - 0.008,
+        text: label.to_string(),
+    });
+}
+
+/// One shelf card. The internal anatomy ports the session window's
+/// (fragment 41's header rows under the ui-v2 chrome): an identity row
+/// (health dot + id + status pill), a fact row (backend badge + goal
+/// chip), the clamped goal/task line, a quiet vitals line (git / cache /
+/// limits), and the context-pressure meter. A pending approval turns
+/// the border amber and the mid line into the wanted command — urgency
+/// outranks selection; the selected card wears the iris wash so
+/// selection and hover never read the same.
 #[allow(clippy::too_many_arguments)]
 fn card(
     agent: &XrAgent,
@@ -260,6 +483,7 @@ fn card(
     selected_id: Option<&str>,
     hover_id: Option<&str>,
     floor_y: f32,
+    measure: &dyn TextMeasure,
     out: &mut SceneBatches,
 ) {
     let hw = kit::CARD_W / 2.0;
@@ -272,16 +496,14 @@ fn card(
 
     // Hover reads at 2 m only if it's loud: full-iris border, not the
     // soft wash (on-device finding — the subtle variant was invisible).
-    let border = if is_selected {
-        kit::IRIS
-    } else if agent.needs_approval {
+    let border = if agent.needs_approval {
         kit::AMBER
-    } else if is_hover {
+    } else if is_selected || is_hover {
         kit::IRIS
     } else {
         kit::LINE_2
     };
-
+    let base_fill = dim(kit::SURFACE, dimf.max(0.7));
     out.panels.push(PanelInstance {
         center: at_floor(center, floor_y),
         right,
@@ -289,37 +511,85 @@ fn card(
         half_w: hw,
         half_h: hh,
         radius: 0.022,
-        fill: dim(kit::SURFACE, dimf.max(0.7)),
+        fill: if is_selected {
+            mix(base_fill, kit::IRIS, 0.16)
+        } else {
+            base_fill
+        },
         border: dim(border, dimf),
-        border_w: if is_selected || agent.needs_approval || is_hover {
+        border_w: if is_selected {
+            0.0055
+        } else if agent.needs_approval || is_hover {
             0.004
         } else {
             0.002
         },
     });
 
-    let accent = status_color(&agent.status, &agent.phase);
-
-    // Status dot.
-    out.panels.push(PanelInstance {
-        center: lift(
-            center + right.scale(-hw + 0.030) + up.scale(hh - 0.036),
+    // Health dot — the identity row's leading verdict (the session
+    // window's vit-health port): present only when the feed carries
+    // vitals for this card, green until git parity or a rate-limit
+    // window elevates it.
+    let has_vitals = !agent.vitals_git.is_empty()
+        || agent.cache_hit_pct >= 0.0
+        || !agent.vitals_limits.is_empty();
+    if has_vitals {
+        let health = if agent.vitals_git_conflict || agent.vitals_limits_state == "crit" {
+            kit::RED
+        } else if agent.vitals_limits_state == "warn" {
+            kit::AMBER
+        } else {
+            kit::GREEN
+        };
+        out.panels.push(PanelInstance {
+            center: lift(
+                center + right.scale(-hw + 0.030) + up.scale(hh - 0.038),
+                right,
+                up,
+                LIFT_DECOR,
+                floor_y,
+            ),
             right,
             up,
-            LIFT_DECOR,
-            floor_y,
-        ),
-        right,
-        up,
-        half_w: 0.009,
-        half_h: 0.009,
-        radius: 0.009,
-        fill: dim(accent, dimf),
-        border: [0.0; 4],
-        border_w: 0.0,
-    });
+            half_w: 0.0075,
+            half_h: 0.0075,
+            radius: 0.0075,
+            fill: dim(health, dimf),
+            border: [0.0; 4],
+            border_w: 0.0,
+        });
+    }
 
-    // Label.
+    // Status pill, top-right: the ui-v2 text-only phase pill (uppercase
+    // grammar, tinted fill + border, full-color text).
+    let (pill_label, pill_color) = status_chip(agent);
+    let pill_text = pill_label.to_ascii_uppercase();
+    let mut label_right = hw - CARD_PAD;
+    if !pill_text.is_empty() {
+        let pill_hw = chip_half_w(&pill_text, measure);
+        let pill_x = hw - 0.020 - pill_hw;
+        draw_chip(
+            &pill_text,
+            &ChipStyle::tinted(pill_color, 0.12, 0.30),
+            dimf,
+            center + right.scale(pill_x) + up.scale(hh - 0.038),
+            pill_hw,
+            right,
+            up,
+            floor_y,
+            out,
+        );
+        label_right = pill_x - pill_hw - 0.012;
+    }
+
+    // Identity: the session's short id (the flat id chip), or the agent
+    // id for synthetic nodes (primary daemon, peers). The backend badge
+    // below carries what the old label prefixed.
+    let ident: String = if agent.session_id.is_empty() {
+        agent.id.clone()
+    } else {
+        agent.session_id.chars().take(10).collect()
+    };
     out.texts.push(TextRun {
         origin: lift(
             center + right.scale(-hw + 0.052) + up.scale(hh - 0.048),
@@ -330,48 +600,64 @@ fn card(
         ),
         right,
         up,
-        height: 0.027,
+        height: 0.024,
         color: dim(kit::TEXT, dimf),
         align: TextAlign::Left,
-        max_width: kit::CARD_W - 0.075,
-        text: agent.label(),
+        max_width: label_right - (-hw + 0.052),
+        text: ident,
     });
 
-    // Status / phase line.
-    let status_line = if agent.recent {
-        "recent session".to_string()
-    } else if agent.status == agent.phase || agent.phase.is_empty() {
-        agent.status.clone()
-    } else {
-        format!("{} · {}", agent.status, agent.phase)
-    };
-    out.texts.push(TextRun {
-        origin: lift(
-            center + right.scale(-hw + 0.052) + up.scale(hh - 0.082),
+    // Fact row: backend badge + goal chip (the session window's facts
+    // line). Chips are whole-or-dropped, never crushed — the flat row's
+    // shrink-proof discipline.
+    let facts_y = hh - 0.082;
+    let mut facts: Vec<(String, ChipStyle)> = Vec::new();
+    if !agent.source.is_empty() {
+        facts.push((agent.source.clone(), source_badge_style(&agent.source)));
+    }
+    if !agent.goal_objective.is_empty() {
+        let color = goal_chip_color(&agent.goal_status);
+        let label = if agent.goal_status.is_empty() {
+            "goal".to_string()
+        } else {
+            format!("goal: {}", agent.goal_status)
+        };
+        facts.push((label, ChipStyle::tinted(color, 0.10, 0.26)));
+    }
+    let mut pen = -hw + CARD_PAD;
+    for (label, style) in facts {
+        let chw = chip_half_w(&label, measure);
+        if pen + chw * 2.0 > hw - CARD_PAD {
+            break;
+        }
+        draw_chip(
+            &label,
+            &style,
+            dimf,
+            center + right.scale(pen + chw) + up.scale(facts_y),
+            chw,
             right,
             up,
-            LIFT_TEXT,
             floor_y,
-        ),
-        right,
-        up,
-        height: 0.019,
-        color: dim(accent, dimf),
-        align: TextAlign::Left,
-        max_width: kit::CARD_W - 0.075,
-        text: status_line,
-    });
+            out,
+        );
+        pen += chw * 2.0 + 0.014;
+    }
 
-    // Goal (fallback: task) line.
-    let line = if !agent.goal_objective.is_empty() {
-        agent.goal_objective.clone()
+    // The clamped message line — or, with an approval pending, the
+    // command wanting an answer (amber, the urgent detail the shelf must
+    // not bury; the banner and workbench carry the full ask).
+    let (line, line_color) = if agent.needs_approval && !agent.approval_command.is_empty() {
+        (format!("wants: {}", agent.approval_command), kit::AMBER)
+    } else if !agent.goal_objective.is_empty() {
+        (agent.goal_objective.clone(), kit::TEXT_2)
     } else {
-        agent.task.clone()
+        (agent.task.clone(), kit::TEXT_2)
     };
     if !line.is_empty() {
         out.texts.push(TextRun {
             origin: lift(
-                center + right.scale(-hw + 0.024) + up.scale(-0.014),
+                center + right.scale(-hw + CARD_PAD) + up.scale(-0.018),
                 right,
                 up,
                 LIFT_TEXT,
@@ -380,11 +666,87 @@ fn card(
             right,
             up,
             height: 0.019,
-            color: dim(kit::TEXT_2, dimf),
+            color: dim(line_color, dimf),
             align: TextAlign::Left,
-            max_width: kit::CARD_W - 0.048,
+            max_width: kit::CARD_W - CARD_PAD * 2.0,
             text: line,
         });
+    }
+
+    // Quiet vitals line (git / cache / limits), the session-window chip
+    // row through the snapshot's pre-formatted fields. Glyphs fold to
+    // the atlas's ASCII; a merge conflict turns the git segment rose,
+    // limits wear their severity, cache hits tier green/amber/rose like
+    // the dashboard chip.
+    let mut segments: Vec<(String, [f32; 4])> = Vec::new();
+    if !agent.vitals_git.is_empty() {
+        segments.push((
+            git_line(agent),
+            if agent.vitals_git_conflict {
+                kit::RED
+            } else {
+                kit::SKY
+            },
+        ));
+    }
+    if agent.cache_hit_pct >= 0.0 {
+        let hit = agent.cache_hit_pct.clamp(0.0, 100.0);
+        let color = if hit >= 90.0 {
+            kit::GREEN
+        } else if hit >= 50.0 {
+            kit::AMBER
+        } else {
+            kit::RED
+        };
+        segments.push((format!("cache {}%", hit.round() as u32), color));
+    }
+    if !agent.vitals_limits.is_empty() {
+        let color = match agent.vitals_limits_state.as_str() {
+            "crit" => kit::RED,
+            "warn" => kit::AMBER,
+            _ => kit::TEXT_2,
+        };
+        segments.push((ascii_fold_vitals(&agent.vitals_limits), color));
+    }
+    if !segments.is_empty() {
+        let gap = 0.016;
+        let mut widths: Vec<f32> = segments
+            .iter()
+            .map(|(text, _)| measure.measure(text, CHIP_TEXT_H))
+            .collect();
+        // The git segment yields (ellipsis) so cache and limits keep
+        // their whole text — the same member-that-yields rule the flat
+        // compact header applies.
+        if widths.len() > 1 {
+            let rest: f32 = widths[1..].iter().sum::<f32>() + gap * (widths.len() as f32 - 1.0);
+            let git_cap = (kit::CARD_W - CARD_PAD * 2.0 - rest).max(0.05);
+            widths[0] = widths[0].min(git_cap);
+        }
+        let mut pen = -hw + CARD_PAD;
+        for ((text, color), natural) in segments.iter().zip(widths.iter()) {
+            let cap = (hw - CARD_PAD) - pen;
+            if cap < 0.035 {
+                break;
+            }
+            let w = natural.min(cap);
+            out.texts.push(TextRun {
+                origin: lift(
+                    center + right.scale(pen) + up.scale(-0.060),
+                    right,
+                    up,
+                    LIFT_TEXT,
+                    floor_y,
+                ),
+                right,
+                up,
+                height: CHIP_TEXT_H,
+                color: dim(*color, dimf),
+                align: TextAlign::Left,
+                max_width: w + 0.002,
+                text: text.clone(),
+            });
+            pen += w + gap;
+        }
     }
 
     // Context-pressure meter along the bottom edge (live sessions only).
@@ -840,5 +1202,235 @@ mod tests {
         assert!(out.hits.is_empty());
         assert_eq!(out.texts.len(), 1);
         assert!(out.texts[0].text.contains("waiting"));
+    }
+
+    /// One fully detailed live session card, the session-window port.
+    fn detail_snapshot() -> XrSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "hosts": [
+                {"id": "local", "name": "mac", "platform": "macos", "connected": true}
+            ],
+            "agents": [
+                {"id": "a1", "hostId": "local", "status": "in_progress",
+                 "phase": "running", "sessionId": "0123456789abcdef",
+                 "source": "claude-code", "tokens": 150000, "tokenCap": 200000,
+                 "goalStatus": "active", "goalObjective": "ship the shelf detail",
+                 "vitalsGit": "⎇ main ●3 +2/−1 ⚠ ⇡2", "vitalsGitConflict": true,
+                 "cacheHitPct": 62,
+                 "vitalsLimits": "▮95% 7d · ↻6:12:03", "vitalsLimitsState": "crit"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn build(snap: &XrSnapshot, selected: Option<&str>) -> SceneBatches {
+        let mut out = SceneBatches::default();
+        build_scene(
+            snap,
+            &[],
+            selected,
+            None,
+            None,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        out
+    }
+
+    fn card_texts(out: &SceneBatches) -> Vec<&str> {
+        out.texts.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    #[test]
+    fn card_ports_the_session_window_detail() {
+        let snap = detail_snapshot();
+        let out = build(&snap, None);
+        let texts = card_texts(&out);
+        // Identity row: short session id + the uppercase status pill.
+        assert!(texts.contains(&"0123456789"), "id chip: {texts:?}");
+        assert!(texts.contains(&"RUNNING"), "status pill: {texts:?}");
+        // Fact row: backend badge + goal chip.
+        assert!(texts.contains(&"claude-code"), "backend badge: {texts:?}");
+        assert!(texts.contains(&"goal: active"), "goal chip: {texts:?}");
+        // Message line: the goal objective.
+        assert!(texts.contains(&"ship the shelf detail"));
+        // Vitals line, ASCII-folded: git (conflict spelled out), cache,
+        // limits — nothing the atlas would render as '?'.
+        assert!(
+            texts.contains(&"main *3 +2/-1 conflict! ^2"),
+            "git line: {texts:?}"
+        );
+        assert!(texts.contains(&"cache 62%"), "cache: {texts:?}");
+        assert!(
+            texts.contains(&"95% 7d resets 6:12:03"),
+            "limits: {texts:?}"
+        );
+        let git = out
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("main "))
+            .unwrap();
+        assert_eq!(git.color, kit::RED, "conflict git segment is rose");
+        let limits = out
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("95%"))
+            .unwrap();
+        assert_eq!(limits.color, kit::RED, "crit limits are rose");
+        let pill = out.texts.iter().find(|t| t.text == "RUNNING").unwrap();
+        assert_eq!(pill.color, kit::IRIS_2, "active pill wears iris");
+        // The health dot: a conflict elevates the verdict to rose.
+        assert!(out
+            .panels
+            .iter()
+            .any(|p| p.half_w == 0.0075 && p.fill == kit::RED));
+    }
+
+    #[test]
+    fn approval_card_wears_amber_and_the_wants_line() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [
+                {"id": "local", "name": "mac", "platform": "macos", "connected": true}
+            ],
+            "agents": [
+                {"id": "a2", "hostId": "local", "status": "waiting",
+                 "phase": "waiting_approval", "needsApproval": true,
+                 "approvalId": "ap9", "approvalCommand": "cargo publish",
+                 "sessionId": "s2", "source": "codex",
+                 "goalObjective": "publish the crate"}
+            ]
+        }))
+        .unwrap();
+        let out = build(&snap, None);
+        let texts = card_texts(&out);
+        assert!(texts.contains(&"APPROVAL"), "{texts:?}");
+        assert!(texts.contains(&"wants: cargo publish"), "{texts:?}");
+        // Urgency outranks everything: the card border is amber, and the
+        // wants line replaces the goal objective until it resolves.
+        assert!(!texts.contains(&"publish the crate"));
+        assert_eq!(out.panels[0].border, kit::AMBER);
+        let wants = out
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("wants:"))
+            .unwrap();
+        assert_eq!(wants.color, kit::AMBER);
+    }
+
+    #[test]
+    fn selected_card_wears_the_iris_wash() {
+        let snap = detail_snapshot();
+        let plain = build(&snap, None);
+        let selected = build(&snap, Some("a1"));
+        // Panel 0 is the card body in both builds: selection thickens the
+        // border and washes the fill toward iris — a different treatment
+        // from hover's border-only highlight.
+        assert_ne!(plain.panels[0].fill, selected.panels[0].fill);
+        assert_eq!(selected.panels[0].border, kit::IRIS);
+        assert!(selected.panels[0].border_w > plain.panels[0].border_w);
+        let mut hover = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            None,
+            Some("card:a1"),
+            None,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut hover,
+        );
+        assert_eq!(hover.panels[0].border, kit::IRIS);
+        assert_eq!(hover.panels[0].fill, plain.panels[0].fill);
+    }
+
+    #[test]
+    fn recent_card_stays_dim_and_inert() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [
+                {"id": "local", "name": "mac", "platform": "macos", "connected": true}
+            ],
+            "agents": [
+                {"id": "a3", "hostId": "local", "status": "idle",
+                 "sessionId": "olds", "source": "codex", "task": "old work",
+                 "recent": true}
+            ]
+        }))
+        .unwrap();
+        let out = build(&snap, None);
+        let texts = card_texts(&out);
+        assert!(texts.contains(&"RECENT"), "{texts:?}");
+        assert!(texts.contains(&"old work"));
+        // No vitals → no health dot; recent → no context meter. Panels:
+        // card body + status pill + backend badge.
+        assert_eq!(out.panels.len(), 3, "{:?}", out.panels.len());
+        let pill = out.texts.iter().find(|t| t.text == "RECENT").unwrap();
+        assert_eq!(pill.color, dim(kit::TEXT_3, 0.5), "muted and dimmed");
+    }
+
+    #[test]
+    fn status_chip_follows_the_dashboard_vocabulary() {
+        let chip_for = |status: &str, phase: &str| {
+            status_chip(&XrAgent {
+                status: status.into(),
+                phase: phase.into(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            chip_for("in_progress", "running"),
+            ("running".into(), kit::IRIS_2)
+        );
+        assert_eq!(
+            chip_for("in_progress", "thinking"),
+            ("thinking".into(), kit::IRIS_2)
+        );
+        assert_eq!(
+            chip_for("waiting_approval", "waiting"),
+            ("approval".into(), kit::AMBER)
+        );
+        assert_eq!(
+            chip_for("waiting", "waiting"),
+            ("waiting".into(), kit::AMBER)
+        );
+        assert_eq!(chip_for("error", "waiting"), ("error".into(), kit::RED));
+        assert_eq!(chip_for("done", "done"), ("done".into(), kit::GREEN));
+        assert_eq!(chip_for("idle", "idle"), ("idle".into(), kit::GREEN));
+        assert_eq!(
+            status_chip(&XrAgent {
+                needs_approval: true,
+                ..Default::default()
+            }),
+            ("approval".into(), kit::AMBER)
+        );
+        assert_eq!(
+            status_chip(&XrAgent {
+                recent: true,
+                ..Default::default()
+            }),
+            ("recent".into(), kit::TEXT_3)
+        );
+    }
+
+    #[test]
+    fn vitals_glyphs_fold_to_ascii() {
+        assert_eq!(
+            ascii_fold_vitals("▮95% 7d · ↻6:12:03"),
+            "95% 7d resets 6:12:03"
+        );
+        assert_eq!(
+            ascii_fold_vitals("5h ⛔ · still alice"),
+            "5h !! still alice"
+        );
+        let git_for = |vitals_git: &str| {
+            git_line(&XrAgent {
+                vitals_git: vitals_git.into(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(git_for("⎇ main ●3 +2/−1 ✓ ⇡2"), "main *3 +2/-1 ok ^2");
+        assert_eq!(git_for("⎇ main ⚠"), "main conflict!");
     }
 }
