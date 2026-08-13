@@ -78,6 +78,9 @@ same pinned-wasm-pack pipeline as the other browser crates):
   action never misfires off a stray pinch. `activate(name)` runs the same
   dispatch path for automation/accessibility (activation by name is the
   deliberate act).
+- **`terminal.rs`** — the in-scene terminal pane (below): summon pill,
+  pane layout, the honest empty/warming/watching states, and the
+  facade seams the dashboard's terminal painter feeds.
 
 ### Feed and action routing
 
@@ -91,6 +94,27 @@ decision}` shape and land in `send_approval` / `resolvePeerApproval` like
 every other frontend. Deferred deliberately: the voice composer toggle (no
 existing action seam to reuse; needs a designed one, not a hack) and
 compositor media layers (below).
+
+### Terminal pane (slice 1: read-only watching)
+
+A "terminal" pill sits on the operator's right (mirroring the monitor
+stack on the left); a quick pinch summons a pane that watches the
+dashboard's standalone shell — the same PTY the flat Terminal tab
+drives (`terminal_open`/`terminal_output` over the dashboard-control
+tunnel, `terminal.rs` on the daemon). The flat tab's machinery owns the
+attach and the xterm buffer; the `ui2-xr.js` terminal section paints
+that buffer onto an offscreen canvas (cell colors/SGR from the same
+ui-v2 token theme the flat terminal resolves) and registers it through
+the facade's canvas-texture seam, so the wire protocol is reused
+verbatim and no second listener is attached. The pane label carries the
+PTY's real id and host ("shell-0 · This daemon"), the status line is
+the flat tab's verbatim, and a visible "watching — input on the
+dashboard" line states the read-only contract — XR deliberately never
+sends `terminal_open` (the daemon's `open_or_attach` would spawn a
+shell when none exists), so a page with no terminal session shows
+"no terminals — open one on the dashboard" instead. Input from the
+headset is a later slice (hardware keyboards in immersive sessions are
+unverified on the Quest).
 
 ### Availability
 
@@ -154,8 +178,10 @@ shim (no dependency; it covers exactly the interface surface
 end: chip → immersive entry → stereo frame loop (2 views) →
 synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
-never routed to a live daemon). `xrProbe` (the `stationProbe`-convention QA
-facade) and `debugJson()` expose engine/scene state for ad-hoc probing.
+never routed to a live daemon) → the terminal pane pass (summon → honest
+empty state → canvas-seam registration → dismiss). `xrProbe` (the
+`stationProbe`-convention QA facade) and `debugJson()` expose engine/scene
+state for ad-hoc probing.
 
 ## Roadmap
 

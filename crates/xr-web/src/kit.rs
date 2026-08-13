@@ -91,12 +91,19 @@ pub(crate) struct TextRun {
 }
 
 /// What a ray can land on. The input layer maps (kind, agent) onto the
-/// dashboard's action vocabulary.
+/// dashboard's action vocabulary. The terminal kinds are scene-local
+/// (pane summon/dismiss — light acts, no daemon action behind them).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HitKind {
     Card,
     Approve,
     Deny,
+    TerminalToggle,
+    TerminalClose,
+    /// Transcript paging on the workbench: toward older rows.
+    ScrollOlder,
+    /// Transcript paging on the workbench: back toward the live tail.
+    ScrollNewer,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +136,12 @@ pub(crate) struct SceneBatches {
     pub frame: SceneFrame,
     pub monitors: Vec<MonitorInstance>,
     pub hits: Vec<HitTarget>,
+    /// Wrapped transcript rows the focused workbench had available (0 =
+    /// no transcript this build) and the scroll offset actually applied
+    /// after clamping — the frame loop writes these back to the facade
+    /// so paging stays bounded and `debug_json` reports truth.
+    pub transcript_rows: usize,
+    pub transcript_scroll: usize,
 }
 
 impl SceneBatches {
@@ -138,6 +151,8 @@ impl SceneBatches {
         self.frame.clear();
         self.monitors.clear();
         self.hits.clear();
+        self.transcript_rows = 0;
+        self.transcript_scroll = 0;
     }
 }
 
@@ -161,16 +176,44 @@ pub(crate) const WORKBENCH_DIST: f32 = 1.05;
 pub(crate) const WORKBENCH_Y: f32 = 1.32;
 pub(crate) const WORKBENCH_HALF_W: f32 = 0.33;
 pub(crate) const WORKBENCH_HALF_H: f32 = 0.23;
+/// Deep workbench: the focused session with a live transcript grows into
+/// a reading surface (top stays under the banner line).
+pub(crate) const WORKBENCH_DEEP_HALF_W: f32 = 0.44;
+pub(crate) const WORKBENCH_DEEP_HALF_H: f32 = 0.33;
+pub(crate) const WORKBENCH_DEEP_Y: f32 = 1.30;
+/// Transcript typography: row glyph height + vertical pitch (meters).
+pub(crate) const TRANSCRIPT_ROW_H: f32 = 0.0165;
+pub(crate) const TRANSCRIPT_ROW_PITCH: f32 = 0.0225;
+/// Rows a single older/newer page step moves.
+pub(crate) const TRANSCRIPT_PAGE_ROWS: usize = 6;
 
 /// Approval banner floats above the workbench line.
 pub(crate) const BANNER_DIST: f32 = 1.1;
 pub(crate) const BANNER_Y: f32 = 1.78;
 
-/// Agenda rail: parked intent on the operator's RIGHT — the mirror of
-/// the monitors' −38° placement on the left, same distance, inside the
-/// comfortable frontal arc.
-pub(crate) const AGENDA_AZ: f32 = 0.66; // ≈ +38°
-pub(crate) const AGENDA_DIST: f32 = 1.85;
+/// Terminal pane: a fixed slot on the operator's right, mirroring how
+/// the monitor stack sits on the left (same distance, opposite azimuth).
+pub(crate) const TERMINAL_AZ: f32 = 0.66;
+pub(crate) const TERMINAL_DIST: f32 = 1.85;
+pub(crate) const TERMINAL_HALF_W: f32 = 0.60;
+pub(crate) const TERMINAL_Y: f32 = 1.42;
+/// Height/width fallback before the first painted frame reports the real
+/// canvas aspect (80x24 cells at the painter's cell metrics).
+pub(crate) const TERMINAL_DEFAULT_ASPECT: f32 = 0.625;
+/// Summon pill: nearer and lower than the pane, on the workbench's
+/// right sightline.
+pub(crate) const TERMINAL_PILL_AZ: f32 = 0.50;
+pub(crate) const TERMINAL_PILL_DIST: f32 = 1.30;
+pub(crate) const TERMINAL_PILL_Y: f32 = 1.05;
+
+/// Agenda rail: parked intent on the operator's RIGHT, outboard of the
+/// terminal slot (the +38° mirror of the monitors went to the summoned
+/// pane) — one band further around the ring and a step deeper, so the
+/// always-on rail never fights the pane's plane: closed pane leaves the
+/// rail fully visible, an open pane cleanly occludes only the rail's
+/// nearest edge.
+pub(crate) const AGENDA_AZ: f32 = 1.05; // ≈ +60°
+pub(crate) const AGENDA_DIST: f32 = 1.95;
 /// Top edge of the first card; the stack grows downward.
 pub(crate) const AGENDA_TOP_Y: f32 = 1.66;
 pub(crate) const AGENDA_CARD_W: f32 = 0.50;

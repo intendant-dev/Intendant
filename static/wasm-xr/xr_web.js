@@ -17,7 +17,8 @@ export class XrWeb {
     }
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
-     * `pill:<agent>:<op>`, `banner:<agent>`), the same
+     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
+     * `terminal:close`), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -68,6 +69,17 @@ export class XrWeb {
     exit() {
         wasm.xrweb_exit(this.__wbg_ptr);
     }
+    /**
+     * New painted content on the registered canvas; the encoder
+     * re-uploads on the next frame (uploads are generation-gated so an
+     * idle terminal costs no texture bandwidth).
+     * @param {string} source_id
+     */
+    markTerminalCanvasDirty(source_id) {
+        const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_markTerminalCanvasDirty(this.__wbg_ptr, ptr0, len0);
+    }
     constructor() {
         const ret = wasm.xrweb_new();
         this.__wbg_ptr = ret >>> 0;
@@ -111,6 +123,18 @@ export class XrWeb {
         wasm.xrweb_registerDisplaySource(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, video);
     }
     /**
+     * Register (or replace) the offscreen canvas the dashboard's
+     * terminal painter keeps fresh — the canvas-source variant of the
+     * display registration seam. Registration counts as painted.
+     * @param {string} source_id
+     * @param {HTMLCanvasElement} canvas
+     */
+    registerTerminalCanvas(source_id, canvas) {
+        const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_registerTerminalCanvas(this.__wbg_ptr, ptr0, len0, canvas);
+    }
+    /**
      * Register the dashboard's action router. Actions emitted by the XR
      * surface call this with one JSON-stringifiable object argument.
      * @param {Function} callback
@@ -135,6 +159,14 @@ export class XrWeb {
         wasm.xrweb_unregisterDisplaySource(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * @param {string} source_id
+     */
+    unregisterTerminalCanvas(source_id) {
+        const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_unregisterTerminalCanvas(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * Ingest one coalesced dashboard state snapshot (same feed schema the
      * other rendered surface consumes). Parse failures keep the previous
      * scene and count in `debug_json` — the feed must never take the
@@ -143,6 +175,15 @@ export class XrWeb {
      */
     updateSnapshot(snapshot) {
         wasm.xrweb_updateSnapshot(this.__wbg_ptr, snapshot);
+    }
+    /**
+     * Ingest the dashboard-derived terminal pane state (label, status,
+     * presence — see `terminal.rs`). Tolerant like `updateSnapshot`:
+     * malformed pushes are dropped and counted, never fatal.
+     * @param {any} state
+     */
+    updateTerminal(state) {
+        wasm.xrweb_updateTerminal(this.__wbg_ptr, state);
     }
 }
 if (Symbol.dispose) XrWeb.prototype[Symbol.dispose] = XrWeb.prototype.free;
@@ -434,6 +475,10 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_get_with_ref_key_1dc361bd10053bfe: function(arg0, arg1) {
             const ret = arg0[arg1];
+            return ret;
+        },
+        __wbg_height_38750dc6de41ee75: function(arg0) {
+            const ret = arg0.height;
             return ret;
         },
         __wbg_height_638650acec5f2b54: function(arg0) {
@@ -755,6 +800,9 @@ function __wbg_get_imports() {
             const ret = arg0.targetRaySpace;
             return ret;
         },
+        __wbg_texImage2D_71971bdd3884c7ec: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+            arg0.texImage2D(arg1 >>> 0, arg2, arg3, arg4 >>> 0, arg5 >>> 0, arg6);
+        }, arguments); },
         __wbg_texImage2D_7677de737241f6ab: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
             arg0.texImage2D(arg1 >>> 0, arg2, arg3, arg4 >>> 0, arg5 >>> 0, arg6);
         }, arguments); },
@@ -828,6 +876,10 @@ function __wbg_get_imports() {
             const ret = arg0.width;
             return ret;
         },
+        __wbg_width_5f66bde2e810fbde: function(arg0) {
+            const ret = arg0.width;
+            return ret;
+        },
         __wbg_width_9bbf873307a2ac4e: function(arg0) {
             const ret = arg0.width;
             return ret;
@@ -851,7 +903,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 73, function: Function { arguments: [Externref], shim_idx: 74, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 76, function: Function { arguments: [Externref], shim_idx: 77, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

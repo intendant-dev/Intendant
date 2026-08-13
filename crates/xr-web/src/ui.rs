@@ -13,7 +13,11 @@ use crate::kit::{
     PanelInstance, SceneBatches, TextAlign, TextRun,
 };
 use crate::math::{v3, Panel, Vec3};
-use crate::model::{XrAgent, XrSnapshot};
+use crate::model::{XrAgent, XrEvent, XrSnapshot};
+
+/// Transcript rows kept after wrapping (newest win) — bounds text-quad
+/// count against a worst-case feed.
+const TRANSCRIPT_ROW_CAP: usize = 240;
 
 /// Max cards per host row before the overflow marker (≈ ±42° arc).
 const ROW_CAP: usize = 7;
@@ -34,6 +38,7 @@ pub(crate) fn build_scene(
     selected_id: Option<&str>,
     hover_id: Option<&str>,
     confirm: Option<(&str, f32)>,
+    transcript_scroll: usize,
     passthrough: bool,
     floor_y: f32,
     measure: &dyn TextMeasure,
@@ -44,9 +49,9 @@ pub(crate) fn build_scene(
     // Screens are independent of the agents feed — they show even while
     // the snapshot warms up.
     monitors(displays, floor_y, out);
-    // Agenda rail on the operator's right (the monitors' mirror):
-    // parked intent, questions, due reminders — read-only, and just as
-    // independent of the agents feed.
+    // Agenda rail on the operator's right, outboard of the terminal
+    // slot: parked intent, questions, due reminders — read-only, and
+    // just as independent of the agents feed as the screens.
     crate::agenda::rail(
         snap.agenda.as_ref(),
         selected_id,
@@ -144,7 +149,16 @@ pub(crate) fn build_scene(
     }
 
     if let Some(agent) = selected_id.and_then(|id| snap.agents.iter().find(|a| a.id == id)) {
-        workbench(agent, hover_id, confirm, floor_y, measure, out);
+        workbench(
+            agent,
+            &snap.events,
+            hover_id,
+            confirm,
+            transcript_scroll,
+            floor_y,
+            measure,
+            out,
+        );
     }
 
     if !pending_approvals.is_empty() {
@@ -457,17 +471,35 @@ fn card(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn workbench(
     agent: &XrAgent,
+    events: &[XrEvent],
     hover_id: Option<&str>,
     confirm: Option<(&str, f32)>,
+    scroll_in: usize,
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
 ) {
-    let (center, right, up) = front_panel_basis(kit::WORKBENCH_DIST, kit::WORKBENCH_Y);
-    let hw = kit::WORKBENCH_HALF_W;
-    let hh = kit::WORKBENCH_HALF_H;
+    // The transcript decides the bench's whole posture: with thread
+    // lines to read, the focused session grows into a reading surface
+    // (the regular dashboard's session window, re-typeset); without
+    // them it stays the compact status card.
+    let deep_hw = kit::WORKBENCH_DEEP_HALF_W;
+    let rows = transcript_rows(agent, events, measure, deep_hw * 2.0 - 0.07);
+    let deep = !rows.is_empty();
+    let (center, right, up) = if deep {
+        front_panel_basis(kit::WORKBENCH_DIST, kit::WORKBENCH_DEEP_Y)
+    } else {
+        front_panel_basis(kit::WORKBENCH_DIST, kit::WORKBENCH_Y)
+    };
+    let hw = if deep { deep_hw } else { kit::WORKBENCH_HALF_W };
+    let hh = if deep {
+        kit::WORKBENCH_DEEP_HALF_H
+    } else {
+        kit::WORKBENCH_HALF_H
+    };
 
     out.panels.push(PanelInstance {
         center: at_floor(center, floor_y),
@@ -530,6 +562,60 @@ fn workbench(
             kit::AMBER,
             &mut y,
         );
+    }
+
+    // Live thread: the dashboard's own activity feed for this agent,
+    // wrapped to the bench, pinned to the tail unless paged back.
+    if deep {
+        let divider_y = y - 0.006;
+        out.panels.push(PanelInstance {
+            center: lift(center + up.scale(divider_y), right, up, LIFT_DECOR, floor_y),
+            right,
+            up,
+            half_w: hw - pad,
+            half_h: 0.0008,
+            radius: 0.0008,
+            fill: kit::LINE,
+            border: [0.0; 4],
+            border_w: 0.0,
+        });
+        // Region floor: clear of the context meter (and the pill row
+        // below it) whatever the header used above.
+        let region_bottom = -hh + 0.075 + 0.045;
+        let row_top = divider_y - 0.012;
+        let fit =
+            (((row_top - region_bottom) / kit::TRANSCRIPT_ROW_PITCH).floor()).max(0.0) as usize;
+        let max_scroll = rows.len().saturating_sub(fit);
+        let scroll = scroll_in.min(max_scroll);
+        out.transcript_rows = rows.len();
+        out.transcript_scroll = scroll;
+        let end = rows.len() - scroll;
+        let start = end.saturating_sub(fit);
+        for (i, row) in rows[start..end].iter().enumerate() {
+            let baseline = row_top - kit::TRANSCRIPT_ROW_H - i as f32 * kit::TRANSCRIPT_ROW_PITCH;
+            out.texts.push(TextRun {
+                origin: lift(
+                    center + right.scale(left) + up.scale(baseline),
+                    right,
+                    up,
+                    LIFT_TEXT,
+                    floor_y,
+                ),
+                right,
+                up,
+                height: kit::TRANSCRIPT_ROW_H,
+                color: row.color,
+                align: TextAlign::Left,
+                max_width: hw * 2.0 - pad * 2.0,
+                text: row.text.clone(),
+            });
+        }
+        if max_scroll > 0 {
+            scroll_pills(
+                &agent.id, center, right, up, hw, hh, scroll, max_scroll, hover_id, floor_y,
+                measure, out,
+            );
+        }
     }
 
     // Context meter across the panel.
@@ -724,6 +810,214 @@ fn banner(pending: &[&XrAgent], hover_id: Option<&str>, floor_y: f32, out: &mut 
     });
 }
 
+struct TranscriptRow {
+    text: String,
+    color: [f32; 4],
+}
+
+/// Feed line → row color + optional speaker prefix, following the
+/// dashboard's own source vocabulary (operator input bright, agent
+/// output regular, reasoning quiet, errors red).
+fn event_style(ev: &XrEvent) -> ([f32; 4], Option<&'static str>) {
+    let src = ev.source.as_str();
+    if ev.level == "error" || src.contains("error") || src.contains("fail") {
+        (kit::RED, None)
+    } else if src.contains("input") || src.contains("user") || src.contains("steer") {
+        (kit::TEXT, Some("you >"))
+    } else if src.contains("reason") {
+        (kit::TEXT_3, None)
+    } else {
+        (kit::TEXT_2, None)
+    }
+}
+
+/// Filter the feed to the agent's thread and wrap to the bench width.
+/// Newest rows win the cap so the live tail always renders.
+fn transcript_rows(
+    agent: &XrAgent,
+    events: &[XrEvent],
+    measure: &dyn TextMeasure,
+    width: f32,
+) -> Vec<TranscriptRow> {
+    let mut rows = Vec::new();
+    for ev in events.iter().filter(|e| e.belongs_to(agent)) {
+        let (color, prefix) = event_style(ev);
+        let mut text = String::new();
+        if let Some(p) = prefix {
+            text.push_str(p);
+            text.push(' ');
+        }
+        text.push_str(ev.msg.trim());
+        for para in text.split('\n') {
+            let para = para.trim();
+            if para.is_empty() {
+                continue;
+            }
+            wrap_into(para, width, measure, color, &mut rows);
+        }
+    }
+    if rows.len() > TRANSCRIPT_ROW_CAP {
+        rows.drain(0..rows.len() - TRANSCRIPT_ROW_CAP);
+    }
+    rows
+}
+
+/// Greedy word wrap at transcript row height; words wider than the whole
+/// region hard-split by character so nothing is silently dropped.
+fn wrap_into(
+    text: &str,
+    width: f32,
+    measure: &dyn TextMeasure,
+    color: [f32; 4],
+    out: &mut Vec<TranscriptRow>,
+) {
+    let h = kit::TRANSCRIPT_ROW_H;
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        while !word.is_empty() && measure.measure(word, h) > width {
+            if !cur.is_empty() {
+                out.push(TranscriptRow {
+                    text: std::mem::take(&mut cur),
+                    color,
+                });
+            }
+            let mut take = 0;
+            let mut acc = String::new();
+            for (idx, ch) in word.char_indices() {
+                acc.push(ch);
+                if measure.measure(&acc, h) > width {
+                    break;
+                }
+                take = idx + ch.len_utf8();
+            }
+            if take == 0 {
+                take = word
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(word.len());
+            }
+            out.push(TranscriptRow {
+                text: word[..take].to_string(),
+                color,
+            });
+            word = &word[take..];
+        }
+        if word.is_empty() {
+            continue;
+        }
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else {
+            let candidate = format!("{cur} {word}");
+            if measure.measure(&candidate, h) > width {
+                out.push(TranscriptRow {
+                    text: std::mem::take(&mut cur),
+                    color,
+                });
+                cur = word.to_string();
+            } else {
+                cur = candidate;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(TranscriptRow { text: cur, color });
+    }
+}
+
+/// Older/newer paging pills in the bench's bottom-right corner. Only an
+/// active direction registers a hit target — an inert pill renders dim
+/// and swallows nothing.
+#[allow(clippy::too_many_arguments)]
+fn scroll_pills(
+    agent_id: &str,
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    hw: f32,
+    hh: f32,
+    scroll: usize,
+    max_scroll: usize,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) {
+    let pill_y = -hh + 0.028;
+    let pill_hh = 0.016;
+    let label_h = 0.017;
+    // Rightmost first: newer hugs the edge, older sits left of it.
+    let specs: [(&str, &str, HitKind, bool); 2] = [
+        ("newer", "scroll:newer", HitKind::ScrollNewer, scroll > 0),
+        (
+            "older",
+            "scroll:older",
+            HitKind::ScrollOlder,
+            scroll < max_scroll,
+        ),
+    ];
+    let mut pen = hw - 0.035;
+    for (label, id, kind, active) in specs {
+        let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.018).max(0.040);
+        let x = pen - pill_hw;
+        pen = x - pill_hw - 0.018;
+        let pcenter = center + right.scale(x) + up.scale(pill_y);
+        let is_hover = active && hover_id == Some(id);
+        let (line_color, text_color) = if active {
+            (kit::LINE_2, kit::TEXT_2)
+        } else {
+            (kit::LINE, kit::TEXT_3)
+        };
+        out.panels.push(PanelInstance {
+            center: lift(pcenter, right, up, LIFT_DECOR, floor_y),
+            right,
+            up,
+            half_w: pill_hw,
+            half_h: pill_hh,
+            radius: pill_hh,
+            fill: if is_hover {
+                dim(kit::IRIS, 0.25)
+            } else {
+                kit::SURFACE
+            },
+            border: line_color,
+            border_w: if is_hover { 0.003 } else { 0.002 },
+        });
+        out.texts.push(TextRun {
+            origin: lift(
+                pcenter - up.scale(0.006),
+                right,
+                up,
+                LIFT_TEXT + LIFT_DECOR,
+                floor_y,
+            ),
+            right,
+            up,
+            height: label_h,
+            color: text_color,
+            align: TextAlign::Center,
+            max_width: pill_hw * 2.0 - 0.008,
+            text: label.to_string(),
+        });
+        if active {
+            out.hits.push(HitTarget {
+                id: id.to_string(),
+                kind,
+                agent_id: agent_id.to_string(),
+                panel: Panel {
+                    center: at_floor(pcenter, floor_y),
+                    right,
+                    up,
+                    half_w: pill_hw,
+                    half_h: pill_hh,
+                },
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +1052,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             0.0,
             &ApproxMeasure,
@@ -784,6 +1079,7 @@ mod tests {
             Some("a2"),
             None,
             None,
+            0,
             false,
             0.0,
             &ApproxMeasure,
@@ -812,6 +1108,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             0.0,
             &ApproxMeasure,
@@ -823,6 +1120,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             -1.5,
             &ApproxMeasure,
@@ -831,6 +1129,133 @@ mod tests {
         let a = level.panels.first().unwrap().center;
         let b = sunk.panels.first().unwrap().center;
         assert!((a.y - b.y - 1.5).abs() < 1e-5);
+    }
+
+    fn events_for(session: &str, n: usize) -> serde_json::Value {
+        let events: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "sessionId": session,
+                    "agentId": "a1",
+                    "source": if i % 3 == 0 { "messages_input" } else { "agent_output" },
+                    "level": "info",
+                    "ts": "12:00",
+                    "msg": format!("line {i}: the encoder pool keeps one encoder per display and shares it")
+                })
+            })
+            .collect();
+        serde_json::Value::Array(events)
+    }
+
+    #[test]
+    fn focused_transcript_deepens_the_bench_and_pages() {
+        let mut raw = serde_json::to_value(serde_json::json!({
+            "hosts": [{"id": "local", "name": "mac", "platform": "macos", "connected": true}],
+            "agents": [{"id": "a1", "hostId": "local", "status": "running",
+                        "sessionId": "s1", "source": "claude-code"}]
+        }))
+        .unwrap();
+        raw["events"] = events_for("s1", 30);
+        let snap: XrSnapshot = serde_json::from_value(raw).unwrap();
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        assert!(out.transcript_rows > 0, "thread lines wrapped into rows");
+        assert_eq!(out.transcript_scroll, 0, "pinned to the live tail");
+        // Deep bench: some panel carries the widened surface.
+        assert!(out
+            .panels
+            .iter()
+            .any(|p| (p.half_w - kit::WORKBENCH_DEEP_HALF_W).abs() < 1e-6));
+        // Overflowing thread arms exactly the older pill (tail = no newer).
+        assert!(out.hits.iter().any(|h| h.kind == HitKind::ScrollOlder));
+        assert!(out.hits.iter().all(|h| h.kind != HitKind::ScrollNewer));
+        // Operator lines carry the speaker prefix.
+        assert!(out.texts.iter().any(|t| t.text.starts_with("you >")));
+
+        // Paged back: scroll clamps, newer arms, the applied offset is
+        // reported for the facade write-back.
+        let mut paged = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            9999,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut paged,
+        );
+        assert!(paged.transcript_scroll > 0);
+        assert!(paged.transcript_scroll < 9999, "clamped to available rows");
+        assert!(paged.hits.iter().any(|h| h.kind == HitKind::ScrollNewer));
+        assert!(paged.hits.iter().all(|h| h.kind != HitKind::ScrollOlder));
+    }
+
+    #[test]
+    fn foreign_thread_lines_keep_the_bench_compact() {
+        let mut raw = serde_json::to_value(serde_json::json!({
+            "hosts": [{"id": "local", "name": "mac", "platform": "macos", "connected": true}],
+            "agents": [{"id": "a1", "hostId": "local", "status": "running",
+                        "sessionId": "s1", "source": "claude-code"}]
+        }))
+        .unwrap();
+        raw["events"] = events_for("other-session", 10);
+        let snap: XrSnapshot = serde_json::from_value(raw).unwrap();
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        assert_eq!(out.transcript_rows, 0);
+        assert!(out
+            .panels
+            .iter()
+            .any(|p| (p.half_w - kit::WORKBENCH_HALF_W).abs() < 1e-6));
+        assert!(out
+            .hits
+            .iter()
+            .all(|h| h.kind != HitKind::ScrollOlder && h.kind != HitKind::ScrollNewer));
+    }
+
+    #[test]
+    fn wrap_hard_splits_oversized_words() {
+        let mut rows = Vec::new();
+        wrap_into(
+            "short aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa end",
+            0.2,
+            &ApproxMeasure,
+            kit::TEXT_2,
+            &mut rows,
+        );
+        assert!(rows.len() >= 3, "long run splits across rows");
+        assert!(rows.iter().all(|r| !r.text.is_empty()));
+        let rejoined: String = rows
+            .iter()
+            .map(|r| r.text.replace(' ', ""))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rejoined.contains("end"), "nothing dropped");
     }
 
     #[test]
@@ -843,6 +1268,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             0.0,
             &ApproxMeasure,

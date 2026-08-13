@@ -10,7 +10,8 @@ export class XrWeb {
     [Symbol.dispose](): void;
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
-     * `pill:<agent>:<op>`, `banner:<agent>`), the same
+     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
+     * `terminal:close`), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -33,6 +34,12 @@ export class XrWeb {
      * session-end callback run from the session's own 'end' event).
      */
     exit(): void;
+    /**
+     * New painted content on the registered canvas; the encoder
+     * re-uploads on the next frame (uploads are generation-gated so an
+     * idle terminal costs no texture bandwidth).
+     */
+    markTerminalCanvasDirty(source_id: string): void;
     constructor();
     /**
      * Probe `navigator.xr` for immersive-ar / immersive-vr support.
@@ -49,6 +56,12 @@ export class XrWeb {
      */
     registerDisplaySource(source_id: string, _host_id: string, _display_id: string, label: string, kind: string, video: HTMLVideoElement): void;
     /**
+     * Register (or replace) the offscreen canvas the dashboard's
+     * terminal painter keeps fresh — the canvas-source variant of the
+     * display registration seam. Registration counts as painted.
+     */
+    registerTerminalCanvas(source_id: string, canvas: HTMLCanvasElement): void;
+    /**
      * Register the dashboard's action router. Actions emitted by the XR
      * surface call this with one JSON-stringifiable object argument.
      */
@@ -59,6 +72,7 @@ export class XrWeb {
      */
     setOnSessionEnd(callback: Function): void;
     unregisterDisplaySource(source_id: string): void;
+    unregisterTerminalCanvas(source_id: string): void;
     /**
      * Ingest one coalesced dashboard state snapshot (same feed schema the
      * other rendered surface consumes). Parse failures keep the previous
@@ -66,6 +80,12 @@ export class XrWeb {
      * session down.
      */
     updateSnapshot(snapshot: any): void;
+    /**
+     * Ingest the dashboard-derived terminal pane state (label, status,
+     * presence — see `terminal.rs`). Tolerant like `updateSnapshot`:
+     * malformed pushes are dropped and counted, never fatal.
+     */
+    updateTerminal(state: any): void;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -77,13 +97,17 @@ export interface InitOutput {
     readonly xrweb_debugJson: (a: number) => [number, number];
     readonly xrweb_enter: (a: number, b: number, c: number) => any;
     readonly xrweb_exit: (a: number) => void;
+    readonly xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
     readonly xrweb_new: () => number;
     readonly xrweb_probeSupport: (a: number) => any;
     readonly xrweb_registerDisplaySource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => void;
+    readonly xrweb_registerTerminalCanvas: (a: number, b: number, c: number, d: any) => void;
     readonly xrweb_setActionCallback: (a: number, b: any) => void;
     readonly xrweb_setOnSessionEnd: (a: number, b: any) => void;
     readonly xrweb_unregisterDisplaySource: (a: number, b: number, c: number) => void;
+    readonly xrweb_unregisterTerminalCanvas: (a: number, b: number, c: number) => void;
     readonly xrweb_updateSnapshot: (a: number, b: any) => void;
+    readonly xrweb_updateTerminal: (a: number, b: any) => void;
     readonly wasm_bindgen__closure__destroy__h95fa55e82713b162: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hb9ef122cd6bafce1: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h80d27238e69792d0: (a: number, b: number, c: number, d: any) => void;

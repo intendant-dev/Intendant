@@ -29,10 +29,12 @@ use crate::model::{XrAgenda, XrAgendaItem};
 const LIFT_DECOR: f32 = 0.0018;
 const LIFT_TEXT: f32 = 0.0036;
 
-/// Type scale at rail distance (1.85 m): everything at or above the
-/// ~0.016 m legibility floor the headset findings set.
-const TITLE_H: f32 = 0.022;
-const META_H: f32 = 0.017;
+/// Type scale at rail distance (1.95 m): everything comfortably above
+/// the ~0.016 m legibility floor the headset findings set (the rail
+/// sits a step deeper than the monitors, so the small line gets a
+/// notch more height to hold the same angular size).
+const TITLE_H: f32 = 0.023;
+const META_H: f32 = 0.018;
 const HEADER_H: f32 = 0.026;
 const NOTE_H: f32 = 0.019;
 /// Baseline pitch between wrapped title lines.
@@ -689,6 +691,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             0.0,
             &ApproxMeasure,
@@ -709,6 +712,7 @@ mod tests {
             None,
             None,
             None,
+            0,
             true,
             0.0,
             &ApproxMeasure,
