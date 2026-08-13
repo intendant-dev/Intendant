@@ -131,6 +131,22 @@ pub(crate) struct XrAgent {
     pub(crate) can_interrupt: bool,
     /// Recent (closed-window) session: dim, inert card.
     pub(crate) recent: bool,
+    /// Session vitals (`stationVitalsFields`): git and limits arrive
+    /// pre-formatted by the dashboard's chip formatters (single source
+    /// of truth for the text), the cache hit as a raw percentage.
+    /// Absent on synthetic and recent cards — defaults mean "no data".
+    pub(crate) vitals_git: String,
+    /// True when merging this card's branch would conflict (the git
+    /// parity chip's crit state).
+    pub(crate) vitals_git_conflict: bool,
+    /// Latest request's cache-hit percentage; negative = no reading
+    /// (the feed's own sentinel).
+    #[serde(deserialize_with = "f64_or_unset")]
+    pub(crate) cache_hit_pct: f64,
+    /// Top rate-limit gauge text ("▮49% 7d · ↻6:12:03") and its
+    /// severity ("", "warn", "crit").
+    pub(crate) vitals_limits: String,
+    pub(crate) vitals_limits_state: String,
 }
 
 impl Default for XrAgent {
@@ -155,6 +171,11 @@ impl Default for XrAgent {
             thread_actions: Vec::new(),
             can_interrupt: false,
             recent: false,
+            vitals_git: String::new(),
+            vitals_git_conflict: false,
+            cache_hit_pct: -1.0,
+            vitals_limits: String::new(),
+            vitals_limits_state: String::new(),
         }
     }
 }
@@ -177,6 +198,26 @@ where
         Ok(Loose::Num(n)) if n.is_finite() => n as f32,
         Ok(Loose::Str(s)) => s.trim().parse::<f32>().unwrap_or(0.0),
         _ => 0.0,
+    })
+}
+
+/// Same tolerance for the cache-hit percentage, folding to the feed's
+/// own "no reading" sentinel (-1) instead of a fake 0% hit.
+fn f64_or_unset<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Loose {
+        Num(f64),
+        Str(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Loose::deserialize(deserializer) {
+        Ok(Loose::Num(n)) if n.is_finite() => n,
+        Ok(Loose::Str(s)) => s.trim().parse::<f64>().unwrap_or(-1.0),
+        _ => -1.0,
     })
 }
 
@@ -304,5 +345,45 @@ mod tests {
         let agenda = snap.agenda.expect("error shape still parses");
         assert_eq!(agenda.error, "agenda unavailable (503)");
         assert!(agenda.items.is_empty());
+    }
+
+    #[test]
+    fn vitals_fields_parse_the_station_shape() {
+        let json = serde_json::json!({
+            "agents": [
+                {"id": "a1", "hostId": "local",
+                 "vitalsGit": "⎇ main ●3 +2/−1 ⚠", "vitalsGitConflict": true,
+                 "cacheHitPct": "62", "cacheLastActivityEpoch": 1754000000,
+                 "cacheTtlSeconds": 300,
+                 "vitalsLimits": "▮95% 7d · ↻6:12:03", "vitalsLimitsState": "crit"}
+            ]
+        });
+        let snap: XrSnapshot = serde_json::from_value(json).unwrap();
+        let a = &snap.agents[0];
+        assert_eq!(a.vitals_git, "⎇ main ●3 +2/−1 ⚠");
+        assert!(a.vitals_git_conflict);
+        assert_eq!(a.cache_hit_pct, 62.0);
+        assert_eq!(a.vitals_limits, "▮95% 7d · ↻6:12:03");
+        assert_eq!(a.vitals_limits_state, "crit");
+    }
+
+    #[test]
+    fn vitals_fields_default_to_no_data_on_old_feeds() {
+        let json = serde_json::json!({
+            "agents": [{"id": "a1", "hostId": "local", "status": "running"}]
+        });
+        let snap: XrSnapshot = serde_json::from_value(json).unwrap();
+        let a = &snap.agents[0];
+        assert!(a.vitals_git.is_empty());
+        assert!(!a.vitals_git_conflict);
+        assert_eq!(a.cache_hit_pct, -1.0);
+        assert!(a.vitals_limits.is_empty());
+        assert!(a.vitals_limits_state.is_empty());
+        // A garbage cache reading folds to the unset sentinel, never 0%.
+        let json = serde_json::json!({
+            "agents": [{"id": "a2", "hostId": "local", "cacheHitPct": null}]
+        });
+        let snap: XrSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.agents[0].cache_hit_pct, -1.0);
     }
 }
