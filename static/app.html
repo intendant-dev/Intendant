@@ -32845,15 +32845,16 @@ html.ui-v2 .ui2-xr-chip[data-state="error"] {
   opacity: .8;
 }
 
-/* Visible entry status: tooltips don't exist in a headset. */
+/* Visible entry status: tooltips don't exist in a headset — and neither
+   do truncated diagnostics. Errors wrap in full; this line IS the
+   debugging surface on devices with no console. */
 html.ui-v2 .ui2-xr-status {
   margin-left: 8px;
   font-size: 12px;
   color: var(--text-2);
-  max-width: 42ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 72ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 html.ui-v2 .ui2-xr-status[data-state="error"] {
@@ -39381,7 +39382,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'efbdff3b29d4d6db';
+const INTENDANT_APP_BUILD = '1607be3eba54d5fa';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146355,8 +146356,11 @@ async function xrEnter() {
     const detail = (err && (err.message || err.name)) || String(err);
     xrSetChipState('error', 'XR entry failed: ' + detail);
     // Persist the failure where a headset user can read it; clear on the
-    // next attempt instead of a timer.
+    // next attempt instead of a timer. Mirror it to the console and the
+    // QA facade for every surface that CAN read those.
     xrShowStatus('error', 'XR entry failed: ' + detail);
+    console.error('[xr] entry failed:', err);
+    globalThis.xrProbe.lastError = detail;
     setTimeout(() => xrSetChipState('idle', 'Enter XR'), 4000);
   }
 }
