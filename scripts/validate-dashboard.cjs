@@ -254,7 +254,6 @@ Checks:
                               stereo frame loop (2 views), synthetic-snapshot scene build,
                               activation-by-name card select, and a captured approval dispatch
                               asserted against the dashboard's action shape (never routed to the
-                              daemon). Appends ?xr=dev to the target URL automatically
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -2294,13 +2293,6 @@ class BrowserHarness {
           { source: XR_WEBXR_SHIM_SOURCE },
           this.sessionId,
         );
-        // The chip is dev-gated and the gate is read at module eval, so
-        // the query param must ride the first navigation. Applied here —
-        // not at arg parse — because --launch-dashboard resolves its URL
-        // only after the temporary daemon binds a port.
-        if (!/[?&]xr=dev\b/.test(opts.url)) {
-          opts.url += (opts.url.includes('?') ? '&' : '?') + 'xr=dev';
-        }
       }
       const nav = await this.cdp.send('Page.navigate', { url: opts.url }, this.sessionId);
       if (nav.errorText) {

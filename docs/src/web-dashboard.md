@@ -778,8 +778,8 @@ authority surface. Today the scene is a 3D constellation backdrop with the
 working UI painted as screen-space HUD panels. Activity remains the default
 DOM control surface. The immersive WebXR direction moved to its own surface
 and chapter as of 2026-08-13 — see [XR](./xr.md): a careful spatial port of
-the regular dashboard (dev-gated entry chip behind `?xr=dev` until its first
-hardware validation), not an extension of Station's design.
+the regular dashboard (entry chip on by default for XR-capable
+browsers; `?xr=off` opts out), not an extension of Station's design.
 The dedicated
 [Station](./station.md) chapter carries the architecture, an honest
 current-state inventory, and the roadmap.
