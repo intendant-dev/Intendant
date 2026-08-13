@@ -9,6 +9,16 @@ export class XrWeb {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * Activate a scene target by hit-target id (`card:<agent>`,
+     * `pill:<agent>:<op>`, `banner:<agent>`), the same
+     * activation-by-name contract the other rendered surface gives the
+     * validator and accessibility layers. Runs the exact dispatch path
+     * a completed ray interaction runs — activation by name IS the
+     * deliberate act, so approve/deny fire without the hold. Returns
+     * true when the target existed and had an effect.
+     */
+    activate(name: string): boolean;
+    /**
      * QA/introspection hook: JSON string of the facade + engine state.
      * Kept schema-stable for the validator probe (`--xr-probe`).
      */
@@ -43,10 +53,11 @@ export class XrWeb {
     setOnSessionEnd(callback: Function): void;
     /**
      * Ingest one coalesced dashboard state snapshot (same feed schema the
-     * other rendered surface consumes). The scene model lands with the
-     * spatial-kit commits; until then only feed liveness is tracked.
+     * other rendered surface consumes). Parse failures keep the previous
+     * scene and count in `debug_json` — the feed must never take the
+     * session down.
      */
-    updateSnapshot(_snapshot: any): void;
+    updateSnapshot(snapshot: any): void;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -54,6 +65,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_xrweb_free: (a: number, b: number) => void;
+    readonly xrweb_activate: (a: number, b: number, c: number) => number;
     readonly xrweb_debugJson: (a: number) => [number, number];
     readonly xrweb_enter: (a: number, b: number, c: number) => any;
     readonly xrweb_exit: (a: number) => void;
@@ -62,17 +74,17 @@ export interface InitOutput {
     readonly xrweb_setActionCallback: (a: number, b: any) => void;
     readonly xrweb_setOnSessionEnd: (a: number, b: any) => void;
     readonly xrweb_updateSnapshot: (a: number, b: any) => void;
+    readonly wasm_bindgen__closure__destroy__h95fa55e82713b162: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hb9ef122cd6bafce1: (a: number, b: number) => void;
-    readonly wasm_bindgen__closure__destroy__hcaa1d086ad689b8b: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h506cd2d5a0312ff7: (a: number, b: number, c: number, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h80d27238e69792d0: (a: number, b: number, c: number, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8830e5bad9fe7bb6: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h5fa997591c1e8ef4: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfc0df02a144684e3: (a: number, b: number, c: any) => void;
+    readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_start: () => void;
 }

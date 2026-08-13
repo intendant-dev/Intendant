@@ -17,9 +17,14 @@
 //! loop, `gl.rs` owns the WebGL2 encoder, `math.rs` the linear algebra,
 //! `webxr_sys.rs` the hand-written WebXR externs.
 
+mod atlas;
 pub mod gl;
+mod input;
+mod kit;
 pub mod math;
+mod model;
 mod session;
+mod ui;
 pub mod webxr_sys;
 
 use std::cell::RefCell;
@@ -51,8 +56,27 @@ pub(crate) struct Inner {
     pub(crate) encoder: Option<gl::GlEncoder>,
     /// Live session state while immersive.
     pub(crate) session_state: Option<session::ActiveSession>,
-    /// One-shot upload latch for the engine-interim reference scene.
+    /// Latch: false forces a scene rebuild on the next frame.
     pub(crate) scene_uploaded: bool,
+    /// Last parsed dashboard snapshot (the scene's single source).
+    pub(crate) model: Option<model::XrSnapshot>,
+    /// Bumped per accepted snapshot; `built_generation` trails it.
+    pub(crate) scene_generation: u64,
+    pub(crate) built_generation: u64,
+    /// Selection / hover changed — rebuild even without new data.
+    pub(crate) ui_dirty: bool,
+    pub(crate) selected_id: Option<String>,
+    pub(crate) hover_id: Option<String>,
+    /// The last build's raycastable targets (input + activate()).
+    pub(crate) hit_targets: Vec<kit::HitTarget>,
+    /// Live pinch-hold on a confirm target (approve/deny).
+    pub(crate) hold_target: Option<String>,
+    pub(crate) hold_started_ms: f64,
+    /// (target id, 0..1) while a confirm-hold is filling.
+    pub(crate) confirm_progress: Option<(String, f32)>,
+    pub(crate) parse_errors: u64,
+    pub(crate) panels_count: u32,
+    pub(crate) texts_count: u32,
     // Frame stats for debug_json.
     pub(crate) frames_rendered: u64,
     pub(crate) last_view_count: u32,
@@ -73,6 +97,19 @@ impl Inner {
             encoder: None,
             session_state: None,
             scene_uploaded: false,
+            model: None,
+            scene_generation: 0,
+            built_generation: 0,
+            ui_dirty: false,
+            selected_id: None,
+            hover_id: None,
+            hit_targets: Vec::new(),
+            hold_target: None,
+            hold_started_ms: 0.0,
+            confirm_progress: None,
+            parse_errors: 0,
+            panels_count: 0,
+            texts_count: 0,
             frames_rendered: 0,
             last_view_count: 0,
             last_raf_time_ms: 0.0,
@@ -101,6 +138,19 @@ fn debug_state_json(inner: &Inner) -> String {
             "passthrough": inner.session_state.as_ref().map(|s| s.passthrough),
             "floorY": inner.session_state.as_ref().map(|s| s.floor_y),
             "sceneUploaded": inner.scene_uploaded,
+        },
+        "scene": {
+            "panels": inner.panels_count,
+            "texts": inner.texts_count,
+            "hitTargets": inner.hit_targets.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+            "sceneGeneration": inner.scene_generation,
+            "builtGeneration": inner.built_generation,
+            "parseErrors": inner.parse_errors,
+            "selected": inner.selected_id,
+            "hover": inner.hover_id,
+            "confirm": inner.confirm_progress.as_ref().map(|(id, p)| {
+                serde_json::json!({ "target": id, "progress": p })
+            }),
         },
     })
     .to_string()
@@ -181,11 +231,31 @@ impl XrWeb {
     }
 
     /// Ingest one coalesced dashboard state snapshot (same feed schema the
-    /// other rendered surface consumes). The scene model lands with the
-    /// spatial-kit commits; until then only feed liveness is tracked.
+    /// other rendered surface consumes). Parse failures keep the previous
+    /// scene and count in `debug_json` — the feed must never take the
+    /// session down.
     #[wasm_bindgen(js_name = updateSnapshot)]
-    pub fn update_snapshot(&self, _snapshot: JsValue) {
-        self.inner.borrow_mut().snapshot_generation += 1;
+    pub fn update_snapshot(&self, snapshot: JsValue) {
+        let mut inner = self.inner.borrow_mut();
+        inner.snapshot_generation += 1;
+        match serde_wasm_bindgen::from_value::<model::XrSnapshot>(snapshot) {
+            Ok(parsed) => {
+                inner.model = Some(parsed);
+                inner.scene_generation += 1;
+            }
+            Err(_) => inner.parse_errors += 1,
+        }
+    }
+
+    /// Activate a scene target by hit-target id (`card:<agent>`,
+    /// `pill:<agent>:<op>`, `banner:<agent>`), the same
+    /// activation-by-name contract the other rendered surface gives the
+    /// validator and accessibility layers. Runs the exact dispatch path
+    /// a completed ray interaction runs — activation by name IS the
+    /// deliberate act, so approve/deny fire without the hold. Returns
+    /// true when the target existed and had an effect.
+    pub fn activate(&self, name: String) -> bool {
+        input::dispatch_target(&mut self.inner.borrow_mut(), &name)
     }
 
     /// QA/introspection hook: JSON string of the facade + engine state.

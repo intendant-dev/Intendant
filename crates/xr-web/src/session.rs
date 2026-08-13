@@ -31,6 +31,8 @@ pub struct ActiveSession {
     pub floor_y: f32,
     raf_slot: RafSlot,
     _on_end: Closure<dyn FnMut(web_sys::Event)>,
+    _on_selectstart: Closure<dyn FnMut(web_sys::Event)>,
+    _on_selectend: Closure<dyn FnMut(web_sys::Event)>,
 }
 
 /// `{ requiredFeatures, optionalFeatures }` for requestSession.
@@ -127,6 +129,26 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
     let passthrough = session.environment_blend_mode() != "opaque";
     let floor_y = if space_kind == "local-floor" { 0.0 } else { -1.5 };
 
+    // Input events: selectstart arms a hold on the hovered target,
+    // selectend resolves clicks / cancels unfinished confirms. The
+    // per-frame ray/hover pass lives in the frame loop.
+    let ss_inner = Rc::clone(&inner);
+    let on_selectstart = Closure::new(move |_event: web_sys::Event| {
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0);
+        crate::input::on_select_start(&mut ss_inner.borrow_mut(), now);
+    });
+    session
+        .add_event_listener_with_callback("selectstart", on_selectstart.as_ref().unchecked_ref())?;
+    let se_inner = Rc::clone(&inner);
+    let on_selectend = Closure::new(move |_event: web_sys::Event| {
+        crate::input::on_select_end(&mut se_inner.borrow_mut());
+    });
+    session
+        .add_event_listener_with_callback("selectend", on_selectend.as_ref().unchecked_ref())?;
+
     // 'end' fires for every termination path (our exit(), the system
     // gesture, runtime shutdown) — single cleanup seam.
     let end_inner = Rc::clone(&inner);
@@ -156,6 +178,8 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
         floor_y,
         raf_slot: Rc::clone(&raf_slot),
         _on_end: on_end,
+        _on_selectstart: on_selectstart,
+        _on_selectend: on_selectend,
     };
 
     {
@@ -215,6 +239,10 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
     }
     inner.last_raf_time_ms = time_ms;
 
+    // Rays, hover, and confirm-hold progress — before the scene rebuild
+    // so this frame paints its own input state.
+    crate::input::update(inner, frame, time_ms);
+
     let Some(state) = inner.session_state.as_ref() else {
         return;
     };
@@ -232,28 +260,51 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
     let views = pose.views();
     let view_count = views.length();
 
-    // Split borrows: the encoder needs &mut for the (one-shot) upload.
-    let scene_uploaded = inner.scene_uploaded;
-    let Some(encoder) = inner.encoder.as_mut() else {
-        return;
-    };
-    if !scene_uploaded {
-        // Engine-interim frame source: the reference scene. The spatial
-        // kit replaces this as the producer (rebuild on snapshot change).
-        let mut scene = crate::gl::reference_scene();
-        if floor_y != 0.0 {
-            // 'local' fallback: shift the whole scene down to a plausible
-            // floor so world content isn't head-height.
-            for chunk in scene.tris.chunks_mut(crate::gl::VERTEX_STRIDE) {
-                chunk[1] += floor_y;
-            }
-            for chunk in scene.lines.chunks_mut(crate::gl::VERTEX_STRIDE) {
-                chunk[1] += floor_y;
-            }
+    // Rebuild the scene when the feed advanced or the UI state (selection,
+    // hover) changed. Field-disjoint borrows: `state` holds
+    // `inner.session_state`, the encoder is `inner.encoder`.
+    let needs_scene = !inner.scene_uploaded
+        || inner.built_generation != inner.scene_generation
+        || inner.ui_dirty;
+    if needs_scene {
+        let selected = inner.selected_id.clone();
+        let hover = inner.hover_id.clone();
+        let confirm = inner.confirm_progress.clone();
+        let snapshot = inner.model.clone().unwrap_or_default();
+        let Some(encoder) = inner.encoder.as_mut() else {
+            return;
+        };
+        let atlas_ok = encoder.ensure_atlas();
+        let mut batches = crate::kit::SceneBatches::default();
+        {
+            let approx = crate::atlas::ApproxMeasure;
+            let measure: &dyn crate::atlas::TextMeasure = match encoder.atlas() {
+                Some(atlas) if atlas_ok => atlas,
+                _ => &approx,
+            };
+            crate::ui::build_scene(
+                &snapshot,
+                selected.as_deref(),
+                hover.as_deref(),
+                confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
+                passthrough,
+                floor_y,
+                measure,
+                &mut batches,
+            );
         }
-        encoder.upload(&scene);
+        encoder.upload_batches(&batches);
+        inner.panels_count = batches.panels.len() as u32;
+        inner.texts_count = batches.texts.len() as u32;
+        inner.hit_targets = batches.hits;
+        inner.scene_uploaded = true;
+        inner.built_generation = inner.scene_generation;
+        inner.ui_dirty = false;
     }
 
+    let Some(encoder) = inner.encoder.as_ref() else {
+        return;
+    };
     encoder.begin_frame(framebuffer.as_ref(), fb_w, fb_h, passthrough);
     let mut drawn = 0u32;
     for view in views.iter() {
@@ -274,7 +325,6 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         drawn += 1;
     }
 
-    inner.scene_uploaded = true;
     inner.frames_rendered += 1;
     inner.last_view_count = drawn.max(view_count);
 }

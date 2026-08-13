@@ -3,29 +3,33 @@
 //! Every WebXR browser can composite an `XRWebGLLayer` (Quest's Horizon
 //! Browser presents XR *only* through WebGL as of 2026-08), so this
 //! encoder is the path that must always work: it draws the spatial kit's
-//! vertex streams into the layer's opaque framebuffer, once per view,
-//! with the view-projection matrix the headset supplies. The
-//! WebXR-WebGPU binding encoder slots in beside it later behind the same
-//! `SceneFrame` seam — the kit never knows which encoder ran.
+//! batches into the layer's opaque framebuffer, once per view, with the
+//! view-projection matrix the headset supplies. The WebXR-WebGPU binding
+//! encoder slots in beside it later behind the same batch seam — the kit
+//! never knows which encoder ran.
 //!
-//! Deliberately boring GL: one interleaved position+color program for
-//! triangles and lines. The textured/text program arrives with the glyph
-//! atlas. All buffer uploads go through copying `Float32Array::from` —
-//! no `unsafe` views (this repo keeps unsafe confined to its documented
-//! platform islands, and the streams are a few kilobytes per frame).
+//! Three deliberately boring programs: interleaved pos+color for
+//! triangles/lines, a rounded-rect SDF program drawing one panel per
+//! call (a scene holds dozens of panels, not thousands — the trivial
+//! data path wins), and a glyph-atlas text program. All buffer uploads
+//! go through copying `Float32Array::from` — no `unsafe` views (this
+//! repo keeps unsafe confined to its documented platform islands, and
+//! the streams are a few kilobytes per frame).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlUniformLocation};
 
+use crate::atlas::{GlyphAtlas, TEXT_VERTEX_STRIDE};
+use crate::kit::{PanelInstance, SceneBatches};
 use crate::math::{v3, Mat4, Vec3};
 
-/// Floats per vertex: xyz + rgba.
+/// Floats per pos+color vertex: xyz + rgba.
 pub const VERTEX_STRIDE: usize = 7;
 
 /// CPU-side vertex streams for one frame, in world space. Rebuilt by the
-/// spatial kit whenever the scene changes; uploaded once per XR frame and
-/// drawn once per view.
+/// spatial kit whenever the scene changes; uploaded once and drawn once
+/// per XR view.
 #[derive(Default, Clone)]
 pub struct SceneFrame {
     pub tris: Vec<f32>,
@@ -81,10 +85,10 @@ impl SceneFrame {
     }
 }
 
-/// The engine-interim reference scene: a floor grid at y=0, axis gizmo at
-/// the origin, and one panel at head height 1.2 m ahead. Proves stereo,
-/// depth, and world-lock on hardware before the spatial kit lands; the
-/// kit replaces this as the frame source.
+/// The engine's hardware smoke scene: a floor grid, axis gizmo, and one
+/// panel at head height. Used by the validator probe and kept as the
+/// canonical "is stereo/depth/world-lock sane" reference; the spatial
+/// kit is the live frame source.
 pub fn reference_scene() -> SceneFrame {
     let mut frame = SceneFrame::default();
     let grid = [0.35, 0.42, 0.55, 0.55f32];
@@ -100,8 +104,6 @@ pub fn reference_scene() -> SceneFrame {
     frame.push_line(v3(0.0, 0.001, 0.0), v3(0.3, 0.001, 0.0), [0.95, 0.35, 0.35, 1.0]);
     frame.push_line(v3(0.0, 0.001, 0.0), v3(0.0, 0.301, 0.0), [0.42, 0.85, 0.48, 1.0]);
     frame.push_line(v3(0.0, 0.001, 0.0), v3(0.0, 0.001, 0.3), [0.45, 0.55, 0.98, 1.0]);
-    // Reference panel: 0.8 × 0.5 m, 1.2 m ahead at 1.4 m height, with a
-    // brighter frame so both depth write and line pass are visible.
     let center = v3(0.0, 1.4, -1.2);
     let right = v3(1.0, 0.0, 0.0);
     let up = v3(0.0, 1.0, 0.0);
@@ -119,23 +121,7 @@ pub fn reference_scene() -> SceneFrame {
     frame
 }
 
-/// One compiled+linked program with the attribute/uniform locations the
-/// encoder binds every frame.
-struct Program {
-    program: WebGlProgram,
-    u_view_proj: WebGlUniformLocation,
-}
-
-/// The encoder: owns the XR-compatible context and the vertex buffers.
-pub struct GlEncoder {
-    canvas: web_sys::HtmlCanvasElement,
-    gl: Gl,
-    solid: Program,
-    vbo_tris: WebGlBuffer,
-    vbo_lines: WebGlBuffer,
-    tri_count: i32,
-    line_count: i32,
-}
+// ---- shaders -------------------------------------------------------------
 
 const VS_SOLID: &str = r"#version 300 es
 layout(location = 0) in vec3 aPos;
@@ -157,10 +143,125 @@ void main() {
 }
 ";
 
+const VS_PANEL: &str = r"#version 300 es
+layout(location = 0) in vec2 aUnit;
+uniform mat4 uViewProj;
+uniform vec3 uCenter;
+uniform vec3 uRight;
+uniform vec3 uUp;
+uniform vec2 uHalf;
+out vec2 vLocal;
+void main() {
+    vLocal = aUnit * uHalf;
+    vec3 world = uCenter + uRight * vLocal.x + uUp * vLocal.y;
+    gl_Position = uViewProj * vec4(world, 1.0);
+}
+";
+
+const FS_PANEL: &str = r"#version 300 es
+precision mediump float;
+in vec2 vLocal;
+uniform vec2 uHalf;
+uniform float uRadius;
+uniform vec4 uFill;
+uniform vec4 uBorder;
+uniform float uBorderW;
+out vec4 outColor;
+void main() {
+    // Rounded-box SDF in panel-local meters.
+    vec2 b = uHalf - vec2(uRadius);
+    vec2 q = abs(vLocal) - b;
+    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - uRadius;
+    float aa = fwidth(d) * 1.25 + 1e-6;
+    float inside = 1.0 - smoothstep(0.0, aa, d);
+    vec4 col = uFill;
+    if (uBorderW > 0.0) {
+        float t = smoothstep(-uBorderW - aa, -uBorderW + aa, d);
+        col = mix(uFill, uBorder, t);
+    }
+    float alpha = col.a * inside;
+    // Transparent corners must not write depth — they'd clip content
+    // behind the rounded cutout.
+    if (alpha <= 0.004) discard;
+    outColor = vec4(col.rgb, alpha);
+}
+";
+
+const VS_TEXT: &str = r"#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aUv;
+layout(location = 2) in vec4 aColor;
+uniform mat4 uViewProj;
+out vec2 vUv;
+out vec4 vColor;
+void main() {
+    vUv = aUv;
+    vColor = aColor;
+    gl_Position = uViewProj * vec4(aPos, 1.0);
+}
+";
+
+const FS_TEXT: &str = r"#version 300 es
+precision mediump float;
+in vec2 vUv;
+in vec4 vColor;
+uniform sampler2D uAtlas;
+out vec4 outColor;
+void main() {
+    float coverage = texture(uAtlas, vUv).r;
+    outColor = vec4(vColor.rgb, vColor.a * coverage);
+}
+";
+
+// ---- programs ------------------------------------------------------------
+
+struct SolidProgram {
+    program: WebGlProgram,
+    u_view_proj: WebGlUniformLocation,
+}
+
+struct PanelProgram {
+    program: WebGlProgram,
+    u_view_proj: WebGlUniformLocation,
+    u_center: WebGlUniformLocation,
+    u_right: WebGlUniformLocation,
+    u_up: WebGlUniformLocation,
+    u_half: WebGlUniformLocation,
+    u_radius: WebGlUniformLocation,
+    u_fill: WebGlUniformLocation,
+    u_border: WebGlUniformLocation,
+    u_border_w: WebGlUniformLocation,
+}
+
+struct TextProgram {
+    program: WebGlProgram,
+    u_view_proj: WebGlUniformLocation,
+    u_atlas: WebGlUniformLocation,
+}
+
+/// The encoder: owns the XR-compatible context, the programs, and the
+/// per-scene vertex buffers.
+pub struct GlEncoder {
+    canvas: web_sys::HtmlCanvasElement,
+    gl: Gl,
+    solid: SolidProgram,
+    panel: PanelProgram,
+    text: TextProgram,
+    vbo_tris: WebGlBuffer,
+    vbo_lines: WebGlBuffer,
+    vbo_text: WebGlBuffer,
+    vbo_unit: WebGlBuffer,
+    tri_count: i32,
+    line_count: i32,
+    text_count: i32,
+    panels: Vec<PanelInstance>,
+    atlas: Option<GlyphAtlas>,
+}
+
 impl GlEncoder {
     /// Create the hidden canvas + XR-compatible WebGL2 context and compile
-    /// the base program. The canvas is never attached to the DOM — the
-    /// context exists to feed `XRWebGLLayer`.
+    /// the programs. The canvas is never attached to the DOM — the context
+    /// exists to feed `XRWebGLLayer`.
     pub fn new() -> Result<GlEncoder, JsValue> {
         let document = web_sys::window()
             .and_then(|w| w.document())
@@ -178,13 +279,48 @@ impl GlEncoder {
             .dyn_into()
             .map_err(|_| JsValue::from_str("xr-web: WebGL2 context has unexpected type"))?;
 
-        let solid = compile_program(&gl, VS_SOLID, FS_SOLID)?;
-        let vbo_tris = gl
-            .create_buffer()
-            .ok_or_else(|| JsValue::from_str("xr-web: buffer alloc failed"))?;
-        let vbo_lines = gl
-            .create_buffer()
-            .ok_or_else(|| JsValue::from_str("xr-web: buffer alloc failed"))?;
+        let solid_raw = compile_program(&gl, VS_SOLID, FS_SOLID)?;
+        let solid = SolidProgram {
+            u_view_proj: uniform(&gl, &solid_raw, "uViewProj")?,
+            program: solid_raw,
+        };
+        let panel_raw = compile_program(&gl, VS_PANEL, FS_PANEL)?;
+        let panel = PanelProgram {
+            u_view_proj: uniform(&gl, &panel_raw, "uViewProj")?,
+            u_center: uniform(&gl, &panel_raw, "uCenter")?,
+            u_right: uniform(&gl, &panel_raw, "uRight")?,
+            u_up: uniform(&gl, &panel_raw, "uUp")?,
+            u_half: uniform(&gl, &panel_raw, "uHalf")?,
+            u_radius: uniform(&gl, &panel_raw, "uRadius")?,
+            u_fill: uniform(&gl, &panel_raw, "uFill")?,
+            u_border: uniform(&gl, &panel_raw, "uBorder")?,
+            u_border_w: uniform(&gl, &panel_raw, "uBorderW")?,
+            program: panel_raw,
+        };
+        let text_raw = compile_program(&gl, VS_TEXT, FS_TEXT)?;
+        let text = TextProgram {
+            u_view_proj: uniform(&gl, &text_raw, "uViewProj")?,
+            u_atlas: uniform(&gl, &text_raw, "uAtlas")?,
+            program: text_raw,
+        };
+
+        let make_buffer = || {
+            gl.create_buffer()
+                .ok_or_else(|| JsValue::from_str("xr-web: buffer alloc failed"))
+        };
+        let vbo_tris = make_buffer()?;
+        let vbo_lines = make_buffer()?;
+        let vbo_text = make_buffer()?;
+        let vbo_unit = make_buffer()?;
+
+        // Static unit quad for the panel program.
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo_unit));
+        let unit: [f32; 12] = [
+            -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, //
+            -1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+        ];
+        let unit_view = js_sys::Float32Array::from(unit.as_slice());
+        gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &unit_view, Gl::STATIC_DRAW);
 
         gl.enable(Gl::DEPTH_TEST);
         gl.depth_func(Gl::LEQUAL);
@@ -200,10 +336,17 @@ impl GlEncoder {
             canvas,
             gl,
             solid,
+            panel,
+            text,
             vbo_tris,
             vbo_lines,
+            vbo_text,
+            vbo_unit,
             tri_count: 0,
             line_count: 0,
+            text_count: 0,
+            panels: Vec::new(),
+            atlas: None,
         })
     }
 
@@ -230,8 +373,50 @@ impl GlEncoder {
         &self.canvas
     }
 
-    /// Upload the frame's vertex streams (copying — no unsafe views).
-    pub fn upload(&mut self, frame: &SceneFrame) {
+    /// Bake the glyph atlas on first use. Failure is survivable: text
+    /// simply doesn't upload, and the caller falls back to approximate
+    /// measurement.
+    pub(crate) fn ensure_atlas(&mut self) -> bool {
+        if self.atlas.is_some() {
+            return true;
+        }
+        match GlyphAtlas::bake(&self.gl) {
+            Ok(atlas) => {
+                self.atlas = Some(atlas);
+                true
+            }
+            Err(err) => {
+                web_sys::console::warn_2(&"xr-web: glyph atlas bake failed".into(), &err);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn atlas(&self) -> Option<&GlyphAtlas> {
+        self.atlas.as_ref()
+    }
+
+    /// Upload a full scene build: line/tri streams, panel instances, and
+    /// atlas-laid text (copying — no unsafe views).
+    pub(crate) fn upload_batches(&mut self, batches: &SceneBatches) {
+        self.upload_streams(&batches.frame);
+        self.panels = batches.panels.clone();
+
+        let mut text_vertices: Vec<f32> = Vec::new();
+        if let Some(atlas) = self.atlas.as_ref() {
+            for run in &batches.texts {
+                atlas.layout_run(run, &mut text_vertices);
+            }
+        }
+        let gl = &self.gl;
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_text));
+        let view = js_sys::Float32Array::from(text_vertices.as_slice());
+        gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &view, Gl::DYNAMIC_DRAW);
+        self.text_count = (text_vertices.len() / TEXT_VERTEX_STRIDE) as i32;
+    }
+
+    /// Upload only the raw line/tri streams (the hardware smoke path).
+    pub fn upload_streams(&mut self, frame: &SceneFrame) {
         let gl = &self.gl;
         gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_tris));
         let data = js_sys::Float32Array::from(frame.tris.as_slice());
@@ -257,6 +442,7 @@ impl GlEncoder {
         let gl = &self.gl;
         gl.bind_framebuffer(Gl::FRAMEBUFFER, framebuffer);
         gl.viewport(0, 0, width, height);
+        gl.depth_mask(true);
         if passthrough {
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
         } else {
@@ -265,23 +451,92 @@ impl GlEncoder {
         gl.clear(Gl::COLOR_BUFFER_BIT | Gl::DEPTH_BUFFER_BIT);
     }
 
-    /// Draw the uploaded streams for one view.
+    /// Draw the uploaded scene for one view: panels (depth-writing),
+    /// then streams, then text (depth-tested, non-writing).
     pub fn draw_view(&self, view_proj: &Mat4, viewport: (i32, i32, i32, i32)) {
         let gl = &self.gl;
         let (x, y, w, h) = viewport;
         gl.viewport(x, y, w, h);
-        gl.use_program(Some(&self.solid.program));
-        gl.uniform_matrix4fv_with_f32_array(Some(&self.solid.u_view_proj), false, &view_proj.0);
 
-        if self.tri_count > 0 {
-            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_tris));
-            bind_pos_color_layout(gl);
-            gl.draw_arrays(Gl::TRIANGLES, 0, self.tri_count);
+        if !self.panels.is_empty() {
+            gl.use_program(Some(&self.panel.program));
+            gl.uniform_matrix4fv_with_f32_array(
+                Some(&self.panel.u_view_proj),
+                false,
+                &view_proj.0,
+            );
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_unit));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 8, 0);
+            gl.disable_vertex_attrib_array(1);
+            for p in &self.panels {
+                gl.uniform3f(Some(&self.panel.u_center), p.center.x, p.center.y, p.center.z);
+                gl.uniform3f(Some(&self.panel.u_right), p.right.x, p.right.y, p.right.z);
+                gl.uniform3f(Some(&self.panel.u_up), p.up.x, p.up.y, p.up.z);
+                gl.uniform2f(Some(&self.panel.u_half), p.half_w, p.half_h);
+                gl.uniform1f(Some(&self.panel.u_radius), p.radius.min(p.half_w).min(p.half_h));
+                gl.uniform4f(
+                    Some(&self.panel.u_fill),
+                    p.fill[0],
+                    p.fill[1],
+                    p.fill[2],
+                    p.fill[3],
+                );
+                gl.uniform4f(
+                    Some(&self.panel.u_border),
+                    p.border[0],
+                    p.border[1],
+                    p.border[2],
+                    p.border[3],
+                );
+                gl.uniform1f(Some(&self.panel.u_border_w), p.border_w);
+                gl.draw_arrays(Gl::TRIANGLES, 0, 6);
+            }
         }
-        if self.line_count > 0 {
-            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_lines));
-            bind_pos_color_layout(gl);
-            gl.draw_arrays(Gl::LINES, 0, self.line_count);
+
+        if self.tri_count > 0 || self.line_count > 0 {
+            gl.use_program(Some(&self.solid.program));
+            gl.uniform_matrix4fv_with_f32_array(
+                Some(&self.solid.u_view_proj),
+                false,
+                &view_proj.0,
+            );
+            if self.tri_count > 0 {
+                gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_tris));
+                bind_pos_color_layout(gl);
+                gl.draw_arrays(Gl::TRIANGLES, 0, self.tri_count);
+            }
+            if self.line_count > 0 {
+                gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_lines));
+                bind_pos_color_layout(gl);
+                gl.draw_arrays(Gl::LINES, 0, self.line_count);
+            }
+        }
+
+        if self.text_count > 0 {
+            if let Some(atlas) = self.atlas.as_ref() {
+                gl.use_program(Some(&self.text.program));
+                gl.uniform_matrix4fv_with_f32_array(
+                    Some(&self.text.u_view_proj),
+                    false,
+                    &view_proj.0,
+                );
+                gl.active_texture(Gl::TEXTURE0);
+                gl.bind_texture(Gl::TEXTURE_2D, Some(atlas.texture()));
+                gl.uniform1i(Some(&self.text.u_atlas), 0);
+                gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_text));
+                let stride = (TEXT_VERTEX_STRIDE * 4) as i32;
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_with_i32(0, 3, Gl::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_with_i32(1, 2, Gl::FLOAT, false, stride, 12);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_with_i32(2, 4, Gl::FLOAT, false, stride, 20);
+                gl.depth_mask(false);
+                gl.draw_arrays(Gl::TRIANGLES, 0, self.text_count);
+                gl.depth_mask(true);
+                gl.disable_vertex_attrib_array(2);
+            }
         }
     }
 }
@@ -295,7 +550,12 @@ fn bind_pos_color_layout(gl: &Gl) {
     gl.vertex_attrib_pointer_with_i32(1, 4, Gl::FLOAT, false, stride, 12);
 }
 
-fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<Program, JsValue> {
+fn uniform(gl: &Gl, program: &WebGlProgram, name: &str) -> Result<WebGlUniformLocation, JsValue> {
+    gl.get_uniform_location(program, name)
+        .ok_or_else(|| JsValue::from_str(&format!("xr-web: uniform {name} missing")))
+}
+
+fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<WebGlProgram, JsValue> {
     let vs = compile_shader(gl, Gl::VERTEX_SHADER, vs)?;
     let fs = compile_shader(gl, Gl::FRAGMENT_SHADER, fs)?;
     let program = gl
@@ -314,20 +574,10 @@ fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<Program, JsValue> {
             .unwrap_or_else(|| "unknown link error".into());
         return Err(JsValue::from_str(&format!("xr-web: link failed: {log}")));
     }
-    let u_view_proj = gl
-        .get_uniform_location(&program, "uViewProj")
-        .ok_or_else(|| JsValue::from_str("xr-web: uViewProj missing"))?;
-    Ok(Program {
-        program,
-        u_view_proj,
-    })
+    Ok(program)
 }
 
-fn compile_shader(
-    gl: &Gl,
-    kind: u32,
-    source: &str,
-) -> Result<web_sys::WebGlShader, JsValue> {
+fn compile_shader(gl: &Gl, kind: u32, source: &str) -> Result<web_sys::WebGlShader, JsValue> {
     let shader = gl
         .create_shader(kind)
         .ok_or_else(|| JsValue::from_str("xr-web: shader alloc failed"))?;

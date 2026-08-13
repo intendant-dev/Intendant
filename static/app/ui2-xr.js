@@ -51,13 +51,18 @@ async function ensureXr() {
   }
   xrInstance = new xrWasmModule.XrWeb();
   xrInstance.setActionCallback((action) => {
-    // Same dispatch seam as the other rendered surface: actions carry the
-    // dashboard's action vocabulary and route into the one control plane.
-    // The router hookup lands with the input commits; log until then so
-    // dev-gate testing shows the emissions.
+    // Same dispatch seam as the other rendered surface: the emitted
+    // objects carry the dashboard's action vocabulary and route through
+    // the SAME router (approvals → send_approval / resolvePeerApproval).
     try {
-      console.log('[xr] action', action);
-    } catch { /* console absent: drop */ }
+      if (typeof handleStationAction === 'function') {
+        handleStationAction(action);
+      } else {
+        console.warn('[xr] no action router in this build', action);
+      }
+    } catch (err) {
+      console.warn('[xr] action dispatch failed', err, action);
+    }
   });
   xrInstance.setOnSessionEnd(() => {
     xrStopSnapshotPump();
