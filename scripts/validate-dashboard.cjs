@@ -189,6 +189,16 @@ const XR_PROBE_SNAPSHOT = {
       sessionId: 'probe-session-2', source: 'codex',
     },
   ],
+  // Thread lines for the approval agent: enough rows that the focused
+  // workbench deepens AND overflows, so the probe can exercise paging.
+  events: Array.from({ length: 24 }, (_, i) => ({
+    sessionId: 'probe-session-2',
+    agentId: 'xr-probe-a2',
+    source: i % 3 === 0 ? 'messages_input' : 'agent_output',
+    level: 'info',
+    ts: '12:00',
+    msg: `probe thread line ${i}: the deliberate confirm hold keeps approvals off stray pinches`,
+  })),
 };
 
 const BROWSER_EXECUTABLE_ENVS = [
@@ -667,6 +677,18 @@ function withLoopbackToken(rawUrl, env) {
   }
 }
 
+// Strip the parse-time token and re-run discovery against the per-port
+// file the freshly launched daemon has (re)written by readiness time.
+function refreshLaunchedDashboardToken(rawUrl, env) {
+  try {
+    const url = new URL(rawUrl);
+    url.searchParams.delete('token');
+    return withLoopbackToken(url.toString(), env);
+  } catch (_) {
+    return rawUrl;
+  }
+}
+
 function validateDashboardLaunchOptions(opts) {
   const port = dashboardLaunchPort(opts);
   if (port === PROTECTED_DASHBOARD_PORT) {
@@ -797,6 +819,13 @@ async function main() {
     launchEnv = resolveLaunchEnvironment(opts);
     if (opts.launchDashboard) {
       dashboard = await TemporaryDashboard.launch(opts, launchEnv);
+      // Loopback admission tokens rotate every daemon boot and the URL
+      // was composed at argument parse — before this daemon existed — so
+      // it carries the PREVIOUS boot's token and every authenticated
+      // lane (WS, /api/*, wasm assets) 401s. Recompose from the file the
+      // just-booted daemon persisted. An INTENDANT_LOOPBACK_TOKEN env
+      // override still wins inside withLoopbackToken.
+      opts.url = refreshLaunchedDashboardToken(opts.url, launchEnv.env || process.env);
     }
     const staticIdentity = opts.requireCurrentStatic
       ? await validateCurrentStaticIdentity(opts.url, process.cwd())
@@ -2353,11 +2382,18 @@ class BrowserHarness {
   /// routed) approval dispatch. Throws on the first failed stage.
   async runXrProbe(opts) {
     const timeoutMs = opts.timeoutMs;
-    // The dev-gated chip appears once the async support probe resolves.
-    await this.waitForFunction(
-      "typeof xrProbe !== 'undefined' && !!document.getElementById('ui2-xr-chip')",
-      timeoutMs,
-    );
+    // The chip appears once the async support probe resolves. On failure,
+    // dump the surface state — chip-mount flakes are otherwise opaque.
+    const chipDiag = "JSON.stringify({ xrProbeType: typeof xrProbe, chip: !!document.getElementById('ui2-xr-chip'), nav: !!navigator.xr, oversight: !!document.getElementById('ui2-oversight'), support: (typeof xrProbe !== 'undefined') ? xrProbe.support() : null })";
+    try {
+      await this.waitForFunction(
+        "typeof xrProbe !== 'undefined' && !!document.getElementById('ui2-xr-chip')",
+        timeoutMs,
+      );
+    } catch (error) {
+      const diag = await this.evaluate(chipDiag).catch(() => 'unavailable');
+      throw new Error(`xr probe: chip never mounted — ${String(diag)} (${error.message})`);
+    }
     // Enter (chip click path) and wait for a live stereo loop.
     await this.evaluate('xrProbe.enter()');
     await this.waitForFunction(
@@ -2388,6 +2424,12 @@ class BrowserHarness {
       "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.hitTargets.includes('pill:xr-probe-a2:approve'))",
       timeoutMs,
     );
+    // The focused session's thread renders on the deep workbench, pinned
+    // to the live tail with the older-page pill armed.
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.transcript.rows > 0 && d.scene.transcript.scroll === 0 && d.scene.hitTargets.includes('scroll:older'))",
+      timeoutMs,
+    );
     // Approve through the same dispatch path, captured instead of routed.
     await this.evaluate('xrProbe.captureOnly(true)');
     const fired = await this.evaluate("xrProbe.activate('pill:xr-probe-a2:approve')");
@@ -2395,9 +2437,6 @@ class BrowserHarness {
       throw new Error('xr probe: approve activation was refused');
     }
     const action = await this.evaluate('JSON.stringify(xrProbe.lastAction || null)');
-    await this.evaluate(
-      '(() => { xrProbe.captureOnly(false); if (window.__xrProbeHold) { clearInterval(window.__xrProbeHold); window.__xrProbeHold = null; } return true; })()',
-    );
     const parsedAction = JSON.parse(String(action || 'null'));
     if (
       !parsedAction
@@ -2408,14 +2447,90 @@ class BrowserHarness {
     ) {
       throw new Error(`xr probe: captured approval action malformed: ${action}`);
     }
+    // Page the transcript back and return to the tail through the same
+    // activation-by-name contract the pinch path uses.
+    const pagedOlder = await this.evaluate("xrProbe.activate('scroll:older')");
+    if (pagedOlder !== true) {
+      throw new Error('xr probe: transcript older-page activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.transcript.scroll > 0 && d.scene.hitTargets.includes('scroll:newer'))",
+      timeoutMs,
+    );
+    const pagedNewer = await this.evaluate("xrProbe.activate('scroll:newer')");
+    if (pagedNewer !== true) {
+      throw new Error('xr probe: transcript newer-page activation was refused');
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.scene.transcript.scroll === 0)',
+      timeoutMs,
+    );
+    // Terminal pane (slice 1, read-only watching). The summon pill is a
+    // standing hit target; a headless page never armed the flat tab's
+    // shell, so opening must land on the honest empty state
+    // (present=false → "no terminals" in-scene).
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('terminal:toggle'))",
+      timeoutMs,
+    );
+    const termOpened = await this.evaluate("xrProbe.activate('terminal:toggle')");
+    if (termOpened !== true) {
+      throw new Error('xr probe: terminal toggle activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.terminal && d.terminal.open === true"
+        + " && d.terminal.present === false"
+        + " && d.scene.hitTargets.includes('terminal:close'))",
+      timeoutMs,
+    );
+    // Canvas seam end to end: register a painted canvas through the
+    // facade (the same calls the page painter makes), mark it dirty, and
+    // the pane must adopt it — hasCanvas plus an advancing generation.
+    await this.evaluate(`(() => {
+      const c = document.createElement('canvas');
+      c.width = 64; c.height = 32;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 64, 32);
+      xrProbe.terminal.registerCanvas('probe-term', c);
+      xrProbe.terminal.update({
+        present: true, live: true, label: 'shell-0 · probe',
+        status: 'Connected to probe', statusKind: 'ok', aspect: 0.5,
+      });
+      xrProbe.terminal.markDirty('probe-term');
+      return true;
+    })()`);
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.terminal.present === true'
+        + ' && d.terminal.hasCanvas === true && d.terminal.canvasGeneration >= 2'
+        + ' && d.terminal.parseErrors === 0)',
+      timeoutMs,
+    );
+    const termClosed = await this.evaluate("xrProbe.activate('terminal:close')");
+    if (termClosed !== true) {
+      throw new Error('xr probe: terminal close activation was refused');
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.terminal.open === false)',
+      timeoutMs,
+    );
+    const terminalSummary = await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.terminal))',
+    );
     const summary = await this.evaluate(
-      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
+      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, transcriptRows: d.scene.transcript.rows, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
+    );
+    // Release the synthetic-state hold only after every assertion has
+    // read from it — the page's own 300 ms pump (real, mostly-empty
+    // dashboard state) wins the race the moment the hold stops.
+    await this.evaluate(
+      '(() => { xrProbe.captureOnly(false); if (window.__xrProbeHold) { clearInterval(window.__xrProbeHold); window.__xrProbeHold = null; } return true; })()',
     );
     const report = JSON.parse(String(summary));
     if (report.parseErrors > 0) {
       throw new Error(`xr probe: snapshot parse errors: ${report.parseErrors}`);
     }
     report.action = parsedAction;
+    report.terminal = JSON.parse(String(terminalSummary || 'null'));
     report.ok = true;
     return report;
   }
@@ -3866,7 +3981,8 @@ class BoundedLog {
 
 function formatXrProbeLine(report) {
   return `xr probe: ok — frames=${report.frames} views=${report.views} panels=${report.panels} `
-    + `texts=${report.texts} hits=${report.hits} passthrough=${report.passthrough} `
+    + `texts=${report.texts} hits=${report.hits} transcriptRows=${report.transcriptRows} `
+    + `passthrough=${report.passthrough} `
     + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'}`;
 }
 

@@ -6,9 +6,10 @@
 //! face so near-field text stays crisp at headset pixel densities; glyph
 //! quads carry per-run color, so one atlas serves every text role.
 //!
-//! ASCII 32..=126 plus '…'. Unknown characters fall back to '?' — the
-//! feed is UTF-8 but the operator surface vocabulary is ASCII-dominant;
-//! full shaping is explicitly out of scope for milestone 1.
+//! ASCII 32..=126 plus the scene's own punctuation ([`SPECIAL_GLYPHS`]).
+//! Unknown characters fall back to '?' — the feed is UTF-8 but the
+//! operator surface vocabulary is ASCII-dominant; full shaping is
+//! explicitly out of scope for milestone 1.
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -31,8 +32,13 @@ const FONT_SPEC: &str = "600 48px 'Hanken Grotesk', ui-sans-serif, system-ui, sa
 
 const GLYPH_FIRST: u32 = 32; // ' '
 const GLYPH_LAST: u32 = 126; // '~'
+/// Non-ASCII punctuation the scene vocabulary actually uses (host-row
+/// and status separators, truncation, the terminal pane's copy) — baked
+/// after the ASCII range so it never hits the '?' fallback. Everything
+/// else still does; full shaping stays out of scope.
+const SPECIAL_GLYPHS: [char; 3] = ['…', '—', '·'];
 const ELLIPSIS_INDEX: usize = (GLYPH_LAST - GLYPH_FIRST + 1) as usize;
-const GLYPH_COUNT: usize = ELLIPSIS_INDEX + 1;
+const GLYPH_COUNT: usize = ELLIPSIS_INDEX + SPECIAL_GLYPHS.len();
 
 /// Measurement abstraction so layout code (and its host tests) never
 /// needs a live atlas.
@@ -62,16 +68,19 @@ fn glyph_index(c: char) -> usize {
     let code = c as u32;
     if (GLYPH_FIRST..=GLYPH_LAST).contains(&code) {
         (code - GLYPH_FIRST) as usize
-    } else if c == '…' {
-        ELLIPSIS_INDEX
+    } else if let Some(i) = SPECIAL_GLYPHS.iter().position(|&s| s == c) {
+        ELLIPSIS_INDEX + i
     } else {
         ('?' as u32 - GLYPH_FIRST) as usize
     }
 }
 
 fn glyph_char(index: usize) -> char {
-    if index == ELLIPSIS_INDEX {
-        '…'
+    if index >= ELLIPSIS_INDEX {
+        SPECIAL_GLYPHS
+            .get(index - ELLIPSIS_INDEX)
+            .copied()
+            .unwrap_or('?')
     } else {
         char::from_u32(GLYPH_FIRST + index as u32).unwrap_or('?')
     }
@@ -265,3 +274,24 @@ impl TextMeasure for GlyphAtlas {
 
 /// Floats per text vertex: pos3 + uv2 + rgba4.
 pub(crate) const TEXT_VERTEX_STRIDE: usize = 9;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_mapping_covers_ascii_specials_and_falls_back() {
+        assert_eq!(glyph_index(' '), 0);
+        assert_eq!(glyph_index('~'), (GLYPH_LAST - GLYPH_FIRST) as usize);
+        assert_eq!(glyph_index('…'), ELLIPSIS_INDEX);
+        // The separators the scene vocabulary uses must never render '?'.
+        let question = glyph_index('?');
+        assert_ne!(glyph_index('—'), question);
+        assert_ne!(glyph_index('·'), question);
+        assert_eq!(glyph_index('☃'), question);
+        // Round trip: every index names the char that maps back to it.
+        for i in 0..GLYPH_COUNT {
+            assert_eq!(glyph_index(glyph_char(i)), i);
+        }
+    }
+}
