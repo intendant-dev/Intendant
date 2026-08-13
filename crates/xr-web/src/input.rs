@@ -112,6 +112,16 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
             inner.selected_id = Some(hit.agent_id.clone());
         }
     }
+    // Terminal pane affordances (summon/dismiss) are light acts: they
+    // resolve on release like cards, never a hold.
+    let released_kind = inner
+        .hit_targets
+        .iter()
+        .find(|h| h.id == target)
+        .map(|h| h.kind);
+    if let Some(kind) = released_kind {
+        crate::terminal::handle_release(inner, kind);
+    }
 }
 
 /// Fire a hit target's action through the dashboard's action router.
@@ -131,6 +141,9 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
             inner.selected_id = Some(hit.agent_id);
             inner.ui_dirty = true;
             true
+        }
+        HitKind::TerminalToggle | HitKind::TerminalClose => {
+            crate::terminal::handle_release(inner, hit.kind)
         }
         HitKind::Approve | HitKind::Deny => {
             let decision = if hit.kind == HitKind::Approve {

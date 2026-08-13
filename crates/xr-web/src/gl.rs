@@ -308,6 +308,10 @@ pub struct GlEncoder {
     panels: Vec<PanelInstance>,
     monitors: Vec<MonitorInstance>,
     video_textures: std::collections::HashMap<String, web_sys::WebGlTexture>,
+    /// Canvas-backed monitor textures (the terminal pane's painter),
+    /// keyed like `video_textures`; the u64 is the last-uploaded paint
+    /// generation so an idle canvas costs no texture bandwidth.
+    canvas_textures: std::collections::HashMap<String, (web_sys::WebGlTexture, u64)>,
     atlas: Option<GlyphAtlas>,
 }
 
@@ -415,6 +419,7 @@ impl GlEncoder {
             panels: Vec::new(),
             monitors: Vec::new(),
             video_textures: std::collections::HashMap::new(),
+            canvas_textures: std::collections::HashMap::new(),
             atlas: None,
         })
     }
@@ -501,6 +506,64 @@ impl GlEncoder {
                 Gl::UNSIGNED_BYTE,
                 video,
             );
+        }
+    }
+
+    /// Refresh (or create/retire) canvas-backed monitor textures — the
+    /// canvas-source variant of the video path above, for sources that
+    /// repaint sparsely (the terminal painter) instead of every frame.
+    /// `texImage2D` re-uploads only when a source's paint generation
+    /// advanced past the stored one.
+    pub(crate) fn update_canvas_textures(
+        &mut self,
+        sources: &[(String, web_sys::HtmlCanvasElement, u64)],
+    ) {
+        let gl = &self.gl;
+        let live: std::collections::HashSet<&str> =
+            sources.iter().map(|(id, _, _)| id.as_str()).collect();
+        self.canvas_textures.retain(|id, (tex, _)| {
+            let keep = live.contains(id.as_str());
+            if !keep {
+                gl.delete_texture(Some(tex));
+            }
+            keep
+        });
+        for (id, canvas, generation) in sources {
+            if canvas.width() == 0 || canvas.height() == 0 {
+                continue;
+            }
+            let entry = match self.canvas_textures.entry(id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(tex) = gl.create_texture() else {
+                        continue;
+                    };
+                    gl.bind_texture(Gl::TEXTURE_2D, Some(&tex));
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+                    // Force the first upload whatever the generation.
+                    e.insert((tex, generation.wrapping_sub(1)))
+                }
+            };
+            if entry.1 == *generation {
+                continue;
+            }
+            gl.bind_texture(Gl::TEXTURE_2D, Some(&entry.0));
+            if gl
+                .tex_image_2d_with_u32_and_u32_and_html_canvas_element(
+                    Gl::TEXTURE_2D,
+                    0,
+                    Gl::RGBA as i32,
+                    Gl::RGBA,
+                    Gl::UNSIGNED_BYTE,
+                    canvas,
+                )
+                .is_ok()
+            {
+                entry.1 = *generation;
+            }
         }
     }
 
@@ -628,7 +691,13 @@ impl GlEncoder {
             gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 8, 0);
             gl.disable_vertex_attrib_array(1);
             for m in &self.monitors {
-                let Some(texture) = self.video_textures.get(&m.id) else {
+                // Monitor quads draw from either source kind: live
+                // videos or painter canvases, same id-keyed seam.
+                let Some(texture) = self
+                    .video_textures
+                    .get(&m.id)
+                    .or_else(|| self.canvas_textures.get(&m.id).map(|(tex, _)| tex))
+                else {
                     continue;
                 };
                 gl.bind_texture(Gl::TEXTURE_2D, Some(texture));

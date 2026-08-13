@@ -383,8 +383,12 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
             );
         }
     }
+    // The terminal painter's canvas rides the same per-frame texture
+    // pass; uploads are generation-gated inside the encoder.
+    let canvas_sources = inner.terminal.canvas_uploads();
     if let Some(encoder) = inner.encoder.as_mut() {
         encoder.update_video_textures(&video_sources);
+        encoder.update_canvas_textures(&canvas_sources);
         encoder.upload_pointer(&pointer.lines);
     }
 
@@ -393,6 +397,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let hover = inner.hover_id.clone();
         let confirm = inner.confirm_progress.clone();
         let snapshot = inner.model.clone().unwrap_or_default();
+        let terminal_view = inner.terminal.pane_view();
         let display_meta: Vec<(String, String)> = inner
             .displays
             .iter()
@@ -416,6 +421,15 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
                 passthrough,
+                floor_y,
+                measure,
+                &mut batches,
+            );
+            // Terminal affordances append to the same batches: the
+            // summon pill always, the pane while open (terminal.rs).
+            crate::terminal::build_pane(
+                &terminal_view,
+                hover.as_deref(),
                 floor_y,
                 measure,
                 &mut batches,

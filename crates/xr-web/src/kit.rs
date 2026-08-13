@@ -90,12 +90,15 @@ pub(crate) struct TextRun {
 }
 
 /// What a ray can land on. The input layer maps (kind, agent) onto the
-/// dashboard's action vocabulary.
+/// dashboard's action vocabulary. The terminal kinds are scene-local
+/// (pane summon/dismiss — light acts, no daemon action behind them).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HitKind {
     Card,
     Approve,
     Deny,
+    TerminalToggle,
+    TerminalClose,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +167,21 @@ pub(crate) const WORKBENCH_HALF_H: f32 = 0.23;
 /// Approval banner floats above the workbench line.
 pub(crate) const BANNER_DIST: f32 = 1.1;
 pub(crate) const BANNER_Y: f32 = 1.78;
+
+/// Terminal pane: a fixed slot on the operator's right, mirroring how
+/// the monitor stack sits on the left (same distance, opposite azimuth).
+pub(crate) const TERMINAL_AZ: f32 = 0.66;
+pub(crate) const TERMINAL_DIST: f32 = 1.85;
+pub(crate) const TERMINAL_HALF_W: f32 = 0.60;
+pub(crate) const TERMINAL_Y: f32 = 1.42;
+/// Height/width fallback before the first painted frame reports the real
+/// canvas aspect (80x24 cells at the painter's cell metrics).
+pub(crate) const TERMINAL_DEFAULT_ASPECT: f32 = 0.625;
+/// Summon pill: nearer and lower than the pane, on the workbench's
+/// right sightline.
+pub(crate) const TERMINAL_PILL_AZ: f32 = 0.50;
+pub(crate) const TERMINAL_PILL_DIST: f32 = 1.30;
+pub(crate) const TERMINAL_PILL_Y: f32 = 1.05;
 
 /// A slot on the shelf cylinder: `index` within `count` cards on `row`
 /// (0 = top). Returns (center, right, up); the panel normal faces the
