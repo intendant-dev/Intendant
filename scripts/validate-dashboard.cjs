@@ -2393,8 +2393,11 @@ class BrowserHarness {
 
   /// --xr-probe: drive the XR surface end to end against the injected
   /// WebXR shim — enter, stereo frames, scene build from a synthetic
-  /// snapshot, activation-by-name selection, and a captured (never
-  /// routed) approval dispatch. Throws on the first failed stage.
+  /// snapshot, activation-by-name selection, a captured (never routed)
+  /// approval dispatch, the terminal pane pass, the agenda rail, and the
+  /// voice hold-to-talk pass (captured talk verbs, a shim transcript
+  /// through the real facade seam, the text-commit contract shape —
+  /// no mic, no ASR). Throws on the first failed stage.
   async runXrProbe(opts) {
     const timeoutMs = opts.timeoutMs;
     // The chip appears once the async support probe resolves. On failure,
@@ -2553,6 +2556,91 @@ class BrowserHarness {
       "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.transcript.rows > 0)",
       timeoutMs,
     );
+    // Voice input (hold-to-talk). Deterministic shim lane end to end:
+    // the talk pill is a standing hit target; activation-by-name toggles
+    // the capture (start/stop actions captured, never routed — the mic
+    // and real ASR are never touched); a fake transcript injected
+    // through the SAME JS seam the capture lane uses must land on the
+    // preview strip; "use" must emit the text-commit contract shape.
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('voice:talk') && d.voice.phase === 'idle')",
+      timeoutMs,
+    );
+    const talkStarted = await this.evaluate("xrProbe.activate('voice:talk')");
+    if (talkStarted !== true) {
+      throw new Error('xr probe: talk activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'listening')",
+      timeoutMs,
+    );
+    const startAction = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (!startAction || startAction.type !== 'voice_talk' || startAction.phase !== 'start') {
+      throw new Error(`xr probe: captured talk-start action malformed: ${JSON.stringify(startAction)}`);
+    }
+    const talkStopped = await this.evaluate("xrProbe.activate('voice:talk')");
+    if (talkStopped !== true) {
+      throw new Error('xr probe: talk stop activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'transcribing')",
+      timeoutMs,
+    );
+    const stopAction = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (!stopAction || stopAction.type !== 'voice_talk' || stopAction.phase !== 'stop') {
+      throw new Error(`xr probe: captured talk-stop action malformed: ${JSON.stringify(stopAction)}`);
+    }
+    // Inject the utterance through the probe seam (same facade call the
+    // JS capture lane makes) — it must land as the preview strip with
+    // use/discard pills, never auto-send.
+    await this.evaluate("xrProbe.voice.result('open the build logs')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'result' && d.voice.result === 'open the build logs'"
+        + " && d.scene.hitTargets.includes('voice:use') && d.scene.hitTargets.includes('voice:discard'))",
+      timeoutMs,
+    );
+    const used = await this.evaluate("xrProbe.activate('voice:use')");
+    if (used !== true) {
+      throw new Error('xr probe: voice use activation was refused');
+    }
+    const commitAction = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (
+      !commitAction
+      || commitAction.type !== 'text_commit'
+      || commitAction.field_id !== 'composer:xr-probe-a2'
+      || commitAction.text !== 'open the build logs'
+    ) {
+      throw new Error(`xr probe: captured text-commit action malformed: ${JSON.stringify(commitAction)}`);
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'idle')",
+      timeoutMs,
+    );
+    // Failed-capture honesty: a capture that ends without a transcript
+    // must fold back to idle with the reason rendered (voice.note).
+    await this.evaluate("xrProbe.activate('voice:talk')");
+    await this.evaluate("xrProbe.activate('voice:talk')");
+    await this.evaluate("xrProbe.voice.failed('no speech recognized — try again')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'idle' && d.voice.note.includes('no speech'))",
+      timeoutMs,
+    );
+    // Unavailability honesty: pushed status renders as the pill's
+    // standing detail line; restore before the closing summary.
+    await this.evaluate("xrProbe.voice.status({ available: false, detail: 'transcription disabled (probe)' })");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.available === false && d.voice.detail === 'transcription disabled (probe)'"
+        + ' && d.voice.parseErrors === 0)',
+      timeoutMs,
+    );
+    await this.evaluate("xrProbe.voice.status({ available: true, detail: '' })");
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.voice.available === true)',
+      timeoutMs,
+    );
+    const voiceSummary = await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.voice))',
+    );
     const terminalSummary = await this.evaluate(
       'xrProbe.debugJson().then((d) => JSON.stringify(d.terminal))',
     );
@@ -2571,6 +2659,8 @@ class BrowserHarness {
     }
     report.action = parsedAction;
     report.terminal = JSON.parse(String(terminalSummary || 'null'));
+    report.voice = JSON.parse(String(voiceSummary || 'null'));
+    report.voiceCommit = commitAction;
     report.ok = true;
     return report;
   }
@@ -4023,7 +4113,8 @@ function formatXrProbeLine(report) {
   return `xr probe: ok — frames=${report.frames} views=${report.views} panels=${report.panels} `
     + `texts=${report.texts} hits=${report.hits} transcriptRows=${report.transcriptRows} `
     + `passthrough=${report.passthrough} `
-    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'}`;
+    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'} `
+    + `voice=${report.voiceCommit ? report.voiceCommit.type + '/' + report.voiceCommit.field_id : 'none'}`;
 }
 
 function waitFunctionExpression(source) {
