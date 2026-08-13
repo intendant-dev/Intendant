@@ -153,7 +153,7 @@ fn steer_grab(inner: &mut Inner) {
         };
         let d = (az - cur.az).abs();
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-            best = Some((d, ray.clone()));
+            best = Some((d, *ray));
         }
     }
     let Some((_, ray)) = best else {

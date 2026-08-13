@@ -243,6 +243,7 @@ fn status_kind_color(kind: &str) -> [f32; 4] {
 /// always (unless the family is dismissed), the pane when open. Called
 /// from the frame loop's scene rebuild, after `ui::build_scene`, into
 /// the same batches.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pane(
     pane: &PaneView,
     layout: &kit::LayoutState,
