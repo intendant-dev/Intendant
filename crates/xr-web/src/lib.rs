@@ -46,6 +46,10 @@ pub(crate) struct Inner {
     pub(crate) active: bool,
     /// "immersive-ar" / "immersive-vr" while active.
     pub(crate) mode: Option<String>,
+    /// dom-overlay spike lane: whether entry asked for the overlay and
+    /// whether the runtime actually granted it (domOverlayState non-null).
+    pub(crate) overlay_requested: bool,
+    pub(crate) overlay_active: bool,
     /// Monotonic count of snapshots received from the dashboard feed.
     snapshot_generation: u64,
     /// Callback into the dashboard's action router (same JSON vocabulary
@@ -107,6 +111,8 @@ impl Inner {
             supported_vr: None,
             active: false,
             mode: None,
+            overlay_requested: false,
+            overlay_active: false,
             snapshot_generation: 0,
             action_callback: None,
             session_end_callback: None,
@@ -152,6 +158,10 @@ fn debug_state_json(inner: &Inner) -> String {
         },
         "snapshotGeneration": inner.snapshot_generation,
         "hasActionCallback": inner.action_callback.is_some(),
+        "overlay": {
+            "requested": inner.overlay_requested,
+            "active": inner.overlay_active,
+        },
         "engine": {
             "framesRendered": inner.frames_rendered,
             "views": inner.last_view_count,
@@ -255,7 +265,21 @@ impl XrWeb {
     pub fn enter(&self, mode: String) -> js_sys::Promise {
         let inner = Rc::clone(&self.inner);
         wasm_bindgen_futures::future_to_promise(async move {
-            session::enter(inner, mode).await?;
+            session::enter(inner, mode, None).await?;
+            Ok(JsValue::TRUE)
+        })
+    }
+
+    /// Spike lane: enter with the WebXR DOM Overlay module requested for
+    /// `root` (the flag-gated entry passes the whole dashboard body, so
+    /// the REGULAR UI composites interactively over the scene where the
+    /// runtime supports it). The feature is optional — ungranted runtimes
+    /// enter normally; `debugJson().overlay` reports the truth.
+    #[wasm_bindgen(js_name = enterWithOverlay)]
+    pub fn enter_with_overlay(&self, mode: String, root: web_sys::Element) -> js_sys::Promise {
+        let inner = Rc::clone(&self.inner);
+        wasm_bindgen_futures::future_to_promise(async move {
+            session::enter(inner, mode, Some(root)).await?;
             Ok(JsValue::TRUE)
         })
     }
@@ -414,6 +438,8 @@ mod tests {
         assert!(parsed["supported"]["ar"].is_null());
         assert_eq!(parsed["snapshotGeneration"], 0);
         assert_eq!(parsed["hasActionCallback"], false);
+        assert_eq!(parsed["overlay"]["requested"], false);
+        assert_eq!(parsed["overlay"]["active"], false);
         assert_eq!(parsed["scene"]["agendaItems"], 0);
         assert_eq!(parsed["engine"]["framesRendered"], 0);
         assert_eq!(parsed["engine"]["views"], 0);
