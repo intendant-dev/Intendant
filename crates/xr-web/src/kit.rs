@@ -30,7 +30,6 @@ pub(crate) const TEXT: [f32; 4] = rgba(0xEAECF2, 1.0); // --text
 pub(crate) const TEXT_2: [f32; 4] = rgba(0xA7AEBE, 1.0); // --text-2
 pub(crate) const TEXT_3: [f32; 4] = rgba(0x7E8896, 1.0); // --text-3
 pub(crate) const IRIS: [f32; 4] = rgba(0x7E8CFA, 1.0); // --iris
-pub(crate) const IRIS_SOFT: [f32; 4] = rgba(0x7E8CFA, 0.35);
 pub(crate) const GREEN: [f32; 4] = rgba(0x69D58C, 1.0);
 pub(crate) const AMBER: [f32; 4] = rgba(0xE8C476, 1.0);
 pub(crate) const RED: [f32; 4] = rgba(0xE87A8B, 1.0);
