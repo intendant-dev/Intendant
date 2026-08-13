@@ -1,0 +1,16 @@
+{
+  "name": "xr-web",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "xr_web_bg.wasm",
+    "xr_web.js",
+    "xr_web.d.ts"
+  ],
+  "main": "xr_web.js",
+  "types": "xr_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

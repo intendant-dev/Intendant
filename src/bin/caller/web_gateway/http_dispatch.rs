@@ -2763,6 +2763,7 @@ pub(crate) async fn serve_http_request(
         &[
             "/wasm-web/presence_web_bg.wasm",
             "/wasm-station/station_web_bg.wasm",
+            "/wasm-xr/xr_web_bg.wasm",
         ],
     ) {
         let reuse = stream.exchange_reusable();
@@ -2969,6 +2970,7 @@ pub(crate) async fn serve_http_request(
         &[
             "/wasm-web/presence_web.js",
             "/wasm-station/station_web.js",
+            "/wasm-xr/xr_web.js",
             "/three.module.min.js",
             "/codemirror-bundle.js",
             "/codemirror-bundle.css",

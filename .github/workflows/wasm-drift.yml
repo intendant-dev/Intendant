@@ -1,13 +1,14 @@
 name: WASM drift
 
-# The committed WASM artifacts (static/wasm-web, static/wasm-station) are
-# build outputs of crates/{presence-web,station-web}: an agent that edits
-# the crates (or their shared dep presence-core) without rebuilding ships
-# a dashboard whose Rust changed but whose WASM didn't — silent drift no
-# suite can see (build.rs's staleness check is mtime-based, which a fresh
-# CI checkout defeats). This gate rebuilds both crates with the PINNED
-# wasm-pack + the PINNED toolchain and fails on any byte difference
-# against the committed artifacts.
+# The committed WASM artifacts (static/wasm-web, static/wasm-station,
+# static/wasm-xr) are build outputs of crates/{presence-web,station-web,
+# xr-web}: an agent that edits the crates (or their shared dep
+# presence-core) without rebuilding ships a dashboard whose Rust changed
+# but whose WASM didn't — silent drift no suite can see (build.rs's
+# staleness check is mtime-based, which a fresh CI checkout defeats).
+# This gate rebuilds the crates with the PINNED wasm-pack + the PINNED
+# toolchain and fails on any byte difference against the committed
+# artifacts.
 #
 # Required-track triggers (unfiltered — a paths-filtered required check
 # blocks queue entry). Relevance is two-tier: a GitHub-hosted classifier
@@ -78,7 +79,7 @@ jobs:
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
+              crates/presence-web/*|crates/station-web/*|crates/xr-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|static/wasm-xr/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
                 relevant=true; break ;;
             esac
           done < <(git diff --name-only "$base" HEAD)
@@ -140,7 +141,7 @@ jobs:
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
+              crates/presence-web/*|crates/station-web/*|crates/xr-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|static/wasm-xr/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
                 relevant=true; break ;;
             esac
           done < <(git diff --name-only "$base" HEAD)
@@ -206,11 +207,11 @@ jobs:
         if: steps.relevance.outputs.relevant == 'true'
         shell: bash
         run: |
-          if ! git diff --exit-code -- static/wasm-web static/wasm-station; then
+          if ! git diff --exit-code -- static/wasm-web static/wasm-station static/wasm-xr; then
             echo "::error::WASM artifacts drift from their crates — rebuild with the pinned wasm-pack (a normal cargo build does it via build.rs on a dev box, or use the manual commands in CLAUDE.md) and commit the result."
             exit 1
           fi
-          untracked=$(git status --porcelain -- static/wasm-web static/wasm-station | grep '^??' || true)
+          untracked=$(git status --porcelain -- static/wasm-web static/wasm-station static/wasm-xr | grep '^??' || true)
           if [ -n "$untracked" ]; then
             echo "::error::the rebuild produced files the tree does not track:"
             echo "$untracked"

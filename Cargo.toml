@@ -12,6 +12,7 @@ members = [
     "crates/presence-web",
     "crates/rustc-governor",
     "crates/station-web",
+    "crates/xr-web",
 ]
 
 [package]

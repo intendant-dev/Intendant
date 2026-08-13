@@ -1,0 +1,48 @@
+/* ui2-xr.css — the XR entry chip (see ui2-xr.js; dev-gated until
+   milestone 1 completes). Lives in the #ui2-oversight header band. */
+
+html.ui-v2 .ui2-xr-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+
+html.ui-v2 .ui2-xr-chip:hover {
+  color: var(--text);
+  border-color: var(--iris);
+}
+
+html.ui-v2 .ui2-xr-chip .ui2-xr-chip-glyph {
+  color: var(--iris);
+}
+
+html.ui-v2 .ui2-xr-chip[data-state="busy"] {
+  opacity: .55;
+  pointer-events: none;
+}
+
+html.ui-v2 .ui2-xr-chip[data-state="active"] {
+  color: var(--on-accent);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  border-color: transparent;
+}
+
+html.ui-v2 .ui2-xr-chip[data-state="active"] .ui2-xr-chip-glyph {
+  color: var(--on-accent);
+}
+
+html.ui-v2 .ui2-xr-chip[data-state="error"] {
+  color: var(--text);
+  border-color: var(--line-2);
+  opacity: .8;
+}

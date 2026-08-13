@@ -18,3 +18,4 @@ registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
 export RUSTFLAGS="--remap-path-prefix ${registry}=/cargo/registry/src"
 (cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web)
 (cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web)
+(cd crates/xr-web && wasm-pack build --target web --out-dir ../../static/wasm-xr --out-name xr_web)
