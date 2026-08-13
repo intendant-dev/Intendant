@@ -192,13 +192,25 @@ Preset ordering is `View < Tasks < Operate`:
 | Terminal and shell | no | no | yes |
 | Filesystem read/write | no | no | yes |
 | Agent-visible display input | no | no | yes |
+| Agenda plane (read + ordinary commands) | no | no | yes |
+| Memory plane (search/read + propose) | no | no | yes |
 
 Every operation not listed is denied. No hosted preset admits IAM/access
 management, credential management or vault unseal, organization-root
 operations, approval resolution, settings/API-key management, peer
-administration, or a change to the lane's own ceiling. Those omissions are a
+administration, or a change to the lane's own ceiling. The plane projection
+carries its own walls at every preset: agenda schedule approval, revocation,
+start-now, and occurrence requests (the tenant edge refuses non-owner
+surfaces), Memory judgment, automation stamping and definition add/remove,
+and reminder delivery policy all stay refused. Those omissions are a
 compiled floor and are not lifted by a root role, state-file role edits, or a
 generic IAM mutation.
+
+Operate's plane writes are attributed, ring-2, and never owner-voiced: a
+hosted lease classifies as an unattributed hosted-lease principal, never a
+dashboard or local-process actor. Memory writes land as propose-only
+candidates pending owner judgment, and agenda commands record the lease
+principal as the op's actor.
 
 The evaluator authorizes a hosted lease only when all of these agree:
 
@@ -250,7 +262,9 @@ cover the complete route/method/frame catalogs.
 Hosted sockets also use an explicit outbound projection. They receive only the
 session catalog/state, bounded usage/status, session conversation and
 lifecycle events, agent-visible display readiness and authority state, and
-events needed to keep those views current. Generic daemon log and audit
+events needed to keep those views current. An Operate socket additionally
+receives the agenda and memory change broadcasts that keep its plane views
+current; weaker presets do not. Generic daemon log and audit
 events, diagnostic report archives, Access/IAM state, peer state, settings,
 autonomy controls, approval payloads, browser-workspace state, private
 displays, app anchors, and lease-management records are omitted. The same
