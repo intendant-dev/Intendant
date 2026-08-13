@@ -14,6 +14,35 @@ use serde::Deserialize;
 pub(crate) struct XrSnapshot {
     pub(crate) hosts: Vec<XrHost>,
     pub(crate) agents: Vec<XrAgent>,
+    /// The dashboard's coalesced activity feed (session-window history +
+    /// live log events, ≤80). The workbench transcript filters these by
+    /// the focused agent — no XR-only feed exists.
+    pub(crate) events: Vec<XrEvent>,
+}
+
+/// One activity-feed line (the dashboard's bounded event shape).
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct XrEvent {
+    pub(crate) session_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) source: String,
+    pub(crate) level: String,
+    pub(crate) ts: String,
+    pub(crate) msg: String,
+}
+
+impl XrEvent {
+    /// Whether this line belongs to the given agent's thread: session id
+    /// when the card projects a live session, agent id otherwise (the
+    /// primary agent and peer nodes have no session of their own).
+    pub(crate) fn belongs_to(&self, agent: &XrAgent) -> bool {
+        if !agent.session_id.is_empty() {
+            self.session_id == agent.session_id
+        } else {
+            self.session_id.is_empty() && self.agent_id == agent.id
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -164,13 +193,22 @@ mod tests {
                  "canInterrupt": true, "recent": false,
                  "someFutureField": {"nested": true}}
             ],
-            "events": [{"id": "e1"}],
+            "events": [
+                {"id": "e1", "sessionId": "abc123def456", "agentId": "session-abc",
+                 "source": "agent_output", "level": "info", "ts": "12:01",
+                 "msg": "wired the encoder pool", "action": "log"},
+                {"id": "e2"}
+            ],
             "controls": {"whatever": 1}
         });
         let snap: XrSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(snap.hosts.len(), 1);
         assert_eq!(snap.hosts[0].name, "macbook");
         assert_eq!(snap.agents.len(), 1);
+        assert_eq!(snap.events.len(), 2, "unknown event fields tolerated");
+        assert_eq!(snap.events[0].msg, "wired the encoder pool");
+        assert!(snap.events[0].belongs_to(&snap.agents[0]));
+        assert!(!snap.events[1].belongs_to(&snap.agents[0]));
         let a = &snap.agents[0];
         assert_eq!(a.host_id, "local");
         assert_eq!(a.tokens, 1500.0);

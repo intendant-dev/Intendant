@@ -108,10 +108,39 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
         return;
     }
     if let Some(hit) = inner.hit_targets.iter().find(|h| h.id == target) {
-        if hit.kind == HitKind::Card {
-            inner.selected_id = Some(hit.agent_id.clone());
+        match hit.kind {
+            HitKind::Card => select_agent(inner, hit.agent_id.clone()),
+            // Paging is a light, reversible act — it fires on release
+            // like a card, never through the confirm hold.
+            HitKind::ScrollOlder | HitKind::ScrollNewer => page_transcript(inner, hit.kind),
+            HitKind::Approve | HitKind::Deny => {}
         }
     }
+}
+
+/// Focus an agent; a fresh focus always starts at the live tail.
+fn select_agent(inner: &mut Inner, agent_id: String) {
+    if inner.selected_id.as_deref() != Some(agent_id.as_str()) {
+        inner.transcript_scroll = 0;
+    }
+    inner.selected_id = Some(agent_id);
+    inner.ui_dirty = true;
+}
+
+/// One page step through the focused transcript. The upper bound is the
+/// last build's row count; the next build clamps exactly and writes the
+/// applied offset back.
+fn page_transcript(inner: &mut Inner, kind: HitKind) {
+    inner.transcript_scroll = match kind {
+        HitKind::ScrollOlder => inner
+            .transcript_scroll
+            .saturating_add(crate::kit::TRANSCRIPT_PAGE_ROWS)
+            .min(inner.transcript_rows),
+        _ => inner
+            .transcript_scroll
+            .saturating_sub(crate::kit::TRANSCRIPT_PAGE_ROWS),
+    };
+    inner.ui_dirty = true;
 }
 
 /// Fire a hit target's action through the dashboard's action router.
@@ -128,8 +157,11 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
     };
     match hit.kind {
         HitKind::Card => {
-            inner.selected_id = Some(hit.agent_id);
-            inner.ui_dirty = true;
+            select_agent(inner, hit.agent_id);
+            true
+        }
+        HitKind::ScrollOlder | HitKind::ScrollNewer => {
+            page_transcript(inner, hit.kind);
             true
         }
         HitKind::Approve | HitKind::Deny => {
