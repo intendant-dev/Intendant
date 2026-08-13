@@ -13328,12 +13328,15 @@ body.display-fullscreen-open {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-/* Immutable hosted floor: these destinations never appear on a lease. */
+/* Immutable hosted floor: these destinations never appear on a lease.
+   The preset-scoped rows below mirror the compiled presets (the agenda
+   and memory planes, terminal, and files project at Operate only) —
+   pinned against the source by policy.rs's
+   hosted_floor_css_mirror_is_pinned_to_the_compiled_presets. */
 html[data-hosted-preset] [data-tab="access"],
 html[data-hosted-preset] [data-tab="vault"],
 html[data-hosted-preset] [data-tab="settings"],
 html[data-hosted-preset] [data-tab="debug"],
-html[data-hosted-preset] [data-tab="agenda"],
 html[data-hosted-preset] #ui2-autonomy-btn,
 html[data-hosted-preset] #upload-attach-btn,
 html[data-hosted-preset] #upload-file-input,
@@ -13360,8 +13363,14 @@ html[data-hosted-preset="view"] #ui2-stop-btn,
 html[data-hosted-preset="tasks"] #ui2-stop-btn,
 html[data-hosted-preset="view"] [data-tab="terminal"],
 html[data-hosted-preset="view"] [data-tab="files"],
+html[data-hosted-preset="view"] [data-tab="agenda"],
+html[data-hosted-preset="view"] [data-tab="memory"],
+html[data-hosted-preset="view"] #ui2-agenda-card,
 html[data-hosted-preset="tasks"] [data-tab="terminal"],
-html[data-hosted-preset="tasks"] [data-tab="files"] {
+html[data-hosted-preset="tasks"] [data-tab="files"],
+html[data-hosted-preset="tasks"] [data-tab="agenda"],
+html[data-hosted-preset="tasks"] [data-tab="memory"],
+html[data-hosted-preset="tasks"] #ui2-agenda-card {
   display: none !important;
 }
 
@@ -39392,7 +39401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '8b8033b687910385';
+const INTENDANT_APP_BUILD = '845ff6c080987ecd';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
