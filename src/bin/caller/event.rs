@@ -983,6 +983,16 @@ pub enum AppEvent {
         kind: String,
         detail: String,
     },
+    /// The ChatGPT voice lane's backing model was rerouted mid-call by
+    /// the provider (`model/rerouted`). Feeds the named
+    /// `PresenceEvent::VoiceModelRerouted` through the presence pump
+    /// (N5: mid-call reroutes stay visible; per-start resolved
+    /// surfacing rides `voice_status`).
+    VoiceModelRerouted {
+        from_model: String,
+        to_model: String,
+        reason: Option<String>,
+    },
 
     // Live audio sub-agent lifecycle
     LiveAudioStarted {
@@ -3987,6 +3997,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
         | AppEvent::VoiceDiagnostic { .. }
+        | AppEvent::VoiceModelRerouted { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
         | AppEvent::LiveAudioCompleted { .. } => None,

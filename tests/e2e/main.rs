@@ -348,15 +348,31 @@ async fn spawn_daemon_on_rig(
     script: &serde_json::Value,
     tls: bool,
 ) -> DaemonRig {
+    spawn_daemon_on_rig_with_autonomy(client, rig, script, tls, "full").await
+}
+
+/// [`spawn_daemon_on_rig`] with the daemon's `--autonomy` level chosen by
+/// the caller — approval-flow scenarios need a level where the gated
+/// action actually stages an approval instead of auto-approving.
+async fn spawn_daemon_on_rig_with_autonomy(
+    client: &reqwest::Client,
+    rig: TestRig,
+    script: &serde_json::Value,
+    tls: bool,
+    autonomy: &str,
+) -> DaemonRig {
     // These rigs model a *rooted* daemon: an idle --web daemon launched
     // from a markerless cwd runs projectless and then requires an explicit
     // per-session project root — but a peer-delegated task
     // (PeerOp::DelegateTask → ControlMsg::StartTask) carries none, so the
     // daemon's default project must exist for it to run. An empty
     // intendant.toml is the minimal project marker (parses to config
-    // defaults; pinned by project.rs's empty-config unit test).
-    std::fs::write(rig.project.path().join("intendant.toml"), "")
-        .expect("mark the daemon rig's project root");
+    // defaults; pinned by project.rs's empty-config unit test). A test
+    // that seeded its own project config keeps it.
+    let project_marker = rig.project.path().join("intendant.toml");
+    if !project_marker.exists() {
+        std::fs::write(&project_marker, "").expect("mark the daemon rig's project root");
+    }
     let script_path = rig.write_script(script);
     let log = std::fs::File::create(rig.home.path().join("daemon.log")).expect("daemon log");
     let mut cmd = rig.command();
@@ -381,7 +397,7 @@ async fn spawn_daemon_on_rig(
     // out, now guaranteed to match the real port.
     cmd.arg("--web")
         .arg("0")
-        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", "full"]);
+        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", autonomy]);
     let http_scheme = if tls {
         "https"
     } else {
@@ -3357,6 +3373,363 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
     .await
     .unwrap_or_else(|| panic!("approval_resolved never broadcast:\n{}", daemon.log_tail()));
     assert_eq!(resolved["action"], "answer", "{resolved}");
+}
+
+/// Track VP R1: the composed voice-approval proof. A `voice_start` over the
+/// REAL `/ws` spawns the scripted mock App Server through the real
+/// `[presence.voice] app_server_command` seam; the daemon stages a REAL
+/// approval (a shell exec at `--autonomy medium`); the broker's injection
+/// lane speaks it into the "call"; the fixture parses the approval id OUT
+/// OF THAT SPEECH (it has no other input channel), fails the evidence gate
+/// once, "speaks" the instruction, and repeats the `item/tool/call
+/// approve_action` — which must resolve the staged approval and let the
+/// gated command actually execute.
+///
+/// Structural immunity to self-staging (the C1 false-positive class): every
+/// assertion targets a daemon-side effect that cannot be produced by the
+/// rig's own inputs —
+/// - the gated command computes its result with shell arithmetic at
+///   execution time (`$((6291*4093))`): the literal product exists in no
+///   input the daemon sees (the mock script holds only the factors and an
+///   `expect_transcript_contains` inside the rig-home script file, which
+///   the daemon never copies into its logs), so the proof file on disk and
+///   the `agent_output` row's stdout preview can only exist if the runtime
+///   actually ran the command;
+/// - the approval id is asserted to round-trip daemon → appendSpeech →
+///   tool call → `ControlMsg::Approve` (the test never tells the fixture
+///   the id, and the id is minted daemon-side);
+/// - the grant is read from the session log's approval rows
+///   (`waiting` strictly before `approved`) and the `approval_resolved`
+///   broadcast, not from any marker the rig planted;
+/// - the mock model's second step refuses to `signal_done` until the
+///   runtime's REAL output round-tripped, so task completion itself fails
+///   if the gated command never ran.
+///
+/// Unix-gated like the suite's other shebang-exec fixtures (the mock App
+/// Server is a committed `#!/bin/sh` script).
+#[cfg(unix)]
+#[tokio::test]
+async fn voice_composed_approval_resolves_real_staged_approval_end_to_end() {
+    use futures_util::SinkExt;
+
+    // Computed at runtime here AND at execution time in the gated shell
+    // command; the literal product appears in the mock script's
+    // round-trip expectation only (rig-home file, never a daemon log).
+    let computed = (6291u64 * 4093u64).to_string();
+    const GATED_COMMAND: &str =
+        "printf %s \"$((6291*4093))\" > vpfix-proof.txt; cat vpfix-proof.txt";
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+
+    // Voice-lane project config: the chatgpt live provider with the App
+    // Server override pointed at the committed scripted fixture — the
+    // exact seam a bundled desktop-app codex would ride.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/e2e/fixtures/mock-voice-app-server.sh"
+    );
+    std::fs::write(
+        rig.project.path().join("intendant.toml"),
+        format!(
+            "[presence]\nlive_provider = \"chatgpt\"\n\n\
+             [presence.voice]\napp_server_command = \"{fixture}\"\n"
+        ),
+    )
+    .expect("write voice project config");
+
+    let script = serde_json::json!({
+        "profiles": [
+            {
+                "match": "vpfix approval target",
+                "steps": [
+                    { "content": "Running the gated command.",
+                      "tool_calls": [{ "name": "exec_command",
+                                       "arguments": { "nonce": 1, "command": GATED_COMMAND } }] },
+                    { "expect_transcript_contains": computed,
+                      "content": "Gated command output received.",
+                      "tool_calls": [{ "name": "signal_done",
+                                       "arguments": { "message": "vpfix run complete" } }] }
+                ]
+            },
+            {
+                "steps": [
+                    { "content": "fallback profile (unexpected session)",
+                      "tool_calls": [{ "name": "signal_done",
+                                       "arguments": { "message": "unexpected session" } }] }
+                ]
+            }
+        ]
+    });
+
+    // `--autonomy medium`: a shell exec stages a REAL approval (the
+    // shell rule is the strictest configured effect rule = Ask) — and no
+    // other approver exists in this rig, so only the voice tool lane can
+    // resolve it.
+    let daemon = spawn_daemon_on_rig_with_autonomy(&client, rig, &script, false, "medium").await;
+    let port = daemon.port;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
+
+    // Become the active presence connection — the broker's owner anchor.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"t": "presence_connect"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send presence_connect");
+    let welcome = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("t").and_then(|v| v.as_str()) == Some("presence_welcome")
+    })
+    .await
+    .unwrap_or_else(|| panic!("presence_welcome never arrived:\n{}", daemon.log_tail()));
+    assert_eq!(
+        welcome["is_active"], true,
+        "first presence connection must win the active slot: {welcome}"
+    );
+
+    // Open the voice call over the real /ws: the daemon spawns the
+    // fixture App Server, relays the offer, and returns its SDP answer.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"t": "voice_start", "sdp": "vpfix-offer-sdp"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send voice_start");
+    let answer = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("t").and_then(|v| v.as_str()) == Some("voice_answer")
+    })
+    .await
+    .unwrap_or_else(|| panic!("voice_answer never arrived:\n{}", daemon.log_tail()));
+    assert_eq!(answer["sdp"], "vpfix-answer-sdp", "{answer}");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("t").and_then(|v| v.as_str()) == Some("voice_status")
+            && json["status"]["active"] == true
+    })
+    .await
+    .unwrap_or_else(|| panic!("voice never reported active:\n{}", daemon.log_tail()));
+
+    // With the call live, start the task whose exec stages the approval.
+    let output = ctl(
+        &daemon,
+        &[
+            "task",
+            "start",
+            "--task",
+            "vpfix approval target: run the gated command",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+    })
+    .await
+    .unwrap_or_else(|| panic!("gated session never started:\n{}", daemon.log_tail()));
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // The REAL staged approval reaches the dashboard rail…
+    let approval = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("approval_required")
+    })
+    .await
+    .unwrap_or_else(|| panic!("approval_required never broadcast:\n{}", daemon.log_tail()));
+    let approval_id = approval["id"].as_u64().expect("approval id");
+    assert!(
+        approval["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("6291"),
+        "staged approval must preview the gated command: {approval}"
+    );
+    // …and at this moment the gated command has NOT run: the approval
+    // actually gates (the computed proof cannot exist yet).
+    let proof_path = daemon.rig.project.path().join("vpfix-proof.txt");
+    assert!(
+        !proof_path.exists(),
+        "the gated command ran before the approval resolved"
+    );
+
+    // The fixture now plays its half autonomously (refused probe →
+    // spoken evidence → verified approve_action). The grant event is the
+    // daemon's own resolution broadcast for the SAME id.
+    let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("approval_resolved")
+            && json.get("id").and_then(|v| v.as_u64()) == Some(approval_id)
+    })
+    .await
+    .unwrap_or_else(|| panic!("approval_resolved never broadcast:\n{}", daemon.log_tail()));
+    assert_eq!(resolved["action"], "approve", "{resolved}");
+
+    // Completion requires the mock model to have SEEN the runtime's real
+    // output (expect_transcript_contains) — execution, not resolution
+    // alone, finishes this session.
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
+
+    // Daemon-side effect #1: the gated command's computed artifact.
+    let proof = std::fs::read_to_string(&proof_path).unwrap_or_else(|e| {
+        panic!(
+            "gated command's proof file missing after approval ({e}):\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(
+        proof.trim(),
+        computed,
+        "proof file must hold the computed product"
+    );
+
+    // Daemon-side effect #2: the session log's approval rows — `waiting`
+    // strictly before `approved`, and the runtime's stdout preview on an
+    // `agent_output` row carrying the computed product. Structural parse:
+    // an error row quoting the expectation can never satisfy these.
+    let logs = daemon.rig.session_logs();
+    let rows: Vec<serde_json::Value> = logs
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let approval_decisions: Vec<String> = rows
+        .iter()
+        .filter(|r| r["event"] == "approval")
+        .filter(|r| {
+            r["data"]["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("6291")
+        })
+        .filter_map(|r| r["data"]["decision"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        approval_decisions,
+        vec!["waiting".to_string(), "approved".to_string()],
+        "session log must record the staged wait and the voice-lane grant:\n{logs}"
+    );
+    assert!(
+        rows.iter().any(|r| {
+            r["event"] == "agent_output"
+                && r["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&computed)
+        }),
+        "no agent_output row carries the computed product — the gated command \
+         did not actually execute:\n{logs}"
+    );
+
+    // Daemon-side effect #3: the two-principal authority audit — the
+    // evidence-less probe REFUSED, the spoken-evidence call DISPATCHED.
+    let audit_raw = std::fs::read_to_string(
+        daemon
+            .rig
+            .home
+            .path()
+            .join(".intendant/presence/voice_authority_audit.jsonl"),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "voice authority audit missing ({e}):\n{}",
+            daemon.log_tail()
+        )
+    });
+    let audit: Vec<serde_json::Value> = audit_raw
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(
+        audit.len(),
+        2,
+        "expected exactly the refused probe and the dispatch:\n{audit_raw}"
+    );
+    assert_eq!(
+        audit[0]["verdict"], "refused-evidence-unmatched",
+        "{audit_raw}"
+    );
+    assert_eq!(audit[0]["evidence_verified"], false, "{audit_raw}");
+    assert_eq!(audit[1]["verdict"], "dispatched", "{audit_raw}");
+    assert_eq!(audit[1]["evidence_verified"], true, "{audit_raw}");
+    assert_eq!(audit[1]["tool"], "approve_action", "{audit_raw}");
+    assert_eq!(
+        audit[1]["acting_principal"], "presence-voice-broker",
+        "{audit_raw}"
+    );
+    assert!(
+        audit[1]["attributed_owner"]["connection_id"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
+        "dispatch must attribute the owner surface:\n{audit_raw}"
+    );
+    assert!(
+        audit.iter().all(|r| r["machine_mediated"] == true),
+        "{audit_raw}"
+    );
+
+    // The id round-trip: the fixture could only learn the approval id
+    // from the broker's appendSpeech injection — pin that the speech it
+    // received named exactly the id the daemon staged, and that the
+    // broker's verdicts answered the fixture's two tool calls.
+    let io_raw = std::fs::read_to_string(
+        daemon
+            .rig
+            .home
+            .path()
+            .join(".intendant/presence/neutral-cwd/io.jsonl"),
+    )
+    .unwrap_or_else(|e| panic!("fixture io log missing ({e}):\n{}", daemon.log_tail()));
+    let io_rows: Vec<serde_json::Value> = io_raw
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(
+        io_rows.iter().any(|r| {
+            r["method"] == "thread/realtime/appendSpeech"
+                && r["params"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("Approval needed (id={approval_id},"))
+        }),
+        "the staged approval id never reached the call as speech:\n{io_raw}"
+    );
+    let verdict_for = |id: u64| -> Option<bool> {
+        io_rows
+            .iter()
+            .find(|r| r.get("method").is_none() && r["id"].as_u64() == Some(id))
+            .and_then(|r| r["result"]["success"].as_bool())
+    };
+    assert_eq!(
+        verdict_for(9001),
+        Some(false),
+        "the evidence-less probe must be refused:\n{io_raw}"
+    );
+    assert_eq!(
+        verdict_for(9002),
+        Some(true),
+        "the spoken-evidence call must be granted:\n{io_raw}"
+    );
+
+    // Clean voice teardown over the same /ws.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"t": "voice_stop"}).to_string().into(),
+    ))
+    .await
+    .expect("send voice_stop");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("t").and_then(|v| v.as_str()) == Some("voice_closed")
+    })
+    .await
+    .unwrap_or_else(|| panic!("voice_closed never arrived:\n{}", daemon.log_tail()));
 }
 
 /// `intendant ctl notify` end to end: fire-and-forget returns immediately,

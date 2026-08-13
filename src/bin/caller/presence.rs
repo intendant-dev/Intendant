@@ -967,6 +967,15 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 category: category.to_string(),
             })
         }
+        AppEvent::VoiceModelRerouted {
+            from_model,
+            to_model,
+            reason,
+        } => Some(PresenceEvent::VoiceModelRerouted {
+            from_model: from_model.clone(),
+            to_model: to_model.clone(),
+            reason: reason.clone(),
+        }),
         AppEvent::ApprovalResolved { id, action, .. } => {
             if action == "deny" {
                 *last_phase = "done".to_string();

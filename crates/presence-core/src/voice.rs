@@ -57,6 +57,25 @@ pub struct PresenceVoiceConfig {
     /// codex). Unset = the configured `[codex] command`.
     #[serde(default)]
     pub app_server_command: Option<String>,
+    /// Owner election to reuse the durable presence thread via
+    /// `thread/resume` on later calls, trusting the provider to keep
+    /// the dynamicTools lane attached to the resumed thread.
+    ///
+    /// Default `false` (capability-safe): the App Server protocol only
+    /// accepts a dynamicTools declaration at `thread/start`
+    /// (`thread/start.dynamicTools`); `thread/resume` has no such
+    /// field, ignores unknown params, and exposes no surface to verify
+    /// or re-arm the tool lane — and the verified server lineage drops
+    /// dynamic tools on every from-disk resume. A resumed thread would
+    /// therefore carry a voice session that can talk but silently
+    /// cannot act. Under the default, the broker mints a successor
+    /// thread per call (tools declared on the wire) and records the
+    /// predecessor in the D1 lineage; conversational memory rides the
+    /// checkpoint either way, which is the authoritative store by
+    /// design. Set `true` only after live acceptance on the deployed
+    /// binary shows resumed threads keep their declared tools.
+    #[serde(default)]
+    pub trust_resume_tool_persistence: bool,
 }
 
 /// Default realtime protocol version for the ChatGPT lane.

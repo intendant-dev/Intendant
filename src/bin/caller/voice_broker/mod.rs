@@ -65,6 +65,12 @@ const INJECTION_SILENCE_MS: u64 = 1_500;
 /// authoritative — no reason to store more than this).
 const USAGE_PAYLOAD_CAP_BYTES: usize = 8 * 1024;
 
+/// Lineage reason recorded when the capability-safe default retires the
+/// durable thread instead of resuming it: the tool lane can only be
+/// declared at `thread/start`, so a successor is minted with the
+/// declaration on the wire (N1).
+const TOOL_LANE_REDECLARE_REASON: &str = "tool-lane-redeclare";
+
 /// Broker construction settings (resolved once at wiring).
 #[derive(Clone)]
 pub(crate) struct VoiceBrokerSettings {
@@ -479,34 +485,56 @@ impl VoiceBroker {
             .clone()
             .unwrap_or_else(|| DEFAULT_REALTIME_VERSION.to_string());
         // Thread: resume the durable identity, or mint (successor) with
-        // lineage recorded (D1).
+        // lineage recorded (D1). Resume is owner-elected
+        // (`trust_resume_tool_persistence`): the protocol declares
+        // dynamicTools only at `thread/start`, and the verified server
+        // lineage drops them on every from-disk resume, so the
+        // capability-safe default retires the durable id into the
+        // lineage and re-declares the tool lane on a successor (the
+        // checkpoint, not the thread, is the authoritative memory).
         let mut record = VoiceThreadRecord::load(&deps.state_root);
         let mut resolved = ResolvedThread::default();
         let mut thread_ready = false;
         if let Some(thread_id) = record.thread_id.clone() {
-            match client
-                .request(
-                    "thread/resume",
-                    Some(thread_pins(
-                        &deps.state_root,
-                        &deps.voice,
-                        Some(thread_id.as_str()),
-                        false,
-                    )),
-                    VOICE_REQUEST_TIMEOUT_SECS,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    resolved.absorb(&resp);
-                    resolved.thread_id = Some(thread_id);
-                    thread_ready = true;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[voice] Warning: presence thread resume failed ({e}); minting successor"
-                    );
-                    record_resume_failure_reason(&mut record, &e);
+            if !deps.voice.trust_resume_tool_persistence {
+                record.pending_retire_reason = Some(TOOL_LANE_REDECLARE_REASON.to_string());
+            } else {
+                match client
+                    .request(
+                        "thread/resume",
+                        Some(thread_pins(
+                            &deps.state_root,
+                            &deps.voice,
+                            Some(thread_id.as_str()),
+                            false,
+                        )),
+                        VOICE_REQUEST_TIMEOUT_SECS,
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        resolved.absorb(&resp);
+                        resolved.thread_id = Some(thread_id);
+                        thread_ready = true;
+                        // Honest by name: nothing in the protocol lets the
+                        // broker verify the resumed thread kept its
+                        // declared tools — the owner elected to trust it.
+                        deps.bus.send(AppEvent::PresenceLog {
+                            message: "voice presence thread resumed; tool lane rides \
+                                      owner-trusted provider-side persistence \
+                                      (trust_resume_tool_persistence = true) — \
+                                      thread/resume cannot re-declare dynamicTools"
+                                .to_string(),
+                            level: Some(LogLevel::Warn),
+                            turn: None,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[voice] Warning: presence thread resume failed ({e}); minting successor"
+                        );
+                        record_resume_failure_reason(&mut record, &e);
+                    }
                 }
             }
         }
@@ -708,6 +736,39 @@ impl VoiceBroker {
                             {
                                 last_assistant_delta_ms = Some(now_ms());
                             }
+                        }
+                        "model/rerouted" => {
+                            // N5: mid-call backing-lane reroutes stay
+                            // visible — status update for the voice card
+                            // plus the named PresenceEvent through the
+                            // presence pump. Stage A's acceptance of the
+                            // account-default backing lane rests on this.
+                            let from_model = notification
+                                .params
+                                .get("fromModel")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let to_model = notification
+                                .params
+                                .get("toModel")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let reason = notification.params.get("reason").map(|r| match r.as_str()
+                            {
+                                Some(s) => s.to_string(),
+                                None => r.to_string(),
+                            });
+                            self.set_status(|s| {
+                                s.resolved_model = Some(to_model.clone());
+                            });
+                            self.push_status(&deps.reply_tx);
+                            deps.bus.send(AppEvent::VoiceModelRerouted {
+                                from_model,
+                                to_model,
+                                reason,
+                            });
                         }
                         "thread/realtime/transcript/done" => {
                             let role = notification
@@ -1080,9 +1141,23 @@ impl VoiceBroker {
 /// Layer-2 pins (S-1..S-4 at the thread layer, per A6 pinned at BOTH
 /// layers): neutral cwd, read-only sandbox, never approvals, pinned
 /// metadata — plus the dynamicTools declaration and the D2 backing
-/// pins on `thread/start` (`thread/resume` has no dynamicTools field;
-/// whether a resumed thread keeps its declared tools is verified in
-/// the live acceptance run).
+/// pins on `thread/start`.
+///
+/// N1 protocol ground truth (source-verified on the codex-rs lineage
+/// matching the Stage B binaries): dynamicTools is declared ONLY at
+/// `thread/start` (`thread/start.dynamicTools`); `ThreadResumeParams`
+/// has no such field and silently ignores unknown params (no
+/// deny_unknown_fields), so a resume-time re-declaration is
+/// unrepresentable — not merely unverified. The server's from-disk
+/// resume path hardcodes an empty dynamic-tools set
+/// (`resume_thread_with_history_with_source` → `Vec::new()`), and no
+/// response or request surface exposes a thread's tool state, so the
+/// client can neither re-declare, re-verify, nor detect-and-refuse
+/// after the fact. The broker therefore only trusts a tool lane it
+/// declared on the wire in this process: by default it retires the
+/// durable id into the D1 lineage and starts a successor with the
+/// declaration (`trust_resume_tool_persistence` is the owner's
+/// escape hatch, verified live per deployed binary).
 fn thread_pins(
     state_root: &std::path::Path,
     voice: &PresenceVoiceConfig,
@@ -1490,6 +1565,20 @@ mod tests {
         auto_answer: bool,
         anchor: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     ) -> Rig {
+        build_rig_with_voice(
+            fail_resume,
+            auto_answer,
+            anchor,
+            PresenceVoiceConfig::default(),
+        )
+    }
+
+    fn build_rig_with_voice(
+        fail_resume: bool,
+        auto_answer: bool,
+        anchor: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        voice: PresenceVoiceConfig,
+    ) -> Rig {
         let tmp = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let settings = VoiceBrokerSettings {
@@ -1497,14 +1586,14 @@ mod tests {
             app_server_command: "codex-unused".to_string(),
             codex_home: None,
             state_root: tmp.path().to_path_buf(),
-            voice: PresenceVoiceConfig::default(),
+            voice: voice.clone(),
         };
         let broker = VoiceBroker::new(settings, bus.clone());
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         let deps = VoiceCallDeps {
             bus,
             state_root: tmp.path().to_path_buf(),
-            voice: PresenceVoiceConfig::default(),
+            voice,
             reply_tx,
             connection_id: "conn-1".to_string(),
             anchor_probe: anchor,
@@ -1651,10 +1740,18 @@ mod tests {
         assert_eq!(rt["params"]["version"], "v3");
     }
 
-    // D1: resume failure mints a successor and records lineage.
+    fn trusting_voice() -> PresenceVoiceConfig {
+        PresenceVoiceConfig {
+            trust_resume_tool_persistence: true,
+            ..PresenceVoiceConfig::default()
+        }
+    }
+
+    // D1: resume failure mints a successor and records lineage. Resume
+    // itself is owner-elected (`trust_resume_tool_persistence`).
     #[tokio::test]
     async fn resume_failure_mints_successor_with_lineage() {
-        let rig = build_rig(true, true, Arc::new(|_c: &str| true));
+        let rig = build_rig_with_voice(true, true, Arc::new(|_c: &str| true), trusting_voice());
         // Seed a durable identity that the mock will refuse to resume.
         let mut record = VoiceThreadRecord::default();
         record.adopt("t-old", 1, "initial");
@@ -1678,6 +1775,118 @@ mod tests {
         assert_eq!(record.lineage.len(), 1);
         assert_eq!(record.lineage[0].thread_id, "t-old");
         assert!(record.lineage[0].reason.starts_with("resume-failed"));
+    }
+
+    // N1 default: the capability-safe policy never sends thread/resume —
+    // the durable id retires into the lineage with the named reason and
+    // the successor's thread/start re-declares the tool lane on the
+    // wire (the only declaration point the protocol has).
+    #[tokio::test]
+    async fn default_policy_redeclares_tool_lane_on_successor_instead_of_resuming() {
+        let rig = build_rig(false, true, Arc::new(|_c: &str| true));
+        let mut record = VoiceThreadRecord::default();
+        record.adopt("t-old", 1, "initial");
+        record.save(&rig.deps.state_root).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let broker = rig.broker.clone();
+        let deps = rig.deps.clone();
+        let client = rig.client;
+        let events = rig.events.unwrap();
+        let mut reply_rx = rig.reply_rx;
+        let task = tokio::spawn(async move {
+            broker
+                .drive_call(&deps, &client, events, "offer".to_string(), stop_rx)
+                .await
+        });
+        let _ = recv_t(&mut reply_rx, "voice_answer").await;
+        stop_tx.send("stopped".to_string()).unwrap();
+        let _ = task.await.unwrap();
+        let seen = rig
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            !seen.iter().any(|m| m["method"] == "thread/resume"),
+            "default policy must not resume into an unverifiable tool lane"
+        );
+        let start = seen
+            .iter()
+            .find(|m| m["method"] == "thread/start")
+            .expect("successor thread/start sent");
+        let tools = start["params"]["dynamicTools"]
+            .as_array()
+            .expect("successor declares the tool lane");
+        assert_eq!(
+            tools.len(),
+            VOICE_AUTHORITY_TOOLS.len() + VOICE_READ_TOOLS.len()
+        );
+        let record = VoiceThreadRecord::load(&rig.deps.state_root);
+        assert_eq!(record.thread_id.as_deref(), Some("t-new"));
+        assert_eq!(record.lineage.len(), 1);
+        assert_eq!(record.lineage[0].thread_id, "t-old");
+        assert_eq!(record.lineage[0].reason, TOOL_LANE_REDECLARE_REASON);
+    }
+
+    // N1 owner election: trusting resume reuses the durable thread; the
+    // resume request carries NO dynamicTools field (the protocol has
+    // none — pinned so a future re-declaration attempt can't silently
+    // regress to an ignored unknown param), and the unverifiable
+    // persistence is surfaced as a named PresenceLog warning.
+    #[tokio::test]
+    async fn trusted_resume_reuses_thread_and_surfaces_unverifiable_tool_lane() {
+        let rig = build_rig_with_voice(false, true, Arc::new(|_c: &str| true), trusting_voice());
+        let mut record = VoiceThreadRecord::default();
+        record.adopt("t-old", 1, "initial");
+        record.save(&rig.deps.state_root).unwrap();
+        let mut bus_rx = rig.deps.bus.subscribe();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let broker = rig.broker.clone();
+        let deps = rig.deps.clone();
+        let client = rig.client;
+        let events = rig.events.unwrap();
+        let mut reply_rx = rig.reply_rx;
+        let task = tokio::spawn(async move {
+            broker
+                .drive_call(&deps, &client, events, "offer".to_string(), stop_rx)
+                .await
+        });
+        let _ = recv_t(&mut reply_rx, "voice_answer").await;
+        stop_tx.send("stopped".to_string()).unwrap();
+        let _ = task.await.unwrap();
+        let seen = rig
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let resume = seen
+            .iter()
+            .find(|m| m["method"] == "thread/resume")
+            .expect("trusted policy resumes the durable thread");
+        assert_eq!(resume["params"]["threadId"], "t-old");
+        assert!(
+            resume["params"].get("dynamicTools").is_none(),
+            "thread/resume has no dynamicTools field; sending one would be silently ignored"
+        );
+        assert!(!seen.iter().any(|m| m["method"] == "thread/start"));
+        let record = VoiceThreadRecord::load(&rig.deps.state_root);
+        assert_eq!(record.thread_id.as_deref(), Some("t-old"));
+        assert!(record.lineage.is_empty());
+        // The named warning rode the bus.
+        let mut warned = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::PresenceLog { message, level, .. } = event {
+                if message.contains("trust_resume_tool_persistence")
+                    && level == Some(LogLevel::Warn)
+                {
+                    warned = true;
+                }
+            }
+        }
+        assert!(
+            warned,
+            "trusted resume must surface the unverifiable tool lane"
+        );
     }
 
     // R4: app-server death mid-call is call-terminal for the browser.
@@ -1925,6 +2134,183 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].verdict, "refused-anchor-midflight");
+    }
+
+    // ── N2: the start_call refusal ladder, entered at start_call ──
+    //
+    // The broker tests above enter at drive_call; these pin the named
+    // refusals the gateway-facing entry point itself owes: provider
+    // unselected, invalid voice pin, unwired broker, passive
+    // connection, second call. None of them may reach an app-server
+    // spawn.
+
+    fn bare_broker(
+        provider_selected: bool,
+        voice: PresenceVoiceConfig,
+    ) -> (Arc<VoiceBroker>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = VoiceBrokerSettings {
+            provider_selected,
+            app_server_command: "codex-unused".to_string(),
+            codex_home: None,
+            state_root: tmp.path().to_path_buf(),
+            voice,
+        };
+        (VoiceBroker::new(settings, EventBus::new()), tmp)
+    }
+
+    fn wire_with_anchor(broker: &Arc<VoiceBroker>, anchor_live: bool) {
+        broker.wire(VoiceBrokerWiring {
+            shared_session: crate::web_gateway::ActiveSessionState::empty(),
+            task_tx: None,
+            anchor_probe: Arc::new(move |_c: &str| anchor_live),
+        });
+    }
+
+    async fn start_and_expect_error(broker: &Arc<VoiceBroker>, needle: &str) {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        broker
+            .start_call("conn-1", "offer-sdp".to_string(), reply_tx)
+            .await;
+        let err = recv_t(&mut reply_rx, "voice_error").await;
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(needle),
+            "expected a named refusal containing {needle:?}, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_call_refuses_unselected_provider() {
+        let (broker, _tmp) = bare_broker(false, PresenceVoiceConfig::default());
+        start_and_expect_error(&broker, "not configured").await;
+    }
+
+    #[tokio::test]
+    async fn start_call_refuses_invalid_voice_pin() {
+        // cedar is a v2 voice; the default version is v3 (v1 family) —
+        // the A4 family validation refuses before anything spawns.
+        let voice = PresenceVoiceConfig {
+            voice: Some("cedar".to_string()),
+            ..PresenceVoiceConfig::default()
+        };
+        let (broker, _tmp) = bare_broker(true, voice);
+        start_and_expect_error(&broker, "voice pin invalid").await;
+    }
+
+    #[tokio::test]
+    async fn start_call_refuses_unwired_broker() {
+        let (broker, _tmp) = bare_broker(true, PresenceVoiceConfig::default());
+        start_and_expect_error(&broker, "not wired").await;
+    }
+
+    #[tokio::test]
+    async fn start_call_refuses_passive_connection() {
+        let (broker, _tmp) = bare_broker(true, PresenceVoiceConfig::default());
+        wire_with_anchor(&broker, false);
+        start_and_expect_error(&broker, "active presence connection").await;
+    }
+
+    #[tokio::test]
+    async fn start_call_refuses_second_call_while_one_is_active() {
+        let (broker, _tmp) = bare_broker(true, PresenceVoiceConfig::default());
+        wire_with_anchor(&broker, true);
+        *broker.active.lock().await = Some(ActiveCall {
+            connection_id: "conn-holder".to_string(),
+            stop_tx: None,
+        });
+        start_and_expect_error(&broker, "already active").await;
+        // The named error names the holding connection.
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        broker
+            .start_call("conn-1", "offer-sdp".to_string(), reply_tx)
+            .await;
+        let err = recv_t(&mut reply_rx, "voice_error").await;
+        assert!(err["message"].as_str().unwrap().contains("conn-holder"));
+    }
+
+    // ── N5: model/rerouted mid-call → status update + named event ──
+    #[tokio::test]
+    async fn model_rerouted_midcall_updates_status_and_emits_named_event() {
+        let rig = build_rig(false, true, Arc::new(|_c: &str| true));
+        let mut bus_rx = rig.deps.bus.subscribe();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let broker = rig.broker.clone();
+        let deps = rig.deps.clone();
+        let client = rig.client;
+        let events = rig.events.unwrap();
+        let mut reply_rx = rig.reply_rx;
+        let push_tx = rig.push_tx.clone();
+        let task = tokio::spawn(async move {
+            broker
+                .drive_call(&deps, &client, events, "offer".to_string(), stop_rx)
+                .await
+        });
+        let _ = recv_t(&mut reply_rx, "voice_answer").await;
+        // Drain the per-start status pushes so the reroute's own status
+        // push is the one asserted below.
+        let started = recv_t(&mut reply_rx, "voice_status").await;
+        assert_eq!(started["status"]["resolved_model"], "gpt-fresh");
+        push_tx
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "model/rerouted",
+                    "params": {"threadId": "t-new", "turnId": "turn-1",
+                                "fromModel": "gpt-fresh", "toModel": "gpt-fallback",
+                                "reason": "capacity"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        // Status update: the voice card's resolved model follows the
+        // reroute mid-call.
+        let rerouted = loop {
+            let status = recv_t(&mut reply_rx, "voice_status").await;
+            if status["status"]["resolved_model"] == "gpt-fallback" {
+                break status;
+            }
+        };
+        assert_eq!(rerouted["status"]["resolved_model"], "gpt-fallback");
+        assert_eq!(
+            rig.broker.status().resolved_model.as_deref(),
+            Some("gpt-fallback")
+        );
+        // Named event on the bus, mapped to the named PresenceEvent by
+        // the presence pump's filter.
+        let named = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(AppEvent::VoiceModelRerouted {
+                        from_model,
+                        to_model,
+                        reason,
+                    }) => return Some((from_model, to_model, reason)),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("named VoiceModelRerouted event on the bus");
+        assert_eq!(named.0, "gpt-fresh");
+        assert_eq!(named.1, "gpt-fallback");
+        assert_eq!(named.2.as_deref(), Some("capacity"));
+        let mut phase = String::new();
+        let presence_event = crate::presence::filter_event(
+            &AppEvent::VoiceModelRerouted {
+                from_model: named.0,
+                to_model: named.1,
+                reason: named.2,
+            },
+            &mut phase,
+        )
+        .expect("reroute maps to a named PresenceEvent");
+        let formatted = presence_core::format_event(&presence_event);
+        assert!(formatted.contains("gpt-fresh") && formatted.contains("gpt-fallback"));
+        stop_tx.send("stopped".to_string()).unwrap();
+        let _ = task.await.unwrap();
     }
 
     // Read tools need no evidence and dispatch straight through.

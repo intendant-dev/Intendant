@@ -47,6 +47,11 @@ pub(crate) fn neutral_cwd_path(state_root: &Path) -> PathBuf {
     presence_dir(state_root).join("neutral-cwd")
 }
 
+/// Cap on retained lineage entries (freshest kept). The default
+/// tool-lane policy retires one predecessor per call, so an unbounded
+/// trail would grow forever on a chatty daemon.
+pub(crate) const MAX_LINEAGE_ENTRIES: usize = 64;
+
 /// A retired predecessor in the presence-thread lineage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ThreadLineageEntry {
@@ -92,7 +97,12 @@ impl VoiceThreadRecord {
     }
 
     /// Adopt a freshly minted thread. When a predecessor existed, it
-    /// retires into the lineage with the reason resume failed.
+    /// retires into the lineage with the reason it was retired (resume
+    /// failed, or the default tool-lane re-declaration policy). The
+    /// lineage is a bounded provenance trail, not an audit log (that is
+    /// the authority-audit JSONL): the default policy retires one
+    /// predecessor per call, so the trail keeps only the freshest
+    /// [`MAX_LINEAGE_ENTRIES`].
     pub(crate) fn adopt(&mut self, new_thread_id: &str, now_epoch: u64, retire_reason: &str) {
         if let Some(prior) = self.thread_id.take() {
             if prior != new_thread_id {
@@ -101,6 +111,10 @@ impl VoiceThreadRecord {
                     retired_epoch: now_epoch,
                     reason: retire_reason.to_string(),
                 });
+                let excess = self.lineage.len().saturating_sub(MAX_LINEAGE_ENTRIES);
+                if excess > 0 {
+                    self.lineage.drain(..excess);
+                }
             }
         }
         self.thread_id = Some(new_thread_id.to_string());
@@ -273,6 +287,22 @@ mod tests {
         assert_eq!(rec.lineage.len(), 1);
         assert_eq!(rec.lineage[0].thread_id, "t-1");
         assert_eq!(rec.lineage[0].reason, "resume-failed");
+    }
+
+    #[test]
+    fn lineage_is_bounded_to_the_freshest_entries() {
+        let mut rec = VoiceThreadRecord::default();
+        rec.adopt("t-0", 0, "initial");
+        for i in 1..=(MAX_LINEAGE_ENTRIES + 10) {
+            rec.adopt(&format!("t-{i}"), i as u64, "tool-lane-redeclare");
+        }
+        assert_eq!(rec.lineage.len(), MAX_LINEAGE_ENTRIES);
+        // Freshest retirements survive; the oldest were drained.
+        assert_eq!(
+            rec.lineage.last().unwrap().thread_id,
+            format!("t-{}", MAX_LINEAGE_ENTRIES + 9)
+        );
+        assert_eq!(rec.lineage.first().unwrap().thread_id, "t-10");
     }
 
     #[test]
