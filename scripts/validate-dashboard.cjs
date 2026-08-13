@@ -75,6 +75,8 @@ const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
   '/wasm-web/presence_web_bg.wasm',
   '/wasm-station/station_web.js',
   '/wasm-station/station_web_bg.wasm',
+  '/wasm-xr/xr_web.js',
+  '/wasm-xr/xr_web_bg.wasm',
   '/three.module.min.js',
   '/codemirror-bundle.js',
   '/codemirror-bundle.css',

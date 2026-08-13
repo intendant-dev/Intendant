@@ -9,9 +9,10 @@
 //!   artifact's mtime.
 //! - Checks whether the compiled WASM artifacts of each browser WASM crate
 //!   (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` →
-//!   `static/wasm-station/`) are older than their Rust sources. If stale,
-//!   auto-rebuilds via `wasm-pack build` using a separate target directory to
-//!   avoid deadlocking with the parent cargo process.
+//!   `static/wasm-station/`, `crates/xr-web` → `static/wasm-xr/`) are older
+//!   than their Rust sources. If stale, auto-rebuilds via `wasm-pack build`
+//!   using a separate target directory to avoid deadlocking with the parent
+//!   cargo process.
 
 use std::path::Path;
 use std::process::Command;
@@ -64,6 +65,12 @@ const WASM_CRATES: &[WasmCrate] = &[
         crate_dir: "crates/station-web",
         artifact_dir: "static/wasm-station",
         out_name: "station_web",
+        extra_src_dirs: &[],
+    },
+    WasmCrate {
+        crate_dir: "crates/xr-web",
+        artifact_dir: "static/wasm-xr",
+        out_name: "xr_web",
         extra_src_dirs: &[],
     },
 ];

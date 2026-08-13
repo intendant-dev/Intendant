@@ -62,6 +62,10 @@ pub(crate) const WASM_STATION_JS: &str =
 pub(crate) const WASM_STATION_BIN: &[u8] =
     include_bytes!("../../../../static/wasm-station/station_web_bg.wasm");
 
+pub(crate) const WASM_XR_JS: &str = include_str!("../../../../static/wasm-xr/xr_web.js");
+
+pub(crate) const WASM_XR_BIN: &[u8] = include_bytes!("../../../../static/wasm-xr/xr_web_bg.wasm");
+
 pub(crate) const THREE_MODULE_JS: &str = include_str!("../../../../static/three.module.min.js");
 
 pub(crate) const CODEMIRROR_BUNDLE_JS: &str =
@@ -113,6 +117,8 @@ pub(crate) fn asset_version_hash() -> String {
     WASM_WEB_JS.hash(&mut hasher);
     WASM_STATION_BIN.hash(&mut hasher);
     WASM_STATION_JS.hash(&mut hasher);
+    WASM_XR_BIN.hash(&mut hasher);
+    WASM_XR_JS.hash(&mut hasher);
     ICON_128_PNG.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
@@ -202,6 +208,18 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             "/wasm-station/station_web.js",
             "application/javascript",
             WASM_STATION_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/wasm-xr/xr_web_bg.wasm",
+            "application/wasm",
+            WASM_XR_BIN,
+            true,
+        );
+        insert(
+            "/wasm-xr/xr_web.js",
+            "application/javascript",
+            WASM_XR_JS.as_bytes(),
             true,
         );
         insert(
@@ -453,12 +471,14 @@ pub(crate) fn rewrite_asset_url_with_version(html: &str, path: &str, version: &s
 /// Asset URLs inside app.html that carry `?v=` cache busters. The
 /// spawn-time rewrite of the embedded copy and the
 /// `INTENDANT_APP_HTML_PATH` per-request override apply the same set.
-const APP_HTML_VERSIONED_ASSETS: [&str; 13] = [
+const APP_HTML_VERSIONED_ASSETS: [&str; 15] = [
     "/xterm.css",
     "/wasm-web/presence_web.js",
     "/wasm-web/presence_web_bg.wasm",
     "/wasm-station/station_web.js",
     "/wasm-station/station_web_bg.wasm",
+    "/wasm-xr/xr_web.js",
+    "/wasm-xr/xr_web_bg.wasm",
     "/three.module.min.js",
     "/codemirror-bundle.js",
     "/codemirror-bundle.css",
@@ -598,6 +618,7 @@ mod tests {
     const STATION_WASM_ARM_PATHS: &[&str] = &[
         "/wasm-web/presence_web_bg.wasm",
         "/wasm-station/station_web_bg.wasm",
+        "/wasm-xr/xr_web_bg.wasm",
     ];
 
     /// Lowercase-hex sha256, matching the assembler's pin encoding.
@@ -2261,8 +2282,10 @@ mod tests {
         for path in [
             "/wasm-web/presence_web_bg.wasm",
             "/wasm-station/station_web_bg.wasm",
+            "/wasm-xr/xr_web_bg.wasm",
             "/wasm-web/presence_web.js",
             "/wasm-station/station_web.js",
+            "/wasm-xr/xr_web.js",
             "/three.module.min.js",
             "/codemirror-bundle.js",
             "/codemirror-bundle.css",
