@@ -101,9 +101,21 @@ pub fn reference_scene() -> SceneFrame {
         d += step;
     }
     // Axis gizmo: X red, Y green, Z blue, 0.3 m.
-    frame.push_line(v3(0.0, 0.001, 0.0), v3(0.3, 0.001, 0.0), [0.95, 0.35, 0.35, 1.0]);
-    frame.push_line(v3(0.0, 0.001, 0.0), v3(0.0, 0.301, 0.0), [0.42, 0.85, 0.48, 1.0]);
-    frame.push_line(v3(0.0, 0.001, 0.0), v3(0.0, 0.001, 0.3), [0.45, 0.55, 0.98, 1.0]);
+    frame.push_line(
+        v3(0.0, 0.001, 0.0),
+        v3(0.3, 0.001, 0.0),
+        [0.95, 0.35, 0.35, 1.0],
+    );
+    frame.push_line(
+        v3(0.0, 0.001, 0.0),
+        v3(0.0, 0.301, 0.0),
+        [0.42, 0.85, 0.48, 1.0],
+    );
+    frame.push_line(
+        v3(0.0, 0.001, 0.0),
+        v3(0.0, 0.001, 0.3),
+        [0.45, 0.55, 0.98, 1.0],
+    );
     let center = v3(0.0, 1.4, -1.2);
     let right = v3(1.0, 0.0, 0.0);
     let up = v3(0.0, 1.0, 0.0);
@@ -470,16 +482,8 @@ impl GlEncoder {
                     gl.bind_texture(Gl::TEXTURE_2D, Some(&tex));
                     gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
                     gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-                    gl.tex_parameteri(
-                        Gl::TEXTURE_2D,
-                        Gl::TEXTURE_WRAP_S,
-                        Gl::CLAMP_TO_EDGE as i32,
-                    );
-                    gl.tex_parameteri(
-                        Gl::TEXTURE_2D,
-                        Gl::TEXTURE_WRAP_T,
-                        Gl::CLAMP_TO_EDGE as i32,
-                    );
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
                     e.insert(tex)
                 }
             };
@@ -561,21 +565,25 @@ impl GlEncoder {
 
         if !self.panels.is_empty() {
             gl.use_program(Some(&self.panel.program));
-            gl.uniform_matrix4fv_with_f32_array(
-                Some(&self.panel.u_view_proj),
-                false,
-                &view_proj.0,
-            );
+            gl.uniform_matrix4fv_with_f32_array(Some(&self.panel.u_view_proj), false, &view_proj.0);
             gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_unit));
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 8, 0);
             gl.disable_vertex_attrib_array(1);
             for p in &self.panels {
-                gl.uniform3f(Some(&self.panel.u_center), p.center.x, p.center.y, p.center.z);
+                gl.uniform3f(
+                    Some(&self.panel.u_center),
+                    p.center.x,
+                    p.center.y,
+                    p.center.z,
+                );
                 gl.uniform3f(Some(&self.panel.u_right), p.right.x, p.right.y, p.right.z);
                 gl.uniform3f(Some(&self.panel.u_up), p.up.x, p.up.y, p.up.z);
                 gl.uniform2f(Some(&self.panel.u_half), p.half_w, p.half_h);
-                gl.uniform1f(Some(&self.panel.u_radius), p.radius.min(p.half_w).min(p.half_h));
+                gl.uniform1f(
+                    Some(&self.panel.u_radius),
+                    p.radius.min(p.half_w).min(p.half_h),
+                );
                 gl.uniform4f(
                     Some(&self.panel.u_fill),
                     p.fill[0],
@@ -597,11 +605,7 @@ impl GlEncoder {
 
         if !self.monitors.is_empty() {
             gl.use_program(Some(&self.video.program));
-            gl.uniform_matrix4fv_with_f32_array(
-                Some(&self.video.u_view_proj),
-                false,
-                &view_proj.0,
-            );
+            gl.uniform_matrix4fv_with_f32_array(Some(&self.video.u_view_proj), false, &view_proj.0);
             gl.active_texture(Gl::TEXTURE0);
             gl.uniform1i(Some(&self.video.u_tex), 0);
             gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_unit));
@@ -613,7 +617,12 @@ impl GlEncoder {
                     continue;
                 };
                 gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
-                gl.uniform3f(Some(&self.video.u_center), m.center.x, m.center.y, m.center.z);
+                gl.uniform3f(
+                    Some(&self.video.u_center),
+                    m.center.x,
+                    m.center.y,
+                    m.center.z,
+                );
                 gl.uniform3f(Some(&self.video.u_right), m.right.x, m.right.y, m.right.z);
                 gl.uniform3f(Some(&self.video.u_up), m.up.x, m.up.y, m.up.z);
                 gl.uniform2f(Some(&self.video.u_half), m.half_w, m.half_h);
@@ -623,11 +632,7 @@ impl GlEncoder {
 
         if self.tri_count > 0 || self.line_count > 0 {
             gl.use_program(Some(&self.solid.program));
-            gl.uniform_matrix4fv_with_f32_array(
-                Some(&self.solid.u_view_proj),
-                false,
-                &view_proj.0,
-            );
+            gl.uniform_matrix4fv_with_f32_array(Some(&self.solid.u_view_proj), false, &view_proj.0);
             if self.tri_count > 0 {
                 gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_tris));
                 bind_pos_color_layout(gl);

@@ -80,8 +80,8 @@ pub(crate) fn build_scene(
         // Host label rides above the row's left-most card slot.
         if shown > 0 {
             let (slot0, right, up) = shelf_slot(0, shown, row);
-            let label_origin = slot0 + up.scale(kit::CARD_H / 2.0 + 0.035)
-                - right.scale(kit::CARD_W / 2.0);
+            let label_origin =
+                slot0 + up.scale(kit::CARD_H / 2.0 + 0.035) - right.scale(kit::CARD_W / 2.0);
             let host_color = if host.connected {
                 kit::TEXT_2
             } else {
@@ -242,16 +242,10 @@ fn backdrop(passthrough: bool, floor_y: f32, out: &mut SceneBatches) {
         let step = 0.5f32;
         let mut d = -extent;
         while d <= extent + 1e-4 {
-            out.frame.push_line(
-                v3(d, floor_y, -extent),
-                v3(d, floor_y, extent),
-                grid,
-            );
-            out.frame.push_line(
-                v3(-extent, floor_y, d),
-                v3(extent, floor_y, d),
-                grid,
-            );
+            out.frame
+                .push_line(v3(d, floor_y, -extent), v3(d, floor_y, extent), grid);
+            out.frame
+                .push_line(v3(-extent, floor_y, d), v3(extent, floor_y, d), grid);
             d += step;
         }
     }
@@ -599,7 +593,11 @@ fn workbench(
                     kit::SURFACE
                 },
                 border: *color,
-                border_w: if is_hover || held.is_some() { 0.0035 } else { 0.0025 },
+                border_w: if is_hover || held.is_some() {
+                    0.0035
+                } else {
+                    0.0025
+                },
             });
             // Deliberate-confirm feedback: the pill fills left→right over
             // the hold window; release early and it drains away.
@@ -741,14 +739,20 @@ mod tests {
     fn scene_builds_cards_banner_and_hits() {
         let snap = snapshot();
         let mut out = SceneBatches::default();
-        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut out);
+        build_scene(
+            &snap,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
 
         // 3 cards + 1 banner target; no workbench pills without selection.
-        let cards = out
-            .hits
-            .iter()
-            .filter(|h| h.kind == HitKind::Card)
-            .count();
+        let cards = out.hits.iter().filter(|h| h.kind == HitKind::Card).count();
         assert_eq!(cards, 4, "3 cards + banner");
         assert!(out.hits.iter().all(|h| h.kind != HitKind::Approve));
         // Approval card gets the amber border; recent card is inert data.
@@ -761,7 +765,17 @@ mod tests {
     fn selecting_the_approval_agent_arms_pills() {
         let snap = snapshot();
         let mut out = SceneBatches::default();
-        build_scene(&snap, &[], Some("a2"), None, None, false, 0.0, &ApproxMeasure, &mut out);
+        build_scene(
+            &snap,
+            &[],
+            Some("a2"),
+            None,
+            None,
+            false,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
         let approve = out
             .hits
             .iter()
@@ -779,8 +793,28 @@ mod tests {
         let snap = snapshot();
         let mut level = SceneBatches::default();
         let mut sunk = SceneBatches::default();
-        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut level);
-        build_scene(&snap, &[], None, None, None, true, -1.5, &ApproxMeasure, &mut sunk);
+        build_scene(
+            &snap,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut level,
+        );
+        build_scene(
+            &snap,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            -1.5,
+            &ApproxMeasure,
+            &mut sunk,
+        );
         let a = level.panels.first().unwrap().center;
         let b = sunk.panels.first().unwrap().center;
         assert!((a.y - b.y - 1.5).abs() < 1e-5);
@@ -790,7 +824,17 @@ mod tests {
     fn empty_feed_renders_waiting_note() {
         let snap = XrSnapshot::default();
         let mut out = SceneBatches::default();
-        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut out);
+        build_scene(
+            &snap,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
         assert!(out.hits.is_empty());
         assert_eq!(out.texts.len(), 1);
         assert!(out.texts[0].text.contains("waiting"));

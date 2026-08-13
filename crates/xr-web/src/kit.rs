@@ -173,11 +173,7 @@ pub(crate) fn shelf_slot(index: usize, count: usize, row: usize) -> (Vec3, Vec3,
     let n = count.max(1) as f32;
     let az = (index as f32 - (n - 1.0) / 2.0) * CARD_ARC_STEP;
     let y = SHELF_TOP_ROW_Y - row as f32 * SHELF_ROW_DROP;
-    let center = v3(
-        SHELF_RADIUS * az.sin(),
-        y,
-        -SHELF_RADIUS * az.cos(),
-    );
+    let center = v3(SHELF_RADIUS * az.sin(), y, -SHELF_RADIUS * az.cos());
     let right = v3(az.cos(), 0.0, az.sin());
     let up = v3(0.0, 1.0, 0.0);
     (center, right, up)

@@ -34,8 +34,7 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
         if let Ok(Some(iter)) = js_sys::try_iter(&sources) {
             for src in iter.flatten() {
                 let src: xr::XrInputSource = src.unchecked_into();
-                let Some(pose) = frame.get_pose(&src.target_ray_space(), &state.ref_space)
-                else {
+                let Some(pose) = frame.get_pose(&src.target_ray_space(), &state.ref_space) else {
                     continue;
                 };
                 let Some(mat) = xr::mat4_from_js(&pose.transform().matrix()) else {
@@ -112,7 +111,12 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
 /// Card targets change local selection; approve/deny emit the
 /// dashboard's approval action. Returns true when something happened.
 pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
-    let Some(hit) = inner.hit_targets.iter().find(|h| h.id == target_id).cloned() else {
+    let Some(hit) = inner
+        .hit_targets
+        .iter()
+        .find(|h| h.id == target_id)
+        .cloned()
+    else {
         return false;
     };
     match hit.kind {

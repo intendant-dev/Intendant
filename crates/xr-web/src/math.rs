@@ -141,10 +141,22 @@ impl Mat4 {
         let rz = v3(m[8], m[9], m[10]);
         let t = v3(m[12], m[13], m[14]);
         Mat4([
-            rx.x, ry.x, rz.x, 0.0, //
-            rx.y, ry.y, rz.y, 0.0, //
-            rx.z, ry.z, rz.z, 0.0, //
-            -rx.dot(t), -ry.dot(t), -rz.dot(t), 1.0,
+            rx.x,
+            ry.x,
+            rz.x,
+            0.0, //
+            rx.y,
+            ry.y,
+            rz.y,
+            0.0, //
+            rx.z,
+            ry.z,
+            rz.z,
+            0.0, //
+            -rx.dot(t),
+            -ry.dot(t),
+            -rz.dot(t),
+            1.0,
         ])
     }
 }
