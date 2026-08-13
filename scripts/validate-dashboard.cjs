@@ -95,7 +95,10 @@ const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
 // path with no XR hardware. Injected before page load; a UA with real
 // WebXR is left untouched.
 const XR_WEBXR_SHIM_SOURCE = `(() => {
-  if (navigator.xr) return; // real WebXR wins
+  // Unconditional override: desktop Chrome exposes a REAL navigator.xr
+  // that supports no immersive modes (observed live on macOS headless —
+  // deferring to it hides the chip and fails the probe). The probe must
+  // not depend on host hardware, so the shim always wins here.
   const eyeMatrix = (dx) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, dx,1.5,0,1]);
   const projMatrix = () => {
     const n = 0.05, f = 60.0, r = n * Math.tan(Math.PI / 4), t = r;
@@ -157,10 +160,16 @@ const XR_WEBXR_SHIM_SOURCE = `(() => {
     }
   }
   window.XRWebGLLayer = FakeWebGLLayer;
-  navigator.xr = {
-    isSessionSupported: (mode) => Promise.resolve(mode === 'immersive-ar' || mode === 'immersive-vr'),
-    requestSession: (mode) => Promise.resolve(new FakeSession(mode)),
-  };
+  // navigator.xr is a readonly prototype accessor where real WebXR
+  // exists — plain assignment silently no-ops. defineProperty on the
+  // instance shadows it deterministically.
+  Object.defineProperty(navigator, 'xr', {
+    configurable: true,
+    value: {
+      isSessionSupported: (mode) => Promise.resolve(mode === 'immersive-ar' || mode === 'immersive-vr'),
+      requestSession: (mode) => Promise.resolve(new FakeSession(mode)),
+    },
+  });
 })();`;
 
 const XR_PROBE_SNAPSHOT = {
@@ -254,7 +263,8 @@ Options:
   --cdp-timeout MS           Chromium CDP readiness timeout (default: ${DEFAULT_CDP_TIMEOUT_MS})
   --browser PATH             Chromium/Chrome executable
   --headed                   Run without --headless=new
-  --enable-gpu               Omit the default --disable-gpu Chromium flag (implied by --station-probe webgpu)
+  --enable-gpu               Omit the default --disable-gpu Chromium flag (implied by
+                             --station-probe webgpu and --xr-probe)
   --browser-arg ARG          Extra Chromium arg; repeatable
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
@@ -525,11 +535,6 @@ function parseArgs(argv, env = process.env) {
   }
 
   opts.url = resolveDashboardUrl(opts, env);
-  if (opts.xrProbe && !/[?&]xr=dev\b/.test(opts.url)) {
-    // The XR entry chip is dev-gated; the probe needs the gate open from
-    // first load (the gate is read at module evaluation).
-    opts.url += (opts.url.includes('?') ? '&' : '?') + 'xr=dev';
-  }
   if (opts.screenshotPath) {
     opts.screenshotPath = path.resolve(opts.screenshotPath);
   }
@@ -859,6 +864,7 @@ async function main() {
       stationWorkflows: validation.stationWorkflows,
       stationSend: validation.stationSend,
       stationPerfEval: validation.stationPerfEval,
+      xrProbe: validation.xrProbe,
       stationState: validation.stationState,
       harnessRetries: Object.keys(harnessRetries).length ? harnessRetries : undefined,
       staticIdentity,
@@ -2288,6 +2294,13 @@ class BrowserHarness {
           { source: XR_WEBXR_SHIM_SOURCE },
           this.sessionId,
         );
+        // The chip is dev-gated and the gate is read at module eval, so
+        // the query param must ride the first navigation. Applied here —
+        // not at arg parse — because --launch-dashboard resolves its URL
+        // only after the temporary daemon binds a port.
+        if (!/[?&]xr=dev\b/.test(opts.url)) {
+          opts.url += (opts.url.includes('?') ? '&' : '?') + 'xr=dev';
+        }
       }
       const nav = await this.cdp.send('Page.navigate', { url: opts.url }, this.sessionId);
       if (nav.errorText) {
@@ -3316,7 +3329,9 @@ function browserArgs(userDataDir, opts) {
 }
 
 function browserValidationNeedsGpu(opts) {
-  return Boolean(opts.enableGpu || (opts.stationProbes || []).includes('webgpu'));
+  // --xr-probe implies GPU: the XR encoder needs a real WebGL2 context,
+  // and --disable-gpu + headless=new yields none on macOS (observed live).
+  return Boolean(opts.enableGpu || opts.xrProbe || (opts.stationProbes || []).includes('webgpu'));
 }
 
 function resolveBrowserExecutable(explicit) {

@@ -158,11 +158,16 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
 /// Call the registered JS action router with one JSON-shaped object.
 /// Failures log and drop — an action must never take the session down.
 fn emit_action(inner: &Inner, payload: &serde_json::Value) {
+    use serde::Serialize as _;
     let Some(callback) = inner.action_callback.clone() else {
         web_sys::console::warn_1(&"xr-web: action emitted with no router registered".into());
         return;
     };
-    match serde_wasm_bindgen::to_value(payload) {
+    // json_compatible(): plain objects, not ES Maps — the repo-wide
+    // serde_wasm_bindgen convention (a Map JSON.stringifies to '{}' and
+    // the dashboard router reads plain properties).
+    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+    match payload.serialize(&serializer) {
         Ok(js) => {
             if let Err(err) = callback.call1(&wasm_bindgen::JsValue::NULL, &js) {
                 web_sys::console::warn_2(&"xr-web: action router threw".into(), &err);

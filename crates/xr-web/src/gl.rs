@@ -135,7 +135,7 @@ void main() {
 ";
 
 const FS_SOLID: &str = r"#version 300 es
-precision mediump float;
+precision highp float;
 in vec4 vColor;
 out vec4 outColor;
 void main() {
@@ -159,7 +159,7 @@ void main() {
 ";
 
 const FS_PANEL: &str = r"#version 300 es
-precision mediump float;
+precision highp float;
 in vec2 vLocal;
 uniform vec2 uHalf;
 uniform float uRadius;
@@ -204,7 +204,7 @@ void main() {
 ";
 
 const FS_VIDEO: &str = r"#version 300 es
-precision mediump float;
+precision highp float;
 in vec2 vUv;
 uniform sampler2D uTex;
 out vec4 outColor;
@@ -228,7 +228,7 @@ void main() {
 ";
 
 const FS_TEXT: &str = r"#version 300 es
-precision mediump float;
+precision highp float;
 in vec2 vUv;
 in vec4 vColor;
 uniform sampler2D uAtlas;
@@ -405,18 +405,6 @@ impl GlEncoder {
     /// The raw context, for `XRWebGLLayer` construction.
     pub fn gl_context_js(&self) -> JsValue {
         self.gl.clone().into()
-    }
-
-    /// `gl.makeXRCompatible()` — required when the adapter changed after
-    /// context creation; guarded because a few runtimes predate it. The
-    /// returned promise (when present) must be awaited before layer
-    /// construction.
-    pub fn make_xr_compatible_promise(&self) -> Option<js_sys::Promise> {
-        let gl_js: &JsValue = self.gl.as_ref();
-        let f = js_sys::Reflect::get(gl_js, &"makeXRCompatible".into()).ok()?;
-        let f: js_sys::Function = f.dyn_into().ok()?;
-        let ret = f.call0(gl_js).ok()?;
-        ret.dyn_into().ok()
     }
 
     /// Keep the hidden canvas alive with the context (dropping it is

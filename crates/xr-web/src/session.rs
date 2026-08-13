@@ -83,20 +83,17 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
         xr::xr_system().ok_or_else(|| JsValue::from_str("xr-web: navigator.xr unavailable"))?;
 
     // The encoder (and its XR-compatible GL context) survives across
-    // sessions; build it lazily on first entry.
+    // sessions; build it lazily on first entry. The context is created
+    // with { xrCompatible: true }, which the spec makes sufficient for
+    // XRWebGLLayer creation — deliberately NO makeXRCompatible() call:
+    // desktop Chrome's implementation can hang that promise indefinitely
+    // when no XR device service exists (observed live under the
+    // validator probe), and the only case it covers beyond the creation
+    // flag is a mid-session GPU adapter change, which session re-entry
+    // already handles.
     if inner.borrow().encoder.is_none() {
         let encoder = GlEncoder::new()?;
         inner.borrow_mut().encoder = Some(encoder);
-    }
-    let compat = inner
-        .borrow()
-        .encoder
-        .as_ref()
-        .and_then(|e| e.make_xr_compatible_promise());
-    if let Some(promise) = compat {
-        // Pre-spec-maturity runtimes may lack makeXRCompatible; the
-        // context was already created with { xrCompatible: true }.
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     let (session, space_kind) = request_session_with_floor(&xr_sys, &mode).await?;
