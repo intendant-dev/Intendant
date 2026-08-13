@@ -5584,6 +5584,23 @@ mod tests {
                 "api_display_input_authority_snapshot",
                 "api_display_input_authority_request",
                 "api_display_input_authority_release",
+                // The agenda/memory planes (Operate widening). The
+                // walled residue — stamp, definition add/remove,
+                // reminder policy, memory judge — must never appear
+                // in any preset's set.
+                "api_agenda_list",
+                "api_agenda_item",
+                "api_agenda_ops",
+                "api_agenda_occurrences",
+                "api_agenda_op",
+                "api_agenda_definitions",
+                "api_agenda_sealed",
+                "api_agenda_ref_drift",
+                "api_agenda_ref_content",
+                "api_agenda_pr_state",
+                "api_memory_search",
+                "api_memory_claim",
+                "api_memory_propose",
             ])
             .collect::<std::collections::BTreeSet<_>>();
 

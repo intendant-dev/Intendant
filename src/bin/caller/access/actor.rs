@@ -233,7 +233,14 @@ impl ActorBinding {
             | "" => Self::dashboard(id),
             "peer_daemon" => Self::peer(id),
             // Unknown principal classes stay visibly unclassified while
-            // still naming the principal the gate bound.
+            // still naming the principal the gate bound. `hosted_lease`
+            // lands here DELIBERATELY: the agenda and memory tenant edges
+            // treat `dashboard`/`local_process` as owner surfaces
+            // (schedule approval, memory judgment), and a hosted lease is
+            // a borrowed remote browser, never the owner's surface —
+            // classifying it upward would silently widen approval-grade
+            // verbs onto hosted (pinned by
+            // `hosted_lease_principals_classify_as_unattributed`).
             _ => Self {
                 kind: ActorKind::Unattributed,
                 principal_id: id,
@@ -334,6 +341,49 @@ mod tests {
         let actor = ActorBinding::from_principal(&impostor, None);
         assert_eq!(actor.kind, ActorKind::Unattributed);
         assert_eq!(actor.principal_id.as_deref(), Some(impostor.id.as_str()));
+    }
+
+    /// MANDATORY PIN (Operate plane widening): a hosted-lease principal
+    /// classifies as `Unattributed` — NEVER `Dashboard` or
+    /// `LocalProcess`. The agenda tenant edge treats those two kinds as
+    /// owner surfaces (schedule approve/revoke/start-now/
+    /// request-occurrence) and the memory service gives them judgment,
+    /// so a reclassification here would silently widen approval-grade
+    /// verbs onto hosted surfaces past the compiled action wall. The
+    /// fixture mirrors the verified-lease principal exactly as the
+    /// hosted runtime constructs it.
+    #[test]
+    fn hosted_lease_principals_classify_as_unattributed() {
+        let principal = crate::access::iam::AccessPrincipal {
+            id: "principal:hosted-lease:abc123".to_string(),
+            kind: crate::access::hosted_control::HOSTED_PRINCIPAL_KIND.to_string(),
+            label: "Hosted lease abc123".to_string(),
+            source: crate::access::hosted_control::HOSTED_SOURCE.to_string(),
+            role_id: "role:hosted-operate".to_string(),
+            grant_id: Some("grant:hosted-lease:abc123".to_string()),
+            transport: "https".to_string(),
+            peer_profile: None,
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": crate::access::hosted_control::HOSTED_AUTHN_KIND,
+                "fingerprint": "browser-key-fp",
+                "public_key": "browser-key-pub",
+            })],
+            authn_kind: Some(crate::access::hosted_control::HOSTED_AUTHN_KIND.to_string()),
+            authn_binding: Some("browser-key-fp".to_string()),
+            authn_origin: Some("https://fleet.invalid".to_string()),
+            hosted_connect: true,
+        };
+        let actor = ActorBinding::from_principal(&principal, None);
+        assert_eq!(
+            actor.kind,
+            ActorKind::Unattributed,
+            "a hosted lease must stay unclassified — Dashboard/LocalProcess \
+             are owner surfaces at the agenda and memory tenant edges",
+        );
+        assert_eq!(actor.principal_id.as_deref(), Some(principal.id.as_str()));
+        assert_eq!(actor.session_id, None);
     }
 
     /// The in-process mint carries no identity fields — no IAM principal
