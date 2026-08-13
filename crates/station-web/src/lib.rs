@@ -3,39 +3,74 @@
 //! `static/app.html`. Rendering is scheduled on demand: see
 //! `StationInner::schedule_frame` / `is_animating`.
 
-mod focus_rows;
-mod gpu;
-mod hud;
-mod input;
+// The snapshot wire schema is pure Rust — kept native-buildable (the
+// presence-web app_state pattern) so its schema-pinning tests run in a
+// plain `cargo test -p station-web`. Nothing native consumes it outside
+// its own tests, hence the native-side allow.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod model;
+
+// Everything below is wasm32-only: the WebGPU/canvas renderer, DOM and
+// input glue, and the wasm-bindgen exports. Cargo.toml mirrors these
+// gates — the browser stack (wgpu above all) lives under a wasm32
+// target table, which keeps wgpu's native graphics backends (~71
+// packages) out of full-workspace native builds. On wasm32 nothing
+// changes.
+#[cfg(target_arch = "wasm32")]
+mod focus_rows;
+#[cfg(target_arch = "wasm32")]
+mod gpu;
+#[cfg(target_arch = "wasm32")]
+mod hud;
+#[cfg(target_arch = "wasm32")]
+mod input;
+#[cfg(target_arch = "wasm32")]
 mod panes;
+#[cfg(target_arch = "wasm32")]
 mod scene;
+#[cfg(target_arch = "wasm32")]
 mod text_atlas;
+#[cfg(target_arch = "wasm32")]
 mod util;
 
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_arch = "wasm32")]
 use std::f32::consts::PI;
+#[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
 
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
+#[cfg(target_arch = "wasm32")]
 use web_sys::{CanvasRenderingContext2d, Event, HtmlCanvasElement, HtmlVideoElement};
 
+#[cfg(target_arch = "wasm32")]
 use gpu::{GpuFrame, GpuRecovery, GpuState};
+#[cfg(target_arch = "wasm32")]
 use hud::{Hud, SystemTarget};
+#[cfg(target_arch = "wasm32")]
 use input::{HitZone, PinchZoom, PointerDrag, ScrollZone};
+#[cfg(target_arch = "wasm32")]
 use model::{StationEvent, StationSnapshot, StationTranscript};
+#[cfg(target_arch = "wasm32")]
 use scene::{layout_positions, LayoutName, Mood, Particle, Vec2, Vec3};
+#[cfg(target_arch = "wasm32")]
 use util::{lcg, level_color, now_ms, station_enable_webgpu, unit};
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct StationWeb {
     inner: Rc<RefCell<StationInner>>,
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl StationWeb {
     #[wasm_bindgen(constructor)]
@@ -436,6 +471,7 @@ impl StationWeb {
 
 /// Hotspot targets as JSON objects (shared by `debug_json` and
 /// `hotspot_rects`).
+#[cfg(target_arch = "wasm32")]
 fn hotspot_json(zones: &[HitZone]) -> Vec<serde_json::Value> {
     input::hotspot_rects_from_zones(zones)
         .into_iter()
@@ -445,6 +481,7 @@ fn hotspot_json(zones: &[HitZone]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[cfg(target_arch = "wasm32")]
 struct StationInner {
     scene_canvas: HtmlCanvasElement,
     hud_canvas: HtmlCanvasElement,
@@ -559,6 +596,7 @@ struct StationInner {
     present_history: Vec<f64>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl StationInner {
     fn new(
         scene_canvas: HtmlCanvasElement,
@@ -1184,6 +1222,7 @@ impl StationInner {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 struct DisplaySource {
     host_id: String,
     label: String,
