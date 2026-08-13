@@ -42,6 +42,13 @@ export class XrWeb {
      */
     probeSupport(): Promise<any>;
     /**
+     * Register (or refresh) a live display stream — the same 6-arg shape
+     * the dashboard already uses for its other rendered surface, so the
+     * JS glue mirrors registrations verbatim. Only `kind == "video"`
+     * sources become monitors. Idempotent per source id.
+     */
+    registerDisplaySource(source_id: string, _host_id: string, _display_id: string, label: string, kind: string, video: HTMLVideoElement): void;
+    /**
      * Register the dashboard's action router. Actions emitted by the XR
      * surface call this with one JSON-stringifiable object argument.
      */
@@ -51,6 +58,7 @@ export class XrWeb {
      * session ends (user gesture, `exit()`, or runtime shutdown).
      */
     setOnSessionEnd(callback: Function): void;
+    unregisterDisplaySource(source_id: string): void;
     /**
      * Ingest one coalesced dashboard state snapshot (same feed schema the
      * other rendered surface consumes). Parse failures keep the previous
@@ -71,8 +79,10 @@ export interface InitOutput {
     readonly xrweb_exit: (a: number) => void;
     readonly xrweb_new: () => number;
     readonly xrweb_probeSupport: (a: number) => any;
+    readonly xrweb_registerDisplaySource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => void;
     readonly xrweb_setActionCallback: (a: number, b: any) => void;
     readonly xrweb_setOnSessionEnd: (a: number, b: any) => void;
+    readonly xrweb_unregisterDisplaySource: (a: number, b: number, c: number) => void;
     readonly xrweb_updateSnapshot: (a: number, b: any) => void;
     readonly wasm_bindgen__closure__destroy__h95fa55e82713b162: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hb9ef122cd6bafce1: (a: number, b: number) => void;

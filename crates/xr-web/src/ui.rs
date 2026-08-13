@@ -9,8 +9,8 @@
 
 use crate::atlas::TextMeasure;
 use crate::kit::{
-    self, front_panel_basis, rgba, shelf_slot, status_color, HitKind, HitTarget, PanelInstance,
-    SceneBatches, TextAlign, TextRun,
+    self, front_panel_basis, rgba, shelf_slot, status_color, HitKind, HitTarget, MonitorInstance,
+    PanelInstance, SceneBatches, TextAlign, TextRun,
 };
 use crate::math::{v3, Panel, Vec3};
 use crate::model::{XrAgent, XrSnapshot};
@@ -30,6 +30,7 @@ fn dim(c: [f32; 4], f: f32) -> [f32; 4] {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_scene(
     snap: &XrSnapshot,
+    displays: &[(String, String)],
     selected_id: Option<&str>,
     hover_id: Option<&str>,
     confirm: Option<(&str, f32)>,
@@ -40,8 +41,13 @@ pub(crate) fn build_scene(
 ) {
     out.clear();
     backdrop(passthrough, floor_y, out);
+    // Screens are independent of the agents feed — they show even while
+    // the snapshot warms up.
+    monitors(displays, floor_y, out);
 
-    // Hosts: connected first, local pinned to the top row.
+    // Hosts: connected first, local pinned to the top row. (The early
+    // return below keeps monitors/backdrop — only shelf content needs
+    // the feed.)
     let mut hosts: Vec<_> = snap.hosts.iter().collect();
     hosts.sort_by_key(|h| (!h.connected, h.id != "local", h.name.clone()));
     if hosts.is_empty() {
@@ -132,6 +138,71 @@ pub(crate) fn build_scene(
 
     if !pending_approvals.is_empty() {
         banner(&pending_approvals, hover_id, floor_y, out);
+    }
+}
+
+/// Live display streams as floating screens on the operator's left —
+/// the fleet's actual desktops in the room. Capped at two stacked
+/// 16:9 screens in v1; the rest are counted honestly.
+fn monitors(displays: &[(String, String)], floor_y: f32, out: &mut SceneBatches) {
+    const AZ: f32 = -0.66; // ≈ −38°: left of the shelf, inside the arc
+    const DIST: f32 = 1.85;
+    const HALF_W: f32 = 0.60;
+    const HALF_H: f32 = HALF_W * 9.0 / 16.0;
+    let right = v3(AZ.cos(), 0.0, AZ.sin());
+    let up = v3(0.0, 1.0, 0.0);
+    for (i, (id, label)) in displays.iter().take(2).enumerate() {
+        let y = 1.52 - i as f32 * (HALF_H * 2.0 + 0.12);
+        let center = v3(DIST * AZ.sin(), y, -DIST * AZ.cos());
+        // Bezel sits just behind the video plane.
+        out.panels.push(PanelInstance {
+            center: lift(center, right, up, -0.004, floor_y),
+            right,
+            up,
+            half_w: HALF_W + 0.016,
+            half_h: HALF_H + 0.016,
+            radius: 0.024,
+            fill: kit::SURFACE_2,
+            border: kit::LINE_2,
+            border_w: 0.003,
+        });
+        out.monitors.push(MonitorInstance {
+            id: id.clone(),
+            center: at_floor(center, floor_y),
+            right,
+            up,
+            half_w: HALF_W,
+            half_h: HALF_H,
+        });
+        out.texts.push(TextRun {
+            origin: lift(
+                center - up.scale(HALF_H + 0.045),
+                right,
+                up,
+                LIFT_TEXT,
+                floor_y,
+            ),
+            right,
+            up,
+            height: 0.024,
+            color: kit::TEXT_2,
+            align: TextAlign::Center,
+            max_width: HALF_W * 2.0,
+            text: label.clone(),
+        });
+    }
+    if displays.len() > 2 {
+        let center = v3(DIST * AZ.sin(), 0.62, -DIST * AZ.cos());
+        out.texts.push(TextRun {
+            origin: lift(center, right, up, LIFT_TEXT, floor_y),
+            right,
+            up,
+            height: 0.024,
+            color: kit::TEXT_3,
+            align: TextAlign::Center,
+            max_width: 0.0,
+            text: format!("+{} more displays on the dashboard", displays.len() - 2),
+        });
     }
 }
 
@@ -670,7 +741,7 @@ mod tests {
     fn scene_builds_cards_banner_and_hits() {
         let snap = snapshot();
         let mut out = SceneBatches::default();
-        build_scene(&snap, None, None, None, true, 0.0, &ApproxMeasure, &mut out);
+        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut out);
 
         // 3 cards + 1 banner target; no workbench pills without selection.
         let cards = out
@@ -690,7 +761,7 @@ mod tests {
     fn selecting_the_approval_agent_arms_pills() {
         let snap = snapshot();
         let mut out = SceneBatches::default();
-        build_scene(&snap, Some("a2"), None, None, false, 0.0, &ApproxMeasure, &mut out);
+        build_scene(&snap, &[], Some("a2"), None, None, false, 0.0, &ApproxMeasure, &mut out);
         let approve = out
             .hits
             .iter()
@@ -708,8 +779,8 @@ mod tests {
         let snap = snapshot();
         let mut level = SceneBatches::default();
         let mut sunk = SceneBatches::default();
-        build_scene(&snap, None, None, None, true, 0.0, &ApproxMeasure, &mut level);
-        build_scene(&snap, None, None, None, true, -1.5, &ApproxMeasure, &mut sunk);
+        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut level);
+        build_scene(&snap, &[], None, None, None, true, -1.5, &ApproxMeasure, &mut sunk);
         let a = level.panels.first().unwrap().center;
         let b = sunk.panels.first().unwrap().center;
         assert!((a.y - b.y - 1.5).abs() < 1e-5);
@@ -719,7 +790,7 @@ mod tests {
     fn empty_feed_renders_waiting_note() {
         let snap = XrSnapshot::default();
         let mut out = SceneBatches::default();
-        build_scene(&snap, None, None, None, true, 0.0, &ApproxMeasure, &mut out);
+        build_scene(&snap, &[], None, None, None, true, 0.0, &ApproxMeasure, &mut out);
         assert!(out.hits.is_empty());
         assert_eq!(out.texts.len(), 1);
         assert!(out.texts[0].text.contains("waiting"));

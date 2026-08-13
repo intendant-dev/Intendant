@@ -266,11 +266,26 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
     let needs_scene = !inner.scene_uploaded
         || inner.built_generation != inner.scene_generation
         || inner.ui_dirty;
+    // Video frames advance regardless of scene rebuilds.
+    let video_sources: Vec<(String, web_sys::HtmlVideoElement)> = inner
+        .displays
+        .iter()
+        .map(|d| (d.source_id.clone(), d.video.clone()))
+        .collect();
+    if let Some(encoder) = inner.encoder.as_mut() {
+        encoder.update_video_textures(&video_sources);
+    }
+
     if needs_scene {
         let selected = inner.selected_id.clone();
         let hover = inner.hover_id.clone();
         let confirm = inner.confirm_progress.clone();
         let snapshot = inner.model.clone().unwrap_or_default();
+        let display_meta: Vec<(String, String)> = inner
+            .displays
+            .iter()
+            .map(|d| (d.source_id.clone(), d.label.clone()))
+            .collect();
         let Some(encoder) = inner.encoder.as_mut() else {
             return;
         };
@@ -284,6 +299,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
             };
             crate::ui::build_scene(
                 &snapshot,
+                &display_meta,
                 selected.as_deref(),
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),

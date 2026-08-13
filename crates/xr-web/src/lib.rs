@@ -69,6 +69,9 @@ pub(crate) struct Inner {
     pub(crate) hover_id: Option<String>,
     /// The last build's raycastable targets (input + activate()).
     pub(crate) hit_targets: Vec<kit::HitTarget>,
+    /// Live display streams registered by the dashboard (same sources
+    /// the other rendered surface paints); shown as floating monitors.
+    pub(crate) displays: Vec<DisplaySource>,
     /// Live pinch-hold on a confirm target (approve/deny).
     pub(crate) hold_target: Option<String>,
     pub(crate) hold_started_ms: f64,
@@ -104,6 +107,7 @@ impl Inner {
             selected_id: None,
             hover_id: None,
             hit_targets: Vec::new(),
+            displays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
             confirm_progress: None,
@@ -154,6 +158,14 @@ fn debug_state_json(inner: &Inner) -> String {
         },
     })
     .to_string()
+}
+
+/// One registered display stream (mirrors the dashboard's display-slot
+/// registry entries: `local:<displayId>` / peer-sourced ids + label).
+pub(crate) struct DisplaySource {
+    pub(crate) source_id: String,
+    pub(crate) label: String,
+    pub(crate) video: web_sys::HtmlVideoElement,
 }
 
 /// The XR surface's JS-facing handle. One per dashboard page, constructed
@@ -228,6 +240,44 @@ impl XrWeb {
     #[wasm_bindgen(js_name = setOnSessionEnd)]
     pub fn set_on_session_end(&self, callback: js_sys::Function) {
         self.inner.borrow_mut().session_end_callback = Some(callback);
+    }
+
+    /// Register (or refresh) a live display stream — the same 6-arg shape
+    /// the dashboard already uses for its other rendered surface, so the
+    /// JS glue mirrors registrations verbatim. Only `kind == "video"`
+    /// sources become monitors. Idempotent per source id.
+    #[wasm_bindgen(js_name = registerDisplaySource)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_display_source(
+        &self,
+        source_id: String,
+        _host_id: String,
+        _display_id: String,
+        label: String,
+        kind: String,
+        video: web_sys::HtmlVideoElement,
+    ) {
+        if kind != "video" {
+            return;
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.displays.retain(|d| d.source_id != source_id);
+        inner.displays.push(DisplaySource {
+            source_id,
+            label,
+            video,
+        });
+        inner.ui_dirty = true;
+    }
+
+    #[wasm_bindgen(js_name = unregisterDisplaySource)]
+    pub fn unregister_display_source(&self, source_id: String) {
+        let mut inner = self.inner.borrow_mut();
+        let before = inner.displays.len();
+        inner.displays.retain(|d| d.source_id != source_id);
+        if inner.displays.len() != before {
+            inner.ui_dirty = true;
+        }
     }
 
     /// Ingest one coalesced dashboard state snapshot (same feed schema the

@@ -87,6 +87,101 @@ const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
   '/fonts/jetbrains-mono-latin-ext.woff2',
 ];
 
+// Deterministic WebXR shim for --xr-probe: covers exactly the interface
+// surface crates/xr-web/src/webxr_sys.rs binds (session request, reference
+// space, XR rAF with synthetic stereo viewer poses, XRWebGLLayer with
+// side-by-side viewports, the select event family via EventTarget), so a
+// headless Chromium exercises the real enter → render → input → dispatch
+// path with no XR hardware. Injected before page load; a UA with real
+// WebXR is left untouched.
+const XR_WEBXR_SHIM_SOURCE = `(() => {
+  if (navigator.xr) return; // real WebXR wins
+  const eyeMatrix = (dx) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, dx,1.5,0,1]);
+  const projMatrix = () => {
+    const n = 0.05, f = 60.0, r = n * Math.tan(Math.PI / 4), t = r;
+    return new Float32Array([n/r,0,0,0, 0,n/t,0,0, 0,0,-(f+n)/(f-n),-1, 0,0,-2*f*n/(f-n),0]);
+  };
+  class FakeRigid { constructor(m) { this.matrix = m; } }
+  class FakeView {
+    constructor(i) {
+      this.eye = i ? 'right' : 'left';
+      this.projectionMatrix = projMatrix();
+      this.transform = new FakeRigid(eyeMatrix(i ? 0.032 : -0.032));
+    }
+  }
+  class FakeViewerPose {
+    constructor() {
+      this.transform = new FakeRigid(eyeMatrix(0));
+      this.views = [new FakeView(0), new FakeView(1)];
+    }
+  }
+  class FakeSpace extends EventTarget {}
+  class FakeFrame {
+    constructor(session) { this.session = session; }
+    getViewerPose() { return new FakeViewerPose(); }
+    getPose() { return null; }
+  }
+  class FakeSession extends EventTarget {
+    constructor(mode) {
+      super();
+      this.environmentBlendMode = mode === 'immersive-ar' ? 'alpha-blend' : 'opaque';
+      this.inputSources = [];
+      this._ended = false;
+    }
+    updateRenderState() {}
+    requestReferenceSpace() { return Promise.resolve(new FakeSpace()); }
+    requestAnimationFrame(cb) {
+      return requestAnimationFrame((t) => { if (!this._ended) cb(t, new FakeFrame(this)); });
+    }
+    cancelAnimationFrame(h) { cancelAnimationFrame(h); }
+    end() {
+      if (!this._ended) {
+        this._ended = true;
+        queueMicrotask(() => this.dispatchEvent(new Event('end')));
+      }
+      return Promise.resolve();
+    }
+  }
+  class FakeWebGLLayer {
+    constructor() {
+      this.framebuffer = null;
+      this.framebufferWidth = 1680;
+      this.framebufferHeight = 880;
+      this.fixedFoveation = 0;
+    }
+    getViewport(view) {
+      const half = this.framebufferWidth / 2;
+      return view.eye === 'right'
+        ? { x: half, y: 0, width: half, height: this.framebufferHeight }
+        : { x: 0, y: 0, width: half, height: this.framebufferHeight };
+    }
+  }
+  window.XRWebGLLayer = FakeWebGLLayer;
+  navigator.xr = {
+    isSessionSupported: (mode) => Promise.resolve(mode === 'immersive-ar' || mode === 'immersive-vr'),
+    requestSession: (mode) => Promise.resolve(new FakeSession(mode)),
+  };
+})();`;
+
+const XR_PROBE_SNAPSHOT = {
+  hosts: [
+    { id: 'local', name: 'probe-host', platform: 'headless', connected: true },
+  ],
+  agents: [
+    {
+      id: 'xr-probe-a1', hostId: 'local', status: 'running', phase: 'working',
+      sessionId: 'probe-session-1', source: 'claude-code',
+      tokens: 90000, tokenCap: 200000, goalObjective: 'xr probe goal',
+    },
+    {
+      id: 'xr-probe-a2', hostId: 'local', status: 'waiting', phase: 'approval',
+      needsApproval: true, approvalId: 'xr-probe-ap1',
+      approvalCommand: 'echo probe', approvalCategory: 'shell',
+      sessionId: 'probe-session-2', source: 'codex',
+    },
+  ],
+};
+
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
   'INTENDANT_BROWSER_EXECUTABLE',
@@ -145,6 +240,12 @@ Checks:
                               the real dispatch path (steer / follow-up / create_session). Passes
                               when the composer clears and the dispatch surfaces in Station state.
                               Use against disposable sessions only
+  --xr-probe                  Drive the XR surface end to end with an injected deterministic
+                              WebXR shim (no headset): dev-gated chip appears, immersive entry,
+                              stereo frame loop (2 views), synthetic-snapshot scene build,
+                              activation-by-name card select, and a captured approval dispatch
+                              asserted against the dashboard's action shape (never routed to the
+                              daemon). Appends ?xr=dev to the target URL automatically
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -220,6 +321,7 @@ function parseArgs(argv, env = process.env) {
     selectors: [],
     functions: [],
     probeJson: [],
+    xrProbe: false,
     stationProbes: [],
     stationMinFps: DEFAULT_STATION_MIN_FPS,
     stationMaxFrameGapMs: DEFAULT_STATION_MAX_FRAME_GAP_MS,
@@ -413,6 +515,8 @@ function parseArgs(argv, env = process.env) {
       opts.appHtmlPath = readValue();
     } else if (arg.startsWith('--app-html=')) {
       opts.appHtmlPath = arg.slice('--app-html='.length);
+    } else if (arg === '--xr-probe') {
+      opts.xrProbe = true;
     } else if (arg === '--json') {
       opts.json = true;
     } else {
@@ -421,6 +525,11 @@ function parseArgs(argv, env = process.env) {
   }
 
   opts.url = resolveDashboardUrl(opts, env);
+  if (opts.xrProbe && !/[?&]xr=dev\b/.test(opts.url)) {
+    // The XR entry chip is dev-gated; the probe needs the gate open from
+    // first load (the gate is read at module evaluation).
+    opts.url += (opts.url.includes('?') ? '&' : '?') + 'xr=dev';
+  }
   if (opts.screenshotPath) {
     opts.screenshotPath = path.resolve(opts.screenshotPath);
   }
@@ -824,6 +933,7 @@ function staticScriptsOnly(opts) {
       && !opts.stationPerfEval
       && !opts.stationWorkflows
       && !opts.stationSendText
+      && !opts.xrProbe
       && !opts.requireStationState
       && !opts.requireAiProviderSession
       && !opts.requireExternalAgent
@@ -969,6 +1079,9 @@ function printResult(opts, result) {
     if (displayResult.stationPerfEval) {
       console.log(formatStationPerfEvalLine(displayResult.stationPerfEval));
     }
+    if (displayResult.xrProbe) {
+      console.log(formatXrProbeLine(displayResult.xrProbe));
+    }
     if (displayResult.stationState) {
       console.log(formatStationStatePass(displayResult.stationState));
     }
@@ -993,6 +1106,9 @@ function printResult(opts, result) {
   }
   if (displayResult.stationPerfEval) {
     console.error(formatStationPerfEvalLine(displayResult.stationPerfEval));
+  }
+  if (displayResult.xrProbe) {
+    console.error(formatXrProbeLine(displayResult.xrProbe));
   }
   if (displayResult.stationWorkflows) {
     console.error(formatStationWorkflowsLine(displayResult.stationWorkflows));
@@ -2164,6 +2280,15 @@ class BrowserHarness {
     };
     this.cdp.on('event', onEvent);
     try {
+      if (opts.xrProbe) {
+        // Must land before any page script runs: the wasm feature-detects
+        // navigator.xr at module evaluation.
+        await this.cdp.send(
+          'Page.addScriptToEvaluateOnNewDocument',
+          { source: XR_WEBXR_SHIM_SOURCE },
+          this.sessionId,
+        );
+      }
       const nav = await this.cdp.send('Page.navigate', { url: opts.url }, this.sessionId);
       if (nav.errorText) {
         throw new Error(`navigation failed: ${nav.errorText}`);
@@ -2205,6 +2330,9 @@ class BrowserHarness {
       if (opts.stationPerfEval) {
         validation.stationPerfEval = await this.runStationPerfEval(opts);
       }
+      if (opts.xrProbe) {
+        validation.xrProbe = await this.runXrProbe(opts);
+      }
       if (opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
         validation.stationState = await this.requireStationState(opts);
       }
@@ -2212,6 +2340,79 @@ class BrowserHarness {
     } finally {
       this.cdp.off('event', onEvent);
     }
+  }
+
+  /// --xr-probe: drive the XR surface end to end against the injected
+  /// WebXR shim — enter, stereo frames, scene build from a synthetic
+  /// snapshot, activation-by-name selection, and a captured (never
+  /// routed) approval dispatch. Throws on the first failed stage.
+  async runXrProbe(opts) {
+    const timeoutMs = opts.timeoutMs;
+    // The dev-gated chip appears once the async support probe resolves.
+    await this.waitForFunction(
+      "typeof xrProbe !== 'undefined' && !!document.getElementById('ui2-xr-chip')",
+      timeoutMs,
+    );
+    // Enter (chip click path) and wait for a live stereo loop.
+    await this.evaluate('xrProbe.enter()');
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.active && d.engine.framesRendered > 20 && d.engine.views === 2)',
+      timeoutMs,
+    );
+    // Synthetic snapshot → shelf builds; keep re-pushing so the page's
+    // own 300 ms pump (real, mostly-empty dashboard state) can't win the
+    // race against the assertions below.
+    const holdSnapshot = `(() => {
+      if (window.__xrProbeHold) clearInterval(window.__xrProbeHold);
+      const push = () => xrProbe.update(${JSON.stringify(XR_PROBE_SNAPSHOT)});
+      push();
+      window.__xrProbeHold = setInterval(push, 40);
+      return true;
+    })()`;
+    await this.evaluate(holdSnapshot);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('card:xr-probe-a2') && d.scene.panels > 0 && d.scene.texts > 0)",
+      timeoutMs,
+    );
+    // Select the approval agent by name (the exact ray-click path).
+    const selected = await this.evaluate("xrProbe.activate('card:xr-probe-a2')");
+    if (selected !== true) {
+      throw new Error('xr probe: card activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.hitTargets.includes('pill:xr-probe-a2:approve'))",
+      timeoutMs,
+    );
+    // Approve through the same dispatch path, captured instead of routed.
+    await this.evaluate('xrProbe.captureOnly(true)');
+    const fired = await this.evaluate("xrProbe.activate('pill:xr-probe-a2:approve')");
+    if (fired !== true) {
+      throw new Error('xr probe: approve activation was refused');
+    }
+    const action = await this.evaluate('JSON.stringify(xrProbe.lastAction || null)');
+    await this.evaluate(
+      '(() => { xrProbe.captureOnly(false); if (window.__xrProbeHold) { clearInterval(window.__xrProbeHold); window.__xrProbeHold = null; } return true; })()',
+    );
+    const parsedAction = JSON.parse(String(action || 'null'));
+    if (
+      !parsedAction
+      || parsedAction.type !== 'approval'
+      || parsedAction.approval_id !== 'xr-probe-ap1'
+      || parsedAction.decision !== 'approve'
+      || parsedAction.host_id !== 'local'
+    ) {
+      throw new Error(`xr probe: captured approval action malformed: ${action}`);
+    }
+    const summary = await this.evaluate(
+      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
+    );
+    const report = JSON.parse(String(summary));
+    if (report.parseErrors > 0) {
+      throw new Error(`xr probe: snapshot parse errors: ${report.parseErrors}`);
+    }
+    report.action = parsedAction;
+    report.ok = true;
+    return report;
   }
 
   async navigateForScreenshot(opts, timeoutMs = FAILURE_SCREENSHOT_NAVIGATION_TIMEOUT_MS) {
@@ -3654,6 +3855,12 @@ class BoundedLog {
   size() {
     return this.lines.length;
   }
+}
+
+function formatXrProbeLine(report) {
+  return `xr probe: ok — frames=${report.frames} views=${report.views} panels=${report.panels} `
+    + `texts=${report.texts} hits=${report.hits} passthrough=${report.passthrough} `
+    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'}`;
 }
 
 function waitFunctionExpression(source) {

@@ -17,6 +17,7 @@ let xrInstance = null;   // XrWeb handle after first ensureXr()
 let xrChipEl = null;
 let xrSupport = { ar: false, vr: false };
 let xrSnapshotTimer = null;
+let xrCaptureOnly = false; // probe mode: record actions, don't route
 
 function xrDevGateOn() {
   try {
@@ -54,6 +55,10 @@ async function ensureXr() {
     // Same dispatch seam as the other rendered surface: the emitted
     // objects carry the dashboard's action vocabulary and route through
     // the SAME router (approvals → send_approval / resolvePeerApproval).
+    // The validator's probe flips captureOnly so asserted actions never
+    // hit a live daemon.
+    globalThis.xrProbe.lastAction = action;
+    if (xrCaptureOnly) return;
     try {
       if (typeof handleStationAction === 'function') {
         handleStationAction(action);
@@ -78,6 +83,36 @@ function xrSetChipState(state, title) {
   if (title) xrChipEl.title = title;
 }
 
+// Mirror the dashboard's live display slots into the XR surface as
+// floating monitors. Registrations are idempotent per source id, so the
+// pump can re-scan cheaply; parked <video> elements need a play() kick
+// exactly like the other rendered surface's registration path.
+function xrSyncDisplaySources() {
+  if (!xrInstance) return;
+  try {
+    if (typeof displaySlots === 'undefined' || !(displaySlots instanceof Map)) return;
+    for (const slot of displaySlots.values()) {
+      if (!slot || !slot.videoEl) continue;
+      if (slot.videoEl.paused && slot.videoEl.srcObject) {
+        slot.videoEl.play().catch(() => {});
+      }
+      const displayId = String(slot.displayId);
+      const hostLabel = (typeof selfHostLabel !== 'undefined' && selfHostLabel) || 'local';
+      const hostId = (typeof selfPeerId !== 'undefined' && selfPeerId) || 'local';
+      xrInstance.registerDisplaySource(
+        `local:${displayId}`,
+        String(hostId),
+        displayId,
+        `${hostLabel} :${displayId}`,
+        'video',
+        slot.videoEl,
+      );
+    }
+  } catch (err) {
+    console.warn('[xr] display sync error', err);
+  }
+}
+
 // Feed the XR surface the same coalesced client state the other rendered
 // surface consumes (fragment 35's buildStationSnapshot) while a session
 // is live. Fail-soft: a feed error must never take the session down.
@@ -92,6 +127,7 @@ function xrStartSnapshotPump() {
     } catch (err) {
       console.warn('[xr] snapshot pump error', err);
     }
+    xrSyncDisplaySources();
   }, 300);
 }
 
@@ -151,4 +187,9 @@ globalThis.xrProbe = {
   ensure: ensureXr,
   enter: xrEnter,
   debugJson: async () => JSON.parse((await ensureXr()).debugJson()),
+  // Direct snapshot push (bypasses the pump) for deterministic probes.
+  update: (snapshot) => { if (xrInstance) xrInstance.updateSnapshot(snapshot); },
+  activate: (name) => (xrInstance ? xrInstance.activate(name) : false),
+  captureOnly: (on) => { xrCaptureOnly = !!on; },
+  lastAction: null,
 };

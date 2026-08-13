@@ -21,7 +21,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlUniformLocation};
 
 use crate::atlas::{GlyphAtlas, TEXT_VERTEX_STRIDE};
-use crate::kit::{PanelInstance, SceneBatches};
+use crate::kit::{MonitorInstance, PanelInstance, SceneBatches};
 use crate::math::{v3, Mat4, Vec3};
 
 /// Floats per pos+color vertex: xyz + rgba.
@@ -187,6 +187,32 @@ void main() {
 }
 ";
 
+const VS_VIDEO: &str = r"#version 300 es
+layout(location = 0) in vec2 aUnit;
+uniform mat4 uViewProj;
+uniform vec3 uCenter;
+uniform vec3 uRight;
+uniform vec3 uUp;
+uniform vec2 uHalf;
+out vec2 vUv;
+void main() {
+    // Video rows land top-first in the texture: v=0 at the screen's top.
+    vUv = vec2(aUnit.x * 0.5 + 0.5, 0.5 - aUnit.y * 0.5);
+    vec3 world = uCenter + uRight * (aUnit.x * uHalf.x) + uUp * (aUnit.y * uHalf.y);
+    gl_Position = uViewProj * vec4(world, 1.0);
+}
+";
+
+const FS_VIDEO: &str = r"#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uTex;
+out vec4 outColor;
+void main() {
+    outColor = vec4(texture(uTex, vUv).rgb, 1.0);
+}
+";
+
 const VS_TEXT: &str = r"#version 300 es
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUv;
@@ -239,6 +265,16 @@ struct TextProgram {
     u_atlas: WebGlUniformLocation,
 }
 
+struct VideoProgram {
+    program: WebGlProgram,
+    u_view_proj: WebGlUniformLocation,
+    u_center: WebGlUniformLocation,
+    u_right: WebGlUniformLocation,
+    u_up: WebGlUniformLocation,
+    u_half: WebGlUniformLocation,
+    u_tex: WebGlUniformLocation,
+}
+
 /// The encoder: owns the XR-compatible context, the programs, and the
 /// per-scene vertex buffers.
 pub struct GlEncoder {
@@ -247,6 +283,7 @@ pub struct GlEncoder {
     solid: SolidProgram,
     panel: PanelProgram,
     text: TextProgram,
+    video: VideoProgram,
     vbo_tris: WebGlBuffer,
     vbo_lines: WebGlBuffer,
     vbo_text: WebGlBuffer,
@@ -255,6 +292,8 @@ pub struct GlEncoder {
     line_count: i32,
     text_count: i32,
     panels: Vec<PanelInstance>,
+    monitors: Vec<MonitorInstance>,
+    video_textures: std::collections::HashMap<String, web_sys::WebGlTexture>,
     atlas: Option<GlyphAtlas>,
 }
 
@@ -303,6 +342,16 @@ impl GlEncoder {
             u_atlas: uniform(&gl, &text_raw, "uAtlas")?,
             program: text_raw,
         };
+        let video_raw = compile_program(&gl, VS_VIDEO, FS_VIDEO)?;
+        let video = VideoProgram {
+            u_view_proj: uniform(&gl, &video_raw, "uViewProj")?,
+            u_center: uniform(&gl, &video_raw, "uCenter")?,
+            u_right: uniform(&gl, &video_raw, "uRight")?,
+            u_up: uniform(&gl, &video_raw, "uUp")?,
+            u_half: uniform(&gl, &video_raw, "uHalf")?,
+            u_tex: uniform(&gl, &video_raw, "uTex")?,
+            program: video_raw,
+        };
 
         let make_buffer = || {
             gl.create_buffer()
@@ -338,6 +387,7 @@ impl GlEncoder {
             solid,
             panel,
             text,
+            video,
             vbo_tris,
             vbo_lines,
             vbo_text,
@@ -346,6 +396,8 @@ impl GlEncoder {
             line_count: 0,
             text_count: 0,
             panels: Vec::new(),
+            monitors: Vec::new(),
+            video_textures: std::collections::HashMap::new(),
             atlas: None,
         })
     }
@@ -396,11 +448,72 @@ impl GlEncoder {
         self.atlas.as_ref()
     }
 
-    /// Upload a full scene build: line/tri streams, panel instances, and
-    /// atlas-laid text (copying — no unsafe views).
+    /// Refresh (or create/retire) the video textures backing the scene's
+    /// monitors from their live `<video>` elements. Called every frame —
+    /// video frames advance regardless of scene rebuilds. Upload errors
+    /// (tainted/cross-origin sources) log once per element state change
+    /// at worst and skip the frame.
+    pub(crate) fn update_video_textures(
+        &mut self,
+        displays: &[(String, web_sys::HtmlVideoElement)],
+    ) {
+        let gl = &self.gl;
+        // Retire textures whose source vanished.
+        let live: std::collections::HashSet<&str> =
+            displays.iter().map(|(id, _)| id.as_str()).collect();
+        self.video_textures.retain(|id, tex| {
+            let keep = live.contains(id.as_str());
+            if !keep {
+                gl.delete_texture(Some(tex));
+            }
+            keep
+        });
+        for (id, video) in displays {
+            // HAVE_CURRENT_DATA(2)+ means a frame is uploadable.
+            if video.ready_state() < 2 {
+                continue;
+            }
+            let texture = match self.video_textures.entry(id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(tex) = gl.create_texture() else {
+                        continue;
+                    };
+                    gl.bind_texture(Gl::TEXTURE_2D, Some(&tex));
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+                    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+                    gl.tex_parameteri(
+                        Gl::TEXTURE_2D,
+                        Gl::TEXTURE_WRAP_S,
+                        Gl::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.tex_parameteri(
+                        Gl::TEXTURE_2D,
+                        Gl::TEXTURE_WRAP_T,
+                        Gl::CLAMP_TO_EDGE as i32,
+                    );
+                    e.insert(tex)
+                }
+            };
+            gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
+            let _ = gl.tex_image_2d_with_u32_and_u32_and_html_video_element(
+                Gl::TEXTURE_2D,
+                0,
+                Gl::RGBA as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                video,
+            );
+        }
+    }
+
+    /// Upload a full scene build: line/tri streams, panel instances,
+    /// monitor placements, and atlas-laid text (copying — no unsafe
+    /// views).
     pub(crate) fn upload_batches(&mut self, batches: &SceneBatches) {
         self.upload_streams(&batches.frame);
         self.panels = batches.panels.clone();
+        self.monitors = batches.monitors.clone();
 
         let mut text_vertices: Vec<f32> = Vec::new();
         if let Some(atlas) = self.atlas.as_ref() {
@@ -490,6 +603,32 @@ impl GlEncoder {
                     p.border[3],
                 );
                 gl.uniform1f(Some(&self.panel.u_border_w), p.border_w);
+                gl.draw_arrays(Gl::TRIANGLES, 0, 6);
+            }
+        }
+
+        if !self.monitors.is_empty() {
+            gl.use_program(Some(&self.video.program));
+            gl.uniform_matrix4fv_with_f32_array(
+                Some(&self.video.u_view_proj),
+                false,
+                &view_proj.0,
+            );
+            gl.active_texture(Gl::TEXTURE0);
+            gl.uniform1i(Some(&self.video.u_tex), 0);
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo_unit));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 8, 0);
+            gl.disable_vertex_attrib_array(1);
+            for m in &self.monitors {
+                let Some(texture) = self.video_textures.get(&m.id) else {
+                    continue;
+                };
+                gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
+                gl.uniform3f(Some(&self.video.u_center), m.center.x, m.center.y, m.center.z);
+                gl.uniform3f(Some(&self.video.u_right), m.right.x, m.right.y, m.right.z);
+                gl.uniform3f(Some(&self.video.u_up), m.up.x, m.up.y, m.up.z);
+                gl.uniform2f(Some(&self.video.u_half), m.half_w, m.half_h);
                 gl.draw_arrays(Gl::TRIANGLES, 0, 6);
             }
         }

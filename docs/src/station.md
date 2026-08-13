@@ -182,16 +182,23 @@ actually rendered, and remains the presentation for hosts/system nodes,
 narrow viewports, and the canvas fallback. The flag flips to opt-out
 when the pane presentation graduates.
 
-### Phase D — XR spatial computing
+### Phase D — XR spatial computing (superseded 2026-08-13)
 
-WebXR immersive sessions over the same scene graph: head-tracked cameras,
-hand / gaze / pointer input mapped onto the existing hit-testing, panes as
-floating spatial surfaces around the operator. Target devices are Apple
-Vision Pro-class headsets (visionOS Safari exposes WebXR with
-transient-pointer input) plus generic WebXR runtimes. The 2D dashboard
-remains fully supported — XR is an additional presentation of the same
-control plane, subject to the same trust model and approval routing as
-every other frontend.
+**This phase moved out of Station.** The ratified XR direction is a careful
+port of the *regular dashboard UI* — its rails and design language,
+re-expressed natively spatially — implemented in its own crate
+(`crates/xr-web`) rather than over Station's scene graph, with Meta Quest 3
+as the primary test device (WebGL2 floor; the WebXR-WebGPU binding arrives
+later for Vision Pro-class devices). The dedicated [XR](./xr.md) chapter
+carries the architecture, platform matrix, and test recipes. Station's own
+design track (the constellation + HUD experience above) is frozen as of the
+same decision — Phases A–C remain the record of what shipped here, and
+whether the constellation eventually retires is a separate product
+decision. What XR reuses from Station are the proven patterns (snapshot
+feed contract, `debug_json`/`activate` QA conventions, glyph-atlas text),
+not the experience. The 2D dashboard remains fully supported — XR is an
+additional presentation of the same control plane, subject to the same
+trust model and approval routing as every other frontend.
 
 ## Relationship to Activity → Timeline
 

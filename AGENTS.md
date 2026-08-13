@@ -48,7 +48,8 @@ Read the relevant chapter before changing a subsystem:
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | The autonomy/approval model | `docs/src/autonomy.md` |
 | Web dashboard (tabs, sessions, live voice) | `docs/src/web-dashboard.md` |
-| Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
+| Station (rendered control canvas): architecture + frozen design-track record | `docs/src/station.md` |
+| XR: the immersive spatial dashboard (crates/xr-web, Quest 3 floor, test recipes) | `docs/src/xr.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
 | MCP client, external CLIs, audio stack, system tools, control socket, CI | `docs/src/integrations.md` |
 | GitHub App PR integration (custody entry, setup ceremony, status) | `docs/src/github-pr-integration.md` |

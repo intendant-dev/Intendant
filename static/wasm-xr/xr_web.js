@@ -86,6 +86,31 @@ export class XrWeb {
         return ret;
     }
     /**
+     * Register (or refresh) a live display stream — the same 6-arg shape
+     * the dashboard already uses for its other rendered surface, so the
+     * JS glue mirrors registrations verbatim. Only `kind == "video"`
+     * sources become monitors. Idempotent per source id.
+     * @param {string} source_id
+     * @param {string} _host_id
+     * @param {string} _display_id
+     * @param {string} label
+     * @param {string} kind
+     * @param {HTMLVideoElement} video
+     */
+    registerDisplaySource(source_id, _host_id, _display_id, label, kind, video) {
+        const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(_host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(_display_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(label, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.xrweb_registerDisplaySource(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, video);
+    }
+    /**
      * Register the dashboard's action router. Actions emitted by the XR
      * surface call this with one JSON-stringifiable object argument.
      * @param {Function} callback
@@ -100,6 +125,14 @@ export class XrWeb {
      */
     setOnSessionEnd(callback) {
         wasm.xrweb_setOnSessionEnd(this.__wbg_ptr, callback);
+    }
+    /**
+     * @param {string} source_id
+     */
+    unregisterDisplaySource(source_id) {
+        const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_unregisterDisplaySource(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Ingest one coalesced dashboard state snapshot (same feed schema the
@@ -263,6 +296,9 @@ function __wbg_get_imports() {
             const len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
+        __wbg_deleteTexture_9d411c0e60ffa324: function(arg0, arg1) {
+            arg0.deleteTexture(arg1);
         },
         __wbg_depthFunc_f670d4cbb9cd0913: function(arg0, arg1) {
             arg0.depthFunc(arg1 >>> 0);
@@ -617,6 +653,10 @@ function __wbg_get_imports() {
         __wbg_queueMicrotask_5bb536982f78a56f: function(arg0) {
             queueMicrotask(arg0);
         },
+        __wbg_readyState_ce115112bd7cd7fd: function(arg0) {
+            const ret = arg0.readyState;
+            return ret;
+        },
         __wbg_requestAnimationFrame_e9afe31debb3e797: function(arg0, arg1) {
             const ret = arg0.requestAnimationFrame(arg1);
             return ret;
@@ -699,6 +739,9 @@ function __wbg_get_imports() {
             const ret = arg0.targetRaySpace;
             return ret;
         },
+        __wbg_texImage2D_7677de737241f6ab: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+            arg0.texImage2D(arg1 >>> 0, arg2, arg3, arg4 >>> 0, arg5 >>> 0, arg6);
+        }, arguments); },
         __wbg_texImage2D_c1bb39f4b3a26e90: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10) {
             arg0.texImage2D(arg1 >>> 0, arg2, arg3, arg4, arg5, arg6, arg7 >>> 0, arg8 >>> 0, arg9 === 0 ? undefined : getArrayU8FromWasm0(arg9, arg10));
         }, arguments); },

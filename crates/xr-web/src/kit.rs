@@ -107,14 +107,27 @@ pub(crate) struct HitTarget {
     pub panel: Panel,
 }
 
+/// One live display stream shown as a floating screen. The id keys the
+/// encoder's video-texture map; geometry is panel-like.
+#[derive(Clone, Debug)]
+pub(crate) struct MonitorInstance {
+    pub id: String,
+    pub center: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub half_w: f32,
+    pub half_h: f32,
+}
+
 /// Everything one scene build produces: panel instances, text runs, raw
-/// line/tri streams (meters, edges, backdrop), and the hit targets the
-/// input layer raycasts.
+/// line/tri streams (meters, edges, backdrop), video monitors, and the
+/// hit targets the input layer raycasts.
 #[derive(Default)]
 pub(crate) struct SceneBatches {
     pub panels: Vec<PanelInstance>,
     pub texts: Vec<TextRun>,
     pub frame: SceneFrame,
+    pub monitors: Vec<MonitorInstance>,
     pub hits: Vec<HitTarget>,
 }
 
@@ -123,6 +136,7 @@ impl SceneBatches {
         self.panels.clear();
         self.texts.clear();
         self.frame.clear();
+        self.monitors.clear();
         self.hits.clear();
     }
 }

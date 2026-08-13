@@ -775,9 +775,11 @@ and density tuning.
 
 Station is the rendered-canvas counterpart to Activity, not a separate
 authority surface. Today the scene is a 3D constellation backdrop with the
-working UI painted as screen-space HUD panels; the destination is action panes
-living *in* the scene, and eventually WebXR spatial computing. Activity remains
-the default DOM control surface while Station carries that immersive roadmap.
+working UI painted as screen-space HUD panels. Activity remains the default
+DOM control surface. The immersive WebXR direction moved to its own surface
+and chapter as of 2026-08-13 — see [XR](./xr.md): a careful spatial port of
+the regular dashboard (dev-gated entry chip behind `?xr=dev` until its first
+hardware validation), not an extension of Station's design.
 The dedicated
 [Station](./station.md) chapter carries the architecture, an honest
 current-state inventory, and the roadmap.

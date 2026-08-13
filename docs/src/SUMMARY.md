@@ -23,6 +23,7 @@
 - [Autonomy & Approvals](./autonomy.md)
 - [Web Dashboard](./web-dashboard.md)
 - [Station](./station.md)
+- [XR (immersive spatial dashboard)](./xr.md)
 - [MCP Server](./mcp-server.md)
 - [Integrations](./integrations.md)
 - [GitHub PR Integration](./github-pr-integration.md)
