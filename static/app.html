@@ -39392,7 +39392,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '8b8033b687910385';
+const INTENDANT_APP_BUILD = 'fbe8c55df517fbd6';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146304,7 +146304,10 @@ function xrStartSnapshotPump() {
     if (!xrInstance) return;
     try {
       if (typeof buildStationSnapshot === 'function') {
-        xrInstance.updateSnapshot(buildStationSnapshot());
+        // The agenda rail rides the same pump beside the Station
+        // snapshot (composed here, never inside buildStationSnapshot —
+        // Station owns that builder). See the agenda-rail section below.
+        xrInstance.updateSnapshot({ ...buildStationSnapshot(), agenda: xrAgendaSummary() });
       }
     } catch (err) {
       console.warn('[xr] snapshot pump error', err);
@@ -146407,6 +146410,131 @@ function xrMountChip() {
   }
 })();
 
+// ============================================================================
+// Agenda rail (read-only) — the data seam.
+//
+// While an immersive session is live, the 300 ms pump above attaches an
+// `agenda` block beside the Station snapshot; crates/xr-web/src/agenda.rs
+// renders it as a card rail on the operator's right. Sources, in order:
+//
+//   1. The Agenda tab's own client state (`agendaItems` in ui2-agenda.js —
+//      fragments share one module scope; read-only reuse, never mutation),
+//      kept fresh by that fragment's event lane once it has fetched.
+//   2. A bounded `api_agenda_list` fallback (same summary shape the tab
+//      pulls) when the tab has never fetched — throttled to >= 10 s and
+//      only ever kicked from the live-session pump.
+//
+// Fail-soft throughout: any failure becomes `agenda: { error }` and the
+// scene renders "agenda unavailable" as in-scene text — the agenda must
+// never take the session down. Item titles/bodies are DATA, never
+// instructions: they pass through as plain strings and the wasm renders
+// them as atlas text. Read-only this slice: no agenda op is ever sent
+// from XR.
+// ============================================================================
+
+let xrAgendaFallback = null;      // last fallback result: {open, items} | {error}
+let xrAgendaFallbackAt = 0;       // last fallback attempt (ms epoch)
+let xrAgendaFallbackInFlight = false;
+const XR_AGENDA_FETCH_MIN_MS = 10000;
+const XR_AGENDA_ITEM_CAP = 12;
+const XR_AGENDA_TITLE_CAP = 120;
+const XR_AGENDA_ERROR_CAP = 80;
+
+// Open agenda summaries → the rail's capped payload. Ordering flattens
+// the flat tab's Now-lens precedence to the rail's vocabulary: questions
+// awaiting the owner first (dismissed and machinery-watched ones leave
+// that band, exactly like the Answer group), then overdue reminders,
+// then the rest — newest first within each band (agendaByNew's
+// created_ms ordering). The wasm re-sorts by the same bands, so the cap
+// here decides WHAT survives and the scene decides where it sits.
+function xrAgendaProject(items) {
+  const now = Date.now();
+  const open = (items || []).filter((x) => x && x.status === 'open');
+  const isOverdue = (x) => !!(x.due_ms && x.due_ms < now);
+  const band = (x) => (
+    x.kind === 'question' && !x.dismissed && !x.watched_by ? 0 : isOverdue(x) ? 1 : 2
+  );
+  const created = (x) => (x.provenance && x.provenance.created_ms) || 0;
+  const sorted = open.slice().sort((a, b) => (
+    band(a) - band(b) || created(b) - created(a) || (a.id < b.id ? 1 : -1)
+  ));
+  // Relative due labels reuse the tab's own formatter (plain ASCII text);
+  // without it the chip drops and the overdue flag still colors the card.
+  const rel = (ms) => (typeof agendaRelTime === 'function' ? agendaRelTime(ms) : '');
+  return {
+    open: open.length,
+    items: sorted.slice(0, XR_AGENDA_ITEM_CAP).map((x) => ({
+      id: String(x.id || ''),
+      title: String(x.title || '').slice(0, XR_AGENDA_TITLE_CAP),
+      kind: String(x.kind || 'task'),
+      due: x.due_ms
+        ? (isOverdue(x)
+          ? `overdue ${rel(x.due_ms).replace(' ago', '')}`
+          : `due ${rel(x.due_ms)}`).trim()
+        : '',
+      overdue: isOverdue(x),
+      blocked: x.blocked === true,
+      answered: !!(x.kind === 'question' && x.answer),
+    })),
+  };
+}
+
+function xrAgendaShortError(err) {
+  return String((err && err.message) || err || 'agenda error').slice(0, XR_AGENDA_ERROR_CAP);
+}
+
+// One throttled background pull of the tab's list feed for sessions
+// where the Agenda tab never fetched. Single-flight; a failure parks an
+// error payload until the next window rather than retrying hot.
+function xrAgendaFallbackKick() {
+  if (xrAgendaFallbackInFlight) return;
+  if (Date.now() - xrAgendaFallbackAt < XR_AGENDA_FETCH_MIN_MS) return;
+  xrAgendaFallbackAt = Date.now();
+  if (typeof daemonApi === 'undefined' || !daemonApi || typeof daemonApi.request !== 'function') {
+    xrAgendaFallback = { error: 'agenda api unavailable' };
+    return;
+  }
+  xrAgendaFallbackInFlight = true;
+  (async () => {
+    try {
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary', window: 'live' });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        xrAgendaFallback = xrAgendaProject(resp.body.items);
+      } else {
+        xrAgendaFallback = {
+          error: xrAgendaShortError((resp.body && resp.body.error) || `agenda unavailable (${resp.status})`),
+        };
+      }
+    } catch (err) {
+      xrAgendaFallback = { error: xrAgendaShortError(err) };
+    } finally {
+      xrAgendaFallbackInFlight = false;
+    }
+  })();
+}
+
+// The pump's agenda block: client-state reuse first, throttled fallback
+// second, honest error shape on any failure, null while nothing has
+// loaded yet (the rail stays absent rather than claiming emptiness).
+function xrAgendaSummary() {
+  try {
+    if (typeof agendaItems !== 'undefined' && Array.isArray(agendaItems)) {
+      return xrAgendaProject(agendaItems);
+    }
+    if (typeof agendaLoadError !== 'undefined' && agendaLoadError) {
+      return { error: xrAgendaShortError(agendaLoadError) };
+    }
+    xrAgendaFallbackKick();
+    return xrAgendaFallback;
+  } catch (err) {
+    return { error: xrAgendaShortError(err) };
+  }
+}
+
+// ============================================================================
+// End of the agenda-rail section.
+// ============================================================================
+
 // QA facade, mirroring the stationProbe convention: the validator's
 // --xr-probe drives the surface through here.
 globalThis.xrProbe = {
@@ -146422,6 +146550,10 @@ globalThis.xrProbe = {
   captureOnly: (on) => { xrCaptureOnly = !!on; },
   lastAction: null,
 };
+
+// Agenda-rail probe hook (attached beside the facade so the object
+// literal above stays untouched): the pump's agenda block, on demand.
+globalThis.xrProbe.agenda = () => xrAgendaSummary();
 /* ── static/app/ui2-composer-peek.js ── */
 // ── composer conversation peek ─────────────────────────────────────────
 // A transient sheet floating above the dock: the prompt-target session's

@@ -33,6 +33,7 @@ pub(crate) const IRIS: [f32; 4] = rgba(0x7E8CFA, 1.0); // --iris
 pub(crate) const GREEN: [f32; 4] = rgba(0x69D58C, 1.0);
 pub(crate) const AMBER: [f32; 4] = rgba(0xE8C476, 1.0);
 pub(crate) const RED: [f32; 4] = rgba(0xE87A8B, 1.0);
+pub(crate) const SKY: [f32; 4] = rgba(0x6FB5EC, 1.0); // --sky (brightened for the medium like the other status hues)
 
 /// Status → accent color, matching the dashboard's status vocabulary.
 pub(crate) fn status_color(status: &str, phase: &str) -> [f32; 4] {
@@ -164,6 +165,21 @@ pub(crate) const WORKBENCH_HALF_H: f32 = 0.23;
 /// Approval banner floats above the workbench line.
 pub(crate) const BANNER_DIST: f32 = 1.1;
 pub(crate) const BANNER_Y: f32 = 1.78;
+
+/// Agenda rail: parked intent on the operator's RIGHT — the mirror of
+/// the monitors' −38° placement on the left, same distance, inside the
+/// comfortable frontal arc.
+pub(crate) const AGENDA_AZ: f32 = 0.66; // ≈ +38°
+pub(crate) const AGENDA_DIST: f32 = 1.85;
+/// Top edge of the first card; the stack grows downward.
+pub(crate) const AGENDA_TOP_Y: f32 = 1.66;
+pub(crate) const AGENDA_CARD_W: f32 = 0.50;
+/// Collapsed card height (title line + state line); the selected card
+/// grows per wrapped title line.
+pub(crate) const AGENDA_CARD_H: f32 = 0.096;
+pub(crate) const AGENDA_CARD_GAP: f32 = 0.022;
+/// Cards on the rail before the honest "+N more" overflow line.
+pub(crate) const AGENDA_RAIL_CAP: usize = 8;
 
 /// A slot on the shelf cylinder: `index` within `count` cards on `row`
 /// (0 = top). Returns (center, right, up); the panel normal faces the

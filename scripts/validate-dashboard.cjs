@@ -189,6 +189,21 @@ const XR_PROBE_SNAPSHOT = {
       sessionId: 'probe-session-2', source: 'codex',
     },
   ],
+  // Agenda rail: two open items (a question and an overdue blocked task)
+  // plus a total that forces the honest "+1 more" overflow line.
+  agenda: {
+    open: 3,
+    items: [
+      {
+        id: 'xr-ag-q1', title: 'Which palette should the rail use?', kind: 'question',
+        due: '', overdue: false, blocked: false, answered: false,
+      },
+      {
+        id: 'xr-ag-t1', title: 'Water the office plants', kind: 'task',
+        due: 'overdue 2h', overdue: true, blocked: true, answered: false,
+      },
+    ],
+  },
 };
 
 const BROWSER_EXECUTABLE_ENVS = [
@@ -2379,6 +2394,21 @@ class BrowserHarness {
       "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('card:xr-probe-a2') && d.scene.panels > 0 && d.scene.texts > 0)",
       timeoutMs,
     );
+    // Agenda rail: the injected snapshot carries two open items — the
+    // scene must build both rail cards (each is a hit target), and a
+    // pinch-select must expand one locally (read-only; no action fires).
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.agendaItems === 2 && d.scene.hitTargets.includes('agenda:xr-ag-q1'))",
+      timeoutMs,
+    );
+    const agendaSelected = await this.evaluate("xrProbe.activate('agenda:xr-ag-t1')");
+    if (agendaSelected !== true) {
+      throw new Error('xr probe: agenda card activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'agenda:xr-ag-t1')",
+      timeoutMs,
+    );
     // Select the approval agent by name (the exact ray-click path).
     const selected = await this.evaluate("xrProbe.activate('card:xr-probe-a2')");
     if (selected !== true) {
@@ -2409,7 +2439,7 @@ class BrowserHarness {
       throw new Error(`xr probe: captured approval action malformed: ${action}`);
     }
     const summary = await this.evaluate(
-      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
+      "xrProbe.debugJson().then((d) => JSON.stringify({ frames: d.engine.framesRendered, views: d.engine.views, panels: d.scene.panels, texts: d.scene.texts, hits: d.scene.hitTargets.length, agendaItems: d.scene.agendaItems, passthrough: d.engine.passthrough, parseErrors: d.scene.parseErrors }))",
     );
     const report = JSON.parse(String(summary));
     if (report.parseErrors > 0) {

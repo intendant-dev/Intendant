@@ -44,6 +44,17 @@ pub(crate) fn build_scene(
     // Screens are independent of the agents feed — they show even while
     // the snapshot warms up.
     monitors(displays, floor_y, out);
+    // Agenda rail on the operator's right (the monitors' mirror):
+    // parked intent, questions, due reminders — read-only, and just as
+    // independent of the agents feed.
+    crate::agenda::rail(
+        snap.agenda.as_ref(),
+        selected_id,
+        hover_id,
+        floor_y,
+        measure,
+        out,
+    );
 
     // Hosts: connected first, local pinned to the top row. (The early
     // return below keeps monitors/backdrop — only shelf content needs
