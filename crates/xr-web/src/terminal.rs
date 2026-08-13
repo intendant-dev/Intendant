@@ -184,14 +184,10 @@ pub(crate) fn handle_release(inner: &mut Inner, kind: HitKind) -> bool {
             inner.ui_dirty = true;
             true
         }
-        HitKind::TerminalClose => {
-            if inner.terminal.open {
-                inner.terminal.open = false;
-                inner.ui_dirty = true;
-                true
-            } else {
-                false
-            }
+        HitKind::TerminalClose if inner.terminal.open => {
+            inner.terminal.open = false;
+            inner.ui_dirty = true;
+            true
         }
         _ => false,
     }
