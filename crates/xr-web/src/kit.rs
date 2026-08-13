@@ -96,6 +96,10 @@ pub(crate) enum HitKind {
     Card,
     Approve,
     Deny,
+    /// Transcript paging on the workbench: toward older rows.
+    ScrollOlder,
+    /// Transcript paging on the workbench: back toward the live tail.
+    ScrollNewer,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +132,12 @@ pub(crate) struct SceneBatches {
     pub frame: SceneFrame,
     pub monitors: Vec<MonitorInstance>,
     pub hits: Vec<HitTarget>,
+    /// Wrapped transcript rows the focused workbench had available (0 =
+    /// no transcript this build) and the scroll offset actually applied
+    /// after clamping — the frame loop writes these back to the facade
+    /// so paging stays bounded and `debug_json` reports truth.
+    pub transcript_rows: usize,
+    pub transcript_scroll: usize,
 }
 
 impl SceneBatches {
@@ -137,6 +147,8 @@ impl SceneBatches {
         self.frame.clear();
         self.monitors.clear();
         self.hits.clear();
+        self.transcript_rows = 0;
+        self.transcript_scroll = 0;
     }
 }
 
@@ -160,6 +172,16 @@ pub(crate) const WORKBENCH_DIST: f32 = 1.05;
 pub(crate) const WORKBENCH_Y: f32 = 1.32;
 pub(crate) const WORKBENCH_HALF_W: f32 = 0.33;
 pub(crate) const WORKBENCH_HALF_H: f32 = 0.23;
+/// Deep workbench: the focused session with a live transcript grows into
+/// a reading surface (top stays under the banner line).
+pub(crate) const WORKBENCH_DEEP_HALF_W: f32 = 0.44;
+pub(crate) const WORKBENCH_DEEP_HALF_H: f32 = 0.33;
+pub(crate) const WORKBENCH_DEEP_Y: f32 = 1.30;
+/// Transcript typography: row glyph height + vertical pitch (meters).
+pub(crate) const TRANSCRIPT_ROW_H: f32 = 0.0165;
+pub(crate) const TRANSCRIPT_ROW_PITCH: f32 = 0.0225;
+/// Rows a single older/newer page step moves.
+pub(crate) const TRANSCRIPT_PAGE_ROWS: usize = 6;
 
 /// Approval banner floats above the workbench line.
 pub(crate) const BANNER_DIST: f32 = 1.1;

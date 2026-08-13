@@ -392,6 +392,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let selected = inner.selected_id.clone();
         let hover = inner.hover_id.clone();
         let confirm = inner.confirm_progress.clone();
+        let transcript_scroll = inner.transcript_scroll;
         let snapshot = inner.model.clone().unwrap_or_default();
         let display_meta: Vec<(String, String)> = inner
             .displays
@@ -415,6 +416,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 selected.as_deref(),
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
+                transcript_scroll,
                 passthrough,
                 floor_y,
                 measure,
@@ -424,6 +426,8 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         encoder.upload_batches(&batches);
         inner.panels_count = batches.panels.len() as u32;
         inner.texts_count = batches.texts.len() as u32;
+        inner.transcript_rows = batches.transcript_rows;
+        inner.transcript_scroll = batches.transcript_scroll;
         inner.hit_targets = batches.hits;
         inner.scene_uploaded = true;
         inner.built_generation = inner.scene_generation;

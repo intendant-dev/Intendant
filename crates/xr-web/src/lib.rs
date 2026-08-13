@@ -80,6 +80,11 @@ pub(crate) struct Inner {
     pub(crate) hold_started_ms: f64,
     /// (target id, 0..1) while a confirm-hold is filling.
     pub(crate) confirm_progress: Option<(String, f32)>,
+    /// Workbench transcript paging: requested offset (rows back from the
+    /// live tail) and the last build's total wrapped rows. The build
+    /// clamps the request and writes both back.
+    pub(crate) transcript_scroll: usize,
+    pub(crate) transcript_rows: usize,
     pub(crate) parse_errors: u64,
     pub(crate) panels_count: u32,
     pub(crate) texts_count: u32,
@@ -115,6 +120,8 @@ impl Inner {
             hold_target: None,
             hold_started_ms: 0.0,
             confirm_progress: None,
+            transcript_scroll: 0,
+            transcript_rows: 0,
             parse_errors: 0,
             panels_count: 0,
             texts_count: 0,
@@ -160,6 +167,10 @@ fn debug_state_json(inner: &Inner) -> String {
             "confirm": inner.confirm_progress.as_ref().map(|(id, p)| {
                 serde_json::json!({ "target": id, "progress": p })
             }),
+            "transcript": {
+                "rows": inner.transcript_rows,
+                "scroll": inner.transcript_scroll,
+            },
         },
     })
     .to_string()
