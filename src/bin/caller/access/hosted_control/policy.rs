@@ -1280,6 +1280,67 @@ mod tests {
         ));
     }
 
+    /// The XR surface's hosted-lease contract (docs/src/xr.md § Testing):
+    /// over a lease the room must fully RENDER — the dashboard feed and
+    /// display offers clear the projection at View — while the approval
+    /// verb stays refused at EVERY preset. Approving is the action wall's
+    /// trust-critical line; the headset approves over the trusted
+    /// loopback/mTLS lane instead. Widening approve/deny onto hosted
+    /// surfaces is a deliberate policy change that must move this pin and
+    /// the XR chapter together.
+    #[test]
+    fn xr_over_hosted_lease_watches_everything_approves_nothing() {
+        let state = LocalIamState::default();
+
+        // Watch side, at the weakest preset: the XR scene's inputs.
+        assert!(hosted_outbound_line_allowed(
+            HostedPreset::View,
+            r#"{"t":"state_snapshot","state":{},"config":{}}"#
+        ));
+        for event in [
+            "session_started",
+            "session_goal",
+            "session_vitals",
+            "session_capabilities",
+            "usage",
+            "status",
+            "round_complete",
+        ] {
+            let line = format!(r#"{{"event":"{event}","session_id":"s1"}}"#);
+            assert!(
+                hosted_outbound_line_allowed(HostedPreset::View, &line),
+                "XR feed event {event} must clear the outbound projection"
+            );
+        }
+        assert!(hosted_ws_frame_allowed(
+            &state,
+            HostedPreset::View,
+            &serde_json::json!({"t": "display_offer", "display_id": "display_1", "sdp": "v=0"})
+        ));
+        assert!(hosted_ws_frame_allowed(
+            &state,
+            HostedPreset::View,
+            &serde_json::json!({"t": "ping"})
+        ));
+
+        // Approval side: refused at every preset, through the same WS
+        // seam the gateway classifies (access_gates →
+        // hosted_ws_frame_allowed). Wire shapes proven in event.rs serde
+        // tests.
+        for preset in HostedPreset::ALL {
+            for action in ["approve", "deny"] {
+                assert!(
+                    !hosted_ws_frame_allowed(
+                        &state,
+                        preset,
+                        &serde_json::json!({"action": action, "id": 7})
+                    ),
+                    "{action} must stay behind the action wall at {preset:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hosted_runtime_config_projection_has_a_closed_key_set() {
         let projected = project_hosted_runtime_config(&serde_json::json!({

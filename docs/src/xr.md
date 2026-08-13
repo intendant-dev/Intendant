@@ -118,6 +118,34 @@ developer loop sidesteps both:
 5. Remote DevTools via `chrome://inspect` on a desktop Chrome over the same
    adb link.
 
+### The no-adb lane: hosted leases (watch mode)
+
+When this daemon has the hosted-control opt-in enabled
+(`[connect] hosted_control_enabled`, see
+[Hosted control](./hosted-control.md)), the headset needs no developer
+mode at all: open the daemon's fleet name (or Connect) in Horizon
+Browser — ordinary WebPKI HTTPS, so a secure context with no
+client-cert problem — ring the doorbell, approve the lease from a
+trusted surface, and enter XR.
+
+Know what that buys, honestly: **over a hosted lease the XR room fully
+renders but stays watch-mode.** The state feed and session events clear
+the lease's outbound projection, and display streams flow at the `View`
+preset — the shelf, workbench, banner, and monitors all live. The
+approval verb does not: the action wall refuses `approve`/`deny` (and
+every trust-critical verb) from hosted surfaces **at every preset**, by
+design — approving stays on surfaces the daemon trusts directly. The
+contract is pinned by
+`xr_over_hosted_lease_watches_everything_approves_nothing` in
+`access/hosted_control/policy.rs`; widening it is a deliberate policy
+change that must move the pin and this paragraph together.
+
+So the two lanes divide cleanly: the **adb/loopback lane** is
+full-powers XR (the headset is a trusted local surface — pinch-hold
+approvals work); the **lease lane** is zero-setup supervision (watch the
+fleet, watch the screens, see approvals pending — and resolve them from
+your desk, phone, or any trusted surface).
+
 ### Without a headset
 
 `scripts/validate-dashboard.cjs --xr-probe` injects a deterministic WebXR
