@@ -4,10 +4,14 @@ name: release
 #  - the native macOS app (the macos-app/ WKWebView wrapper bundling the
 #    release `intendant` + `intendant-runtime` binaries) via
 #    scripts/bundle-macos.sh, built/signed/notarized on the fleet Mac;
-#  - standalone Linux `intendant` binaries (x86_64 + aarch64), the
-#    checksum-pinned fast path for Codex Cloud / remote-compute workers
-#    (scripts/codex-cloud/setup.sh's INTENDANT_CLOUD_BINARY_URL lane;
-#    docs/src/codex-cloud-workers.md, "Environment bootstrap");
+#  - standalone Linux binaries (x86_64 + aarch64), two shapes per arch:
+#    the bare `intendant` worker binary — the checksum-pinned fast path
+#    for Codex Cloud / remote-compute workers (scripts/codex-cloud/setup.sh's
+#    INTENDANT_CLOUD_BINARY_URL lane; docs/src/codex-cloud-workers.md,
+#    "Environment bootstrap") — and the paired
+#    `Intendant-<version>-linux-<arch>.tar.gz` carrying `intendant` +
+#    `intendant-runtime` at their final sibling names, for installs that
+#    skip the source build;
 #  - the standalone Windows daemon + runtime pair (x86_64): one zip
 #    carrying `intendant.exe` + `intendant-runtime.exe` at their final
 #    sibling names; not Authenticode-signed while that lane stays
@@ -121,12 +125,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Standalone Linux binaries: the checksum-pinned worker fast path.
+  # Standalone Linux binaries, two shapes per arch from one build: the
+  # bare renamed `intendant` (the checksum-pinned worker fast path) and
+  # the paired `Intendant-<version>-linux-<arch>.tar.gz` daemon install.
   # Built on GitHub-hosted runners deliberately — an ephemeral image with
   # a known library baseline (the glibc + system libs of ubuntu-24.04,
   # the same image the fork-PR CI legs prove the tree builds on) rather
   # than a long-lived fleet box; per-arch native runners, so no cross
-  # toolchain. The binaries flow into the macos-app job's dist/, where
+  # toolchain. The assets flow into the macos-app job's dist/, where
   # the PGP sign, publish, and transparency-log steps cover them exactly
   # like the app archive and installers.
   linux-binaries:
@@ -138,15 +144,21 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             asset: intendant-linux-x86_64
+            arch: x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             asset: intendant-linux-aarch64
+            arch: aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # Full history so dispatch dry-runs can stamp a `git describe
+          # --tags` dev version into the tar.gz name (same reason as the
+          # windows-binary checkout).
+          fetch-depth: 0
 
       # The build-time subset of scripts/setup-linux.sh's APT_PACKAGES the
       # hosted CI legs install (windows.yml carries the canonical comment
@@ -158,15 +170,45 @@ jobs:
             pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
-      - name: Build release binary
-        run: cargo build --release --locked --bin intendant
+      - name: Build release binaries
+        run: cargo build --release --locked --bin intendant --bin intendant-runtime
 
-      - name: Stage asset
+      # Two assets per arch from the one build:
+      #  - the bare renamed `intendant` (+ .sha256) — the Codex Cloud /
+      #    remote-compute worker fast path (INTENDANT_CLOUD_BINARY_URL).
+      #    External consumers pin these exact names; never change them.
+      #  - `Intendant-<version>-linux-<arch>.tar.gz` (+ .sha256) carrying
+      #    `intendant` + `intendant-runtime` at their final sibling names —
+      #    the controller resolves its runtime as a sibling of the running
+      #    exe (src/bin/caller/agent_runner.rs), so a working daemon
+      #    install needs the pair; the install scripts' binary fast path
+      #    consumes this archive like the Windows zip. tar.gz rather than
+      #    zip so the executable bits survive extraction. The version in
+      #    the name mirrors the windows-binary job's (tag minus its "v",
+      #    or a `git describe` dev stamp on tagless dispatch).
+      - name: Stage assets
         run: |
           set -euo pipefail
           mkdir -p out
           cp target/release/intendant "out/${{ matrix.asset }}"
           (cd out && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          version="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="$(git describe --tags --match 'v*' --always --dirty 2>/dev/null || true)"
+          fi
+          [ -n "$version" ] || version="0.0.0-dev"
+          version="${version#v}"
+          case "$version" in
+            *.*) : ;;
+            *) version="0.0.0-${version}" ;;
+          esac
+          tar_name="Intendant-${version}-linux-${{ matrix.arch }}.tar.gz"
+          mkdir -p out/stage
+          cp target/release/intendant target/release/intendant-runtime out/stage/
+          chmod 755 out/stage/intendant out/stage/intendant-runtime
+          tar -C out/stage -czf "out/$tar_name" intendant intendant-runtime
+          rm -rf out/stage
+          (cd out && sha256sum "$tar_name" > "$tar_name.sha256")
           ls -l out
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -603,9 +645,10 @@ jobs:
           (cd dist && shasum -a 256 install.ps1 > install.ps1.sha256)
           ls -l dist
 
-      # Pull the Linux worker binaries into dist/ so the PGP sign,
-      # publish, and transparency-log steps below cover them exactly like
-      # the app archive and installers.
+      # Pull the Linux assets (bare worker binaries + paired tar.gz
+      # archives) into dist/ so the PGP sign, publish, and
+      # transparency-log steps below cover them exactly like the app
+      # archive and installers.
       - name: Collect Linux release binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -616,16 +659,44 @@ jobs:
       # Re-verify the staged checksums: proves the artifact transport
       # delivered the built bytes AND that each .sha256 verifies by name
       # from inside dist/ — the exact ritual the release notes document.
+      # The paired tar.gz additionally gets the shape check its existence
+      # promises (like the Windows zip's): both binaries at the archive
+      # root at their final sibling names, with the owner-executable bit
+      # the tar format exists to preserve.
       - name: Verify collected Linux binaries
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           for asset in intendant-linux-x86_64 intendant-linux-aarch64; do
             if [ ! -f "dist/$asset" ]; then
               echo "::error::dist/$asset missing after artifact download"
               exit 1
             fi
             (cd dist && shasum -a 256 -c "$asset.sha256")
+          done
+          for arch in x86_64 aarch64; do
+            tars=(dist/Intendant-*-linux-"$arch".tar.gz)
+            if [ "${#tars[@]}" != "1" ]; then
+              echo "::error::expected exactly one Intendant-*-linux-$arch.tar.gz in dist/ after artifact download, found ${#tars[@]}"
+              exit 1
+            fi
+            (cd dist && shasum -a 256 -c "$(basename "${tars[0]}").sha256")
+            listing="$(tar -tvzf "${tars[0]}")"
+            for entry in intendant intendant-runtime; do
+              mode="$(awk -v n="$entry" '$NF == n { print $1 }' <<< "$listing")"
+              if [ -z "$mode" ]; then
+                echo "::error::$(basename "${tars[0]}") does not carry $entry at the archive root — the runtime must stay a sibling of the daemon binary at their final names."
+                echo "$listing"
+                exit 1
+              fi
+              case "$mode" in
+                -rwx*) : ;;
+                *)
+                  echo "::error::$entry in $(basename "${tars[0]}") is not owner-executable (mode $mode) — preserved exec bits are why this asset is a tar.gz."
+                  exit 1 ;;
+              esac
+            done
           done
 
       # Same collection for the Windows zip.
@@ -709,6 +780,8 @@ jobs:
           # macOS app zip and the Windows binaries zip distinct.
           zip_file="$(ls dist/Intendant-*-macos-*.zip)"
           win_zip="$(ls dist/Intendant-*-windows-x86_64.zip)"
+          linux_tar_x86="$(ls dist/Intendant-*-linux-x86_64.tar.gz)"
+          linux_tar_arm="$(ls dist/Intendant-*-linux-aarch64.tar.gz)"
           # Alpha marking rides the version string (v0.2.0-alpha.1) and
           # the notes banner below — deliberately NOT GitHub's prerelease
           # flag. While the whole line is alpha there is no stable release
@@ -789,6 +862,8 @@ jobs:
             echo "**Windows binaries (x86_64):** \`$(basename "$win_zip")\` carries the standalone \`intendant.exe\` + \`intendant-runtime.exe\` pair. Unzip anywhere and keep the two files side by side — the daemon resolves its runtime as a sibling of the running exe — then run \`intendant.exe\` from a terminal. No packaged Windows app yet: this is the daemon + runtime, CLI-first."
             echo
             echo "These binaries are not Authenticode-signed: on first run, Windows SmartScreen will interpose (\"Windows protected your PC\") — choose **More info → Run anyway**. Authenticity rides the detached \`.asc\` PGP signatures, the public transparency log, and \`intendant hosted-verify --releases $tag\` — verify before running."
+            echo
+            echo "**Linux binaries (x86_64 / aarch64):** \`$(basename "$linux_tar_x86")\` and \`$(basename "$linux_tar_arm")\` carry the standalone \`intendant\` + \`intendant-runtime\` pair at their final sibling names, executable bits preserved. Unpack anywhere and keep the two files side by side — the daemon resolves its runtime as a sibling of the running binary — then run \`./intendant\`. Built on ubuntu-24.04: they need that image's library baseline at runtime (glibc 2.39+, libvpx, libpipewire, libxcb). Verify like every asset: the detached \`.asc\` signatures, the \`.sha256\` sidecars, and \`intendant hosted-verify --releases $tag\`."
             echo
             echo "**Linux worker binaries (Codex Cloud / remote compute):** standalone \`intendant\` binaries for x86_64 and aarch64 glibc Linux (built on ubuntu-24.04; they need that image's library baseline at runtime — glibc 2.39+, libvpx, libpipewire, libxcb). They exist for the checksum-pinned worker bootstrap fast path; configure the Codex Cloud environment with:"
             echo '```'
