@@ -72,6 +72,7 @@ async function ensureXr() {
   xrInstance.setOnSessionEnd(() => {
     xrStopSnapshotPump();
     xrSetChipState('idle', 'Enter XR');
+    xrShowStatus('', '');
   });
   await xrInstance.probeSupport();
   return xrInstance;
@@ -138,18 +139,54 @@ function xrStopSnapshotPump() {
   }
 }
 
+// Visible status line beside the chip. Tooltips don't exist inside a
+// headset, so entry progress and failures must be rendered text.
+function xrShowStatus(state, text) {
+  if (!xrChipEl) return;
+  let el = document.getElementById('ui2-xr-status');
+  if (!text) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('span');
+    el.id = 'ui2-xr-status';
+    el.className = 'ui2-xr-status';
+    xrChipEl.insertAdjacentElement('afterend', el);
+  }
+  el.dataset.state = state;
+  el.textContent = text;
+}
+
 async function xrEnter() {
   xrSetChipState('busy', 'Starting immersive session…');
+  xrShowStatus('busy', 'starting…');
+  // The permission dialog can take a while to be noticed in-headset; an
+  // unsettled entry is almost always the consent prompt waiting, not a
+  // hang. Say so where the operator can read it.
+  const consentHint = setTimeout(() => {
+    xrShowStatus('busy', 'waiting for the headset permission dialog — look for an Allow prompt');
+  }, 6000);
   try {
-    const inst = await ensureXr();
+    // The module is preloaded at chip mount so this click reaches
+    // requestSession while its user activation is still fresh — a slow
+    // module fetch here used to burn the activation window.
+    const inst = xrInstance || await ensureXr();
     // Passthrough-first: prefer AR on hardware that has it (Quest 3),
     // fall back to VR (Vision Pro Safari has no immersive-ar).
     const mode = xrSupport.ar ? 'immersive-ar' : 'immersive-vr';
     await inst.enter(mode);
+    clearTimeout(consentHint);
     xrStartSnapshotPump();
     xrSetChipState('active', 'Immersive session running');
+    xrShowStatus('', '');
   } catch (err) {
-    xrSetChipState('error', 'XR entry failed: ' + (err && err.message ? err.message : err));
+    clearTimeout(consentHint);
+    const detail = (err && (err.message || err.name)) || String(err);
+    xrSetChipState('error', 'XR entry failed: ' + detail);
+    // Persist the failure where a headset user can read it; clear on the
+    // next attempt instead of a timer.
+    xrShowStatus('error', 'XR entry failed: ' + detail);
     setTimeout(() => xrSetChipState('idle', 'Enter XR'), 4000);
   }
 }
@@ -176,6 +213,14 @@ function xrMountChip() {
   xrSupport = await xrProbeSupportLight();
   if (!xrSupport.ar && !xrSupport.vr) return;
   xrMountChip();
+  // Preload the WASM module now so the click handler reaches
+  // requestSession within its transient user-activation window — the
+  // module fetch must never sit between the tap and the session request.
+  try {
+    await ensureXr();
+  } catch (err) {
+    xrShowStatus('error', 'XR module failed to load: ' + ((err && err.message) || err));
+  }
 })();
 
 // QA facade, mirroring the stationProbe convention: the validator's
