@@ -22,7 +22,11 @@
 
     Dependencies (git, rustup, VS Build Tools, NASM) are handled by
     scripts/setup-windows.ps1 from the cloned repo -- run automatically
-    when this shell is elevated, otherwise checked and reported.
+    when this shell is elevated, otherwise checked and reported. The
+    Rust toolchain is only required when building from source: a release
+    install prefers the release's prebuilt, sha256-verified
+    intendant.exe + intendant-runtime.exe pair and builds from source
+    only as the fallback (-FromSource forces the source build).
 
     The install finishes concretely: it generates the per-user dashboard
     access certificates and imports them into this user's certificate
@@ -62,6 +66,13 @@
 .PARAMETER NoRun
     Build and link only; print how to start it.
 
+.PARAMETER FromSource
+    Always build from source, skipping the prebuilt-binary fast path
+    (the fully source-verified install). Without it, installing a
+    release downloads the release's sha256-verified binary pair when
+    one is published for this platform, and builds from source
+    otherwise.
+
 .PARAMETER Repo
     Git URL to clone (default: https://github.com/intendant-dev/Intendant).
 
@@ -75,6 +86,7 @@ param(
     [string]$Ref = "",
     [switch]$Service,
     [switch]$NoRun,
+    [switch]$FromSource,
     [string]$Repo = "https://github.com/intendant-dev/Intendant",
     [string]$InstallDir = (Join-Path $HOME "intendant")
 )
@@ -272,22 +284,121 @@ if ($InstallerReleaseCommit -and $Ref -eq $InstallerReleaseTag) {
     Say "release pin verified: $Ref is commit $actualCommit"
 }
 
+# -- Binary fast path --
+# When the resolved ref IS a release tag, that release may publish the
+# prebuilt intendant.exe + intendant-runtime.exe pair
+# (Intendant-<version>-windows-x86_64.zip): downloading it replaces the
+# multi-minute source compile. The trust story is unchanged -- the
+# checkout above stays pin-verified to the release commit, and the zip
+# is sha256-verified against the .sha256 sidecar published by the same
+# release, every asset of which is PGP-signed and committed to the
+# public transparency log. -FromSource opts out and keeps the fully
+# source-verified build. Old releases without the pair, other
+# architectures, a non-GitHub -Repo, or any verification or smoke
+# failure fall back to the source build below.
+$BinaryInstall = $false
+$daemonExe = Join-Path $InstallDir "target\release\intendant.exe"
+function Get-GitHubRepoPath([string]$RepoUrl) {
+    if ($RepoUrl -match '^https://github\.com/([^/]+/[^/]+?)(\.git)?/?$') { return $Matches[1] }
+    return $null
+}
+if (-not $FromSource -and $Ref -match '^v[0-9]' -and $env:PROCESSOR_ARCHITECTURE -eq 'AMD64') {
+    $repoPath = Get-GitHubRepoPath $Repo
+    if ($repoPath) {
+        $fastAsset = "Intendant-" + $Ref.Substring(1) + "-windows-x86_64.zip"
+        $fastBase = "https://github.com/$repoPath/releases/download/$Ref"
+        $fastTmp = Join-Path $env:TEMP ("intendant-asset-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $fastTmp | Out-Null
+        $fastZip = Join-Path $fastTmp $fastAsset
+        $fetched = $false
+        # Windows PowerShell 5.1: older .NET defaults can exclude TLS 1.2
+        # (GitHub requires it), and the IWR progress bar slows large
+        # downloads by an order of magnitude.
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $prevProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            Say "binary fast path: fetching $fastAsset from the $Ref release"
+            Invoke-WebRequest -UseBasicParsing -Uri "$fastBase/$fastAsset" -OutFile $fastZip
+            Invoke-WebRequest -UseBasicParsing -Uri "$fastBase/$fastAsset.sha256" -OutFile "$fastZip.sha256"
+            $fetched = $true
+        } catch {
+            Say "note: no prebuilt binary pair for $Ref (releases before v0.2.0-alpha.6 ship none) -- building from source"
+        } finally {
+            $ProgressPreference = $prevProgress
+        }
+        if ($fetched) {
+            $want = ((Get-Content -LiteralPath "$fastZip.sha256" -TotalCount 1) -replace '^\s+', '' -split '\s+')[0]
+            $got = (Get-FileHash -LiteralPath $fastZip -Algorithm SHA256).Hash
+            if (-not $want -or -not ($want -ieq $got)) {
+                Say "WARNING: $fastAsset did not match its .sha256 sidecar (expected $want, got $got) -- discarding the download and building from source instead"
+            } else {
+                Say "verified $fastAsset against its .sha256 sidecar"
+                $fastReleaseDir = Join-Path $InstallDir "target\release"
+                New-Item -ItemType Directory -Force -Path $fastReleaseDir | Out-Null
+                $extracted = $false
+                try {
+                    Expand-Archive -LiteralPath $fastZip -DestinationPath $fastReleaseDir -Force
+                    $extracted = $true
+                } catch {
+                    Say "WARNING: could not extract $fastAsset ($($_.Exception.Message)) -- building from source instead"
+                }
+                if ($extracted -and (Test-Path $daemonExe) -and (Test-Path (Join-Path $fastReleaseDir "intendant-runtime.exe"))) {
+                    # Post-extract smoke: --version prints the version and
+                    # exits 0 immediately on a healthy binary; a
+                    # wrong-architecture or corrupt exe fails here.
+                    # Shielded like Get-TokenedDashboardUrl below: under
+                    # $ErrorActionPreference = "Stop", Windows PowerShell
+                    # 5.1 can escalate redirected native stderr into a
+                    # terminating error.
+                    $prevEap = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    $smokeOk = $false
+                    try {
+                        & $daemonExe --version 2>$null | Out-Null
+                        $smokeOk = ($LASTEXITCODE -eq 0)
+                    } catch {
+                        $smokeOk = $false
+                    } finally {
+                        $ErrorActionPreference = $prevEap
+                    }
+                    if ($smokeOk) {
+                        $BinaryInstall = $true
+                        Say "installed the release's prebuilt binary pair (windows-x86_64) -- the source build is skipped (-FromSource forces one)"
+                    } else {
+                        Say "WARNING: the prebuilt intendant.exe does not run on this system (wrong architecture or a corrupt download) -- removing it and building from source instead"
+                        Remove-Item -LiteralPath $daemonExe -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath (Join-Path $fastReleaseDir "intendant-runtime.exe") -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+        Remove-Item -LiteralPath $fastTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # -- System dependencies --
 # setup-windows.ps1 is the dependency authority (rustup, VS Build Tools
 # C++ workload, NASM, ffmpeg, Media Foundation). It needs elevation to
-# install; unelevated we only verify and report.
+# install; unelevated we only verify and report. The Rust toolchain is
+# only REQUIRED when building from source: on the binary fast path an
+# unelevated shell without cargo is fine.
 $setup = Join-Path $InstallDir "scripts\setup-windows.ps1"
 if ($elevated -and (Test-Path $setup)) {
     Say "installing system dependencies (scripts\setup-windows.ps1 -NoBuild)"
     & $setup -NoBuild
     if ($LASTEXITCODE -ne 0) { Fail "system dependency setup failed" }
+} elseif ($BinaryInstall) {
+    Say "note: unelevated shell -- skipping dependency setup (the prebuilt binaries need no build toolchain; run scripts\setup-windows.ps1 from an elevated PowerShell later for the optional tools it manages)."
 } elseif (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Fail "Rust is required. Either re-run this installer from an elevated PowerShell (it will run scripts\setup-windows.ps1 for you) or install rustup from https://rustup.rs and re-run."
+    Fail "Rust is required to build from source. Either re-run this installer from an elevated PowerShell (it will run scripts\setup-windows.ps1 for you) or install rustup from https://rustup.rs and re-run."
 } else {
     Say "note: unelevated shell -- skipping dependency setup; if the build fails on a missing native dep, run scripts\setup-windows.ps1 from an elevated PowerShell."
 }
 
 # -- Build --
+# Skipped entirely when the verified prebuilt pair is in place: only the
+# source build requires the Rust toolchain.
 # --locked: build exactly the committed Cargo.lock -- a resolution that
 # differs from what CI tested is a failure, not a fallback.
 # Named bins mirror the release lane's proven build shape (release.yml's
@@ -297,10 +408,11 @@ if ($elevated -and (Test-Path $setup)) {
 # bare workspace build would compile -- a configuration no CI leg gates --
 # while shrinking the install build. intendant-connect is the hosted
 # rendezvous service and is not part of a daemon install.
-Say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release --locked --bin intendant --bin intendant-runtime
-if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
-$daemonExe = Join-Path $InstallDir "target\release\intendant.exe"
+if (-not $BinaryInstall) {
+    Say "building release binaries (this takes a few minutes on a fresh box)"
+    cargo build --release --locked --bin intendant --bin intendant-runtime
+    if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
+}
 
 # -- Dashboard access certs + Windows certificate-store import --
 # The dashboard defaults to mTLS. Generate the per-user access material
