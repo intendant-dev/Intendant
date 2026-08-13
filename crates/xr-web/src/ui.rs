@@ -41,6 +41,8 @@ pub(crate) fn build_scene(
     transcript_scroll: usize,
     passthrough: bool,
     floor_y: f32,
+    layout: &kit::LayoutState,
+    grab: Option<&str>,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
 ) {
@@ -48,25 +50,33 @@ pub(crate) fn build_scene(
     backdrop(passthrough, floor_y, out);
     // Screens are independent of the agents feed — they show even while
     // the snapshot warms up.
-    monitors(displays, floor_y, out);
+    monitors(displays, layout, grab, hover_id, floor_y, measure, out);
     // Agenda rail on the operator's right, outboard of the terminal
-    // slot: parked intent, questions, due reminders — read-only, and
-    // just as independent of the agents feed as the screens.
+    // slot: parked intent, questions, due reminders — just as
+    // independent of the agents feed as the screens.
     crate::agenda::rail(
         snap.agenda.as_ref(),
         selected_id,
         hover_id,
+        confirm,
+        layout,
+        grab,
         floor_y,
         measure,
         out,
     );
+    // The layout strip is the one surface that never hides — anything
+    // dismissed comes back through it.
+    layout_strip(layout, hover_id, floor_y, measure, out);
+
+    let sessions_hidden = layout.is_hidden("sessions");
 
     // Hosts: connected first, local pinned to the top row. (The early
-    // return below keeps monitors/backdrop — only shelf content needs
-    // the feed.)
+    // return below keeps monitors/backdrop/strip — only shelf content
+    // needs the feed.)
     let mut hosts: Vec<_> = snap.hosts.iter().collect();
     hosts.sort_by_key(|h| (!h.connected, h.id != "local", h.name.clone()));
-    if hosts.is_empty() {
+    if !sessions_hidden && hosts.is_empty() {
         // Feed not warm yet: keep the space honest, not empty.
         out.texts.push(TextRun {
             origin: v3(0.0, kit::WORKBENCH_Y + floor_y, -kit::WORKBENCH_DIST),
@@ -83,83 +93,90 @@ pub(crate) fn build_scene(
 
     let mut pending_approvals: Vec<&XrAgent> = Vec::new();
 
-    for (row, host) in hosts.iter().enumerate() {
-        let mut agents: Vec<_> = snap
-            .agents
-            .iter()
-            .filter(|a| a.host_id == host.id)
-            .collect();
-        agents.sort_by_key(|a| (!a.needs_approval, a.recent, a.id.clone()));
-        pending_approvals.extend(agents.iter().filter(|a| a.needs_approval));
+    if sessions_hidden {
+        // The shelf and workbench are tidied away, but a pending ask is
+        // not tidy-away-able: collect approvals straight off the feed so
+        // the banner keeps its gravity.
+        pending_approvals.extend(snap.agents.iter().filter(|a| a.needs_approval));
+    } else {
+        for (row, host) in hosts.iter().enumerate() {
+            let mut agents: Vec<_> = snap
+                .agents
+                .iter()
+                .filter(|a| a.host_id == host.id)
+                .collect();
+            agents.sort_by_key(|a| (!a.needs_approval, a.recent, a.id.clone()));
+            pending_approvals.extend(agents.iter().filter(|a| a.needs_approval));
 
-        let shown = agents.len().min(ROW_CAP);
-        // Host label rides above the row's left-most card slot.
-        if shown > 0 {
-            let (slot0, right, up) = shelf_slot(0, shown, row);
-            let label_origin =
-                slot0 + up.scale(kit::CARD_H / 2.0 + 0.035) - right.scale(kit::CARD_W / 2.0);
-            let host_color = if host.connected {
-                kit::TEXT_2
-            } else {
-                kit::TEXT_3
-            };
-            out.texts.push(TextRun {
-                origin: lift(label_origin, right, up, LIFT_TEXT, floor_y),
-                right,
-                up,
-                height: 0.026,
-                color: host_color,
-                align: TextAlign::Left,
-                max_width: 0.6,
-                text: if host.connected {
-                    format!("{} — {}", host.name, host.platform)
+            let shown = agents.len().min(ROW_CAP);
+            // Host label rides above the row's left-most card slot.
+            if shown > 0 {
+                let (slot0, right, up) = shelf_slot(0, shown, row);
+                let label_origin =
+                    slot0 + up.scale(kit::CARD_H / 2.0 + 0.035) - right.scale(kit::CARD_W / 2.0);
+                let host_color = if host.connected {
+                    kit::TEXT_2
                 } else {
-                    format!("{} — offline", host.name)
-                },
-            });
+                    kit::TEXT_3
+                };
+                out.texts.push(TextRun {
+                    origin: lift(label_origin, right, up, LIFT_TEXT, floor_y),
+                    right,
+                    up,
+                    height: 0.026,
+                    color: host_color,
+                    align: TextAlign::Left,
+                    max_width: 0.6,
+                    text: if host.connected {
+                        format!("{} — {}", host.name, host.platform)
+                    } else {
+                        format!("{} — offline", host.name)
+                    },
+                });
+            }
+
+            for (i, agent) in agents.iter().take(ROW_CAP).enumerate() {
+                let (center, right, up) = shelf_slot(i, shown, row);
+                card(
+                    agent,
+                    center,
+                    right,
+                    up,
+                    selected_id,
+                    hover_id,
+                    floor_y,
+                    measure,
+                    out,
+                );
+            }
+            if agents.len() > ROW_CAP {
+                let (last, right, up) = shelf_slot(ROW_CAP - 1, shown, row);
+                let more = last + right.scale(kit::CARD_W / 2.0 + 0.05);
+                out.texts.push(TextRun {
+                    origin: lift(more, right, up, LIFT_TEXT, floor_y),
+                    right,
+                    up,
+                    height: 0.024,
+                    color: kit::TEXT_3,
+                    align: TextAlign::Left,
+                    max_width: 0.0,
+                    text: format!("+{} more", agents.len() - ROW_CAP),
+                });
+            }
         }
 
-        for (i, agent) in agents.iter().take(ROW_CAP).enumerate() {
-            let (center, right, up) = shelf_slot(i, shown, row);
-            card(
+        if let Some(agent) = selected_id.and_then(|id| snap.agents.iter().find(|a| a.id == id)) {
+            workbench(
                 agent,
-                center,
-                right,
-                up,
-                selected_id,
+                &snap.events,
                 hover_id,
+                confirm,
+                transcript_scroll,
                 floor_y,
                 measure,
                 out,
             );
         }
-        if agents.len() > ROW_CAP {
-            let (last, right, up) = shelf_slot(ROW_CAP - 1, shown, row);
-            let more = last + right.scale(kit::CARD_W / 2.0 + 0.05);
-            out.texts.push(TextRun {
-                origin: lift(more, right, up, LIFT_TEXT, floor_y),
-                right,
-                up,
-                height: 0.024,
-                color: kit::TEXT_3,
-                align: TextAlign::Left,
-                max_width: 0.0,
-                text: format!("+{} more", agents.len() - ROW_CAP),
-            });
-        }
-    }
-
-    if let Some(agent) = selected_id.and_then(|id| snap.agents.iter().find(|a| a.id == id)) {
-        workbench(
-            agent,
-            &snap.events,
-            hover_id,
-            confirm,
-            transcript_scroll,
-            floor_y,
-            measure,
-            out,
-        );
     }
 
     if !pending_approvals.is_empty() {
@@ -167,19 +184,155 @@ pub(crate) fn build_scene(
     }
 }
 
-/// Live display streams as floating screens on the operator's left —
-/// the fleet's actual desktops in the room. Capped at two stacked
-/// 16:9 screens in v1; the rest are counted honestly.
-fn monitors(displays: &[(String, String)], floor_y: f32, out: &mut SceneBatches) {
-    const AZ: f32 = -0.66; // ≈ −38°: left of the shelf, inside the arc
-    const DIST: f32 = 1.85;
+/// The layout strip: four visibility toggle pills, fixed low-front. Each
+/// pill carries a state dot (iris = visible, muted = hidden) so the
+/// strip reads as rendered status text, never a tooltip.
+fn layout_strip(
+    layout: &kit::LayoutState,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) {
+    let (center, right, up) = front_panel_basis(kit::LAYOUT_STRIP_DIST, kit::LAYOUT_STRIP_Y);
+    let text_h = 0.017;
+    let pill_hh = 0.017;
+    let dot_r = 0.005;
+    let dot_gap = 0.009;
+    let gap = 0.016;
+
+    // Pre-measure so the row centers on the forward axis.
+    let widths: Vec<f32> = kit::LAYOUT_SURFACES
+        .iter()
+        .map(|name| {
+            ((measure.measure(name, text_h) + dot_r * 2.0 + dot_gap) / 2.0 + 0.018).max(0.045)
+        })
+        .collect();
+    let total: f32 = widths.iter().map(|hw| hw * 2.0).sum::<f32>() + gap * 3.0;
+    let mut pen = -total / 2.0;
+    for (name, pill_hw) in kit::LAYOUT_SURFACES.iter().zip(widths.iter()) {
+        let pill_hw = *pill_hw;
+        let hidden = if *name == "monitors" {
+            layout.is_hidden("monitors")
+        } else {
+            layout.is_hidden(name)
+        };
+        let id = format!("layout:{name}");
+        let is_hover = hover_id == Some(id.as_str());
+        let pcenter = center + right.scale(pen + pill_hw);
+        pen += pill_hw * 2.0 + gap;
+        out.panels.push(PanelInstance {
+            center: lift(pcenter, right, up, LIFT_DECOR, floor_y),
+            right,
+            up,
+            half_w: pill_hw,
+            half_h: pill_hh,
+            radius: pill_hh,
+            fill: if is_hover {
+                dim(kit::IRIS, 0.25)
+            } else {
+                kit::SURFACE
+            },
+            border: if is_hover { kit::IRIS } else { kit::LINE_2 },
+            border_w: if is_hover { 0.003 } else { 0.002 },
+        });
+        let content_hw = (dot_r * 2.0 + dot_gap + measure.measure(name, text_h)) / 2.0;
+        out.panels.push(PanelInstance {
+            center: lift(
+                pcenter + right.scale(-content_hw + dot_r),
+                right,
+                up,
+                LIFT_DECOR * 2.0,
+                floor_y,
+            ),
+            right,
+            up,
+            half_w: dot_r,
+            half_h: dot_r,
+            radius: dot_r,
+            fill: if hidden { kit::TEXT_3 } else { kit::IRIS },
+            border: [0.0; 4],
+            border_w: 0.0,
+        });
+        out.texts.push(TextRun {
+            origin: lift(
+                pcenter + right.scale(-content_hw + dot_r * 2.0 + dot_gap) - up.scale(0.006),
+                right,
+                up,
+                LIFT_TEXT + LIFT_DECOR,
+                floor_y,
+            ),
+            right,
+            up,
+            height: text_h,
+            color: if hidden { kit::TEXT_3 } else { kit::TEXT_2 },
+            align: TextAlign::Left,
+            max_width: pill_hw * 2.0 - 0.012,
+            text: (*name).to_string(),
+        });
+        out.hits.push(HitTarget {
+            id,
+            kind: HitKind::LayoutToggle,
+            agent_id: (*name).to_string(),
+            panel: Panel {
+                center: at_floor(pcenter, floor_y),
+                right,
+                up,
+                half_w: pill_hw,
+                half_h: pill_hh,
+            },
+        });
+    }
+}
+
+/// Live display streams as floating screens, by default on the
+/// operator's left — the fleet's actual desktops in the room. Capped at
+/// two stacked 16:9 screens in v1; the rest are counted honestly. The
+/// stack is a movable surface (grab bar above the top screen), each
+/// screen carries a dismiss x-pill, and the whole family folds away via
+/// the layout strip.
+fn monitors(
+    displays: &[(String, String)],
+    layout: &kit::LayoutState,
+    grab: Option<&str>,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) {
+    if layout.is_hidden("monitors") {
+        return;
+    }
     const HALF_W: f32 = 0.60;
     const HALF_H: f32 = HALF_W * 9.0 / 16.0;
-    let right = v3(AZ.cos(), 0.0, AZ.sin());
+    let pose = layout.pose("monitors");
+    let az = pose.az;
+    let dist = kit::MONITORS_DIST;
+    let right = v3(az.cos(), 0.0, az.sin());
     let up = v3(0.0, 1.0, 0.0);
-    for (i, (id, label)) in displays.iter().take(2).enumerate() {
-        let y = 1.52 - i as f32 * (HALF_H * 2.0 + 0.12);
-        let center = v3(DIST * AZ.sin(), y, -DIST * AZ.cos());
+    let visible: Vec<&(String, String)> = displays
+        .iter()
+        .filter(|(id, _)| !layout.monitor_hidden(id))
+        .collect();
+    let shown = visible.len().min(2);
+    if shown > 0 {
+        // Grab bar above the top screen: the whole stack moves as one.
+        let bar_center = v3(dist * az.sin(), pose.y + HALF_H + 0.062, -dist * az.cos());
+        grab_bar(
+            "monitors",
+            bar_center,
+            right,
+            up,
+            HALF_W * 0.5,
+            grab,
+            hover_id,
+            floor_y,
+            out,
+        );
+    }
+    for (i, (id, label)) in visible.iter().take(2).enumerate() {
+        let y = pose.y - i as f32 * (HALF_H * 2.0 + 0.12);
+        let center = v3(dist * az.sin(), y, -dist * az.cos());
         // Bezel sits just behind the video plane.
         out.panels.push(PanelInstance {
             center: lift(center, right, up, -0.004, floor_y),
@@ -193,13 +346,25 @@ fn monitors(displays: &[(String, String)], floor_y: f32, out: &mut SceneBatches)
             border_w: 0.003,
         });
         out.monitors.push(MonitorInstance {
-            id: id.clone(),
+            id: (*id).clone(),
             center: at_floor(center, floor_y),
             right,
             up,
             half_w: HALF_W,
             half_h: HALF_H,
         });
+        // Dismiss x-pill on the screen's top-right corner.
+        dismiss_pill(
+            &format!("close:monitor:{id}"),
+            &format!("monitor:{id}"),
+            center + right.scale(HALF_W - 0.026) + up.scale(HALF_H + 0.040),
+            right,
+            up,
+            hover_id,
+            floor_y,
+            measure,
+            out,
+        );
         out.texts.push(TextRun {
             origin: lift(
                 center - up.scale(HALF_H + 0.045),
@@ -214,11 +379,11 @@ fn monitors(displays: &[(String, String)], floor_y: f32, out: &mut SceneBatches)
             color: kit::TEXT_2,
             align: TextAlign::Center,
             max_width: HALF_W * 2.0,
-            text: label.clone(),
+            text: (*label).clone(),
         });
     }
-    if displays.len() > 2 {
-        let center = v3(DIST * AZ.sin(), 0.62, -DIST * AZ.cos());
+    if visible.len() > 2 {
+        let center = v3(dist * az.sin(), pose.y - 0.90, -dist * az.cos());
         out.texts.push(TextRun {
             origin: lift(center, right, up, LIFT_TEXT, floor_y),
             right,
@@ -227,9 +392,128 @@ fn monitors(displays: &[(String, String)], floor_y: f32, out: &mut SceneBatches)
             color: kit::TEXT_3,
             align: TextAlign::Center,
             max_width: 0.0,
-            text: format!("+{} more displays on the dashboard", displays.len() - 2),
+            text: format!("+{} more displays on the dashboard", visible.len() - 2),
         });
     }
+}
+
+/// One small dismiss x-pill (quick pinch → hide the keyed surface).
+/// Shared by the monitors and the agenda rail; `close_key` is what
+/// `LayoutState::hide` receives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dismiss_pill(
+    id: &str,
+    close_key: &str,
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) {
+    let text_h = 0.018;
+    let pill_hw = (measure.measure("x", text_h) / 2.0 + 0.012).max(0.020);
+    let pill_hh = 0.016;
+    let is_hover = hover_id == Some(id);
+    out.panels.push(PanelInstance {
+        center: lift(center, right, up, LIFT_DECOR, floor_y),
+        right,
+        up,
+        half_w: pill_hw,
+        half_h: pill_hh,
+        radius: pill_hh,
+        fill: if is_hover {
+            dim(kit::IRIS, 0.30)
+        } else {
+            kit::SURFACE
+        },
+        border: if is_hover { kit::IRIS } else { kit::LINE_2 },
+        border_w: if is_hover { 0.0032 } else { 0.0022 },
+    });
+    out.texts.push(TextRun {
+        origin: lift(
+            center - up.scale(0.0068),
+            right,
+            up,
+            LIFT_TEXT + LIFT_DECOR,
+            floor_y,
+        ),
+        right,
+        up,
+        height: text_h,
+        color: if is_hover { kit::TEXT } else { kit::TEXT_2 },
+        align: TextAlign::Center,
+        max_width: 0.0,
+        text: "x".into(),
+    });
+    out.hits.push(HitTarget {
+        id: id.to_string(),
+        kind: HitKind::SurfaceClose,
+        agent_id: close_key.to_string(),
+        panel: Panel {
+            center: at_floor(center, floor_y),
+            right,
+            up,
+            half_w: pill_hw,
+            half_h: pill_hh,
+        },
+    });
+}
+
+/// A surface's grab bar: a slim rounded handle above the surface. Pinch
+/// and hold it, move the ray, and the surface follows along its
+/// cylinder band; release drops it. Shared by every movable surface.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grab_bar(
+    surface: &str,
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    half_w: f32,
+    grab: Option<&str>,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    out: &mut SceneBatches,
+) {
+    let id = format!("grab:{surface}");
+    let grabbed = grab == Some(surface);
+    let is_hover = hover_id == Some(id.as_str());
+    let pill_hh = 0.011;
+    out.panels.push(PanelInstance {
+        center: lift(center, right, up, LIFT_DECOR, floor_y),
+        right,
+        up,
+        half_w,
+        half_h: pill_hh,
+        radius: pill_hh,
+        fill: if grabbed {
+            dim(kit::IRIS, 0.45)
+        } else if is_hover {
+            dim(kit::IRIS, 0.28)
+        } else {
+            kit::SURFACE_3
+        },
+        border: if grabbed || is_hover {
+            kit::IRIS
+        } else {
+            kit::LINE_2
+        },
+        border_w: if grabbed || is_hover { 0.0030 } else { 0.0020 },
+    });
+    out.hits.push(HitTarget {
+        id,
+        kind: HitKind::Grab,
+        agent_id: surface.to_string(),
+        panel: Panel {
+            center: at_floor(center, floor_y),
+            right,
+            up,
+            // Generous hit slab: a slim bar is a hard ray target.
+            half_w: half_w + 0.02,
+            half_h: pill_hh + 0.014,
+        },
+    });
 }
 
 /// Shift a point along a panel's outward normal and apply the floor
@@ -833,6 +1117,181 @@ fn card(
     });
 }
 
+/// One labeled action pill with the full interaction dress: hover
+/// highlight, and — for hold-tier kinds — the deliberate-confirm fill
+/// that grows left→right over the hold window and drains on an early
+/// release. Shared by the workbench verbs, the terminal lifecycle pills,
+/// and the agenda quick-verbs. Returns the pill half-width so callers
+/// can pen-advance.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn action_pill(
+    id: &str,
+    label: &str,
+    kind: HitKind,
+    agent_id: &str,
+    color: [f32; 4],
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    hover_id: Option<&str>,
+    confirm: Option<(&str, f32)>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) -> f32 {
+    let label_h = 0.019;
+    let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.020).max(0.045);
+    let pill_hh = 0.018;
+    let is_hover = hover_id == Some(id);
+    let held = confirm.filter(|(cid, _)| *cid == id);
+    out.panels.push(PanelInstance {
+        center: lift(center, right, up, LIFT_DECOR, floor_y),
+        right,
+        up,
+        half_w: pill_hw,
+        half_h: pill_hh,
+        radius: pill_hh,
+        fill: if held.is_some() {
+            dim(color, 0.18)
+        } else if is_hover {
+            dim(color, 0.30)
+        } else {
+            kit::SURFACE
+        },
+        border: color,
+        border_w: if is_hover || held.is_some() {
+            0.0035
+        } else {
+            0.0025
+        },
+    });
+    if let Some((_, progress)) = held {
+        let fill_hw = pill_hw * progress.clamp(0.0, 1.0);
+        if fill_hw > 0.003 {
+            out.panels.push(PanelInstance {
+                center: lift(
+                    center + right.scale(-pill_hw + fill_hw),
+                    right,
+                    up,
+                    LIFT_DECOR * 2.0,
+                    floor_y,
+                ),
+                right,
+                up,
+                half_w: fill_hw,
+                half_h: pill_hh,
+                radius: pill_hh.min(fill_hw),
+                fill: dim(color, 0.55),
+                border: [0.0; 4],
+                border_w: 0.0,
+            });
+        }
+    }
+    out.texts.push(TextRun {
+        origin: lift(
+            center - up.scale(0.0072),
+            right,
+            up,
+            LIFT_TEXT + LIFT_DECOR,
+            floor_y,
+        ),
+        right,
+        up,
+        height: label_h,
+        color,
+        align: TextAlign::Center,
+        max_width: pill_hw * 2.0 - 0.01,
+        text: label.to_string(),
+    });
+    out.hits.push(HitTarget {
+        id: id.to_string(),
+        kind,
+        agent_id: agent_id.to_string(),
+        panel: Panel {
+            center: at_floor(center, floor_y),
+            right,
+            up,
+            half_w: pill_hw,
+            half_h: pill_hh,
+        },
+    });
+    pill_hw
+}
+
+/// The focused session's verb row, above the bench's top edge (the
+/// terminal pane's header-row convention — zero interference with the
+/// bench's internal layout): stop when the turn is interruptible
+/// (hold-tier — it stops a live turn), plus the session's advertised
+/// thread-action ops (quick pinch), gated exactly like the flat
+/// surface's focus pills.
+#[allow(clippy::too_many_arguments)]
+fn workbench_verbs(
+    agent: &XrAgent,
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    hw: f32,
+    hh: f32,
+    hover_id: Option<&str>,
+    confirm: Option<(&str, f32)>,
+    floor_y: f32,
+    measure: &dyn TextMeasure,
+    out: &mut SceneBatches,
+) {
+    if agent.recent || agent.session_id.is_empty() {
+        return;
+    }
+    let row_y = hh + 0.030;
+    // Right-aligned, rightmost first.
+    let mut specs: Vec<(String, &'static str, HitKind, [f32; 4])> = Vec::new();
+    if agent.thread_actions.iter().any(|op| op == "fork") {
+        specs.push((
+            format!("verb:{}:fork", agent.id),
+            "fork",
+            HitKind::ThreadAction,
+            kit::AMBER,
+        ));
+    }
+    if agent.thread_actions.iter().any(|op| op == "compact") {
+        specs.push((
+            format!("verb:{}:compact", agent.id),
+            "compact",
+            HitKind::ThreadAction,
+            kit::IRIS_2,
+        ));
+    }
+    if agent.can_interrupt {
+        specs.push((
+            format!("verb:{}:interrupt", agent.id),
+            "stop",
+            HitKind::Interrupt,
+            kit::RED,
+        ));
+    }
+    let mut pen = hw;
+    for (id, label, kind, color) in specs {
+        let label_h = 0.019;
+        let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.020).max(0.045);
+        let x = pen - pill_hw;
+        pen = x - pill_hw - 0.018;
+        action_pill(
+            &id,
+            label,
+            kind,
+            &agent.id,
+            color,
+            center + right.scale(x) + up.scale(row_y),
+            right,
+            up,
+            hover_id,
+            confirm,
+            floor_y,
+            measure,
+            out,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn workbench(
     agent: &XrAgent,
@@ -874,6 +1333,11 @@ fn workbench(
         border: kit::LINE_2,
         border_w: 0.003,
     });
+
+    // Session verbs ride above the bench's top edge.
+    workbench_verbs(
+        agent, center, right, up, hw, hh, hover_id, confirm, floor_y, measure, out,
+    );
 
     let pad = 0.035;
     let left = -hw + pad;
@@ -1417,6 +1881,8 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -1444,6 +1910,8 @@ mod tests {
             0,
             false,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -1473,6 +1941,8 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut level,
         );
@@ -1485,6 +1955,8 @@ mod tests {
             0,
             true,
             -1.5,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut sunk,
         );
@@ -1529,6 +2001,8 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -1557,6 +2031,8 @@ mod tests {
             9999,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut paged,
         );
@@ -1586,6 +2062,8 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -1633,12 +2111,17 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
-        assert!(out.hits.is_empty());
-        assert_eq!(out.texts.len(), 1);
-        assert!(out.texts[0].text.contains("waiting"));
+        // Only the always-on layout strip is interactive.
+        assert!(out.hits.iter().all(|h| h.kind == HitKind::LayoutToggle));
+        assert_eq!(out.hits.len(), 4);
+        assert!(out.texts.iter().any(|t| t.text.contains("waiting")));
+        // Strip labels + the waiting note and nothing else.
+        assert_eq!(out.texts.len(), 5);
     }
 
     /// One fully detailed live session card, the session-window port.
@@ -1671,6 +2154,8 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -1679,6 +2164,15 @@ mod tests {
 
     fn card_texts(out: &SceneBatches) -> Vec<&str> {
         out.texts.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    /// The shelf card body panels (skipping the layout strip's chrome
+    /// and the small in-card decor).
+    fn card_bodies(out: &SceneBatches) -> Vec<&PanelInstance> {
+        out.panels
+            .iter()
+            .filter(|p| (p.half_w - kit::CARD_W / 2.0).abs() < 1e-6)
+            .collect()
     }
 
     #[test]
@@ -1748,7 +2242,7 @@ mod tests {
         // Urgency outranks everything: the card border is amber, and the
         // wants line replaces the goal objective until it resolves.
         assert!(!texts.contains(&"publish the crate"));
-        assert_eq!(out.panels[0].border, kit::AMBER);
+        assert_eq!(card_bodies(&out)[0].border, kit::AMBER);
         let wants = out
             .texts
             .iter()
@@ -1762,12 +2256,12 @@ mod tests {
         let snap = detail_snapshot();
         let plain = build(&snap, None);
         let selected = build(&snap, Some("a1"));
-        // Panel 0 is the card body in both builds: selection thickens the
-        // border and washes the fill toward iris — a different treatment
-        // from hover's border-only highlight.
-        assert_ne!(plain.panels[0].fill, selected.panels[0].fill);
-        assert_eq!(selected.panels[0].border, kit::IRIS);
-        assert!(selected.panels[0].border_w > plain.panels[0].border_w);
+        // The card body: selection thickens the border and washes the
+        // fill toward iris — a different treatment from hover's
+        // border-only highlight.
+        assert_ne!(card_bodies(&plain)[0].fill, card_bodies(&selected)[0].fill);
+        assert_eq!(card_bodies(&selected)[0].border, kit::IRIS);
+        assert!(card_bodies(&selected)[0].border_w > card_bodies(&plain)[0].border_w);
         let mut hover = SceneBatches::default();
         build_scene(
             &snap,
@@ -1778,11 +2272,13 @@ mod tests {
             0,
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut hover,
         );
-        assert_eq!(hover.panels[0].border, kit::IRIS);
-        assert_eq!(hover.panels[0].fill, plain.panels[0].fill);
+        assert_eq!(card_bodies(&hover)[0].border, kit::IRIS);
+        assert_eq!(card_bodies(&hover)[0].fill, card_bodies(&plain)[0].fill);
     }
 
     #[test]
@@ -1803,10 +2299,254 @@ mod tests {
         assert!(texts.contains(&"RECENT"), "{texts:?}");
         assert!(texts.contains(&"old work"));
         // No vitals → no health dot; recent → no context meter. Panels:
-        // card body + status pill + backend badge.
-        assert_eq!(out.panels.len(), 3, "{:?}", out.panels.len());
+        // card body + status pill + backend badge, plus the layout
+        // strip's fixed chrome (4 pills × pill + state dot).
+        assert_eq!(out.panels.len(), 3 + 8, "{:?}", out.panels.len());
+        assert_eq!(card_bodies(&out).len(), 1);
         let pill = out.texts.iter().find(|t| t.text == "RECENT").unwrap();
         assert_eq!(pill.color, dim(kit::TEXT_3, 0.5), "muted and dimmed");
+    }
+
+    #[test]
+    fn layout_strip_is_always_present_with_state_dots() {
+        let snap = snapshot();
+        let out = build(&snap, None);
+        for name in kit::LAYOUT_SURFACES {
+            let id = format!("layout:{name}");
+            let hit = out
+                .hits
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap_or_else(|| panic!("strip pill {id}"));
+            assert_eq!(hit.kind, HitKind::LayoutToggle);
+            assert_eq!(hit.agent_id, name);
+        }
+        let texts = card_texts(&out);
+        for name in kit::LAYOUT_SURFACES {
+            assert!(texts.contains(&name), "strip label {name}");
+        }
+
+        // The strip survives every dismissal — it IS the way back.
+        let mut layout = kit::LayoutState::default();
+        for name in kit::LAYOUT_SURFACES {
+            layout.toggle(name);
+        }
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            None,
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &layout,
+            None,
+            &ApproxMeasure,
+            &mut out,
+        );
+        // Everything folds except the strip — and the approval banner,
+        // which no toggle may bury.
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(out.hits.len(), 5, "strip + banner remain: {ids:?}");
+        assert!(ids.contains(&"banner:a2"));
+    }
+
+    #[test]
+    fn hidden_sessions_drop_the_shelf_but_never_the_banner() {
+        let snap = snapshot(); // a2 carries a pending approval
+        let mut layout = kit::LayoutState::default();
+        layout.hide("sessions");
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &layout,
+            None,
+            &ApproxMeasure,
+            &mut out,
+        );
+        // No cards, no workbench — but the approval banner keeps its
+        // gravity (an urgent ask is not tidy-away-able).
+        assert!(out.hits.iter().all(|h| !h.id.starts_with("card:")));
+        assert!(out
+            .hits
+            .iter()
+            .any(|h| h.id == "banner:a2" && h.kind == HitKind::Card));
+        assert!(card_bodies(&out).is_empty());
+        // No waiting note either — the empty space is deliberate.
+        assert!(!card_texts(&out).iter().any(|t| t.contains("waiting")));
+    }
+
+    #[test]
+    fn monitors_wear_close_pills_grab_bar_and_pose() {
+        let snap = snapshot();
+        let displays = vec![
+            ("local:1".to_string(), "mac :1".to_string()),
+            ("local:2".to_string(), "mac :2".to_string()),
+        ];
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &displays,
+            None,
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &kit::LayoutState::default(),
+            None,
+            &ApproxMeasure,
+            &mut out,
+        );
+        assert_eq!(out.monitors.len(), 2);
+        assert!(out.hits.iter().any(|h| h.id == "close:monitor:local:1"
+            && h.kind == HitKind::SurfaceClose
+            && h.agent_id == "monitor:local:1"));
+        assert!(out.hits.iter().any(|h| h.id == "close:monitor:local:2"));
+        assert!(out
+            .hits
+            .iter()
+            .any(|h| h.id == "grab:monitors" && h.kind == HitKind::Grab));
+
+        // A single dismissed monitor drops from the stack; the second
+        // takes the top slot.
+        let mut layout = kit::LayoutState::default();
+        layout.hide("monitor:local:1");
+        let mut one = SceneBatches::default();
+        build_scene(
+            &snap,
+            &displays,
+            None,
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &layout,
+            None,
+            &ApproxMeasure,
+            &mut one,
+        );
+        assert_eq!(one.monitors.len(), 1);
+        assert_eq!(one.monitors[0].id, "local:2");
+        assert!((one.monitors[0].center.y - kit::MONITORS_TOP_Y).abs() < 1e-5);
+
+        // The family toggle folds the whole stack (and its chrome) away.
+        let mut all = kit::LayoutState::default();
+        all.toggle("monitors");
+        let mut none = SceneBatches::default();
+        build_scene(
+            &snap,
+            &displays,
+            None,
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &all,
+            None,
+            &ApproxMeasure,
+            &mut none,
+        );
+        assert!(none.monitors.is_empty());
+        assert!(none
+            .hits
+            .iter()
+            .all(|h| !h.id.starts_with("close:monitor:")));
+        assert!(none.hits.iter().all(|h| h.id != "grab:monitors"));
+
+        // A moved pose relocates the stack along the band.
+        let mut moved_layout = kit::LayoutState::default();
+        moved_layout.set_pose("monitors", 0.5, 1.2);
+        let mut moved = SceneBatches::default();
+        build_scene(
+            &snap,
+            &displays,
+            None,
+            None,
+            None,
+            0,
+            true,
+            0.0,
+            &moved_layout,
+            None,
+            &ApproxMeasure,
+            &mut moved,
+        );
+        assert!((moved.monitors[0].center.y - 1.2).abs() < 1e-5);
+        assert!(moved.monitors[0].center.x > 0.0, "moved to the right side");
+    }
+
+    #[test]
+    fn workbench_arms_interrupt_and_advertised_thread_actions() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{"id": "local", "name": "mac", "platform": "macos", "connected": true}],
+            "agents": [
+                {"id": "a1", "hostId": "local", "status": "running",
+                 "sessionId": "sess-1", "source": "claude-code",
+                 "canInterrupt": true, "threadActions": ["compact", "fork"]},
+                {"id": "a2", "hostId": "local", "status": "running",
+                 "sessionId": "sess-2", "source": "codex"}
+            ]
+        }))
+        .unwrap();
+        // Focused with the verbs advertised: stop (hold tier) + the two
+        // quick thread-action pills.
+        let out = build(&snap, Some("a1"));
+        let stop = out
+            .hits
+            .iter()
+            .find(|h| h.id == "verb:a1:interrupt")
+            .expect("interrupt pill armed");
+        assert_eq!(stop.kind, HitKind::Interrupt);
+        assert_eq!(stop.agent_id, "a1");
+        assert!(out
+            .hits
+            .iter()
+            .any(|h| h.id == "verb:a1:compact" && h.kind == HitKind::ThreadAction));
+        assert!(out
+            .hits
+            .iter()
+            .any(|h| h.id == "verb:a1:fork" && h.kind == HitKind::ThreadAction));
+        let texts = card_texts(&out);
+        assert!(texts.contains(&"stop") && texts.contains(&"compact") && texts.contains(&"fork"));
+
+        // Nothing advertised → no verb targets; unfocused → none either.
+        let out = build(&snap, Some("a2"));
+        assert!(out.hits.iter().all(|h| !h.id.starts_with("verb:")));
+        let out = build(&snap, None);
+        assert!(out.hits.iter().all(|h| !h.id.starts_with("verb:")));
+    }
+
+    #[test]
+    fn recent_and_synthetic_cards_never_arm_verbs() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{"id": "local", "name": "mac", "platform": "macos", "connected": true}],
+            "agents": [
+                {"id": "a1", "hostId": "local", "status": "idle", "recent": true,
+                 "sessionId": "olds", "canInterrupt": true,
+                 "threadActions": ["compact"]},
+                {"id": "primary", "hostId": "local", "status": "running",
+                 "canInterrupt": true}
+            ]
+        }))
+        .unwrap();
+        let out = build(&snap, Some("a1"));
+        assert!(out.hits.iter().all(|h| !h.id.starts_with("verb:")));
+        // Synthetic node (no session id) — interrupt has no session to
+        // route to; the pill never arms.
+        let out = build(&snap, Some("primary"));
+        assert!(out.hits.iter().all(|h| !h.id.starts_with("verb:")));
     }
 
     #[test]
