@@ -44,7 +44,8 @@ winget or choco on Windows — announcing the exact command before it runs,
 escalating via `sudo` only where it exists and never silently, and otherwise
 stopping to name the command for you to run. Rust and the native build
 dependencies follow the same law via the per-OS setup scripts from the
-cloned tree.
+cloned tree — and the Rust toolchain is only required at all when the
+install builds from source (see below).
 
 The install ends concretely, not silently: once the daemon reports ready, the
 installer prints the dashboard's tokened loopback owner URL (`intendant ctl
@@ -65,8 +66,20 @@ stamped installer double-checks itself: it prints its release identity
 (`tag @ commit`) before doing anything else, installs exactly that released
 tree, and fails closed with `RELEASE_PIN_MISMATCH` when the checkout doesn't
 match the commit its release recorded. Everything else it executes comes from
-that verified tree, and `cargo build --locked` extends the pinning to
-dependency hashes.
+that verified tree, and on the source build `cargo build --locked` extends
+the pinning to dependency hashes.
+
+Installing a release, the script skips the source compile where the release
+publishes a prebuilt binary pair for the platform (Linux x86_64/aarch64
+`.tar.gz`, Windows `.zip` — from v0.2.0-alpha.6 on): the pair is downloaded
+from the same release and verified against its `.sha256` sidecar, and every
+asset — pair, sidecar, installer — is covered by the release's PGP-signed,
+transparency-logged manifest. No matching asset, a failed verification, or a
+binary that doesn't run on the box (old glibc, wrong arch) falls back to the
+source build; `--from-source` / `-FromSource` forces that fully
+source-verified path outright. macOS always builds from source — no paired
+unix binary asset is published for it (the packaged app carries the macOS
+binaries).
 
 Pick your rung of the trust ladder honestly:
 

@@ -44,7 +44,11 @@ the `curl | sh` one-liner, from an elevated PowerShell on a fresh box:
 ```
 
 It clones the repo, runs the dependency setup below (elevated shells only),
-builds, and launches. The script is a per-release GitHub asset — stamped
+installs the release's prebuilt, sha256-verified `intendant.exe` +
+`intendant-runtime.exe` pair when the release publishes one (from
+v0.2.0-alpha.6 on; the source build remains the fallback, and `-FromSource`
+forces it — only that path needs the Rust toolchain), and launches. The
+script is a per-release GitHub asset — stamped
 with the release it installs, hash-committed to the public transparency
 log, and fail-closed (`RELEASE_PIN_MISMATCH`) when the checkout doesn't
 match its release; a rendezvous serves at most a redirect to it. Add
