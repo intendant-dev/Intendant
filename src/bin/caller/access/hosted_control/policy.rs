@@ -40,6 +40,13 @@ pub fn preset_allows_operation(preset: HostedPreset, operation: PeerOperation) -
             operation,
             PresenceRead | StatsRead | SessionInspect | DisplayView | Message | Task
         ),
+        // Operate projects the agenda and memory planes (read + bounded
+        // write). The planes' trust-critical verbs — schedule approval/
+        // revocation/start-now/occurrence-request, automation stamping and
+        // definition add/remove, reminder policy, memory judgment — stay
+        // refused by the Settings operation class, the second-stage
+        // route/method walls below, and the tenant edges' owner-surface
+        // checks (hosted leases classify as unattributed actors).
         HostedPreset::Operate => matches!(
             operation,
             PresenceRead
@@ -55,6 +62,10 @@ pub fn preset_allows_operation(preset: HostedPreset, operation: PeerOperation) -
                 | FilesystemRead
                 | FilesystemWrite
                 | DisplayInput
+                | AgendaRead
+                | AgendaWrite
+                | MemoryRead
+                | MemoryWrite
         ),
     }
 }
@@ -232,6 +243,25 @@ pub fn hosted_http_route_allowed(preset: HostedPreset, method: &str, path: &str)
             ("POST", ["api", "transfers", id, "chunk" | "commit" | "delete"])
             | ("GET", ["api", "transfers", id, "download"])
             | ("DELETE", ["api", "transfers", id]) => super::valid_id_component(id),
+            // The agenda and memory planes at Operate: reads plus the
+            // ordinary command/propose lanes. Deliberately unlisted, so
+            // default-deny at every preset: POST/DELETE
+            // /api/agenda/definitions and POST /api/agenda/stamp (mint
+            // sealed automation definitions), POST
+            // /api/agenda/reminders/policy (Settings-grade delivery
+            // policy), and POST /api/memory/judge (owner judgment).
+            ("GET", ["api", "agenda"])
+            | ("GET", ["api", "agenda", "ops" | "occurrences" | "definitions"])
+            | ("POST", ["api", "agenda", "op"])
+            | ("GET", ["api", "memory", "search" | "claim"])
+            | ("POST", ["api", "memory", "propose"]) => true,
+            ("GET", ["api", "agenda", "items", item_id])
+            | ("GET", ["api", "agenda", "items", item_id, "pr-state"])
+            | ("GET", ["api", "agenda", "items", item_id, "refs", "drift" | "content"])
+            | ("GET", ["api", "agenda", "sealed", item_id]) => super::valid_id_component(item_id),
+            ("GET", ["api", "agenda", "blobs", item_id, blob_id, "raw"]) => {
+                super::valid_id_component(item_id) && super::valid_id_component(blob_id)
+            }
             _ => false,
         };
     }
@@ -273,6 +303,12 @@ pub fn hosted_dashboard_method_allowed(preset: HostedPreset, method: &str) -> bo
     if preset >= HostedPreset::Tasks && method == "api_control_msg" {
         return true;
     }
+    // The agenda and memory planes at Operate: every read plus the
+    // ordinary command/propose lanes. Deliberately unlisted, so refused
+    // at every preset: `api_agenda_stamp` (mints sealed automation
+    // definitions), `api_agenda_definition_add` /
+    // `api_agenda_definition_remove` and `api_agenda_reminder_policy`
+    // (Settings-grade), and `api_memory_judge` (owner judgment).
     preset == HostedPreset::Operate
         && matches!(
             method,
@@ -294,6 +330,19 @@ pub fn hosted_dashboard_method_allowed(preset: HostedPreset, method: &str) -> bo
                 | "api_display_input_authority_snapshot"
                 | "api_display_input_authority_request"
                 | "api_display_input_authority_release"
+                | "api_agenda_list"
+                | "api_agenda_item"
+                | "api_agenda_ops"
+                | "api_agenda_occurrences"
+                | "api_agenda_op"
+                | "api_agenda_definitions"
+                | "api_agenda_sealed"
+                | "api_agenda_ref_drift"
+                | "api_agenda_ref_content"
+                | "api_agenda_pr_state"
+                | "api_memory_search"
+                | "api_memory_claim"
+                | "api_memory_propose"
         )
 }
 
@@ -681,6 +730,18 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
     {
         return false;
     }
+    // The plane change broadcasts keep Operate's agenda/memory views
+    // current; the presets that cannot read the planes never see them.
+    // Each carries only what the admitted routes already serve (the
+    // decorated item / the provenance-labeled claim view).
+    if preset == HostedPreset::Operate
+        && matches!(
+            value.get("event").and_then(serde_json::Value::as_str),
+            Some("agenda_changed" | "memory_changed")
+        )
+    {
+        return true;
+    }
     matches!(
         value.get("event").and_then(serde_json::Value::as_str),
         Some(
@@ -779,10 +840,6 @@ mod tests {
                 Settings,
                 CredentialsManage,
                 RuntimeControl,
-                AgendaRead,
-                AgendaWrite,
-                MemoryRead,
-                MemoryWrite,
             ] {
                 assert!(
                     !preset_allows_operation(preset, operation),
@@ -849,6 +906,10 @@ mod tests {
                     ShellSpawn,
                     FilesystemRead,
                     FilesystemWrite,
+                    AgendaRead,
+                    AgendaWrite,
+                    MemoryRead,
+                    MemoryWrite,
                 ],
             ),
         ];
@@ -898,6 +959,15 @@ mod tests {
                 ("GET", "/api/session/session-1/report/extra"),
                 ("GET", "/api/sessions-extra"),
                 ("POST", "/api/diagnostics/visual-freshness"),
+                // The planes' trust-critical verbs stay outside the
+                // projection at EVERY preset: definition intake and
+                // stamping mint sealed automations, reminder policy is
+                // Settings-grade, and memory judgment is the owner's.
+                ("POST", "/api/agenda/stamp"),
+                ("POST", "/api/agenda/definitions"),
+                ("DELETE", "/api/agenda/definitions/some-template"),
+                ("POST", "/api/agenda/reminders/policy"),
+                ("POST", "/api/memory/judge"),
             ] {
                 assert!(
                     !hosted_http_route_allowed(preset, method, path),
@@ -931,11 +1001,40 @@ mod tests {
             ("POST", "/api/transfers/job-1/delete"),
             ("DELETE", "/api/transfers/job-1"),
             ("GET", "/api/transfers/job-1/download"),
+            ("GET", "/api/agenda"),
+            ("GET", "/api/agenda/items/01ITEM"),
+            ("GET", "/api/agenda/items/01ITEM/pr-state"),
+            ("GET", "/api/agenda/items/01ITEM/refs/drift"),
+            ("GET", "/api/agenda/items/01ITEM/refs/content"),
+            ("GET", "/api/agenda/ops"),
+            ("GET", "/api/agenda/occurrences"),
+            ("POST", "/api/agenda/op"),
+            ("GET", "/api/agenda/definitions"),
+            ("GET", "/api/agenda/sealed/abc123"),
+            ("GET", "/api/agenda/blobs/01ITEM/blob-1/raw"),
+            ("GET", "/api/memory/search"),
+            ("GET", "/api/memory/claim"),
+            ("POST", "/api/memory/propose"),
         ] {
             assert!(
                 hosted_http_route_allowed(HostedPreset::Operate, method, path),
                 "Operate should admit {method} {path}",
             );
+        }
+        for preset in [HostedPreset::View, HostedPreset::Tasks] {
+            for (method, path) in [
+                ("GET", "/api/agenda"),
+                ("GET", "/api/agenda/items/01ITEM"),
+                ("POST", "/api/agenda/op"),
+                ("GET", "/api/memory/search"),
+                ("POST", "/api/memory/propose"),
+            ] {
+                assert!(
+                    !hosted_http_route_allowed(preset, method, path),
+                    "{} unexpectedly admitted {method} {path}",
+                    preset.as_str(),
+                );
+            }
         }
         for (method, path) in [
             ("POST", "/api/fs/read"),
@@ -945,6 +1044,16 @@ mod tests {
             ("POST", "/api/transfers/job-1/future"),
             ("DELETE", "/api/transfers/job-1/download"),
             ("GET", "/api/transfers/bad%2fid/download"),
+            ("POST", "/api/agenda"),
+            ("POST", "/api/agenda/items/01ITEM"),
+            ("GET", "/api/agenda/op"),
+            ("GET", "/api/agenda/items/bad%2fid"),
+            ("GET", "/api/agenda/sealed/bad%2fdigest"),
+            ("GET", "/api/agenda/blobs/01ITEM/bad%2fid/raw"),
+            ("GET", "/api/agenda/items/01ITEM/refs/future"),
+            ("POST", "/api/memory/search"),
+            ("GET", "/api/memory/propose"),
+            ("GET", "/api/memory/future"),
         ] {
             assert!(
                 !hosted_http_route_allowed(HostedPreset::Operate, method, path),
@@ -1341,6 +1450,96 @@ mod tests {
         }
     }
 
+    /// The Operate plane contract (ratified widening): a hosted Operate
+    /// lease can read the agenda and park/annotate through the ordinary
+    /// command lane, and search/read memory and author candidates — while
+    /// the planes' trust-critical verbs refuse at EVERY preset: automation
+    /// stamping and definition add/remove, reminder policy, and memory
+    /// judgment. Approval-adjacent agenda commands (schedule approve/
+    /// revoke/start-now/request-occurrence) ride the admitted command
+    /// lane but are refused by the tenant edge, because a hosted lease
+    /// classifies as an unattributed actor, never an owner surface
+    /// (pinned in `access::actor`). Widening any of these onto hosted
+    /// surfaces is a deliberate policy change that must move this pin
+    /// and the hosted-control chapter together.
+    #[test]
+    fn operate_lease_reaches_the_planes_but_no_trust_critical_verb() {
+        // Read + ordinary-write lanes clear the wall at Operate only.
+        for method in [
+            "api_agenda_list",
+            "api_agenda_item",
+            "api_agenda_ops",
+            "api_agenda_occurrences",
+            "api_agenda_op",
+            "api_agenda_definitions",
+            "api_agenda_sealed",
+            "api_agenda_ref_drift",
+            "api_agenda_ref_content",
+            "api_agenda_pr_state",
+            "api_memory_search",
+            "api_memory_claim",
+            "api_memory_propose",
+        ] {
+            assert!(
+                hosted_dashboard_method_allowed(HostedPreset::Operate, method),
+                "Operate must admit {method}",
+            );
+            for preset in [HostedPreset::View, HostedPreset::Tasks] {
+                assert!(
+                    !hosted_dashboard_method_allowed(preset, method),
+                    "{} unexpectedly admitted {method}",
+                    preset.as_str(),
+                );
+            }
+        }
+        // The walled verbs stay refused at every preset, on both the
+        // tunnel-method and HTTP seams.
+        for preset in HostedPreset::ALL {
+            for method in [
+                "api_agenda_stamp",
+                "api_agenda_definition_add",
+                "api_agenda_definition_remove",
+                "api_agenda_reminder_policy",
+                "api_memory_judge",
+            ] {
+                assert!(
+                    !hosted_dashboard_method_allowed(preset, method),
+                    "{method} must stay behind the action wall at {preset:?}",
+                );
+            }
+            for (http_method, path) in [
+                ("POST", "/api/agenda/stamp"),
+                ("POST", "/api/agenda/definitions"),
+                ("DELETE", "/api/agenda/definitions/some-template"),
+                ("POST", "/api/agenda/reminders/policy"),
+                ("POST", "/api/memory/judge"),
+            ] {
+                assert!(
+                    !hosted_http_route_allowed(preset, http_method, path),
+                    "{http_method} {path} must stay behind the action wall at {preset:?}",
+                );
+            }
+        }
+        // The live-update lane matches the read projection: the change
+        // broadcasts reach an Operate socket and no weaker preset.
+        for line in [
+            r#"{"event":"agenda_changed","item":{"id":"01ITEM"},"counts":{},"seq":7}"#,
+            r#"{"event":"memory_changed","claim":{"id":"claim-1"}}"#,
+        ] {
+            assert!(
+                hosted_outbound_line_allowed(HostedPreset::Operate, line),
+                "Operate must receive the plane change event: {line}",
+            );
+            for preset in [HostedPreset::View, HostedPreset::Tasks] {
+                assert!(
+                    !hosted_outbound_line_allowed(preset, line),
+                    "{} unexpectedly received: {line}",
+                    preset.as_str(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn hosted_runtime_config_projection_has_a_closed_key_set() {
         let projected = project_hosted_runtime_config(&serde_json::json!({
@@ -1389,5 +1588,133 @@ mod tests {
             !source.contains("hosted_lease_id"),
             "the internal session provenance field must not exist in browser code",
         );
+    }
+
+    /// Derive-don't-mirror parity for the hosted floor CSS
+    /// (`static/app/15-styles-hosted-control.css`): the dashboard cannot
+    /// read the compiled presets, so its floor block is a static mirror —
+    /// this pin keeps the mirror honest against the source. Every nav
+    /// destination (`UI2_NAV_GROUPS` in `ui2-chrome.js`) must be
+    /// classified: hidden on every lease (the immutable floor's owner
+    /// surfaces), preset-scoped to its plane's read operation, or
+    /// deliberately lease-visible. A new tab shipping without a
+    /// classification fails here instead of rendering dead over hosted.
+    #[test]
+    fn hosted_floor_css_mirror_is_pinned_to_the_compiled_presets() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let css = include_str!("../../../../../static/app/15-styles-hosted-control.css");
+        let nav = include_str!("../../../../../static/app/ui2-chrome.js");
+
+        // The nav destination vocabulary, from the UI2_NAV_GROUPS rows.
+        let mut tabs = BTreeSet::new();
+        let mut rest = nav;
+        while let Some(at) = rest.find("{ tab: '") {
+            let tail = &rest[at + "{ tab: '".len()..];
+            let end = tail
+                .find('\'')
+                .expect("unterminated tab name in UI2_NAV_GROUPS");
+            tabs.insert(&tail[..end]);
+            rest = &tail[end..];
+        }
+        assert!(
+            tabs.contains("activity") && tabs.contains("agenda") && tabs.contains("memory"),
+            "UI2_NAV_GROUPS tab extraction lost its anchor rows: {tabs:?}",
+        );
+
+        // The floor block's tab rows, by preset scope.
+        let mut hidden: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for line in css.lines() {
+            let Some(scoped) = line.trim().strip_prefix("html[data-hosted-preset") else {
+                continue;
+            };
+            let (scope, tail) = match scoped.strip_prefix("=\"") {
+                Some(tail) => {
+                    let end = tail.find('"').expect("unterminated preset scope");
+                    (&tail[..end], &tail[end..])
+                }
+                None => ("every", scoped),
+            };
+            let Some(tab_at) = tail.find("[data-tab=\"") else {
+                continue;
+            };
+            let tab = &tail[tab_at + "[data-tab=\"".len()..];
+            let end = tab.find('"').expect("unterminated data-tab selector");
+            hidden.entry(scope).or_default().insert(&tab[..end]);
+        }
+
+        let empty = BTreeSet::new();
+        let every = hidden.get("every").unwrap_or(&empty);
+        let view = hidden.get("view").unwrap_or(&empty);
+        let tasks = hidden.get("tasks").unwrap_or(&empty);
+
+        // The immutable floor's destinations: owner surfaces on every
+        // lease. Operate is the widest preset, so anything no lease may
+        // see belongs here — never on an operate-scoped row.
+        assert_eq!(
+            every,
+            &["access", "debug", "settings", "vault"]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the every-preset floor block drifted",
+        );
+        assert_eq!(
+            hidden.get("operate"),
+            None,
+            "unexpected operate-scoped tab rows",
+        );
+
+        // Preset-scoped destinations mirror their plane's read operation
+        // in the compiled presets.
+        let plane_tabs = [
+            ("terminal", PeerOperation::TerminalView),
+            ("files", PeerOperation::FilesystemRead),
+            ("agenda", PeerOperation::AgendaRead),
+            ("memory", PeerOperation::MemoryRead),
+        ];
+        let scoped: BTreeSet<&str> = plane_tabs.iter().map(|(tab, _)| *tab).collect();
+        assert_eq!(view, &scoped, "the view-preset hide rows drifted");
+        assert_eq!(tasks, &scoped, "the tasks-preset hide rows drifted");
+        for (tab, operation) in plane_tabs {
+            for (preset, hidden_here) in [
+                (HostedPreset::View, view.contains(tab)),
+                (HostedPreset::Tasks, tasks.contains(tab)),
+                (HostedPreset::Operate, every.contains(tab)),
+            ] {
+                assert_eq!(
+                    preset_allows_operation(preset, operation),
+                    !hidden_here,
+                    "tab {tab} visibility at {} contradicts the compiled preset",
+                    preset.as_str(),
+                );
+            }
+        }
+
+        // Every other destination is deliberately lease-visible and
+        // renders only what the hosted projection serves. A new tab must
+        // join one of the sets above (or, deliberately, this list).
+        let visible: BTreeSet<&str> = tabs
+            .iter()
+            .copied()
+            .filter(|tab| !every.contains(tab) && !scoped.contains(tab))
+            .collect();
+        assert_eq!(
+            visible,
+            ["activity", "displays", "plugins", "sessions", "station", "stats"]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "a nav destination shipped without a hosted floor classification",
+        );
+
+        // The Activity pane's agenda card is an agenda surface outside
+        // the tab router: it carries the same view/tasks gates as the
+        // agenda tab.
+        for preset in ["view", "tasks"] {
+            assert!(
+                css.contains(&format!(
+                    "html[data-hosted-preset=\"{preset}\"] #ui2-agenda-card"
+                )),
+                "#ui2-agenda-card lost its {preset} hide row",
+            );
+        }
     }
 }

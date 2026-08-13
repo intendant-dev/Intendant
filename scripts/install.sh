@@ -48,10 +48,11 @@ Options:
   --ref <ref>     Pin the fresh clone to a tag, branch, or commit.
                   Default: the release this installer was stamped with
                   (when fetched as a release asset); an unstamped copy
-                  falls back to the newest published release tag (vX.Y.Z),
-                  and to the default branch head only while no release
-                  exists. An explicit ref you choose skips the
-                  release-pin verification.
+                  falls back to the newest published release tag by
+                  semver precedence (vX.Y.Z or vX.Y.Z-<prerelease> —
+                  prerelease releases count), and to the default branch
+                  head only while no release exists. An explicit ref you
+                  choose skips the release-pin verification.
   --no-run        Build and link only; print how to start it.
 
 Environment overrides:
@@ -161,6 +162,53 @@ then re-run this installer"
   command -v git >/dev/null 2>&1 || die "the install reported success but git is still not on PATH — install git yourself, then re-run this installer"
 fi
 
+# ── Release-tag picker ──
+# Reads candidate tags (vX.Y.Z or vX.Y.Z-<prerelease>) one per line and
+# prints the highest-precedence one under semver 2.0 ordering: version
+# core first, then release > prerelease, then prerelease identifiers
+# (dot-separated; numeric identifiers compare numerically and rank below
+# alphanumeric ones, alphanumeric compare ASCII-lexically, the shorter
+# identifier set loses ties). Earlier copies filtered prerelease tags out
+# entirely (and `sort -V` cannot order them per semver anyway) — but the
+# published alphas ARE the product releases (GitHub marks them Latest),
+# so an unstamped copy was silently regressing fresh installs to the
+# stale v0.1.0.
+semver_max_tag() {
+  awk '
+    function ident_cmp(x, y,   xn, yn) {
+      xn = (x ~ /^[0-9]+$/); yn = (y ~ /^[0-9]+$/)
+      if (xn && yn) { if (x + 0 == y + 0) return 0; return (x + 0 < y + 0) ? -1 : 1 }
+      if (xn != yn) return xn ? -1 : 1
+      if (x "" == y "") return 0
+      return (x "" < y "") ? -1 : 1
+    }
+    function pre_cmp(a, b,   ai, bi, na, nb, i, r) {
+      na = split(a, ai, "."); nb = split(b, bi, ".")
+      for (i = 1; i <= na && i <= nb; i++) {
+        r = ident_cmp(ai[i], bi[i]); if (r != 0) return r
+      }
+      if (na == nb) return 0
+      return (na < nb) ? -1 : 1
+    }
+    function tag_cmp(a, b,   ac, bc, ap, bp, ai, bi, i, p) {
+      ap = ""; bp = ""
+      ac = substr(a, 2); bc = substr(b, 2)
+      if ((p = index(ac, "-")) > 0) { ap = substr(ac, p + 1); ac = substr(ac, 1, p - 1) }
+      if ((p = index(bc, "-")) > 0) { bp = substr(bc, p + 1); bc = substr(bc, 1, p - 1) }
+      split(ac, ai, "."); split(bc, bi, ".")
+      for (i = 1; i <= 3; i++) {
+        if (ai[i] + 0 != bi[i] + 0) return (ai[i] + 0 < bi[i] + 0) ? -1 : 1
+      }
+      if (ap == "" && bp == "") return 0
+      if (ap == "") return 1
+      if (bp == "") return -1
+      return pre_cmp(ap, bp)
+    }
+    NR == 1 || tag_cmp($0, best) > 0 { best = $0 }
+    END { if (best != "") print best }
+  '
+}
+
 # ── Source ──
 if [ -d "$INSTALL_DIR/.git" ]; then
   [ -z "$REF" ] || die "--ref pins fresh clones only; $INSTALL_DIR already exists — check out the ref there yourself"
@@ -175,14 +223,16 @@ else
       say "installing the stamped release: $REF"
     else
       # Unstamped copy: default fresh installs to the newest published
-      # release tag (vX.Y.Z only — pre-releases and peeled refs are
-      # filtered) so even this path delivers an immutable, released tree.
+      # release tag by semver precedence so even this path delivers an
+      # immutable, released tree. Prerelease tags count (see the picker
+      # above — the old vX.Y.Z-only filter regressed fresh installs to
+      # v0.1.0); peeled ^{} refs stay excluded by the $-anchored match.
       # Falling back to the mutable default-branch head happens only while
       # no release exists, and says so out loud. --ref / INTENDANT_REF
       # override either way.
       REF="$(git ls-remote --tags "$REPO" 'v*' 2>/dev/null \
-        | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9.]*\)$|\1|p' \
-        | sort -V | tail -n 1 || true)"
+        | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[0-9A-Za-z.-][0-9A-Za-z.-]*\)\{0,1\}\)$|\1|p' \
+        | semver_max_tag || true)"
       if [ -n "$REF" ]; then
         say "pinning to the latest release tag: $REF (override with --ref)"
       else
@@ -239,8 +289,15 @@ command -v cargo >/dev/null 2>&1 || die "Rust is required. Install via https://r
 # ── Build ──
 # --locked: build exactly the committed Cargo.lock — a resolution that
 # differs from what CI tested is a failure, not a fallback.
+# Named bins mirror the release lane's proven build shape (release.yml's
+# binary jobs): a daemon install needs `intendant` + `intendant-runtime`
+# only, and naming them skips the wasm workspace members and
+# station-web's native graphics stack (~71 packages) that a bare
+# workspace build would compile — a configuration no CI leg gates —
+# while shrinking the install build. intendant-connect is the hosted
+# rendezvous service and is not part of a daemon install.
 say "building release binaries (this takes a few minutes on a fresh box)"
-cargo build --release --locked
+cargo build --release --locked --bin intendant --bin intendant-runtime
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
