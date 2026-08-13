@@ -72,7 +72,20 @@ async function ensureXr() {
   xrInstance.setOnSessionEnd(() => {
     xrStopSnapshotPump();
     xrSetChipState('idle', 'Enter XR');
-    xrShowStatus('', '');
+    // Leave a readable trace of how the session went: frames=0 means the
+    // loop never presented (entry-path failure), frames>0 means a live
+    // session ended normally. This line is the whole diagnosis when the
+    // headset has no devtools.
+    try {
+      const d = JSON.parse(xrInstance.debugJson());
+      const frames = (d.engine && d.engine.framesRendered) || 0;
+      xrShowStatus(
+        frames > 0 ? 'busy' : 'error',
+        `session ended — frames=${frames} views=${(d.engine && d.engine.views) || 0}`,
+      );
+    } catch {
+      xrShowStatus('', '');
+    }
   });
   await xrInstance.probeSupport();
   return xrInstance;
