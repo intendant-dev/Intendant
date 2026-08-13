@@ -122,6 +122,16 @@ pub enum PresenceEvent {
         id: u64,
         action: String,
     },
+    /// The voice lane's backing model was rerouted mid-call by the
+    /// provider (`model/rerouted`). Named so acceptance of the
+    /// account-default backing lane rests on reroutes being visible,
+    /// not inferred (Stage A binding refinement 2).
+    VoiceModelRerouted {
+        from_model: String,
+        to_model: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     HumanQuestion {
         question: String,
     },

@@ -279,6 +279,7 @@ surfaced on the dashboard voice card after every start — never silently.
 | `voice` | string | provider default | Realtime voice, validated against the version's family (v3 uses the v1 family) |
 | `realtime_version` | string | `v3` | Realtime protocol version (`v1`/`v2`/`v3`) |
 | `app_server_command` | string | `[agent.codex] command` | Explicit App Server binary override |
+| `trust_resume_tool_persistence` | bool | `false` | Reuse the durable presence thread via `thread/resume` on later calls, trusting the provider to keep the dynamicTools lane attached. The protocol only declares tools at `thread/start` and offers no way to re-declare or verify them on resume, so the capability-safe default mints a successor thread per call (tools declared on the wire; predecessor recorded in the lineage). Enable only after live acceptance on the deployed binary shows resumed threads keep their declared tools. |
 
 ### `[transcription]`
 

@@ -1336,6 +1336,16 @@ impl AppEventUpcaster {
                 format!("{kind}: {detail}"),
             )],
 
+            AppEvent::VoiceModelRerouted {
+                from_model,
+                to_model,
+                ..
+            } => vec![log_event(
+                LogLevel::Warn,
+                "voice",
+                format!("backing model rerouted: {from_model} -> {to_model}"),
+            )],
+
             AppEvent::UserTranscript { text, seq: _ } => {
                 let seq = self.next_seq();
                 vec![PeerEvent::Message {

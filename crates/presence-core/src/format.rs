@@ -302,6 +302,20 @@ pub fn format_event(event: &PresenceEvent) -> String {
         PresenceEvent::ApprovalResolved { id, action } => {
             format!("Approval resolved (id={}): {}", id, action)
         }
+        PresenceEvent::VoiceModelRerouted {
+            from_model,
+            to_model,
+            reason,
+        } => match reason {
+            Some(reason) => format!(
+                "Voice backing model rerouted: {} -> {} ({})",
+                from_model, to_model, reason
+            ),
+            None => format!(
+                "Voice backing model rerouted: {} -> {}",
+                from_model, to_model
+            ),
+        },
         PresenceEvent::HumanQuestion { question } => {
             format!("Worker has a question: {}", question)
         }

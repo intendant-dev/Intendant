@@ -218,11 +218,20 @@ allow-list with no auth-custody surface).
   of every `INTENDANT*` variable; `thread/start`/`thread/resume` re-pin
   cwd/sandbox/approvals at the thread layer.
 - **Permanent presence thread, checkpoint-authoritative.** One durable
-  thread (id + successor lineage in `presence/voice_thread.json` under the
-  state root) is resumed each call; conversational memory rides a persisted
-  checkpoint that seeds every realtime session's `initialItems` under a
-  deliberate token budget. The dashboard voice card carries the owner's
-  purge lever (`thread/delete` + local identity reset).
+  thread identity (id + successor lineage in `presence/voice_thread.json`
+  under the state root) persists across calls; conversational memory rides
+  a persisted checkpoint that seeds every realtime session's
+  `initialItems` under a deliberate token budget. The dashboard voice card
+  carries the owner's purge lever (`thread/delete` + local identity
+  reset). Reusing the thread via `thread/resume` is owner-elected
+  (`[presence.voice] trust_resume_tool_persistence`, default off): the
+  protocol declares dynamicTools only at `thread/start` and offers no
+  resume-time re-declaration or verification, and the verified server
+  lineage drops them on from-disk resume — so by default the broker mints
+  a successor per call with the tool lane declared on the wire, recording
+  the predecessor in the lineage (`tool-lane-redeclare`); memory
+  continuity is unaffected because the checkpoint, not the thread, is the
+  authoritative store.
 - **Tool lane = dynamicTools.** The presence toolset (minus the
   frame-inspection pair) is declared on the backing thread and executed by
   the broker itself. Authority-bearing tools (`approve_action`,
@@ -249,6 +258,12 @@ allow-list with no auth-custody surface).
   codex account view (non-codex limit ids become their own named window
   classes); the browser forwards the data channel's `session.usage.updated`
   telemetry as provider-reported decoration on the voice card.
+- **Backing-lane visibility, mid-call included.** The resolved backing
+  model/effort are surfaced on `voice_status` after every start, and a
+  provider `model/rerouted` notification mid-call updates the voice card's
+  resolved model and emits the named `VoiceModelRerouted` presence event —
+  acceptance of the account-default backing lane rests on reroutes staying
+  visible, never inferred.
 
 ## Presence Tools
 

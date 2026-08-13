@@ -864,6 +864,16 @@ pub fn spawn_event_listener(
                     AppEvent::VoiceDiagnostic { kind, detail } => {
                         s.push_log(LogLevel::Warn, format!("[voice:{}] {}", kind, detail));
                     }
+                    AppEvent::VoiceModelRerouted {
+                        ref from_model,
+                        ref to_model,
+                        ..
+                    } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("[voice] backing model rerouted: {from_model} -> {to_model}"),
+                        );
+                    }
                     AppEvent::UserTranscript { ref text, seq } => {
                         s.push_log(LogLevel::Info, format!("[transcript #{}] {}", seq, text));
                     }
