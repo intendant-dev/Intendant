@@ -57,15 +57,21 @@ async fn request_session_with_floor(
     xr_sys: &xr::XrSystem,
     mode: &str,
 ) -> Result<(xr::XrSession, &'static str), JsValue> {
-    // hand-tracking and layers are optional everywhere: controllers-only
-    // Quests, Vision Pro (no layers module), and emulators must all enter.
-    let with_floor = session_options(&["local-floor"], &["hand-tracking", "layers"]);
+    // hand-tracking is optional everywhere (controllers-only Quests,
+    // Vision Pro, emulators must all enter). Deliberately NOT requested:
+    // 'layers' — a session granted the layers feature FORBIDS the legacy
+    // renderState.baseLayer this milestone renders through ("Can't use
+    // baseLayer with layers feature requested", live Quest 3 field
+    // report), and Horizon Browser is exactly the runtime that grants
+    // it. The M2 media-layers work re-requests it together with the
+    // XRWebGLBinding projection-layer render path it requires.
+    let with_floor = session_options(&["local-floor"], &["hand-tracking"]);
     match wasm_bindgen_futures::JsFuture::from(xr_sys.request_session(mode, &with_floor)).await {
         Ok(session) => Ok((session.unchecked_into(), "local-floor")),
         Err(_) => {
             // Some runtimes can't promise a floor; fall back to 'local'
             // (origin at head height) and let the scene compensate.
-            let local = session_options(&["local"], &["hand-tracking", "layers"]);
+            let local = session_options(&["local"], &["hand-tracking"]);
             let session =
                 wasm_bindgen_futures::JsFuture::from(xr_sys.request_session(mode, &local)).await?;
             Ok((session.unchecked_into(), "local"))

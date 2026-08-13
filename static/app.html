@@ -32845,19 +32845,30 @@ html.ui-v2 .ui2-xr-chip[data-state="error"] {
   opacity: .8;
 }
 
-/* Visible entry status: tooltips don't exist in a headset. */
+/* Visible entry status: tooltips don't exist in a headset — and neither
+   do truncated diagnostics. A fixed banner under the header, full-width
+   and fully wrapped: on devices with no console this IS the debugging
+   surface, so it must never fight the header flex row for space. */
 html.ui-v2 .ui2-xr-status {
-  margin-left: 8px;
-  font-size: 12px;
-  color: var(--text-2);
-  max-width: 42ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  position: fixed;
+  top: 52px;
+  left: 12px;
+  right: 12px;
+  z-index: 60;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 html.ui-v2 .ui2-xr-status[data-state="error"] {
   color: #E87A8B;
+  border-color: #E87A8B;
 }
 </style>
 <!-- ── static/app/20-shell.html ── -->
@@ -39381,7 +39392,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'efbdff3b29d4d6db';
+const INTENDANT_APP_BUILD = 'aa2582a1bde90f64';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146355,8 +146366,11 @@ async function xrEnter() {
     const detail = (err && (err.message || err.name)) || String(err);
     xrSetChipState('error', 'XR entry failed: ' + detail);
     // Persist the failure where a headset user can read it; clear on the
-    // next attempt instead of a timer.
+    // next attempt instead of a timer. Mirror it to the console and the
+    // QA facade for every surface that CAN read those.
     xrShowStatus('error', 'XR entry failed: ' + detail);
+    console.error('[xr] entry failed:', err);
+    globalThis.xrProbe.lastError = detail;
     setTimeout(() => xrSetChipState('idle', 'Enter XR'), 4000);
   }
 }

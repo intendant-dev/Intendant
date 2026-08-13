@@ -47,17 +47,28 @@ html.ui-v2 .ui2-xr-chip[data-state="error"] {
   opacity: .8;
 }
 
-/* Visible entry status: tooltips don't exist in a headset. */
+/* Visible entry status: tooltips don't exist in a headset — and neither
+   do truncated diagnostics. A fixed banner under the header, full-width
+   and fully wrapped: on devices with no console this IS the debugging
+   surface, so it must never fight the header flex row for space. */
 html.ui-v2 .ui2-xr-status {
-  margin-left: 8px;
-  font-size: 12px;
-  color: var(--text-2);
-  max-width: 42ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  position: fixed;
+  top: 52px;
+  left: 12px;
+  right: 12px;
+  z-index: 60;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 html.ui-v2 .ui2-xr-status[data-state="error"] {
   color: #E87A8B;
+  border-color: #E87A8B;
 }

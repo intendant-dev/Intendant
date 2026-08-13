@@ -198,8 +198,11 @@ async function xrEnter() {
     const detail = (err && (err.message || err.name)) || String(err);
     xrSetChipState('error', 'XR entry failed: ' + detail);
     // Persist the failure where a headset user can read it; clear on the
-    // next attempt instead of a timer.
+    // next attempt instead of a timer. Mirror it to the console and the
+    // QA facade for every surface that CAN read those.
     xrShowStatus('error', 'XR entry failed: ' + detail);
+    console.error('[xr] entry failed:', err);
+    globalThis.xrProbe.lastError = detail;
     setTimeout(() => xrSetChipState('idle', 'Enter XR'), 4000);
   }
 }
