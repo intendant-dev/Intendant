@@ -222,7 +222,11 @@ async fn configure_and_arm(
         .add_event_listener_with_callback("selectstart", on_selectstart.as_ref().unchecked_ref())?;
     let se_inner = Rc::clone(inner);
     let on_selectend = Closure::new(move |_event: web_sys::Event| {
-        crate::input::on_select_end(&mut se_inner.borrow_mut());
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0);
+        crate::input::on_select_end(&mut se_inner.borrow_mut(), now);
     });
     session.add_event_listener_with_callback("selectend", on_selectend.as_ref().unchecked_ref())?;
 
@@ -399,6 +403,10 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let transcript_scroll = inner.transcript_scroll;
         let snapshot = inner.model.clone().unwrap_or_default();
         let terminal_view = inner.terminal.pane_view();
+        let voice_view = inner.voice.dock_view();
+        // The commit target: the selection filtered to real session
+        // cards (agenda selections aren't sendable).
+        let voice_target = crate::voice::selected_session(inner);
         let display_meta: Vec<(String, String)> = inner
             .displays
             .iter()
@@ -432,6 +440,18 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
             crate::terminal::build_pane(
                 &terminal_view,
                 hover.as_deref(),
+                floor_y,
+                measure,
+                &mut batches,
+            );
+            // Voice affordances too: the talk pill always, the honest
+            // status line whenever there is one, the transcript preview
+            // strip while a result is pending (voice.rs).
+            crate::voice::build_dock(
+                &voice_view,
+                voice_target.as_deref(),
+                hover.as_deref(),
+                time_ms,
                 floor_y,
                 measure,
                 &mut batches,

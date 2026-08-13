@@ -27,6 +27,7 @@ mod model;
 mod session;
 mod terminal;
 mod ui;
+mod voice;
 pub mod webxr_sys;
 
 use std::cell::RefCell;
@@ -77,6 +78,9 @@ pub(crate) struct Inner {
     /// In-scene terminal pane (read-only mirror of the dashboard's
     /// standalone shell; see `terminal.rs`).
     pub(crate) terminal: terminal::TerminalPane,
+    /// Hold-to-talk voice input (talk pill, capture state machine,
+    /// transcript preview strip; see `voice.rs`).
+    pub(crate) voice: voice::VoiceDock,
     /// Per-frame controller/hand rays with their nearest hit distance —
     /// rendered as visible beams + hit markers (the pointer).
     pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
@@ -122,6 +126,7 @@ impl Inner {
             hit_targets: Vec::new(),
             displays: Vec::new(),
             terminal: terminal::TerminalPane::default(),
+            voice: voice::VoiceDock::default(),
             pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
@@ -168,6 +173,19 @@ fn debug_state_json(inner: &Inner) -> String {
             "hasCanvas": inner.terminal.canvas.is_some(),
             "canvasGeneration": inner.terminal.canvas_generation,
             "parseErrors": inner.terminal.parse_errors,
+        },
+        "voice": {
+            "phase": inner.voice.phase_name(),
+            "available": inner.voice.availability.as_ref().map(|a| a.available),
+            "detail": inner
+                .voice
+                .availability
+                .as_ref()
+                .map(|a| a.detail.clone())
+                .unwrap_or_default(),
+            "note": inner.voice.note,
+            "result": inner.voice.result_text(),
+            "parseErrors": inner.voice.parse_errors,
         },
         "scene": {
             "panels": inner.panels_count,
@@ -364,9 +382,42 @@ impl XrWeb {
         }
     }
 
+    /// Standing voice-input availability from the JS glue, which owns
+    /// the truth (daemon transcription config, transport posture, mic
+    /// permission): `{available: bool, detail: string}`. While
+    /// unavailable the talk pill renders `detail` as a visible status
+    /// line — never a silent no-op. Malformed pushes are dropped and
+    /// counted, never fatal.
+    #[wasm_bindgen(js_name = voiceStatus)]
+    pub fn voice_status(&self, status: JsValue) {
+        voice::apply_status_js(&mut self.inner.borrow_mut(), status);
+    }
+
+    /// A captured utterance transcript from the JS capture lane. Lands
+    /// as the preview strip's pending result — reviewed and committed by
+    /// a deliberate pinch, NEVER auto-sent.
+    #[wasm_bindgen(js_name = voiceResult)]
+    pub fn voice_result(&self, text: String) {
+        let mut inner = self.inner.borrow_mut();
+        if voice::apply_result(&mut inner.voice, &text) {
+            inner.ui_dirty = true;
+        }
+    }
+
+    /// The capture attempt ended without a transcript (mic denied, no
+    /// speech recognized, lane down): back to idle with the reason
+    /// rendered under the pill.
+    #[wasm_bindgen(js_name = voiceFailed)]
+    pub fn voice_failed(&self, message: String) {
+        let mut inner = self.inner.borrow_mut();
+        voice::apply_failed(&mut inner.voice, &message);
+        inner.ui_dirty = true;
+    }
+
     /// Activate a scene target by hit-target id (`card:<agent>`,
     /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-    /// `terminal:close`), the same
+    /// `terminal:close`, `voice:talk` — toggles the capture —
+    /// `voice:use`, `voice:discard`), the same
     /// activation-by-name contract the other rendered surface gives the
     /// validator and accessibility layers. Runs the exact dispatch path
     /// a completed ray interaction runs — activation by name IS the
@@ -455,5 +506,32 @@ mod tests {
         assert_eq!(parsed["terminal"]["live"], true);
         assert_eq!(parsed["terminal"]["label"], "shell-0 · This daemon");
         assert_eq!(parsed["terminal"]["canvasGeneration"], 4);
+    }
+
+    #[test]
+    fn debug_json_reports_voice_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "idle");
+        assert!(parsed["voice"]["available"].is_null());
+        assert_eq!(parsed["voice"]["note"], "");
+        assert!(parsed["voice"]["result"].is_null());
+        assert_eq!(parsed["voice"]["parseErrors"], 0);
+
+        voice::on_press(&mut inner.voice, 0.0);
+        voice::on_release(&mut inner.voice, 1000.0, false);
+        voice::apply_result(&mut inner.voice, "open the logs");
+        voice::apply_availability(
+            &mut inner.voice,
+            voice::VoiceAvailability {
+                available: false,
+                detail: "transcription is off".into(),
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "result");
+        assert_eq!(parsed["voice"]["available"], false);
+        assert_eq!(parsed["voice"]["detail"], "transcription is off");
+        assert_eq!(parsed["voice"]["result"], "open the logs");
     }
 }
