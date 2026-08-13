@@ -3,10 +3,13 @@
 export const memory: WebAssembly.Memory;
 export const __wbg_xrweb_free: (a: number, b: number) => void;
 export const xrweb_activate: (a: number, b: number, c: number) => number;
+export const xrweb_applyLayout: (a: number, b: number, c: number) => number;
 export const xrweb_debugJson: (a: number) => [number, number];
 export const xrweb_enter: (a: number, b: number, c: number) => any;
 export const xrweb_exit: (a: number) => void;
+export const xrweb_layoutJson: (a: number) => [number, number];
 export const xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
+export const xrweb_moveSurface: (a: number, b: number, c: number, d: number, e: number) => number;
 export const xrweb_new: () => number;
 export const xrweb_probeSupport: (a: number) => any;
 export const xrweb_registerDisplaySource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => void;
