@@ -81,6 +81,9 @@ same pinned-wasm-pack pipeline as the other browser crates):
 - **`terminal.rs`** — the in-scene terminal pane (below): summon pill,
   pane layout, the honest empty/warming/watching states, and the
   facade seams the dashboard's terminal painter feeds.
+- **`voice.rs`** — hold-to-talk voice input (below): the talk pill, the
+  pure capture state machine, and the transcript preview strip with its
+  deliberate-confirm commit.
 
 ### Feed and action routing
 
@@ -91,9 +94,12 @@ rendered surface consumes, display-slot mirroring (same 6-arg registration
 shape), and action routing straight into `handleStationAction` — approvals
 emit the dashboard's existing `{type:'approval', host_id, approval_id,
 decision}` shape and land in `send_approval` / `resolvePeerApproval` like
-every other frontend. Deferred deliberately: the voice composer toggle (no
-existing action seam to reuse; needs a designed one, not a hack) and
-compositor media layers (below).
+every other frontend. Voice-lane actions (`voice_talk` capture verbs,
+`text_commit`) are consumed by the fragment's voice section before the
+router (below). Deferred deliberately: the live voice-composer
+*conversation* (talking WITH the presence AI in XR — a designed seam,
+not a hack) and compositor media layers (below); hold-to-talk text
+input shipped instead as the first voice slice.
 
 ### Terminal pane (slice 1: read-only watching)
 
@@ -115,6 +121,58 @@ shell when none exists), so a page with no terminal session shows
 "no terminals — open one on the dashboard" instead. Input from the
 headset is a later slice (hardware keyboards in immersive sessions are
 unverified on the Quest).
+
+### Voice input (hold-to-talk)
+
+A "talk" pill sits below-left of the workbench (mirroring the terminal
+summon pill on the right). It is the **third hold semantic**, kept
+strictly apart from the other two: a quick pinch selects, the 900 ms
+confirm-hold approves — and the talk hold **records**. Pinch-and-hold
+the pill and the hold is the recording window (a pulsing ring says so
+from across the room); release stops it. The talk hold never fires on a
+timer and never cancels on aim drift — a hand wanders while its owner
+speaks — releasing the pinch is the only stop, so the mic can never
+stay hot. Releases under 300 ms read as accidental pinches and cancel
+with a rendered "hold to talk" hint. Mic permission is requested on the
+FIRST talk press, never at session entry, and release always stops the
+capture tracks (the browser's recording indicator goes out).
+
+The capture rides the dashboard's **existing server-side transcription
+lane** end to end: the `ui2-xr.js` voice section streams mic PCM over
+the page's `user_audio` frames into the daemon's Whisper pipeline
+(`transcription.rs`, `[transcription] enabled = true` — off by
+default), and the transcript returns on the broadcast `user_transcript`
+event. That lane only logs daemon-side; nothing injects it into any
+conversation, so voice capture adds **no presence-pipeline changes and
+no daemon changes**. Two lane facts shape the glue: the daemon
+transcribes in fixed ~3 s windows with no flush verb, so release pads
+one full window of silence to flush the spoken tail (pure-silence
+windows are RMS-gated daemon-side and transcribe nothing); and if the
+flat dashboard mic is already streaming (live voice session with
+transcription on), no second capture opens — the section just taps the
+transcripts already flowing.
+
+The transcript is **never auto-sent**. It lands on a preview strip
+below the workbench — the captured text plus `use` / `discard` pills —
+and only a deliberate pinch on `use` emits
+`{type:'text_commit', field_id: 'composer:<sessionId>', text}` through
+the ordinary action router; the JS glue routes it through the
+dashboard's existing send path (`focusSessionWindow` +
+`submitComposedText`, i.e. exactly what clicking a session window and
+submitting the composer does — steer / follow-up / task phase logic
+included). With no session focused the strip says so and offers only
+discard. That `text_commit` shape is the standing contract for XR text
+entry: the ray-keyboard TextEntry work commits through the same shape,
+and when its field buffer lands, the strip's commit collapses into that
+buffer's path (a deletion, not a rewrite).
+
+Honesty contract: every unavailability — transcription off, hosted
+Connect lane (user_audio is not tunneled), dead event stream, no secure
+context, mic denied — renders as a visible status line on the pill,
+never a silent no-op. `debug_json` exposes the whole machine under
+`voice` ({phase, available, detail, note, result}), and the validator's
+`--xr-probe` drives the full loop through `xrProbe.voice` with a shim
+transcript — no mic or ASR in CI.
 
 ### Availability
 
@@ -179,17 +237,21 @@ end: chip → immersive entry → stereo frame loop (2 views) →
 synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
 never routed to a live daemon) → the terminal pane pass (summon → honest
-empty state → canvas-seam registration → dismiss). `xrProbe` (the
-`stationProbe`-convention QA facade) and `debugJson()` expose engine/scene
-state for ad-hoc probing.
+empty state → canvas-seam registration → dismiss) → the voice pass
+(talk toggle → captured capture verbs → a shim transcript through the
+real `voiceResult` seam → preview strip → captured `text_commit`
+contract shape → failure/unavailability honesty; no mic, no ASR).
+`xrProbe` (the `stationProbe`-convention QA facade) and `debugJson()`
+expose engine/scene state for ad-hoc probing.
 
 ## Roadmap
 
 - **M2 — the feel:** compositor video via `XRMediaBinding` quad layers where
   the Layers module exists (Quest's most optimized path; requires moving the
   scene to `XRWebGLBinding` projection layers — the current in-scene textured
-  quads remain the universal fallback), the designed voice-composer seam
-  (talking to your agents is the native XR composer), spatialized per-session
+  quads remain the universal fallback), the live voice-composer
+  *conversation* (talking WITH the presence AI in XR; hold-to-talk text
+  input shipped as the first slice), spatialized per-session
   presence audio, hand-tracking polish, multi-monitor walls, comfort and
   legibility tuning on hardware.
 - **M3 — the place:** hosts as arrangeable zones, the timeline as a spatial
