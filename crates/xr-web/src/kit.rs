@@ -106,6 +106,13 @@ pub(crate) enum HitKind {
     ScrollOlder,
     /// Transcript paging on the workbench: back toward the live tail.
     ScrollNewer,
+    /// Opens the in-scene text entry bound to the target's field
+    /// (`steer:<agent>` on the workbench). A light act — quick pinch.
+    SteerOpen,
+    /// One key on the rendered keyboard (`key:<token>`). Light acts —
+    /// quick pinches, never the deliberate-confirm hold (that grammar
+    /// stays approvals-only).
+    Key,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +214,19 @@ pub(crate) const TERMINAL_DEFAULT_ASPECT: f32 = 0.625;
 pub(crate) const TERMINAL_PILL_AZ: f32 = 0.50;
 pub(crate) const TERMINAL_PILL_DIST: f32 = 1.30;
 pub(crate) const TERMINAL_PILL_Y: f32 = 1.05;
+
+/// Text-entry keyboard (`keyboard.rs`): a FIXED near-field slot —
+/// front-low, below the workbench, tilted back so the plate faces the
+/// operator's downward gaze. Deliberately not a movable panel: the
+/// arrangement verbs own movable state; a keyboard that drifts is a
+/// keyboard you hunt for. Key pitch keeps every cap ≥ 35 mm — the
+/// ray-typing legibility/accuracy floor at this distance.
+pub(crate) const KEYBOARD_DIST: f32 = 0.92;
+pub(crate) const KEYBOARD_Y: f32 = 0.84;
+/// Backward tilt in radians (≈ 29°): drafting-table posture.
+pub(crate) const KEYBOARD_TILT: f32 = 0.50;
+pub(crate) const KEY_PITCH: f32 = 0.042;
+pub(crate) const KEY_GAP: f32 = 0.006;
 
 /// Agenda rail: parked intent on the operator's RIGHT, outboard of the
 /// terminal slot (the +38° mirror of the monitors went to the summoned
