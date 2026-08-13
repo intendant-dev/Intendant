@@ -32846,19 +32846,29 @@ html.ui-v2 .ui2-xr-chip[data-state="error"] {
 }
 
 /* Visible entry status: tooltips don't exist in a headset — and neither
-   do truncated diagnostics. Errors wrap in full; this line IS the
-   debugging surface on devices with no console. */
+   do truncated diagnostics. A fixed banner under the header, full-width
+   and fully wrapped: on devices with no console this IS the debugging
+   surface, so it must never fight the header flex row for space. */
 html.ui-v2 .ui2-xr-status {
-  margin-left: 8px;
-  font-size: 12px;
-  color: var(--text-2);
-  max-width: 72ch;
+  position: fixed;
+  top: 52px;
+  left: 12px;
+  right: 12px;
+  z-index: 60;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
   white-space: normal;
   overflow-wrap: anywhere;
 }
 
 html.ui-v2 .ui2-xr-status[data-state="error"] {
   color: #E87A8B;
+  border-color: #E87A8B;
 }
 </style>
 <!-- ── static/app/20-shell.html ── -->
@@ -39382,7 +39392,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '1607be3eba54d5fa';
+const INTENDANT_APP_BUILD = 'aa2582a1bde90f64';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
