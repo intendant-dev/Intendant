@@ -63,6 +63,11 @@ extern "C" {
     #[wasm_bindgen(method, getter, js_name = environmentBlendMode)]
     pub fn environment_blend_mode(this: &XrSession) -> String;
 
+    /// `XRDOMOverlayState | null` — non-null iff the dom-overlay feature
+    /// was granted for this session (Module: WebXR DOM Overlay).
+    #[wasm_bindgen(method, getter, js_name = domOverlayState)]
+    pub fn dom_overlay_state(this: &XrSession) -> JsValue;
+
     // ---- frame / poses ---------------------------------------------------
 
     #[wasm_bindgen(js_name = XRFrame)]

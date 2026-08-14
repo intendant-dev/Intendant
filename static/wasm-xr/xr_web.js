@@ -69,6 +69,22 @@ export class XrWeb {
         return ret;
     }
     /**
+     * Spike lane: enter with the WebXR DOM Overlay module requested for
+     * `root` (the flag-gated entry passes the whole dashboard body, so
+     * the REGULAR UI composites interactively over the scene where the
+     * runtime supports it). The feature is optional — ungranted runtimes
+     * enter normally; `debugJson().overlay` reports the truth.
+     * @param {string} mode
+     * @param {Element} root
+     * @returns {Promise<any>}
+     */
+    enterWithOverlay(mode, root) {
+        const ptr0 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.xrweb_enterWithOverlay(this.__wbg_ptr, ptr0, len0, root);
+        return ret;
+    }
+    /**
      * End the active immersive session, if any (cleanup and the
      * session-end callback run from the session's own 'end' event).
      */
@@ -394,6 +410,10 @@ function __wbg_get_imports() {
         __wbg_document_ee35a3d3ae34ef6c: function(arg0) {
             const ret = arg0.document;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_domOverlayState_708ea1750a9e977b: function(arg0) {
+            const ret = arg0.domOverlayState;
+            return ret;
         },
         __wbg_done_57b39ecd9addfe81: function(arg0) {
             const ret = arg0.done;
@@ -930,17 +950,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 39, function: Function { arguments: [F64, Externref], shim_idx: 42, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 41, function: Function { arguments: [F64, Externref], shim_idx: 44, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h95fa55e82713b162, wasm_bindgen__convert__closures_____invoke__h80d27238e69792d0);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 39, function: Function { arguments: [NamedExternref("Event")], shim_idx: 40, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 41, function: Function { arguments: [NamedExternref("Event")], shim_idx: 42, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h95fa55e82713b162, wasm_bindgen__convert__closures_____invoke__h5fa997591c1e8ef4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 77, function: Function { arguments: [Externref], shim_idx: 78, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 81, function: Function { arguments: [Externref], shim_idx: 82, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

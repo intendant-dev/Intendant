@@ -34,6 +34,14 @@ export class XrWeb {
      */
     enter(mode: string): Promise<any>;
     /**
+     * Spike lane: enter with the WebXR DOM Overlay module requested for
+     * `root` (the flag-gated entry passes the whole dashboard body, so
+     * the REGULAR UI composites interactively over the scene where the
+     * runtime supports it). The feature is optional — ungranted runtimes
+     * enter normally; `debugJson().overlay` reports the truth.
+     */
+    enterWithOverlay(mode: string, root: Element): Promise<any>;
+    /**
      * End the active immersive session, if any (cleanup and the
      * session-end callback run from the session's own 'end' event).
      */
@@ -115,6 +123,7 @@ export interface InitOutput {
     readonly xrweb_cancelTextEntry: (a: number) => void;
     readonly xrweb_debugJson: (a: number) => [number, number];
     readonly xrweb_enter: (a: number, b: number, c: number) => any;
+    readonly xrweb_enterWithOverlay: (a: number, b: number, c: number, d: any) => any;
     readonly xrweb_exit: (a: number) => void;
     readonly xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
     readonly xrweb_new: () => number;

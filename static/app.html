@@ -39401,7 +39401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '2a74da8ea32195e5';
+const INTENDANT_APP_BUILD = 'fc693809f68ce0de';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146204,6 +146204,20 @@ function xrEnabled() {
   }
 }
 
+// Spike lane (?xr=overlay): request the WebXR DOM Overlay module with
+// the whole dashboard as the overlay root — the REGULAR UI, composer
+// and all, composited interactively over the spatial scene where the
+// runtime supports it (Quest Horizon Browser does; desktop and the
+// probe shim simply don't grant the optional feature). Flag-gated
+// until the on-device verdict.
+function xrOverlayRequested() {
+  try {
+    return new URLSearchParams(location.search).get('xr') === 'overlay';
+  } catch {
+    return false;
+  }
+}
+
 // Feature probe without loading the WASM: chip visibility must cost
 // nothing on the overwhelmingly common non-XR browser.
 async function xrProbeSupportLight() {
@@ -146386,11 +146400,24 @@ async function xrEnter() {
     // Passthrough-first: prefer AR on hardware that has it (Quest 3),
     // fall back to VR (Vision Pro Safari has no immersive-ar).
     const mode = xrSupport.ar ? 'immersive-ar' : 'immersive-vr';
-    await inst.enter(mode);
-    clearTimeout(consentHint);
-    xrStartSnapshotPump();
-    xrSetChipState('active', 'Immersive session running');
-    xrShowStatus('', '');
+    if (xrOverlayRequested() && document.body) {
+      await inst.enterWithOverlay(mode, document.body);
+      const granted = JSON.parse(inst.debugJson()).overlay?.active === true;
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      // The overlay verdict is the whole point of the spike — say it
+      // where the headset user can read it.
+      xrShowStatus(granted ? 'busy' : 'error',
+        granted ? 'dom-overlay active — the regular UI should float over the scene'
+                : 'dom-overlay not granted by this runtime — scene only');
+    } else {
+      await inst.enter(mode);
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      xrShowStatus('', '');
+    }
   } catch (err) {
     clearTimeout(consentHint);
     const detail = (err && (err.message || err.name)) || String(err);

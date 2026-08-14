@@ -6,6 +6,7 @@ export const xrweb_activate: (a: number, b: number, c: number) => number;
 export const xrweb_cancelTextEntry: (a: number) => void;
 export const xrweb_debugJson: (a: number) => [number, number];
 export const xrweb_enter: (a: number, b: number, c: number) => any;
+export const xrweb_enterWithOverlay: (a: number, b: number, c: number, d: any) => any;
 export const xrweb_exit: (a: number) => void;
 export const xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
 export const xrweb_new: () => number;

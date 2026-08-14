@@ -245,6 +245,23 @@ engine/scene state for ad-hoc probing.
   stays on the 2D dashboard, which a headset can still open as a flat browser
   window at any time.
 
+## DOM-overlay spike (`?xr=overlay`)
+
+Flag-gated experiment toward full-richness XR: entering with `?xr=overlay`
+requests the WebXR DOM Overlay module (an *optional* feature — unlike
+`layers` it coexists with `renderState.baseLayer`) with the entire dashboard
+body as the overlay root. Where the runtime grants it (Quest's Horizon
+Browser ships the module; desktop Chrome and the probe shim don't), the
+regular UI composites as a live, interactive DOM layer over the spatial
+scene — composer, tabs, and (to be verified on-device) the system keyboard
+on focused text fields. The status line beside the chip reports the grant
+verdict at entry, and `debugJson().overlay` carries `{requested, active}`.
+Open on-device questions: input routing quality between overlay DOM and
+scene ray targets (`beforexrselect` gating), keyboard summon inside the
+immersive session, and legibility of the composited page. If the spike
+holds up, "overlay mode" becomes the bridge that keeps every dashboard
+capability reachable in-headset while native spatial surfaces mature.
+
 ## Relationship to Station
 
 Station remains the 2D rendered-canvas tab (see [Station](./station.md));
