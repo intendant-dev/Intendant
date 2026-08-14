@@ -77,6 +77,13 @@ pub(crate) struct Inner {
     pub(crate) hover_id: Option<String>,
     /// The last build's raycastable targets (input + activate()).
     pub(crate) hit_targets: Vec<kit::HitTarget>,
+    /// Scene layout: per-surface visibility + grab-to-move poses.
+    /// Survives snapshot ticks; persisted/restored by `ui2-xr.js`.
+    pub(crate) layout: kit::LayoutState,
+    /// Surface currently held by a grab bar (pinch down on `grab:<name>`);
+    /// the per-frame input pass steers its pose from the ray until
+    /// release.
+    pub(crate) grab_surface: Option<String>,
     /// Live display streams registered by the dashboard (same sources
     /// the other rendered surface paints); shown as floating monitors.
     pub(crate) displays: Vec<DisplaySource>,
@@ -135,6 +142,8 @@ impl Inner {
             selected_id: None,
             hover_id: None,
             hit_targets: Vec::new(),
+            layout: kit::LayoutState::default(),
+            grab_surface: None,
             displays: Vec::new(),
             terminal: terminal::TerminalPane::default(),
             text_entry: keyboard::TextEntry::default(),
@@ -189,6 +198,10 @@ fn debug_state_json(inner: &Inner) -> String {
             "hasCanvas": inner.terminal.canvas.is_some(),
             "canvasGeneration": inner.terminal.canvas_generation,
             "parseErrors": inner.terminal.parse_errors,
+        },
+        "layout": {
+            "state": inner.layout.to_json(),
+            "grabbing": inner.grab_surface,
         },
         "textEntry": {
             "open": inner.text_entry.open,
@@ -460,16 +473,52 @@ impl XrWeb {
     }
 
     /// Activate a scene target by hit-target id (`card:<agent>`,
-    /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-    /// `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
-    /// toggles the capture), the same
-    /// activation-by-name contract the other rendered surface gives the
-    /// validator and accessibility layers. Runs the exact dispatch path
-    /// a completed ray interaction runs — activation by name IS the
-    /// deliberate act, so approve/deny fire without the hold. Returns
-    /// true when the target existed and had an effect.
+    /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle` /
+    /// `close` / `open` / `kill`, `verb:<agent>:<op>`,
+    /// `agendaop:<item>:<op>`, `layout:<surface>`, `close:<surface>`,
+    /// `steer:<agent>`, `key:<token>`, `voice:talk` — toggles the
+    /// capture), the same activation-by-name contract the other
+    /// rendered surface gives the validator and accessibility layers.
+    /// Runs the exact dispatch path a completed ray interaction runs —
+    /// activation by name IS the deliberate act, so hold-tier targets
+    /// (approve/deny, interrupt, terminal open/kill, agenda complete)
+    /// fire without the hold. Returns true when the target existed and
+    /// had an effect.
     pub fn activate(&self, name: String) -> bool {
         input::dispatch_target(&mut self.inner.borrow_mut(), &name)
+    }
+
+    /// Nudge a movable surface (terminal / agenda / monitors) along its
+    /// cylinder band — the QA/probe twin of grab-to-move. Deltas are
+    /// radians and meters; the result clamps to the comfortable band.
+    #[wasm_bindgen(js_name = moveSurface)]
+    pub fn move_surface(&self, surface: String, d_az: f32, d_y: f32) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let moved = inner.layout.move_by(&surface, d_az, d_y);
+        if moved {
+            inner.ui_dirty = true;
+        }
+        moved
+    }
+
+    /// The layout state (hidden set + stored poses) as a JSON string —
+    /// what `ui2-xr.js` persists to localStorage.
+    #[wasm_bindgen(js_name = layoutJson)]
+    pub fn layout_json(&self) -> String {
+        self.inner.borrow().layout.to_json().to_string()
+    }
+
+    /// Restore a persisted layout snapshot (the `layoutJson` shape).
+    /// Tolerant of malformed input; values clamp. Returns whether
+    /// anything applied.
+    #[wasm_bindgen(js_name = applyLayout)]
+    pub fn apply_layout(&self, json: String) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let applied = inner.layout.apply_json(&json);
+        if applied {
+            inner.ui_dirty = true;
+        }
+        applied
     }
 
     /// Open the in-scene text entry bound to a field id, with a human
@@ -555,6 +604,35 @@ mod tests {
         assert_eq!(parsed["engine"]["framesRendered"], 42);
         assert_eq!(parsed["engine"]["views"], 2);
         assert_eq!(parsed["engine"]["sceneUploaded"], true);
+    }
+
+    #[test]
+    fn debug_json_reports_layout_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(
+            parsed["layout"]["state"]["hidden"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(parsed["layout"]["grabbing"].is_null());
+
+        inner.layout.hide("agenda");
+        inner.layout.set_pose("terminal", 0.3, 1.1);
+        inner.grab_surface = Some("terminal".into());
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["layout"]["state"]["hidden"][0], "agenda");
+        assert!(
+            (parsed["layout"]["state"]["poses"]["terminal"]["az"]
+                .as_f64()
+                .unwrap()
+                - 0.3)
+                .abs()
+                < 1e-5
+        );
+        assert_eq!(parsed["layout"]["grabbing"], "terminal");
     }
 
     #[test]

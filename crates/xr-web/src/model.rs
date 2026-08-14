@@ -63,6 +63,22 @@ pub(crate) struct XrAgenda {
     /// Total open items on the daemon (the rail shows at most a few).
     pub(crate) open: u32,
     pub(crate) items: Vec<XrAgendaItem>,
+    /// Live feedback for the last agenda op fired from XR (complete /
+    /// reopen). Owned by the JS seam — it runs the `api_agenda_op`
+    /// request and rides the result here so the rail can render honest
+    /// per-item status instead of a silent maybe.
+    pub(crate) op_status: Option<XrAgendaOpStatus>,
+}
+
+/// One in-flight or settled agenda op: `state` is "pending" / "ok" /
+/// "error", `detail` carries the refusal text when the daemon said no.
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct XrAgendaOpStatus {
+    pub(crate) id: String,
+    pub(crate) op: String,
+    pub(crate) state: String,
+    pub(crate) detail: String,
 }
 
 /// One agenda item, pre-digested for the medium: the title (JS caps it),
@@ -80,6 +96,10 @@ pub(crate) struct XrAgendaItem {
     pub(crate) overdue: bool,
     pub(crate) blocked: bool,
     pub(crate) answered: bool,
+    /// A recently completed item the JS seam keeps on the rail briefly
+    /// so the reopen (undo) pinch has a target; done cards render muted
+    /// at the rail's bottom.
+    pub(crate) done: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -331,6 +351,36 @@ mod tests {
         assert_eq!(sparse.kind, "question");
         assert!(sparse.id.is_empty() && sparse.due.is_empty());
         assert!(!sparse.overdue && !sparse.blocked && !sparse.answered);
+    }
+
+    #[test]
+    fn agenda_done_and_op_status_parse_with_defaults() {
+        let snap: XrSnapshot = serde_json::from_value(serde_json::json!({
+            "agenda": {
+                "open": 1,
+                "items": [
+                    {"id": "01A", "title": "shipped", "kind": "task", "done": true},
+                    {"id": "01B", "title": "live", "kind": "task"}
+                ],
+                "opStatus": {"id": "01A", "op": "complete", "state": "ok", "detail": ""}
+            }
+        }))
+        .unwrap();
+        let agenda = snap.agenda.expect("agenda present");
+        assert!(agenda.items[0].done);
+        assert!(!agenda.items[1].done, "done defaults false");
+        let status = agenda.op_status.expect("op status parsed");
+        assert_eq!(
+            (status.id.as_str(), status.op.as_str()),
+            ("01A", "complete")
+        );
+        assert_eq!(status.state, "ok");
+
+        // Absent opStatus reads as none — old feeds unchanged.
+        let snap: XrSnapshot =
+            serde_json::from_value(serde_json::json!({"agenda": {"open": 0, "items": []}}))
+                .unwrap();
+        assert!(snap.agenda.unwrap().op_status.is_none());
     }
 
     #[test]

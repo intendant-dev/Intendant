@@ -1,4 +1,4 @@
-//! Agenda rail: the daemon's parked intent in the room — read-only.
+//! Agenda rail: the daemon's parked intent in the room.
 //!
 //! The careful port of the flat Agenda tab's card decisions, re-typeset
 //! for the medium: a stack of item cards on the operator's RIGHT
@@ -8,19 +8,24 @@
 //! overdue), the blocked chip (rose), and the answered state (green).
 //! Ordering flattens the tab's Now-lens precedence: questions awaiting
 //! the owner first, then overdue reminders, then the rest in the feed's
-//! newest-first order. Overflow past the rail cap is counted honestly,
-//! and empty/unavailable states render as in-scene text — a headset has
-//! no tooltips and no console.
+//! newest-first order (recently completed items sink to the bottom as
+//! muted "done" cards so the reopen undo has a target). Overflow past
+//! the rail cap is counted honestly, and empty/unavailable states render
+//! as in-scene text — a headset has no tooltips and no console.
 //!
-//! Read-only by design this slice: a pinch selects a card and expands it
-//! in place (the full title wraps out), but no write verb exists here —
-//! park/complete/answer stay on the trusted 2D surfaces. Item titles are
-//! DATA: they render as plain atlas text, never as instructions.
+//! Quick-verbs this slice: the selected (expanded) card carries
+//! `complete` (900 ms hold — semi-destructive) or `reopen` (quick pinch,
+//! the undo on a done card); both route through the dashboard's own
+//! `api_agenda_op` projection via the JS seam, and the seam feeds honest
+//! per-item status back onto the rail. Answer/park-with-text wait for
+//! the keyboard seat. The rail is also a floating surface: grab bar to
+//! move it, x-pill or layout strip to dismiss it. Item titles are DATA:
+//! they render as plain atlas text, never as instructions.
 
 use crate::atlas::TextMeasure;
 use crate::kit::{self, HitKind, HitTarget, PanelInstance, SceneBatches, TextAlign, TextRun};
 use crate::math::{v3, Panel, Vec3};
-use crate::model::{XrAgenda, XrAgendaItem};
+use crate::model::{XrAgenda, XrAgendaItem, XrAgendaOpStatus};
 
 /// Layer lifts off the card plane (meters) so co-planar content never
 /// z-fights — private mirrors of `ui.rs`'s values (kept local so this
@@ -41,6 +46,8 @@ const NOTE_H: f32 = 0.019;
 const LINE_PITCH: f32 = 0.030;
 /// Wrapped title lines on the expanded (selected) card.
 const EXPAND_MAX_LINES: usize = 3;
+/// Extra height the selected card grows for its quick-verb row.
+const VERB_ROW_H: f32 = 0.048;
 /// Left inset for text after the kind mark; right pad.
 const PAD_MARK: f32 = 0.052;
 const PAD_R: f32 = 0.024;
@@ -63,26 +70,28 @@ fn at_floor(p: Vec3, floor_y: f32) -> Vec3 {
     v3(p.x, p.y + floor_y, p.z)
 }
 
-/// Rail plane basis: `right`/`up` for a panel at the agenda azimuth
-/// facing the operator column (the mirror of the monitors' basis).
-fn rail_basis() -> (Vec3, Vec3) {
-    let az = kit::AGENDA_AZ;
+/// Rail plane basis: `right`/`up` for a panel at azimuth `az` facing the
+/// operator column (the mirror of the monitors' basis). The azimuth
+/// comes from the layout pose — the rail is a movable surface.
+fn rail_basis(az: f32) -> (Vec3, Vec3) {
     (v3(az.cos(), 0.0, az.sin()), v3(0.0, 1.0, 0.0))
 }
 
-/// Card-stack center for a given height `y`.
-fn rail_center(y: f32) -> Vec3 {
-    let az = kit::AGENDA_AZ;
+/// Card-stack center for a given height `y` at azimuth `az`.
+fn rail_center(az: f32, y: f32) -> Vec3 {
     v3(kit::AGENDA_DIST * az.sin(), y, -kit::AGENDA_DIST * az.cos())
 }
 
 /// The rail's display order — the flat tab's Now-lens precedence
 /// flattened to the summary's vocabulary: (0) questions still awaiting
-/// an answer, (1) overdue reminders, (2) everything else. Stable within
+/// an answer, (1) overdue reminders, (2) everything else, (3) recently
+/// completed cards (the reopen targets) at the bottom. Stable within
 /// bands, preserving the feed's newest-first order (the JS seam sorts
 /// with the tab's own created_ms ordering before capping).
 fn band(item: &XrAgendaItem) -> u8 {
-    if item.kind == "question" && !item.answered {
+    if item.done {
+        3
+    } else if item.kind == "question" && !item.answered {
         0
     } else if item.overdue {
         1
@@ -142,14 +151,19 @@ fn wrap_title(
 }
 
 /// Build the rail into the scene. `agenda == None` (a feed that carries
-/// no agenda block) renders nothing; empty and error states render
+/// no agenda block) renders nothing; a dismissed rail renders nothing
+/// (the layout strip is the way back); empty and error states render
 /// honest in-scene text. Called from `ui.rs::build_scene` next to the
 /// monitors — the rail, like the screens, is independent of the agents
 /// feed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rail(
     agenda: Option<&XrAgenda>,
     selected_id: Option<&str>,
     hover_id: Option<&str>,
+    confirm: Option<(&str, f32)>,
+    layout: &kit::LayoutState,
+    grab: Option<&str>,
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
@@ -157,11 +171,21 @@ pub(crate) fn rail(
     let Some(agenda) = agenda else {
         return;
     };
-    let (right, up) = rail_basis();
+    if layout.is_hidden("agenda") {
+        return;
+    }
+    let pose = layout.pose("agenda");
+    let az = pose.az;
+    let top_y = pose.y;
+    let (right, up) = rail_basis(az);
     let hw = kit::AGENDA_CARD_W / 2.0;
 
-    // Header rides above the first card slot, host-label style.
-    let header_origin = rail_center(kit::AGENDA_TOP_Y + 0.030) - right.scale(hw);
+    // Grab bar above the header: the whole rail moves as one.
+    grab_bar_for_rail(az, top_y, right, up, grab, hover_id, floor_y, out);
+
+    // Header rides above the first card slot, host-label style, with the
+    // dismiss x-pill on its right.
+    let header_origin = rail_center(az, top_y + 0.030) - right.scale(hw);
     out.texts.push(TextRun {
         origin: lift(header_origin, right, up, LIFT_TEXT, floor_y),
         right,
@@ -169,15 +193,27 @@ pub(crate) fn rail(
         height: HEADER_H,
         color: kit::TEXT_2,
         align: TextAlign::Left,
-        max_width: kit::AGENDA_CARD_W,
+        max_width: kit::AGENDA_CARD_W - 0.06,
         text: "Agenda".into(),
     });
+    crate::ui::dismiss_pill(
+        "close:agenda",
+        "agenda",
+        rail_center(az, top_y + 0.040) + right.scale(hw - 0.022),
+        right,
+        up,
+        hover_id,
+        floor_y,
+        measure,
+        out,
+    );
 
     // Unavailable beats everything: say so where the operator can read
     // it, never a silent blank (the flat tab's load-error law).
     if !agenda.error.is_empty() {
         note(
-            kit::AGENDA_TOP_Y - 0.030,
+            az,
+            top_y - 0.030,
             "agenda unavailable",
             kit::AMBER,
             right,
@@ -186,7 +222,8 @@ pub(crate) fn rail(
             out,
         );
         note(
-            kit::AGENDA_TOP_Y - 0.062,
+            az,
+            top_y - 0.062,
             &agenda.error,
             kit::TEXT_3,
             right,
@@ -196,9 +233,20 @@ pub(crate) fn rail(
         );
         return;
     }
+
+    // Honest per-item op feedback: the JS seam's live status for the
+    // last complete/reopen fired from this room.
+    let mut pen = top_y;
+    if let Some(status) = agenda.op_status.as_ref().filter(|s| !s.state.is_empty()) {
+        let (text, color) = op_status_line(status);
+        note(az, pen - 0.006, &text, color, right, up, floor_y, out);
+        pen -= 0.042;
+    }
+
     if agenda.items.is_empty() {
         note(
-            kit::AGENDA_TOP_Y - 0.030,
+            az,
+            pen - 0.030,
             "agenda is empty",
             kit::TEXT_3,
             right,
@@ -212,7 +260,6 @@ pub(crate) fn rail(
     let order = rail_order(&agenda.items);
     let shown = order.len().min(kit::AGENDA_RAIL_CAP);
     // `pen` walks the top edge of each card down the stack.
-    let mut pen = kit::AGENDA_TOP_Y;
     for &idx in order.iter().take(kit::AGENDA_RAIL_CAP) {
         let item = &agenda.items[idx];
         let key = format!("agenda:{}", item.id);
@@ -228,9 +275,13 @@ pub(crate) fn rail(
         } else {
             vec![item.title.clone()]
         };
-        let card_h = kit::AGENDA_CARD_H + (title_lines.len() - 1) as f32 * LINE_PITCH;
+        // The selected card grows one more row for its quick-verb pill.
+        let verbs = is_selected && !item.id.is_empty();
+        let card_h = kit::AGENDA_CARD_H
+            + (title_lines.len() - 1) as f32 * LINE_PITCH
+            + if verbs { VERB_ROW_H } else { 0.0 };
         let hh = card_h / 2.0;
-        let center = rail_center(pen - hh);
+        let center = rail_center(az, pen - hh);
         card(
             item,
             &key,
@@ -241,6 +292,7 @@ pub(crate) fn rail(
             hh,
             is_selected,
             hover_id,
+            confirm,
             floor_y,
             measure,
             out,
@@ -253,6 +305,7 @@ pub(crate) fn rail(
     let more = (agenda.open as usize).saturating_sub(shown);
     if more > 0 {
         note(
+            az,
             pen - 0.012,
             &format!("+{more} more on the dashboard"),
             kit::TEXT_3,
@@ -264,9 +317,57 @@ pub(crate) fn rail(
     }
 }
 
+/// The rail's grab bar, sized to the card width.
+#[allow(clippy::too_many_arguments)]
+fn grab_bar_for_rail(
+    az: f32,
+    top_y: f32,
+    right: Vec3,
+    up: Vec3,
+    grab: Option<&str>,
+    hover_id: Option<&str>,
+    floor_y: f32,
+    out: &mut SceneBatches,
+) {
+    crate::ui::grab_bar(
+        "agenda",
+        rail_center(az, top_y + 0.078),
+        right,
+        up,
+        kit::AGENDA_CARD_W * 0.35,
+        grab,
+        hover_id,
+        floor_y,
+        out,
+    );
+}
+
+/// The op-status line's text + accent: "completing…" while pending,
+/// "completed" / "reopened" green, the daemon's refusal text rose.
+fn op_status_line(status: &XrAgendaOpStatus) -> (String, [f32; 4]) {
+    let verb = match status.op.as_str() {
+        "reopen" => ("reopening…", "reopened"),
+        _ => ("completing…", "completed"),
+    };
+    match status.state.as_str() {
+        "pending" => (verb.0.to_string(), kit::TEXT_2),
+        "ok" => (verb.1.to_string(), kit::GREEN),
+        _ => {
+            let detail = if status.detail.is_empty() {
+                "agenda op failed".to_string()
+            } else {
+                status.detail.clone()
+            };
+            (detail, kit::RED)
+        }
+    }
+}
+
 /// One dim status line on the rail plane (empty state, errors, the
-/// overflow count).
+/// overflow count, op feedback).
+#[allow(clippy::too_many_arguments)]
 fn note(
+    az: f32,
     y: f32,
     text: &str,
     color: [f32; 4],
@@ -275,7 +376,7 @@ fn note(
     floor_y: f32,
     out: &mut SceneBatches,
 ) {
-    let origin = rail_center(y) - right.scale(kit::AGENDA_CARD_W / 2.0);
+    let origin = rail_center(az, y) - right.scale(kit::AGENDA_CARD_W / 2.0);
     out.texts.push(TextRun {
         origin: lift(origin, right, up, LIFT_TEXT, floor_y),
         right,
@@ -299,6 +400,7 @@ fn card(
     hh: f32,
     is_selected: bool,
     hover_id: Option<&str>,
+    confirm: Option<(&str, f32)>,
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
@@ -308,10 +410,11 @@ fn card(
 
     // Border vocabulary ports the session cards': loud iris on
     // hover/selection (the on-device legibility finding), amber for the
-    // needs-you state — here, an overdue reminder.
+    // needs-you state — here, an overdue reminder. A done card is a
+    // quiet undo target, never a warning.
     let border = if is_selected || is_hover {
         kit::IRIS
-    } else if item.overdue {
+    } else if item.overdue && !item.done {
         kit::AMBER
     } else {
         kit::LINE_2
@@ -378,7 +481,7 @@ fn card(
         });
     }
 
-    // Title (wrapped only on the expanded card).
+    // Title (wrapped only on the expanded card); a done card mutes.
     for (i, line) in title_lines.iter().enumerate() {
         out.texts.push(TextRun {
             origin: lift(
@@ -391,7 +494,7 @@ fn card(
             right,
             up,
             height: TITLE_H,
-            color: kit::TEXT,
+            color: if item.done { kit::TEXT_3 } else { kit::TEXT },
             align: TextAlign::Left,
             max_width: kit::AGENDA_CARD_W - PAD_MARK - PAD_R,
             text: line.clone(),
@@ -399,27 +502,33 @@ fn card(
     }
 
     // Meta line: the kind word, then the ported state chips — due
-    // (sky / amber once overdue), blocked (rose), answered (green) —
-    // pen-advanced left to right; chips past the card's edge drop
-    // rather than collide.
+    // (sky / amber once overdue), blocked (rose), answered (green);
+    // a done card carries just the green "done" state — pen-advanced
+    // left to right; chips past the card's edge drop rather than
+    // collide. The selected card's verb row sits below the meta line.
+    let verbs = is_selected && !item.id.is_empty();
     let mut chips: Vec<(String, [f32; 4])> = vec![(item.kind.clone(), kit::TEXT_3)];
-    if !item.due.is_empty() {
-        chips.push((
-            item.due.clone(),
-            if item.overdue { kit::AMBER } else { kit::SKY },
-        ));
+    if item.done {
+        chips.push(("done".into(), kit::GREEN));
+    } else {
+        if !item.due.is_empty() {
+            chips.push((
+                item.due.clone(),
+                if item.overdue { kit::AMBER } else { kit::SKY },
+            ));
+        }
+        if item.blocked {
+            chips.push(("blocked".into(), kit::RED));
+        }
+        if is_question {
+            chips.push(if item.answered {
+                ("answered".into(), kit::GREEN)
+            } else {
+                ("awaiting answer".into(), kit::AMBER)
+            });
+        }
     }
-    if item.blocked {
-        chips.push(("blocked".into(), kit::RED));
-    }
-    if is_question {
-        chips.push(if item.answered {
-            ("answered".into(), kit::GREEN)
-        } else {
-            ("awaiting answer".into(), kit::AMBER)
-        });
-    }
-    let meta_y = -hh + 0.022;
+    let meta_y = -hh + 0.022 + if verbs { VERB_ROW_H } else { 0.0 };
     let mut pen = -hw + PAD_MARK;
     for (text, color) in chips {
         let w = measure.measure(&text, META_H);
@@ -443,6 +552,44 @@ fn card(
             text,
         });
         pen += w + CHIP_GAP;
+    }
+
+    // Quick-verb row on the expanded card: complete is semi-destructive
+    // (900 ms hold with the confirm fill); reopen is the undo on a done
+    // card (quick pinch). One verb per state — never both.
+    if verbs {
+        let (verb_id, label, kind, color) = if item.done {
+            (
+                format!("agendaop:{}:reopen", item.id),
+                "reopen",
+                HitKind::AgendaReopen,
+                kit::IRIS_2,
+            )
+        } else {
+            (
+                format!("agendaop:{}:complete", item.id),
+                "complete",
+                HitKind::AgendaComplete,
+                kit::GREEN,
+            )
+        };
+        let label_h = 0.019;
+        let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.020).max(0.045);
+        crate::ui::action_pill(
+            &verb_id,
+            label,
+            kind,
+            &item.id,
+            color,
+            center + right.scale(-hw + PAD_MARK + pill_hw) + up.scale(-hh + 0.028),
+            right,
+            up,
+            hover_id,
+            confirm,
+            floor_y,
+            measure,
+            out,
+        );
     }
 
     // A pinch selects (and expands) the card — local presentation only;
@@ -483,6 +630,7 @@ mod tests {
             overdue,
             blocked: false,
             answered,
+            done: false,
         }
     }
 
@@ -491,16 +639,48 @@ mod tests {
             error: String::new(),
             open,
             items,
+            op_status: None,
         }
+    }
+
+    fn build_rail(
+        agenda: Option<&XrAgenda>,
+        selected: Option<&str>,
+        layout: &kit::LayoutState,
+    ) -> SceneBatches {
+        let mut out = SceneBatches::default();
+        rail(
+            agenda,
+            selected,
+            None,
+            None,
+            layout,
+            None,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        out
     }
 
     fn texts_of(out: &SceneBatches) -> Vec<&str> {
         out.texts.iter().map(|t| t.text.as_str()).collect()
     }
 
+    /// The rail's own card panels (skipping the grab bar / pill chrome).
+    fn card_panels(out: &SceneBatches) -> Vec<&PanelInstance> {
+        out.panels
+            .iter()
+            .filter(|p| (p.half_w - kit::AGENDA_CARD_W / 2.0).abs() < 1e-6)
+            .collect()
+    }
+
     #[test]
-    fn rail_orders_questions_then_overdue_then_rest() {
+    fn rail_orders_questions_then_overdue_then_rest_then_done() {
+        let mut done = item("d1", "task", false, false);
+        done.done = true;
         let items = vec![
+            done,
             item("t1", "task", false, false),
             item("t2", "task", true, false),
             item("q1", "question", false, false),
@@ -510,25 +690,38 @@ mod tests {
         let order = rail_order(&items);
         let ids: Vec<&str> = order.iter().map(|&i| items[i].id.as_str()).collect();
         // Awaiting question first, overdue second; the rest keep their
-        // feed order (stable sort).
-        assert_eq!(ids, vec!["q1", "t2", "t1", "q2", "n1"]);
+        // feed order (stable sort); done cards sink to the bottom.
+        assert_eq!(ids, vec!["q1", "t2", "t1", "q2", "n1", "d1"]);
     }
 
     #[test]
-    fn rail_builds_cards_hits_and_overflow() {
+    fn rail_builds_cards_hits_chrome_and_overflow() {
         let mut items: Vec<XrAgendaItem> = (0..10)
             .map(|i| item(&format!("i{i}"), "task", false, false))
             .collect();
         items[0].blocked = true;
         let agenda = agenda(items, 12);
-        let mut out = SceneBatches::default();
-        rail(Some(&agenda), None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(Some(&agenda), None, &kit::LayoutState::default());
 
-        // Rail cap: 8 cards, each a hit target keyed by item id.
+        // Rail cap: 8 cards, each a hit target keyed by item id, plus
+        // the dismiss x-pill and the grab bar.
         let hits: Vec<&str> = out.hits.iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(hits.len(), kit::AGENDA_RAIL_CAP);
+        let cards = out.hits.iter().filter(|h| h.kind == HitKind::Card).count();
+        assert_eq!(cards, kit::AGENDA_RAIL_CAP);
         assert!(hits.contains(&"agenda:i0"));
-        assert!(out.hits.iter().all(|h| h.kind == HitKind::Card));
+        assert!(hits.contains(&"close:agenda"));
+        assert!(hits.contains(&"grab:agenda"));
+        let close = out.hits.iter().find(|h| h.id == "close:agenda").unwrap();
+        assert_eq!(close.kind, HitKind::SurfaceClose);
+        assert_eq!(close.agent_id, "agenda");
+        assert_eq!(
+            out.hits
+                .iter()
+                .find(|h| h.id == "grab:agenda")
+                .unwrap()
+                .kind,
+            HitKind::Grab
+        );
         // Header, a blocked chip, and the honest overflow count (12 open
         // minus 8 shown).
         let texts = texts_of(&out);
@@ -545,12 +738,38 @@ mod tests {
     }
 
     #[test]
+    fn hidden_rail_builds_nothing_and_pose_moves_it() {
+        let ag = agenda(vec![item("t1", "task", false, false)], 1);
+        let mut layout = kit::LayoutState::default();
+        layout.hide("agenda");
+        let out = build_rail(Some(&ag), None, &layout);
+        assert!(out.texts.is_empty() && out.panels.is_empty() && out.hits.is_empty());
+
+        // A moved pose relocates every rail target along the band.
+        let mut moved = kit::LayoutState::default();
+        moved.set_pose("agenda", 0.3, 1.2);
+        let default_out = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        let moved_out = build_rail(Some(&ag), None, &moved);
+        let card_at = |out: &SceneBatches| {
+            out.hits
+                .iter()
+                .find(|h| h.id == "agenda:t1")
+                .unwrap()
+                .panel
+                .center
+        };
+        let a = card_at(&default_out);
+        let b = card_at(&moved_out);
+        assert!(a.x != b.x || a.y != b.y, "pose moved the rail");
+        assert!(b.y < a.y, "lowered top edge lowers the cards");
+    }
+
+    #[test]
     fn question_and_due_chips_follow_the_tab_vocabulary() {
         let mut q = item("q1", "question", false, false);
         q.due = "due in 2h".into();
         let ag = agenda(vec![q], 1);
-        let mut out = SceneBatches::default();
-        rail(Some(&ag), None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
         let texts = texts_of(&out);
         assert!(texts.contains(&"?"), "question mark badge");
         assert!(texts.contains(&"awaiting answer"));
@@ -558,23 +777,20 @@ mod tests {
         // border warns.
         let due = out.texts.iter().find(|t| t.text == "due in 2h").unwrap();
         assert_eq!(due.color, kit::SKY);
-        let card = out.panels.first().unwrap();
-        assert_eq!(card.border, kit::LINE_2);
+        assert_eq!(card_panels(&out)[0].border, kit::LINE_2);
 
         let ov = item("t1", "task", true, false);
         let ag = agenda(vec![ov], 1);
-        let mut out = SceneBatches::default();
-        rail(Some(&ag), None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
         let due = out.texts.iter().find(|t| t.text == "overdue 2h").unwrap();
         assert_eq!(due.color, kit::AMBER);
-        assert_eq!(out.panels.first().unwrap().border, kit::AMBER);
+        assert_eq!(card_panels(&out)[0].border, kit::AMBER);
     }
 
     #[test]
     fn answered_question_reads_green() {
         let ag = agenda(vec![item("q1", "question", false, true)], 1);
-        let mut out = SceneBatches::default();
-        rail(Some(&ag), None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
         let answered = out.texts.iter().find(|t| t.text == "answered").unwrap();
         assert_eq!(answered.color, kit::GREEN);
     }
@@ -586,17 +802,8 @@ mod tests {
             "a genuinely long parked question title that cannot fit one rail line".repeat(2);
         let ag = agenda(vec![long, item("t1", "task", false, false)], 2);
 
-        let mut collapsed = SceneBatches::default();
-        rail(Some(&ag), None, None, 0.0, &ApproxMeasure, &mut collapsed);
-        let mut expanded = SceneBatches::default();
-        rail(
-            Some(&ag),
-            Some("agenda:q1"),
-            None,
-            0.0,
-            &ApproxMeasure,
-            &mut expanded,
-        );
+        let collapsed = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        let expanded = build_rail(Some(&ag), Some("agenda:q1"), &kit::LayoutState::default());
 
         let h = |out: &SceneBatches| {
             out.hits
@@ -612,7 +819,7 @@ mod tests {
             "wrapped title lines render"
         );
         // Selection wears the loud iris border.
-        assert_eq!(expanded.panels.first().unwrap().border, kit::IRIS);
+        assert_eq!(card_panels(&expanded)[0].border, kit::IRIS);
         // The card below shifts down to make room.
         let below = |out: &SceneBatches| {
             out.hits
@@ -627,35 +834,104 @@ mod tests {
     }
 
     #[test]
+    fn selected_open_card_arms_the_complete_hold() {
+        let ag = agenda(vec![item("t1", "task", false, false)], 1);
+        // Unselected: no verb targets at all.
+        let collapsed = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        assert!(collapsed
+            .hits
+            .iter()
+            .all(|h| !h.id.starts_with("agendaop:")));
+        let out = build_rail(Some(&ag), Some("agenda:t1"), &kit::LayoutState::default());
+        let verb = out
+            .hits
+            .iter()
+            .find(|h| h.id == "agendaop:t1:complete")
+            .expect("complete pill armed");
+        assert_eq!(verb.kind, HitKind::AgendaComplete);
+        assert_eq!(verb.agent_id, "t1");
+        assert!(out.hits.iter().all(|h| h.id != "agendaop:t1:reopen"));
+        assert!(texts_of(&out).contains(&"complete"));
+    }
+
+    #[test]
+    fn selected_done_card_arms_the_reopen_undo() {
+        let mut done = item("d1", "task", true, false);
+        done.done = true;
+        let ag = agenda(vec![done], 1);
+        let out = build_rail(Some(&ag), Some("agenda:d1"), &kit::LayoutState::default());
+        let verb = out
+            .hits
+            .iter()
+            .find(|h| h.id == "agendaop:d1:reopen")
+            .expect("reopen pill armed");
+        assert_eq!(verb.kind, HitKind::AgendaReopen);
+        assert!(out.hits.iter().all(|h| h.id != "agendaop:d1:complete"));
+        let texts = texts_of(&out);
+        assert!(texts.contains(&"reopen"));
+        assert!(texts.contains(&"done"), "done chip: {texts:?}");
+        // A done card never warns, whatever its old due state.
+        assert_eq!(card_panels(&out)[0].border, kit::IRIS, "selected border");
+        assert!(!texts.contains(&"overdue 2h"), "due chip drops on done");
+    }
+
+    #[test]
+    fn op_status_renders_honest_feedback() {
+        let mut ag = agenda(vec![item("t1", "task", false, false)], 1);
+        ag.op_status = Some(XrAgendaOpStatus {
+            id: "t1".into(),
+            op: "complete".into(),
+            state: "pending".into(),
+            detail: String::new(),
+        });
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        assert!(texts_of(&out).contains(&"completing…"));
+
+        ag.op_status.as_mut().unwrap().state = "ok".into();
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        let line = out.texts.iter().find(|t| t.text == "completed").unwrap();
+        assert_eq!(line.color, kit::GREEN);
+
+        ag.op_status = Some(XrAgendaOpStatus {
+            id: "t1".into(),
+            op: "reopen".into(),
+            state: "error".into(),
+            detail: "agenda op failed (403)".into(),
+        });
+        let out = build_rail(Some(&ag), None, &kit::LayoutState::default());
+        let line = out
+            .texts
+            .iter()
+            .find(|t| t.text == "agenda op failed (403)")
+            .expect("refusal text rendered");
+        assert_eq!(line.color, kit::RED);
+    }
+
+    #[test]
     fn empty_error_and_absent_states_are_honest() {
-        let mut out = SceneBatches::default();
-        rail(
+        let out = build_rail(
             Some(&agenda(Vec::new(), 0)),
             None,
-            None,
-            0.0,
-            &ApproxMeasure,
-            &mut out,
+            &kit::LayoutState::default(),
         );
         let texts = texts_of(&out);
         assert!(texts.contains(&"Agenda"));
         assert!(texts.contains(&"agenda is empty"));
-        assert!(out.hits.is_empty());
+        assert!(out.hits.iter().all(|h| h.kind != HitKind::Card));
 
-        let mut out = SceneBatches::default();
         let err = XrAgenda {
             error: "agenda unavailable (503)".into(),
             open: 0,
             items: Vec::new(),
+            op_status: None,
         };
-        rail(Some(&err), None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(Some(&err), None, &kit::LayoutState::default());
         let texts = texts_of(&out);
         assert!(texts.contains(&"agenda unavailable"));
         assert!(texts.contains(&"agenda unavailable (503)"));
 
         // No agenda block at all → no rail, not even a header.
-        let mut out = SceneBatches::default();
-        rail(None, None, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build_rail(None, None, &kit::LayoutState::default());
         assert!(out.texts.is_empty() && out.panels.is_empty() && out.hits.is_empty());
     }
 
@@ -695,6 +971,8 @@ mod tests {
             &Default::default(),
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );
@@ -717,6 +995,8 @@ mod tests {
             &Default::default(),
             true,
             0.0,
+            &kit::LayoutState::default(),
+            None,
             &ApproxMeasure,
             &mut out,
         );

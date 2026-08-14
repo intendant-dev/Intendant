@@ -17,14 +17,17 @@ export class XrWeb {
     }
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
-     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
-     * toggles the capture), the same
-     * activation-by-name contract the other rendered surface gives the
-     * validator and accessibility layers. Runs the exact dispatch path
-     * a completed ray interaction runs — activation by name IS the
-     * deliberate act, so approve/deny fire without the hold. Returns
-     * true when the target existed and had an effect.
+     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle` /
+     * `close` / `open` / `kill`, `verb:<agent>:<op>`,
+     * `agendaop:<item>:<op>`, `layout:<surface>`, `close:<surface>`,
+     * `steer:<agent>`, `key:<token>`, `voice:talk` — toggles the
+     * capture), the same activation-by-name contract the other
+     * rendered surface gives the validator and accessibility layers.
+     * Runs the exact dispatch path a completed ray interaction runs —
+     * activation by name IS the deliberate act, so hold-tier targets
+     * (approve/deny, interrupt, terminal open/kill, agenda complete)
+     * fire without the hold. Returns true when the target existed and
+     * had an effect.
      * @param {string} name
      * @returns {boolean}
      */
@@ -32,6 +35,19 @@ export class XrWeb {
         const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.xrweb_activate(this.__wbg_ptr, ptr0, len0);
+        return ret !== 0;
+    }
+    /**
+     * Restore a persisted layout snapshot (the `layoutJson` shape).
+     * Tolerant of malformed input; values clamp. Returns whether
+     * anything applied.
+     * @param {string} json
+     * @returns {boolean}
+     */
+    applyLayout(json) {
+        const ptr0 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.xrweb_applyLayout(this.__wbg_ptr, ptr0, len0);
         return ret !== 0;
     }
     /**
@@ -93,6 +109,23 @@ export class XrWeb {
         wasm.xrweb_exit(this.__wbg_ptr);
     }
     /**
+     * The layout state (hidden set + stored poses) as a JSON string —
+     * what `ui2-xr.js` persists to localStorage.
+     * @returns {string}
+     */
+    layoutJson() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.xrweb_layoutJson(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * New painted content on the registered canvas; the encoder
      * re-uploads on the next frame (uploads are generation-gated so an
      * idle terminal costs no texture bandwidth).
@@ -102,6 +135,21 @@ export class XrWeb {
         const ptr0 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.xrweb_markTerminalCanvasDirty(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Nudge a movable surface (terminal / agenda / monitors) along its
+     * cylinder band — the QA/probe twin of grab-to-move. Deltas are
+     * radians and meters; the result clamps to the comfortable band.
+     * @param {string} surface
+     * @param {number} d_az
+     * @param {number} d_y
+     * @returns {boolean}
+     */
+    moveSurface(surface, d_az, d_y) {
+        const ptr0 = passStringToWasm0(surface, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.xrweb_moveSurface(this.__wbg_ptr, ptr0, len0, d_az, d_y);
+        return ret !== 0;
     }
     constructor() {
         const ret = wasm.xrweb_new();
@@ -998,7 +1046,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 83, function: Function { arguments: [Externref], shim_idx: 84, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 85, function: Function { arguments: [Externref], shim_idx: 86, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

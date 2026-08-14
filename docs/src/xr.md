@@ -72,15 +72,21 @@ same pinned-wasm-pack pipeline as the other browser crates):
   termination path.
 - **`input.rs`** — one abstraction for every input source (Quest
   controllers, Quest hands, Vision Pro transient-pointer): target ray +
-  the select event family. Per-frame raycast hover; cards select on
-  release; **approve/deny require a 900 ms uninterrupted pinch-hold** that
-  visibly fills the pill and cancels when aim drifts — a trust-critical
-  action never misfires off a stray pinch. `activate(name)` runs the same
-  dispatch path for automation/accessibility (activation by name is the
-  deliberate act).
+  the select event family. Per-frame raycast hover; the interaction
+  grammar is absolute — **quick pinch = light/reversible acts** (select,
+  paging, summon/dismiss, layout toggles, thread-action pills, reopen),
+  **900 ms uninterrupted pinch-hold = trust-critical or destructive
+  acts** (approve/deny, interrupt, terminal open/kill, agenda complete)
+  with the visible confirm fill that cancels when aim drifts. A pinch on
+  a grab bar instead steers that surface along its cylinder band until
+  release. `activate(name)` runs the same dispatch path for
+  automation/accessibility (activation by name is the deliberate act,
+  so hold-tier targets fire without the hold).
 - **`terminal.rs`** — the in-scene terminal pane (below): summon pill,
-  pane layout, the honest empty/warming/watching states, and the
-  facade seams the dashboard's terminal painter feeds.
+  pane layout, the honest empty/warming/watching/exited states, the
+  lifecycle pills (held open/restart + held end-shell, quick
+  view-dismiss), and the facade seams the dashboard's terminal painter
+  feeds.
 - **`keyboard.rs`** — in-scene text entry (below): the focused-field
   model (`TextEntry` — field id, label, buffer, cursor, one-shot
   shift), the ray-typed QWERTY board, and the `text_commit` emit path.
@@ -106,26 +112,78 @@ presence AI in XR — a designed seam, not a hack) and compositor media
 layers (below); ray typing and hold-to-talk dictation shipped instead
 as the first text-input slices.
 
-### Terminal pane (slice 1: read-only watching)
+### Terminal pane (slice 2: watching + lifecycle)
 
 A "terminal" pill sits on the operator's right (mirroring the monitor
-stack on the left); a quick pinch summons a pane that watches the
-dashboard's standalone shell — the same PTY the flat Terminal tab
-drives (`terminal_open`/`terminal_output` over the dashboard-control
-tunnel, `terminal.rs` on the daemon). The flat tab's machinery owns the
-attach and the xterm buffer; the `ui2-xr.js` terminal section paints
-that buffer onto an offscreen canvas (cell colors/SGR from the same
-ui-v2 token theme the flat terminal resolves) and registers it through
-the facade's canvas-texture seam, so the wire protocol is reused
-verbatim and no second listener is attached. The pane label carries the
-PTY's real id and host ("shell-0 · This daemon"), the status line is
-the flat tab's verbatim, and a visible "watching — input on the
-dashboard" line states the read-only contract — XR deliberately never
-sends `terminal_open` (the daemon's `open_or_attach` would spawn a
-shell when none exists), so a page with no terminal session shows
-"no terminals — open one on the dashboard" instead. Input from the
-headset is a later slice (hardware keyboards in immersive sessions are
-unverified on the Quest).
+stack's default slot on the left); a quick pinch summons a pane that
+watches the dashboard's standalone shell — the same PTY the flat
+Terminal tab drives (`terminal_open`/`terminal_output` over the
+dashboard-control tunnel, `terminal.rs` on the daemon). The flat tab's
+machinery owns the attach and the xterm buffer; the `ui2-xr.js`
+terminal section paints that buffer onto an offscreen canvas (cell
+colors/SGR from the same ui-v2 token theme the flat terminal resolves)
+and registers it through the facade's canvas-texture seam, so the wire
+protocol is reused verbatim and no second listener is attached. The
+pane label carries the PTY's real id and host ("shell-0 · This
+daemon") and the status line is the flat tab's verbatim.
+
+Lifecycle lives in-scene (owner-directed; this relaxed slice 1's
+read-only-no-open stance): with no live session the pane offers an
+**open terminal** (or, over an exited session, **restart shell**) pill —
+a 900 ms hold with the confirm fill, because the daemon's
+`open_or_attach` spawns a shell when none exists; the note beside it
+says so ("hold — spawns a shell on this daemon"). Completing the hold
+emits the dashboard's own `navigate → terminal/shell` action, arming
+the flat machinery exactly as clicking the Terminal tab would — no new
+protocol. A live session instead carries the held **end shell** pill
+(a `terminal_close` frame through the existing shell-frame sender —
+it kills the PTY and the pane relabels to the honest exited state),
+while the quick **close** pill only dismisses the XR view: the PTY and
+the flat tab's attach keep running. Spawning works where the flat
+Terminal works (loopback and Operate-tier lanes); a lane that refuses
+terminal frames keeps refusing — XR renders the same refusal, never a
+second path.
+
+Typing from the headset still waits for the keyboard seat (hardware
+keyboards in immersive sessions are unverified on the Quest); the
+"watching — input on the dashboard" line states that contract, and the
+seat's entry point is already plumbed: `xrTerminalStdin(text)` in
+`ui2-xr.js` routes bytes through the exact sender the flat xterm's
+onData uses (queueing and re-open behavior included).
+
+### Scene control (dismiss/summon, grab-to-move, verbs)
+
+The room is operable, not just watchable:
+
+- **Dismiss and summon.** The agenda rail and each monitor carry a
+  small `x` pill (quick pinch); a fixed **layout strip** low in front —
+  the one surface that never hides — carries four toggle pills
+  (sessions / terminal / agenda / monitors) with state dots, so
+  anything dismissed comes back the same way it left. Hiding
+  `sessions` folds the shelf and workbench but **never the approval
+  banner** — an urgent ask is not tidy-away-able. Hidden state lives in
+  the engine (`debug_json.layout`) and survives snapshot ticks.
+- **Grab-to-move.** The terminal pane, agenda rail, and monitor stack
+  each carry a slim grab bar: pinch-hold it and the surface follows the
+  ray along its cylinder band (azimuth + height, clamped to a
+  comfortable range); release drops it. `ui2-xr.js` persists poses and
+  hidden state to localStorage per browser and restores them before
+  entry; `xrProbe.moveSurface(name, dAz, dY)` is the QA twin.
+- **Session verbs.** The focused session's workbench carries a verb row
+  above its top edge: **stop** when the feed says the turn is
+  interruptible (900 ms hold — it stops a live turn) plus the session's
+  advertised thread-action ops (**compact** / **fork**, quick pinch).
+  They emit the flat surface's exact `session_action` shapes through
+  `handleStationAction`, so routing, peer scoping, and refusals are the
+  dashboard's own.
+- **Agenda quick-verbs.** The rail's selected card carries **complete**
+  (900 ms hold — semi-destructive) or, on a just-completed card,
+  **reopen** (quick pinch — the undo; completed items linger briefly as
+  muted done cards so the undo has a target). Both route through the
+  dashboard's own `api_agenda_op` projection via `daemonApi`, and the
+  rail renders honest per-op status (completing… / completed / the
+  daemon's refusal text). Answer and park-with-text wait for the
+  keyboard seat.
 
 ### Text input (steering a session from the room)
 
@@ -267,9 +325,16 @@ change that must move the pin and this paragraph together.
 
 So the two lanes divide cleanly: the **adb/loopback lane** is
 full-powers XR (the headset is a trusted local surface — pinch-hold
-approvals work); the **lease lane** is zero-setup supervision (watch the
-fleet, watch the screens, see approvals pending — and resolve them from
-your desk, phone, or any trusted surface).
+approvals work, and so do the scene verbs: interrupt, thread actions,
+terminal lifecycle, agenda ops); the **lease lane** is zero-setup
+supervision (watch the fleet, watch the screens, see approvals pending —
+and resolve them from your desk, phone, or any trusted surface). The
+scene verbs never widen a wall: each rides an existing dashboard
+route/action, so whatever a lane's projection or the action wall
+refuses stays refused, and XR renders the refusal (the agenda rail's op
+status line, the terminal status line) instead of inventing a second
+path. Scene-local control — dismiss/summon, grab-to-move, the layout
+strip — works on every lane; it touches no daemon.
 
 ### Without a headset
 
@@ -279,15 +344,23 @@ shim (no dependency; it covers exactly the interface surface
 end: chip → immersive entry → stereo frame loop (2 views) →
 synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
-never routed to a live daemon) → the text-entry pass (steer pill → ray-typed
-keys → a captured `text_commit` asserted field-and-text, plus the honest
-"sending" park under captureOnly and a clean cancel) → the voice pass
-(talk toggle → captured capture verbs → a shim transcript through the
-real `voiceResult` seam landing in the text-entry buffer → the keyboard's
-enter committing it as a captured `text_commit` → failure/unavailability
-honesty; no mic, no ASR) → the terminal pane pass (summon → honest empty
-state → canvas-seam registration → dismiss).
-`xrProbe` (the `stationProbe`-convention QA facade) and `debugJson()` expose
+never routed to a live daemon) → transcript paging → the text-entry pass
+(steer pill → ray-typed keys → a captured `text_commit` asserted
+field-and-text, plus the honest "sending" park under captureOnly and a
+clean cancel) → the voice pass (talk toggle → captured capture verbs → a
+shim transcript through the real `voiceResult` seam landing in the
+text-entry buffer → the keyboard's enter committing it as a captured
+`text_commit` → failure/unavailability honesty; no mic, no ASR) → the
+terminal pane pass (summon → honest empty state → canvas-seam
+registration → dismiss) → the scene-verbs pass: captured
+interrupt/thread-action shapes off the workbench, the terminal open
+affordance captured as the navigate action (no PTY is ever spawned by
+the probe) and the held kill's intent, layout strip hide/show asserted
+through `debug_json`'s hidden set and panel deltas, grab-move nudges
+with band clamps via `xrProbe.moveSurface`, and the agenda
+complete/reopen captures. The agenda rail leg rides the same snapshot
+(three cards including a done one). `xrProbe` (the
+`stationProbe`-convention QA facade) and `debugJson()` expose
 engine/scene state for ad-hoc probing.
 
 ## Roadmap

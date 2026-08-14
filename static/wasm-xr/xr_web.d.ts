@@ -10,16 +10,25 @@ export class XrWeb {
     [Symbol.dispose](): void;
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
-     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
-     * toggles the capture), the same
-     * activation-by-name contract the other rendered surface gives the
-     * validator and accessibility layers. Runs the exact dispatch path
-     * a completed ray interaction runs — activation by name IS the
-     * deliberate act, so approve/deny fire without the hold. Returns
-     * true when the target existed and had an effect.
+     * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle` /
+     * `close` / `open` / `kill`, `verb:<agent>:<op>`,
+     * `agendaop:<item>:<op>`, `layout:<surface>`, `close:<surface>`,
+     * `steer:<agent>`, `key:<token>`, `voice:talk` — toggles the
+     * capture), the same activation-by-name contract the other
+     * rendered surface gives the validator and accessibility layers.
+     * Runs the exact dispatch path a completed ray interaction runs —
+     * activation by name IS the deliberate act, so hold-tier targets
+     * (approve/deny, interrupt, terminal open/kill, agenda complete)
+     * fire without the hold. Returns true when the target existed and
+     * had an effect.
      */
     activate(name: string): boolean;
+    /**
+     * Restore a persisted layout snapshot (the `layoutJson` shape).
+     * Tolerant of malformed input; values clamp. Returns whether
+     * anything applied.
+     */
+    applyLayout(json: string): boolean;
     /**
      * Close the text entry without committing (drops the draft).
      */
@@ -48,11 +57,22 @@ export class XrWeb {
      */
     exit(): void;
     /**
+     * The layout state (hidden set + stored poses) as a JSON string —
+     * what `ui2-xr.js` persists to localStorage.
+     */
+    layoutJson(): string;
+    /**
      * New painted content on the registered canvas; the encoder
      * re-uploads on the next frame (uploads are generation-gated so an
      * idle terminal costs no texture bandwidth).
      */
     markTerminalCanvasDirty(source_id: string): void;
+    /**
+     * Nudge a movable surface (terminal / agenda / monitors) along its
+     * cylinder band — the QA/probe twin of grab-to-move. Deltas are
+     * radians and meters; the result clamps to the comfortable band.
+     */
+    moveSurface(surface: string, d_az: number, d_y: number): boolean;
     constructor();
     /**
      * Open the in-scene text entry bound to a field id, with a human
@@ -145,12 +165,15 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_xrweb_free: (a: number, b: number) => void;
     readonly xrweb_activate: (a: number, b: number, c: number) => number;
+    readonly xrweb_applyLayout: (a: number, b: number, c: number) => number;
     readonly xrweb_cancelTextEntry: (a: number) => void;
     readonly xrweb_debugJson: (a: number) => [number, number];
     readonly xrweb_enter: (a: number, b: number, c: number) => any;
     readonly xrweb_enterWithOverlay: (a: number, b: number, c: number, d: any) => any;
     readonly xrweb_exit: (a: number) => void;
+    readonly xrweb_layoutJson: (a: number) => [number, number];
     readonly xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
+    readonly xrweb_moveSurface: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly xrweb_new: () => number;
     readonly xrweb_openTextEntry: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly xrweb_probeSupport: (a: number) => any;

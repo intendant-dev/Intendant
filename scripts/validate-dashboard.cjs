@@ -187,6 +187,8 @@ const XR_PROBE_SNAPSHOT = {
       needsApproval: true, approvalId: 'xr-probe-ap1',
       approvalCommand: 'echo probe', approvalCategory: 'shell',
       sessionId: 'probe-session-2', source: 'codex',
+      // Session verbs: the interrupt hold + one advertised thread op.
+      canInterrupt: true, threadActions: ['compact'],
     },
   ],
   // Thread lines for the approval agent: enough rows that the focused
@@ -200,7 +202,8 @@ const XR_PROBE_SNAPSHOT = {
     msg: `probe thread line ${i}: the deliberate confirm hold keeps approvals off stray pinches`,
   })),
   // Agenda rail: two open items (a question and an overdue blocked task)
-  // plus a total that forces the honest "+1 more" overflow line.
+  // plus a total that forces the honest "+1 more" overflow line, and a
+  // done card (the reopen undo's target).
   agenda: {
     open: 3,
     items: [
@@ -211,6 +214,10 @@ const XR_PROBE_SNAPSHOT = {
       {
         id: 'xr-ag-t1', title: 'Water the office plants', kind: 'task',
         due: 'overdue 2h', overdue: true, blocked: true, answered: false,
+      },
+      {
+        id: 'xr-ag-d1', title: 'Already shipped', kind: 'task',
+        due: '', overdue: false, blocked: false, answered: false, done: true,
       },
     ],
   },
@@ -2720,11 +2727,12 @@ class BrowserHarness {
       'xrProbe.debugJson().then((d) => d.terminal.open === false)',
       timeoutMs,
     );
-    // Agenda rail: the injected snapshot carries two open items — the
-    // scene must build both rail cards (each is a hit target), and a
-    // pinch-select must expand one locally (read-only; no action fires).
+    // Agenda rail: the injected snapshot carries two open items and a
+    // done card — the scene must build all three rail cards (each a hit
+    // target), and a pinch-select must expand one locally (selection is
+    // scene-local; no action fires).
     await this.waitForFunction(
-      "xrProbe.debugJson().then((d) => d.scene.agendaItems === 2 && d.scene.hitTargets.includes('agenda:xr-ag-q1'))",
+      "xrProbe.debugJson().then((d) => d.scene.agendaItems === 3 && d.scene.hitTargets.includes('agenda:xr-ag-q1'))",
       timeoutMs,
     );
     const agendaSelected = await this.evaluate("xrProbe.activate('agenda:xr-ag-t1')");
@@ -2740,6 +2748,210 @@ class BrowserHarness {
     const reselected = await this.evaluate("xrProbe.activate('card:xr-probe-a2')");
     if (reselected !== true) {
       throw new Error('xr probe: session re-selection after the agenda pass was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.transcript.rows > 0)",
+      timeoutMs,
+    );
+    // Session verbs on the focused workbench: the interrupt hold and the
+    // advertised thread op, captured against the flat surface's exact
+    // session_action shapes (captureOnly is still on — nothing routes).
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('verb:xr-probe-a2:interrupt') && d.scene.hitTargets.includes('verb:xr-probe-a2:compact'))",
+      timeoutMs,
+    );
+    const interrupted = await this.evaluate("xrProbe.activate('verb:xr-probe-a2:interrupt')");
+    if (interrupted !== true) {
+      throw new Error('xr probe: interrupt activation was refused');
+    }
+    const interruptAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (
+      !interruptAction
+      || interruptAction.type !== 'session_action'
+      || interruptAction.action !== 'interrupt'
+      || interruptAction.session_id !== 'probe-session-2'
+    ) {
+      throw new Error(`xr probe: captured interrupt action malformed: ${JSON.stringify(interruptAction)}`);
+    }
+    const compacted = await this.evaluate("xrProbe.activate('verb:xr-probe-a2:compact')");
+    if (compacted !== true) {
+      throw new Error('xr probe: thread-compact activation was refused');
+    }
+    const compactAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (
+      !compactAction
+      || compactAction.type !== 'session_action'
+      || compactAction.action !== 'thread-compact'
+      || compactAction.session_id !== 'probe-session-2'
+    ) {
+      throw new Error(`xr probe: captured thread action malformed: ${JSON.stringify(compactAction)}`);
+    }
+    // Terminal lifecycle: with no page-side session the reopened pane
+    // offers the held open pill (and no kill); its activation is
+    // CAPTURED as the dashboard's own navigate action — captureOnly
+    // keeps it from routing, so no PTY is ever spawned by the probe.
+    const termReopened = await this.evaluate("xrProbe.activate('terminal:toggle')");
+    if (termReopened !== true) {
+      throw new Error('xr probe: terminal re-open activation was refused');
+    }
+    await this.evaluate(`xrProbe.terminal.update({
+      present: false, live: false, label: '', status: '', statusKind: '', aspect: 0,
+    })`);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.terminal.open === true && d.terminal.present === false"
+        + " && d.scene.hitTargets.includes('terminal:open')"
+        + " && !d.scene.hitTargets.includes('terminal:kill'))",
+      timeoutMs,
+    );
+    const termOpenFired = await this.evaluate("xrProbe.activate('terminal:open')");
+    if (termOpenFired !== true) {
+      throw new Error('xr probe: terminal open activation was refused');
+    }
+    const openAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (
+      !openAction
+      || openAction.type !== 'navigate'
+      || openAction.tab !== 'terminal'
+      || openAction.subtab !== 'shell'
+    ) {
+      throw new Error(`xr probe: captured terminal-open action malformed: ${JSON.stringify(openAction)}`);
+    }
+    // A live session flips the affordances: kill (held) appears, open
+    // disappears; the capture is the XR-local terminal_kill intent.
+    await this.evaluate(`xrProbe.terminal.update({
+      present: true, live: true, label: 'shell-0 · probe',
+      status: 'Connected to probe', statusKind: 'ok', aspect: 0.5,
+    })`);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('terminal:kill')"
+        + " && !d.scene.hitTargets.includes('terminal:open'))",
+      timeoutMs,
+    );
+    const termKillFired = await this.evaluate("xrProbe.activate('terminal:kill')");
+    if (termKillFired !== true) {
+      throw new Error('xr probe: terminal kill activation was refused');
+    }
+    const killAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (!killAction || killAction.type !== 'terminal_kill') {
+      throw new Error(`xr probe: captured terminal-kill action malformed: ${JSON.stringify(killAction)}`);
+    }
+    const termReclosed = await this.evaluate("xrProbe.activate('terminal:close')");
+    if (termReclosed !== true) {
+      throw new Error('xr probe: terminal re-close activation was refused');
+    }
+    // Layout strip: hiding the agenda folds its cards (and panels) away;
+    // toggling back restores them. Hiding the terminal family removes
+    // even the summon pill.
+    const panelsBefore = Number(await this.evaluate('xrProbe.debugJson().then((d) => d.scene.panels)'));
+    const agendaHidden = await this.evaluate("xrProbe.activate('layout:agenda')");
+    if (agendaHidden !== true) {
+      throw new Error('xr probe: layout agenda toggle was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.layout.state.hidden.includes('agenda') && d.scene.agendaItems === 0)",
+      timeoutMs,
+    );
+    const panelsHidden = Number(await this.evaluate('xrProbe.debugJson().then((d) => d.scene.panels)'));
+    if (!(panelsHidden < panelsBefore)) {
+      throw new Error(`xr probe: hiding the agenda did not shrink the scene (${panelsBefore} -> ${panelsHidden})`);
+    }
+    await this.evaluate("xrProbe.activate('layout:agenda')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => !d.layout.state.hidden.includes('agenda') && d.scene.agendaItems === 3)",
+      timeoutMs,
+    );
+    await this.evaluate("xrProbe.activate('layout:terminal')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.layout.state.hidden.includes('terminal') && !d.scene.hitTargets.includes('terminal:toggle'))",
+      timeoutMs,
+    );
+    await this.evaluate("xrProbe.activate('layout:terminal')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('terminal:toggle'))",
+      timeoutMs,
+    );
+    // Grab-to-move via the facade nudge: deltas apply, the band clamps,
+    // and non-movable surfaces refuse.
+    const moved = await this.evaluate("xrProbe.moveSurface('terminal', -0.2, -0.1)");
+    if (moved !== true) {
+      throw new Error('xr probe: moveSurface(terminal) was refused');
+    }
+    const pose = await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.layout.state.poses.terminal || null))',
+    );
+    const parsedPose = JSON.parse(String(pose || 'null'));
+    if (!parsedPose || Math.abs(parsedPose.az - 0.46) > 0.01 || Math.abs(parsedPose.y - 1.32) > 0.01) {
+      throw new Error(`xr probe: terminal pose after nudge is off: ${pose}`);
+    }
+    await this.evaluate("xrProbe.moveSurface('terminal', 99, 99)");
+    const clamped = JSON.parse(String(await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.layout.state.poses.terminal))',
+    )));
+    if (Math.abs(clamped.az - 1.45) > 0.01 || Math.abs(clamped.y - 2.05) > 0.01) {
+      throw new Error(`xr probe: pose clamp failed: ${JSON.stringify(clamped)}`);
+    }
+    const immovable = await this.evaluate("xrProbe.moveSurface('sessions', 0.1, 0)");
+    if (immovable !== false) {
+      throw new Error('xr probe: sessions must not be movable');
+    }
+    await this.evaluate("xrProbe.moveSurface('terminal', -99, -99)");
+    await this.evaluate("xrProbe.moveSurface('terminal', 0.66 - (-1.45), 1.42 - 0.75)");
+    // Agenda quick-verbs: the selected open card arms the complete hold,
+    // the done card the reopen undo; both captures carry the agenda_op
+    // shape the JS seam routes into api_agenda_op.
+    await this.evaluate("xrProbe.activate('agenda:xr-ag-t1')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('agendaop:xr-ag-t1:complete'))",
+      timeoutMs,
+    );
+    const completeFired = await this.evaluate("xrProbe.activate('agendaop:xr-ag-t1:complete')");
+    if (completeFired !== true) {
+      throw new Error('xr probe: agenda complete activation was refused');
+    }
+    const completeAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (
+      !completeAction
+      || completeAction.type !== 'agenda_op'
+      || completeAction.op !== 'complete'
+      || completeAction.id !== 'xr-ag-t1'
+    ) {
+      throw new Error(`xr probe: captured agenda complete malformed: ${JSON.stringify(completeAction)}`);
+    }
+    await this.evaluate("xrProbe.activate('agenda:xr-ag-d1')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('agendaop:xr-ag-d1:reopen'))",
+      timeoutMs,
+    );
+    const reopenFired = await this.evaluate("xrProbe.activate('agendaop:xr-ag-d1:reopen')");
+    if (reopenFired !== true) {
+      throw new Error('xr probe: agenda reopen activation was refused');
+    }
+    const reopenAction = JSON.parse(String(
+      await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null',
+    ));
+    if (
+      !reopenAction
+      || reopenAction.type !== 'agenda_op'
+      || reopenAction.op !== 'reopen'
+      || reopenAction.id !== 'xr-ag-d1'
+    ) {
+      throw new Error(`xr probe: captured agenda reopen malformed: ${JSON.stringify(reopenAction)}`);
+    }
+    // Focus the session card again so the closing summary reads the
+    // transcript-bearing scene.
+    const refocused = await this.evaluate("xrProbe.activate('card:xr-probe-a2')");
+    if (refocused !== true) {
+      throw new Error('xr probe: final session re-selection was refused');
     }
     await this.waitForFunction(
       "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.transcript.rows > 0)",

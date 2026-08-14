@@ -39401,7 +39401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4673af2812145b6f';
+const INTENDANT_APP_BUILD = 'c80e65e25d9fb8e2';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -146258,8 +146258,11 @@ async function xrBootModule() {
     // Same dispatch seam as the other rendered surface: the emitted
     // objects carry the dashboard's action vocabulary and route through
     // the SAME router (approvals → send_approval / resolvePeerApproval).
-    // The validator's probe flips captureOnly so asserted actions never
-    // hit a live daemon.
+    // The two XR-local types (agenda_op, terminal_kill) are consumed by
+    // this fragment's scene-verbs section and routed through the
+    // dashboard's own projections — never a new protocol. The
+    // validator's probe flips captureOnly so asserted actions never hit
+    // a live daemon.
     globalThis.xrProbe.lastAction = action;
     if (xrCaptureOnly) return;
     if (action && action.type === 'text_commit') {
@@ -146269,10 +146272,13 @@ async function xrBootModule() {
       return;
     }
     try {
-      // Voice capture verbs (voice_talk start/stop/cancel) are consumed
-      // by the voice section below; everything else takes the ordinary
-      // router. (text_commit was already routed above — voice text rides
-      // the text-entry commit path, never a lane of its own.)
+      // XR-local action types are consumed by their own appended
+      // sections — scene verbs (agenda_op, terminal_kill) and voice
+      // capture verbs (voice_talk start/stop/cancel); everything else
+      // takes the ordinary router. (text_commit was already routed
+      // above — voice text rides the text-entry commit path, never a
+      // lane of its own.)
+      if (xrHandleLocalAction(action)) return;
       if (typeof xrVoiceHandleAction === 'function' && xrVoiceHandleAction(action)) return;
       if (typeof handleStationAction === 'function') {
         handleStationAction(action);
@@ -146283,8 +146289,12 @@ async function xrBootModule() {
       console.warn('[xr] action dispatch failed', err, action);
     }
   });
+  // Restore the persisted scene layout (hidden surfaces + grab-moved
+  // poses) before any session enters.
+  xrLayoutRestore();
   xrInstance.setOnSessionEnd(() => {
     xrStopSnapshotPump();
+    xrLayoutPersistMaybe();
     xrSetChipState('idle', 'Enter XR');
     // Leave a readable trace of how the session went: frames=0 means the
     // loop never presented (entry-path failure), frames>0 means a live
@@ -146359,6 +146369,7 @@ function xrStartSnapshotPump() {
       console.warn('[xr] snapshot pump error', err);
     }
     xrSyncDisplaySources();
+    xrLayoutPersistMaybe();
   }, 300);
 }
 
@@ -146487,8 +146498,11 @@ function xrMountChip() {
 // scene renders "agenda unavailable" as in-scene text — the agenda must
 // never take the session down. Item titles/bodies are DATA, never
 // instructions: they pass through as plain strings and the wasm renders
-// them as atlas text. Read-only this slice: no agenda op is ever sent
-// from XR.
+// them as atlas text. Quick-verbs (complete/reopen) route through the
+// scene-verbs section below into the dashboard's own api_agenda_op
+// projection; the pump's payload also carries the live op status and
+// keeps just-completed items visible briefly as done cards (the reopen
+// undo's target).
 // ============================================================================
 
 let xrAgendaFallback = null;      // last fallback result: {open, items} | {error}
@@ -146520,6 +146534,21 @@ function xrAgendaProject(items) {
   // Relative due labels reuse the tab's own formatter (plain ASCII text);
   // without it the chip drops and the overdue flag still colors the card.
   const rel = (ms) => (typeof agendaRelTime === 'function' ? agendaRelTime(ms) : '');
+  // Recently-XR-completed items ride along briefly as muted done cards
+  // so the reopen undo has a target: pruned by TTL, and dropped the
+  // moment the feed shows the item open again (reopened anywhere).
+  const doneCards = [];
+  for (const [id, keep] of xrAgendaDoneKeep) {
+    if (now - keep.at > XR_AGENDA_DONE_TTL_MS
+      || open.some((x) => String(x.id) === id)) {
+      xrAgendaDoneKeep.delete(id);
+      continue;
+    }
+    doneCards.push({
+      id, title: keep.title, kind: keep.kind,
+      due: '', overdue: false, blocked: false, answered: false, done: true,
+    });
+  }
   return {
     open: open.length,
     items: sorted.slice(0, XR_AGENDA_ITEM_CAP).map((x) => ({
@@ -146534,7 +146563,7 @@ function xrAgendaProject(items) {
       overdue: isOverdue(x),
       blocked: x.blocked === true,
       answered: !!(x.kind === 'question' && x.answer),
-    })),
+    })).concat(doneCards.slice(0, XR_AGENDA_DONE_CAP)),
   };
 }
 
@@ -146575,16 +146604,21 @@ function xrAgendaFallbackKick() {
 // The pump's agenda block: client-state reuse first, throttled fallback
 // second, honest error shape on any failure, null while nothing has
 // loaded yet (the rail stays absent rather than claiming emptiness).
+// The live op status (scene-verbs section) rides every non-null shape
+// so the rail can report the last complete/reopen honestly.
 function xrAgendaSummary() {
   try {
+    let out = null;
     if (typeof agendaItems !== 'undefined' && Array.isArray(agendaItems)) {
-      return xrAgendaProject(agendaItems);
+      out = xrAgendaProject(agendaItems);
+    } else if (typeof agendaLoadError !== 'undefined' && agendaLoadError) {
+      out = { error: xrAgendaShortError(agendaLoadError) };
+    } else {
+      xrAgendaFallbackKick();
+      out = xrAgendaFallback;
     }
-    if (typeof agendaLoadError !== 'undefined' && agendaLoadError) {
-      return { error: xrAgendaShortError(agendaLoadError) };
-    }
-    xrAgendaFallbackKick();
-    return xrAgendaFallback;
+    if (out && xrAgendaOpStatus) return { ...out, opStatus: { ...xrAgendaOpStatus } };
+    return out;
   } catch (err) {
     return { error: xrAgendaShortError(err) };
   }
@@ -147325,6 +147359,199 @@ function xrRouteTextCommit(action) {
 }
 
 // ── End of the text-entry section. ──
+// ── XR scene verbs (terminal lifecycle, agenda quick-verbs, layout) ──
+//
+// Appended section: the browser half of the scene's verbs. Every daemon
+// effect rides EXISTING dashboard machinery — terminal lifecycle
+// through the shell-frame sender + the navigate action (which arms
+// initShell/openShellSessionIfPossible exactly as a tab click), agenda
+// ops through the daemonApi api_agenda_op projection the flat tab
+// uses — and the layout (hidden surfaces + grab-moved poses) persists
+// to localStorage per browser. Fail-soft throughout: a refused lane
+// becomes rendered in-scene status, never a silent no-op.
+
+const XR_LAYOUT_KEY = 'intendant.ui2.xrLayout';
+const XR_AGENDA_DONE_TTL_MS = 5 * 60 * 1000;
+const XR_AGENDA_DONE_CAP = 3;
+let xrAgendaOpStatus = null;      // {id, op, state, detail} | null
+let xrAgendaOpClearTimer = null;
+const xrAgendaDoneKeep = new Map(); // id -> {title, kind, at}
+let xrLayoutLastSaved = '';
+
+// Consume the XR-local action types the wasm emits; everything else
+// falls through to handleStationAction. Always returns true for the
+// local types (the station router must never see them).
+function xrHandleLocalAction(action) {
+  if (!action || typeof action !== 'object') return false;
+  if (action.type === 'agenda_op') {
+    xrAgendaOpRun(String(action.op || ''), String(action.id || ''));
+    return true;
+  }
+  if (action.type === 'terminal_kill') {
+    xrTerminalKill();
+    return true;
+  }
+  return false;
+}
+
+// End the standalone shell's PTY: the existing terminal_close wire verb
+// through the existing sender (the daemon's close_visible sends the
+// shell EOF and releases the PTY). The page-side state is reconciled
+// through handleShellExited — our own forwarder is torn down by the
+// close, so no exited event would otherwise arrive — which relabels the
+// XR pane to its honest exited state with the restart pill.
+function xrTerminalKill() {
+  try {
+    if (typeof shellOpenAcked === 'undefined' || !shellOpenAcked) return;
+    if (typeof sendShellMessage !== 'function') return;
+    const sent = sendShellMessage({
+      t: 'terminal_close',
+      host_id: typeof currentShellHostId === 'function' ? currentShellHostId() : SHELL_HOST_ID,
+      terminal_id: SHELL_TERMINAL_ID,
+    });
+    if (sent && typeof handleShellExited === 'function') handleShellExited('closed');
+  } catch (err) {
+    console.warn('[xr] terminal kill failed', err);
+  }
+}
+
+// The keyboard seat's text seam: route bytes into the standalone shell
+// through the exact sender the flat tab's xterm onData uses (queueing
+// and re-open behavior included). Returns whether the text was handed
+// to the shell machinery. No XR surface calls this yet — the keyboard
+// seat's text path will.
+function xrTerminalStdin(text) {
+  const s = String(text ?? '');
+  if (!s) return false;
+  if (typeof shellInitialized === 'undefined' || !shellInitialized) return false;
+  if (typeof sendShellBytes !== 'function') return false;
+  sendShellBytes(s);
+  return true;
+}
+
+// Find an agenda item's display data across whichever source is live
+// (the tab's client state or the projected fallback).
+function xrAgendaFindItem(id) {
+  const pools = [];
+  if (typeof agendaItems !== 'undefined' && Array.isArray(agendaItems)) pools.push(agendaItems);
+  if (xrAgendaFallback && Array.isArray(xrAgendaFallback.items)) pools.push(xrAgendaFallback.items);
+  for (const pool of pools) {
+    const found = pool.find((x) => x && String(x.id) === id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function xrAgendaSetOpStatus(id, op, state, detail) {
+  xrAgendaOpStatus = { id, op, state, detail: String(detail || '') };
+  if (xrAgendaOpClearTimer) {
+    clearTimeout(xrAgendaOpClearTimer);
+    xrAgendaOpClearTimer = null;
+  }
+  if (state !== 'pending') {
+    // Settled states clear themselves; errors linger longer so a rail
+    // glance still catches them.
+    const snap = xrAgendaOpStatus;
+    xrAgendaOpClearTimer = setTimeout(() => {
+      if (xrAgendaOpStatus === snap) xrAgendaOpStatus = null;
+    }, state === 'ok' ? 6000 : 12000);
+  }
+}
+
+// One agenda op (complete/reopen) through the dashboard's own
+// api_agenda_op projection, with honest per-item status fed back to the
+// rail via the pump. Single-flight: a pending op refuses overlap.
+function xrAgendaOpRun(op, id) {
+  const itemId = String(id || '');
+  if ((op !== 'complete' && op !== 'reopen') || !itemId) return;
+  if (xrAgendaOpStatus && xrAgendaOpStatus.state === 'pending') return;
+  if (typeof daemonApi === 'undefined' || !daemonApi || typeof daemonApi.request !== 'function') {
+    xrAgendaSetOpStatus(itemId, op, 'error', 'agenda api unavailable');
+    return;
+  }
+  // Capture display data for the done card before the item leaves the
+  // open feed.
+  const known = xrAgendaFindItem(itemId);
+  xrAgendaSetOpStatus(itemId, op, 'pending', '');
+  (async () => {
+    try {
+      const resp = await daemonApi.request('api_agenda_op', { op, id: itemId });
+      if (resp.ok && resp.body && resp.body.item) {
+        xrAgendaSetOpStatus(itemId, op, 'ok', '');
+        if (op === 'complete') {
+          xrAgendaDoneKeep.set(itemId, {
+            title: String((known && known.title) || 'completed item').slice(0, XR_AGENDA_TITLE_CAP),
+            kind: String((known && known.kind) || 'task'),
+            at: Date.now(),
+          });
+        } else {
+          xrAgendaDoneKeep.delete(itemId);
+        }
+        // Keep the flat tab's client state honest with the same merge
+        // the tab's own emitter performs.
+        try {
+          if (typeof agendaObserveServerMessage === 'function') {
+            agendaObserveServerMessage({ item: resp.body.item });
+          }
+        } catch (_) { /* tab state repaint is best-effort */ }
+        // The throttled fallback must not keep showing the stale state:
+        // patch it now, refetch on the next pump window.
+        if (xrAgendaFallback && Array.isArray(xrAgendaFallback.items)) {
+          xrAgendaFallback = {
+            ...xrAgendaFallback,
+            items: xrAgendaFallback.items.filter((x) => String(x.id) !== itemId),
+            open: Math.max(0, (xrAgendaFallback.open || 0) - (op === 'complete' ? 1 : 0)),
+          };
+        }
+        xrAgendaFallbackAt = 0;
+      } else {
+        xrAgendaSetOpStatus(itemId, op, 'error', xrAgendaShortError(
+          (resp.body && resp.body.error) || `agenda op failed (${resp.status})`,
+        ));
+      }
+    } catch (err) {
+      xrAgendaSetOpStatus(itemId, op, 'error', xrAgendaShortError(err));
+    }
+  })();
+}
+
+// ── Layout persistence (per-browser, localStorage) ──
+
+function xrLayoutRestore() {
+  if (!xrInstance || typeof xrInstance.applyLayout !== 'function') return;
+  try {
+    const raw = window.localStorage ? localStorage.getItem(XR_LAYOUT_KEY) : null;
+    if (raw) {
+      xrInstance.applyLayout(raw);
+      xrLayoutLastSaved = xrInstance.layoutJson();
+    }
+  } catch (_) { /* storage disabled — defaults stand */ }
+}
+
+// Change-only persistence, cheap enough for the 300 ms pump: the wasm's
+// layoutJson is the single serialization, compared as a string.
+function xrLayoutPersistMaybe() {
+  if (!xrInstance || typeof xrInstance.layoutJson !== 'function') return;
+  try {
+    const now = xrInstance.layoutJson();
+    if (now === xrLayoutLastSaved) return;
+    xrLayoutLastSaved = now;
+    if (window.localStorage) localStorage.setItem(XR_LAYOUT_KEY, now);
+  } catch (_) { /* storage disabled — layout stays session-local */ }
+}
+
+// QA facade extensions for the scene verbs (stationProbe conventions).
+globalThis.xrProbe.moveSurface = (name, dAz, dY) => (
+  xrInstance ? xrInstance.moveSurface(String(name), Number(dAz) || 0, Number(dY) || 0) : false
+);
+globalThis.xrProbe.layout = () => (xrInstance ? JSON.parse(xrInstance.layoutJson()) : null);
+globalThis.xrProbe.applyLayout = (layout) => (
+  xrInstance
+    ? xrInstance.applyLayout(typeof layout === 'string' ? layout : JSON.stringify(layout))
+    : false
+);
+globalThis.xrProbe.agendaOpStatus = () => (xrAgendaOpStatus ? { ...xrAgendaOpStatus } : null);
+globalThis.xrProbe.terminal.stdin = (text) => xrTerminalStdin(text);
 /* ── static/app/ui2-composer-peek.js ── */
 // ── composer conversation peek ─────────────────────────────────────────
 // A transient sheet floating above the dock: the prompt-target session's

@@ -1,5 +1,4 @@
-//! In-scene terminal pane: read-only watching of the dashboard's
-//! standalone shell (slice 1).
+//! In-scene terminal pane: watching plus lifecycle (slice 2).
 //!
 //! The pane is a *mirror* of the flat Terminal tab's session — the same
 //! PTY the dashboard's terminal machinery attaches (`terminal_open` /
@@ -10,13 +9,18 @@
 //! second listener (a second `terminal_open` from the same page would
 //! double every output frame into the page's single handler).
 //!
-//! Read-only is the slice: XR never sends `terminal_open` — the daemon's
-//! `open_or_attach` SPAWNS a shell when none exists, and a watch surface
-//! must not create PTYs on the machine. No page-side session means the
-//! honest empty state, and the remedy is named in-scene. Input stays on
-//! the dashboard (hardware keyboards in immersive sessions are
-//! unverified on the Quest); the pane says so in a visible line rather
-//! than a tooltip.
+//! Lifecycle from XR (owner-directed relaxation of the slice-1
+//! read-only stance): with no live session to watch, the pane offers an
+//! `open terminal` / `restart shell` pill — a 900 ms hold, because the
+//! daemon's `open_or_attach` SPAWNS a PTY when none exists (the act
+//! routes as the dashboard's own `navigate → terminal/shell`, arming the
+//! flat machinery exactly as a tab click would). A live session gets the
+//! held `end shell` pill (`terminal_close` — kills the PTY, labeled as
+//! what it does), while the quick close pill only dismisses the XR view
+//! and detaches nothing. Typing still lives on the dashboard until the
+//! keyboard seat lands its text path (the `xrTerminalStdin` seam in
+//! ui2-xr.js is that seat's entry); the pane says so in a visible line
+//! rather than a tooltip.
 //!
 //! Every feed edge is fail-soft: a malformed state push is dropped and
 //! counted, a missing canvas renders the status line instead, and
@@ -32,10 +36,15 @@ use crate::kit::{
 use crate::math::{v3, Panel, Vec3};
 use crate::Inner;
 
-/// The read-only contract, rendered where the operator can see it.
+/// The typing contract, rendered where the operator can see it (the
+/// keyboard seat's text path lifts it).
 const WATCHING_LINE: &str = "watching — input on the dashboard";
-/// Empty state: the page has no terminal session to mirror.
-const EMPTY_LINE: &str = "no terminals — open one on the dashboard";
+/// Empty state: the page has no terminal session to mirror; the open
+/// pill below it is the in-scene remedy.
+const EMPTY_LINE: &str = "no terminal session";
+/// What the held open pill does, stated in-scene — spawning a shell on
+/// the machine is never ambient.
+const OPEN_NOTE_LINE: &str = "hold — spawns a shell on this daemon";
 /// Attach mirrored but the page's xterm (and so the canvas) not up yet.
 const WARMING_LINE: &str = "waiting for terminal output…";
 
@@ -231,21 +240,30 @@ fn status_kind_color(kind: &str) -> [f32; 4] {
 }
 
 /// Append the terminal affordances to a built scene: the summon pill
-/// always, the pane when open. Called from the frame loop's scene
-/// rebuild, after `ui::build_scene`, into the same batches.
+/// always (unless the family is dismissed), the pane when open. Called
+/// from the frame loop's scene rebuild, after `ui::build_scene`, into
+/// the same batches.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pane(
     pane: &PaneView,
+    layout: &kit::LayoutState,
+    grab: Option<&str>,
     hover_id: Option<&str>,
+    confirm: Option<(&str, f32)>,
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
 ) {
+    if layout.is_hidden("terminal") {
+        return;
+    }
     summon_pill(pane, hover_id, floor_y, measure, out);
     if !pane.open {
         return;
     }
 
-    let (center, right, up) = side_basis(kit::TERMINAL_AZ, kit::TERMINAL_DIST, kit::TERMINAL_Y);
+    let pose = layout.pose("terminal");
+    let (center, right, up) = side_basis(pose.az, kit::TERMINAL_DIST, pose.y);
     let hw = kit::TERMINAL_HALF_W;
     let aspect = if pane.view.aspect > 0.05 {
         pane.view.aspect
@@ -268,8 +286,19 @@ pub(crate) fn build_pane(
     });
 
     // Header row above the top edge: the PTY's real id/host on the left,
-    // the dismiss pill on the right.
+    // the lifecycle pills on the right; the grab bar rides above it all.
     let header_y = hh + 0.048;
+    crate::ui::grab_bar(
+        "terminal",
+        center + up.scale(header_y + 0.040),
+        right,
+        up,
+        hw * 0.5,
+        grab,
+        hover_id,
+        floor_y,
+        out,
+    );
     let label = if pane.view.label.is_empty() {
         "terminal".to_string()
     } else {
@@ -288,12 +317,34 @@ pub(crate) fn build_pane(
         height: 0.026,
         color: kit::TEXT,
         align: TextAlign::Left,
-        max_width: hw * 2.0 - 0.22,
+        max_width: hw * 2.0 - 0.34,
         text: label,
     });
-    close_pill(
+    let close_left = close_pill(
         center, right, up, hw, header_y, hover_id, floor_y, measure, out,
     );
+    // The kill verb, held: ends the PTY itself (terminal_close on the
+    // wire), distinct from the quick close that only dismisses this
+    // view. Only a live session can be ended.
+    if pane.view.present && pane.view.live {
+        let label_h = 0.019;
+        let pill_hw = (measure.measure("end shell", label_h) / 2.0 + 0.020).max(0.045);
+        crate::ui::action_pill(
+            "terminal:kill",
+            "end shell",
+            HitKind::TerminalKill,
+            "",
+            kit::RED,
+            center + right.scale(close_left - pill_hw - 0.016) + up.scale(header_y - 0.008),
+            right,
+            up,
+            hover_id,
+            confirm,
+            floor_y,
+            measure,
+            out,
+        );
+    }
 
     if pane.view.present {
         match &pane.canvas_id {
@@ -339,7 +390,7 @@ pub(crate) fn build_pane(
     }
 
     // Below the pane: the flat tab's status line verbatim, then the
-    // read-only contract while something is being watched.
+    // typing contract while something is being watched.
     let mut below_y = -hh - 0.045;
     if !pane.view.status.is_empty() {
         out.texts.push(TextRun {
@@ -376,6 +427,52 @@ pub(crate) fn build_pane(
             align: TextAlign::Left,
             max_width: hw * 2.0,
             text: WATCHING_LINE.to_string(),
+        });
+        below_y -= 0.040;
+    }
+    // The open verb, held: with no live session — never armed, nothing
+    // to open — spawning is the deliberate act. An exited page session
+    // restarts (the daemon's open replaces the dead PTY with a fresh
+    // spawn); a page that never armed one opens cold. Both route as the
+    // dashboard's own navigate action, arming the flat machinery whole.
+    if !(pane.view.present && pane.view.live) {
+        let open_label = if pane.view.present {
+            "restart shell"
+        } else {
+            "open terminal"
+        };
+        let label_h = 0.019;
+        let pill_hw = (measure.measure(open_label, label_h) / 2.0 + 0.020).max(0.045);
+        crate::ui::action_pill(
+            "terminal:open",
+            open_label,
+            HitKind::TerminalOpen,
+            "",
+            kit::GREEN,
+            center + right.scale(-hw + pill_hw) + up.scale(below_y - 0.012),
+            right,
+            up,
+            hover_id,
+            confirm,
+            floor_y,
+            measure,
+            out,
+        );
+        out.texts.push(TextRun {
+            origin: lift(
+                center + right.scale(-hw + pill_hw * 2.0 + 0.022) + up.scale(below_y - 0.018),
+                right,
+                up,
+                LIFT_TEXT,
+                floor_y,
+            ),
+            right,
+            up,
+            height: 0.017,
+            color: kit::TEXT_3,
+            align: TextAlign::Left,
+            max_width: hw * 2.0 - pill_hw * 2.0 - 0.03,
+            text: OPEN_NOTE_LINE.to_string(),
         });
     }
 }
@@ -483,7 +580,10 @@ fn summon_pill(
     });
 }
 
-/// The pane's dismiss pill, top-right on the header row.
+/// The pane's dismiss pill, top-right on the header row. Quick pinch —
+/// it closes only this XR view; the PTY (and the flat tab's attach)
+/// keep running. Returns the pill's left edge in panel-local x so the
+/// kill pill can sit beside it.
 #[allow(clippy::too_many_arguments)]
 fn close_pill(
     pane_center: Vec3,
@@ -495,7 +595,7 @@ fn close_pill(
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
-) {
+) -> f32 {
     let text_h = 0.019;
     let label = "close";
     let pill_hw = (measure.measure(label, text_h) / 2.0 + 0.020).max(0.045);
@@ -545,6 +645,7 @@ fn close_pill(
             half_h: pill_hh,
         },
     });
+    hw - pill_hw * 2.0
 }
 
 #[cfg(test)]
@@ -571,6 +672,21 @@ mod tests {
         }
     }
 
+    fn build(pane: &PaneView, layout: &kit::LayoutState) -> SceneBatches {
+        let mut out = SceneBatches::default();
+        build_pane(
+            pane,
+            layout,
+            None,
+            None,
+            None,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        out
+    }
+
     #[test]
     fn view_parses_the_dashboard_shape_and_ignores_extras() {
         let parsed: TerminalView = serde_json::from_value(serde_json::json!({
@@ -591,9 +707,8 @@ mod tests {
 
     #[test]
     fn closed_pane_offers_only_the_summon_pill() {
-        let mut out = SceneBatches::default();
         let pane = PaneView::default();
-        build_pane(&pane, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build(&pane, &kit::LayoutState::default());
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].id, "terminal:toggle");
         assert_eq!(out.hits[0].kind, HitKind::TerminalToggle);
@@ -603,41 +718,107 @@ mod tests {
     }
 
     #[test]
-    fn open_pane_with_canvas_watches_and_stays_honest() {
-        let mut out = SceneBatches::default();
-        build_pane(&view(true), None, 0.0, &ApproxMeasure, &mut out);
+    fn hidden_family_builds_nothing_at_all() {
+        let mut layout = kit::LayoutState::default();
+        layout.hide("terminal");
+        let out = build(&view(true), &layout);
+        assert!(out.hits.is_empty() && out.panels.is_empty() && out.texts.is_empty());
+        assert!(out.monitors.is_empty());
+    }
+
+    #[test]
+    fn open_pane_with_canvas_watches_and_arms_lifecycle() {
+        let out = build(&view(true), &kit::LayoutState::default());
         // The canvas quad rides the monitor path under the canvas id.
         assert_eq!(out.monitors.len(), 1);
         assert_eq!(out.monitors[0].id, "term:shell");
-        // Dismiss affordance armed.
+        // Dismiss affordance armed (quick, view-local), the held kill
+        // verb beside it, and the grab bar above; a live session offers
+        // no open pill.
         assert!(out.hits.iter().any(|h| h.id == "terminal:close"));
-        // Label, status (verbatim), and the read-only contract line.
+        let kill = out
+            .hits
+            .iter()
+            .find(|h| h.id == "terminal:kill")
+            .expect("end-shell pill armed");
+        assert_eq!(kill.kind, HitKind::TerminalKill);
+        let grab = out
+            .hits
+            .iter()
+            .find(|h| h.id == "grab:terminal")
+            .expect("grab bar armed");
+        assert_eq!(grab.kind, HitKind::Grab);
+        assert_eq!(grab.agent_id, "terminal");
+        assert!(out.hits.iter().all(|h| h.id != "terminal:open"));
+        // Label, status (verbatim), the typing contract line, and the
+        // honest kill label.
         assert!(out.texts.iter().any(|t| t.text == "shell-0 · This daemon"));
         assert!(out
             .texts
             .iter()
             .any(|t| t.text == "Connected to This daemon"));
         assert!(out.texts.iter().any(|t| t.text == WATCHING_LINE));
+        assert!(out.texts.iter().any(|t| t.text == "end shell"));
         assert!(!out.texts.iter().any(|t| t.text == EMPTY_LINE));
     }
 
     #[test]
-    fn open_pane_without_session_renders_the_empty_state() {
-        let mut out = SceneBatches::default();
-        build_pane(&view(false), None, 0.0, &ApproxMeasure, &mut out);
+    fn open_pane_without_session_offers_the_held_open() {
+        let out = build(&view(false), &kit::LayoutState::default());
         assert!(out.monitors.is_empty());
         assert!(out.texts.iter().any(|t| t.text == EMPTY_LINE));
-        // No session — no watching claim.
+        // No session — no watching claim, no kill verb; the open pill
+        // (hold tier) and its spawn note are the in-scene remedy.
         assert!(!out.texts.iter().any(|t| t.text == WATCHING_LINE));
+        assert!(out.hits.iter().all(|h| h.id != "terminal:kill"));
+        let open = out
+            .hits
+            .iter()
+            .find(|h| h.id == "terminal:open")
+            .expect("open pill armed");
+        assert_eq!(open.kind, HitKind::TerminalOpen);
+        assert!(out.texts.iter().any(|t| t.text == "open terminal"));
+        assert!(out.texts.iter().any(|t| t.text == OPEN_NOTE_LINE));
         assert!(out.hits.iter().any(|h| h.id == "terminal:close"));
     }
 
     #[test]
+    fn exited_session_offers_restart_not_open() {
+        // present but not live: the page mirrors a dead PTY (exited) —
+        // the open pill relabels honestly and the kill verb drops.
+        let mut pane = view(true);
+        pane.view.live = false;
+        pane.view.status = "Shell exited (status 0) on This daemon".into();
+        pane.view.status_kind = "warn".into();
+        let out = build(&pane, &kit::LayoutState::default());
+        let open = out
+            .hits
+            .iter()
+            .find(|h| h.id == "terminal:open")
+            .expect("restart pill armed");
+        assert_eq!(open.kind, HitKind::TerminalOpen);
+        assert!(out.texts.iter().any(|t| t.text == "restart shell"));
+        assert!(!out.texts.iter().any(|t| t.text == "open terminal"));
+        assert!(out.hits.iter().all(|h| h.id != "terminal:kill"));
+    }
+
+    #[test]
+    fn pane_pose_moves_with_the_layout() {
+        let mut moved = kit::LayoutState::default();
+        moved.set_pose("terminal", 0.2, 1.1);
+        let default_out = build(&view(true), &kit::LayoutState::default());
+        let moved_out = build(&view(true), &moved);
+        let a = default_out.monitors[0].center;
+        let b = moved_out.monitors[0].center;
+        assert!(a.x != b.x, "azimuth moved the pane");
+        assert!((b.y - 1.1).abs() < 1e-5, "height follows the pose");
+    }
+
+    #[test]
     fn present_without_canvas_reports_warming_not_empty() {
-        let mut out = SceneBatches::default();
         let mut pane = view(true);
         pane.canvas_id = None;
-        build_pane(&pane, None, 0.0, &ApproxMeasure, &mut out);
+        let out = build(&pane, &kit::LayoutState::default());
         assert!(out.monitors.is_empty());
         assert!(out.texts.iter().any(|t| t.text == WARMING_LINE));
         assert!(!out.texts.iter().any(|t| t.text == EMPTY_LINE));
@@ -645,13 +826,11 @@ mod tests {
 
     #[test]
     fn canvas_aspect_drives_pane_height() {
-        let mut tall = SceneBatches::default();
         let mut pane = view(true);
         pane.view.aspect = 0.9;
-        build_pane(&pane, None, 0.0, &ApproxMeasure, &mut tall);
-        let mut default = SceneBatches::default();
+        let tall = build(&pane, &kit::LayoutState::default());
         pane.view.aspect = 0.0;
-        build_pane(&pane, None, 0.0, &ApproxMeasure, &mut default);
+        let default = build(&pane, &kit::LayoutState::default());
         let th = tall.monitors[0].half_h;
         let dh = default.monitors[0].half_h;
         assert!((th - kit::TERMINAL_HALF_W * 0.9).abs() < 1e-5);

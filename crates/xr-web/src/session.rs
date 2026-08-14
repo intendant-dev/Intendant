@@ -270,6 +270,8 @@ async fn configure_and_arm(
             let mut inner = end_inner.borrow_mut();
             inner.active = false;
             inner.mode = None;
+            // A grab can't survive the session that was steering it.
+            inner.grab_surface = None;
             inner.overlay_requested = false;
             inner.overlay_active = false;
             if let Some(state) = inner.session_state.take() {
@@ -376,10 +378,12 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
     let view_count = views.length();
 
     // Rebuild the scene when the feed advanced or the UI state (selection,
-    // hover) changed. Field-disjoint borrows: `state` holds
-    // `inner.session_state`, the encoder is `inner.encoder`.
-    let needs_scene =
-        !inner.scene_uploaded || inner.built_generation != inner.scene_generation || inner.ui_dirty;
+    // hover, layout, a live grab) changed. Field-disjoint borrows: `state`
+    // holds `inner.session_state`, the encoder is `inner.encoder`.
+    let needs_scene = !inner.scene_uploaded
+        || inner.built_generation != inner.scene_generation
+        || inner.ui_dirty
+        || inner.grab_surface.is_some();
     // Video frames advance regardless of scene rebuilds; so does the
     // pointer overlay (ray beams + hit markers rebuilt every frame from
     // the input pass — without a drawn ray, aiming in a headset is
@@ -437,6 +441,8 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let transcript_scroll = inner.transcript_scroll;
         let snapshot = inner.model.clone().unwrap_or_default();
         let terminal_view = inner.terminal.pane_view();
+        let layout = inner.layout.clone();
+        let grab = inner.grab_surface.clone();
         let entry_view = inner.text_entry.view();
         let voice_view = inner.voice.dock_view();
         let display_meta: Vec<(String, String)> = inner
@@ -465,6 +471,8 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 &entry_view,
                 passthrough,
                 floor_y,
+                &layout,
+                grab.as_deref(),
                 measure,
                 &mut batches,
             );
@@ -472,7 +480,10 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
             // summon pill always, the pane while open (terminal.rs).
             crate::terminal::build_pane(
                 &terminal_view,
+                &layout,
+                grab.as_deref(),
                 hover.as_deref(),
+                confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
                 floor_y,
                 measure,
                 &mut batches,
