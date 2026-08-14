@@ -18,7 +18,7 @@ export class XrWeb {
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
      * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`), the same
+     * `terminal:close`, `steer:<agent>`, `key:<token>`), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -32,6 +32,12 @@ export class XrWeb {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.xrweb_activate(this.__wbg_ptr, ptr0, len0);
         return ret !== 0;
+    }
+    /**
+     * Close the text entry without committing (drops the draft).
+     */
+    cancelTextEntry() {
+        wasm.xrweb_cancelTextEntry(this.__wbg_ptr);
     }
     /**
      * QA/introspection hook: JSON string of the facade + engine state.
@@ -85,6 +91,21 @@ export class XrWeb {
         this.__wbg_ptr = ret >>> 0;
         XrWebFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * Open the in-scene text entry bound to a field id, with a human
+     * label for the board's header. The workbench steer pill runs this
+     * same path via `activate("steer:<agent>")`; this direct seam is
+     * for future consumers and deterministic probes.
+     * @param {string} field_id
+     * @param {string} label
+     */
+    openTextEntry(field_id, label) {
+        const ptr0 = passStringToWasm0(field_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(label, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.xrweb_openTextEntry(this.__wbg_ptr, ptr0, len0, ptr1, len1);
     }
     /**
      * Probe `navigator.xr` for immersive-ar / immersive-vr support.
@@ -149,6 +170,22 @@ export class XrWeb {
      */
     setOnSessionEnd(callback) {
         wasm.xrweb_setOnSessionEnd(this.__wbg_ptr, callback);
+    }
+    /**
+     * Delivery verdict for a committed field, reported by the
+     * dashboard's router after it routes a `text_commit` action:
+     * ok → the scene says "sent", !ok → it says why not. Honest state,
+     * never assumed.
+     * @param {string} field_id
+     * @param {boolean} ok
+     * @param {string} detail
+     */
+    textEntryResult(field_id, ok, detail) {
+        const ptr0 = passStringToWasm0(field_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(detail, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.xrweb_textEntryResult(this.__wbg_ptr, ptr0, len0, ok, ptr1, len1);
     }
     /**
      * @param {string} source_id
@@ -903,7 +940,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 76, function: Function { arguments: [Externref], shim_idx: 77, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 77, function: Function { arguments: [Externref], shim_idx: 78, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

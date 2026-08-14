@@ -118,6 +118,18 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
             HitKind::TerminalToggle | HitKind::TerminalClose => {
                 crate::terminal::handle_release(inner, hit.kind);
             }
+            // Text entry: opening the board and every keystroke are
+            // light, reversible acts (backspace undoes a key) — quick
+            // pinches, resolved on release. The 900 ms confirm hold
+            // stays approvals-only.
+            HitKind::SteerOpen => {
+                let hit = hit.clone();
+                crate::keyboard::open_for_steer(inner, &hit);
+            }
+            HitKind::Key => {
+                let id = hit.id.clone();
+                crate::keyboard::handle_key(inner, &id);
+            }
             HitKind::Approve | HitKind::Deny => {}
         }
     }
@@ -172,6 +184,11 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
         HitKind::TerminalToggle | HitKind::TerminalClose => {
             crate::terminal::handle_release(inner, hit.kind)
         }
+        // Text entry: the steer pill toggles the board; keys type into
+        // it. `activate(name)` runs the same arms, so the validator and
+        // accessibility layers type exactly like a pinch does.
+        HitKind::SteerOpen => crate::keyboard::open_for_steer(inner, &hit),
+        HitKind::Key => crate::keyboard::handle_key(inner, &hit.id),
         HitKind::Approve | HitKind::Deny => {
             let decision = if hit.kind == HitKind::Approve {
                 "approve"
@@ -208,9 +225,13 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
 
 /// Call the registered JS action router with one JSON-shaped object.
 /// Failures log and drop — an action must never take the session down.
-fn emit_action(inner: &Inner, payload: &serde_json::Value) {
+/// `pub(crate)` so the keyboard's commit emits through the same seam;
+/// the no-router warn is wasm-only (host tests exercise emitters with
+/// no callback, and web-sys imports panic off-browser).
+pub(crate) fn emit_action(inner: &Inner, payload: &serde_json::Value) {
     use serde::Serialize as _;
     let Some(callback) = inner.action_callback.clone() else {
+        #[cfg(target_arch = "wasm32")]
         web_sys::console::warn_1(&"xr-web: action emitted with no router registered".into());
         return;
     };

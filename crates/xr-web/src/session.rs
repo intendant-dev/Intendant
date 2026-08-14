@@ -399,6 +399,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let transcript_scroll = inner.transcript_scroll;
         let snapshot = inner.model.clone().unwrap_or_default();
         let terminal_view = inner.terminal.pane_view();
+        let entry_view = inner.text_entry.view();
         let display_meta: Vec<(String, String)> = inner
             .displays
             .iter()
@@ -422,6 +423,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
                 transcript_scroll,
+                &entry_view,
                 passthrough,
                 floor_y,
                 measure,
