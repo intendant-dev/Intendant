@@ -11,8 +11,8 @@ export class XrWeb {
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
      * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`, `voice:talk` — toggles the capture —
-     * `voice:use`, `voice:discard`), the same
+     * `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
+     * toggles the capture), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -20,6 +20,10 @@ export class XrWeb {
      * true when the target existed and had an effect.
      */
     activate(name: string): boolean;
+    /**
+     * Close the text entry without committing (drops the draft).
+     */
+    cancelTextEntry(): void;
     /**
      * QA/introspection hook: JSON string of the facade + engine state.
      * Kept schema-stable for the validator probe (`--xr-probe`).
@@ -30,6 +34,14 @@ export class XrWeb {
      * Resolves once the session is live and the frame loop is armed.
      */
     enter(mode: string): Promise<any>;
+    /**
+     * Spike lane: enter with the WebXR DOM Overlay module requested for
+     * `root` (the flag-gated entry passes the whole dashboard body, so
+     * the REGULAR UI composites interactively over the scene where the
+     * runtime supports it). The feature is optional — ungranted runtimes
+     * enter normally; `debugJson().overlay` reports the truth.
+     */
+    enterWithOverlay(mode: string, root: Element): Promise<any>;
     /**
      * End the active immersive session, if any (cleanup and the
      * session-end callback run from the session's own 'end' event).
@@ -42,6 +54,13 @@ export class XrWeb {
      */
     markTerminalCanvasDirty(source_id: string): void;
     constructor();
+    /**
+     * Open the in-scene text entry bound to a field id, with a human
+     * label for the board's header. The workbench steer pill runs this
+     * same path via `activate("steer:<agent>")`; this direct seam is
+     * for future consumers and deterministic probes.
+     */
+    openTextEntry(field_id: string, label: string): void;
     /**
      * Probe `navigator.xr` for immersive-ar / immersive-vr support.
      * Resolves to `{ ar: bool, vr: bool }` and caches the answer for
@@ -72,6 +91,13 @@ export class XrWeb {
      * session ends (user gesture, `exit()`, or runtime shutdown).
      */
     setOnSessionEnd(callback: Function): void;
+    /**
+     * Delivery verdict for a committed field, reported by the
+     * dashboard's router after it routes a `text_commit` action:
+     * ok → the scene says "sent", !ok → it says why not. Honest state,
+     * never assumed.
+     */
+    textEntryResult(field_id: string, ok: boolean, detail: string): void;
     unregisterDisplaySource(source_id: string): void;
     unregisterTerminalCanvas(source_id: string): void;
     /**
@@ -95,8 +121,11 @@ export class XrWeb {
     voiceFailed(message: string): void;
     /**
      * A captured utterance transcript from the JS capture lane. Lands
-     * as the preview strip's pending result — reviewed and committed by
-     * a deliberate pinch, NEVER auto-sent.
+     * in the ACTIVE text-entry buffer (`keyboard.rs`) — appended at the
+     * cursor when the board is open, else the board opens bound to the
+     * focused session's steer field with the transcript as its draft.
+     * Review and commit go through the keyboard's own enter/cancel —
+     * NEVER auto-sent.
      */
     voiceResult(text: string): void;
     /**
@@ -116,16 +145,20 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_xrweb_free: (a: number, b: number) => void;
     readonly xrweb_activate: (a: number, b: number, c: number) => number;
+    readonly xrweb_cancelTextEntry: (a: number) => void;
     readonly xrweb_debugJson: (a: number) => [number, number];
     readonly xrweb_enter: (a: number, b: number, c: number) => any;
+    readonly xrweb_enterWithOverlay: (a: number, b: number, c: number, d: any) => any;
     readonly xrweb_exit: (a: number) => void;
     readonly xrweb_markTerminalCanvasDirty: (a: number, b: number, c: number) => void;
     readonly xrweb_new: () => number;
+    readonly xrweb_openTextEntry: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly xrweb_probeSupport: (a: number) => any;
     readonly xrweb_registerDisplaySource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => void;
     readonly xrweb_registerTerminalCanvas: (a: number, b: number, c: number, d: any) => void;
     readonly xrweb_setActionCallback: (a: number, b: any) => void;
     readonly xrweb_setOnSessionEnd: (a: number, b: any) => void;
+    readonly xrweb_textEntryResult: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly xrweb_unregisterDisplaySource: (a: number, b: number, c: number) => void;
     readonly xrweb_unregisterTerminalCanvas: (a: number, b: number, c: number) => void;
     readonly xrweb_updateSnapshot: (a: number, b: any) => void;

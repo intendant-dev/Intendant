@@ -39,6 +39,7 @@ pub(crate) fn build_scene(
     hover_id: Option<&str>,
     confirm: Option<(&str, f32)>,
     transcript_scroll: usize,
+    entry: &crate::keyboard::EntryView,
     passthrough: bool,
     floor_y: f32,
     measure: &dyn TextMeasure,
@@ -60,6 +61,10 @@ pub(crate) fn build_scene(
         measure,
         out,
     );
+    // Text-entry keyboard in its fixed near-field slot. Independent of
+    // the agents feed too: an open entry must survive feed churn — the
+    // draft in your hands never vanishes because a snapshot went empty.
+    crate::keyboard::build_keyboard(entry, hover_id, floor_y, measure, out);
 
     // Hosts: connected first, local pinned to the top row. (The early
     // return below keeps monitors/backdrop — only shelf content needs
@@ -156,6 +161,7 @@ pub(crate) fn build_scene(
             hover_id,
             confirm,
             transcript_scroll,
+            entry,
             floor_y,
             measure,
             out,
@@ -840,6 +846,7 @@ fn workbench(
     hover_id: Option<&str>,
     confirm: Option<(&str, f32)>,
     scroll_in: usize,
+    entry: &crate::keyboard::EntryView,
     floor_y: f32,
     measure: &dyn TextMeasure,
     out: &mut SceneBatches,
@@ -1020,21 +1027,24 @@ fn workbench(
             border_w: 0.0,
         });
     }
+    // Pill row along the bottom edge: approve/deny first when an
+    // approval is pending, then the steer pill. One shared pen keeps
+    // them on one line whatever the mix.
+    let pill_y = -hh + 0.028;
+    let mut pill_pen = left;
     // Approve / deny pills (drawn now; the pinch-hold interaction arms
     // them in the input pass). Widths fit their labels.
     if agent.needs_approval {
-        let pill_y = -hh + 0.028;
         let pill_hh = 0.020;
         let label_h = 0.021;
         let specs: [(&str, HitKind, [f32; 4]); 2] = [
             ("approve", HitKind::Approve, kit::GREEN),
             ("deny", HitKind::Deny, kit::RED),
         ];
-        let mut pen = left;
         for (label, kind, color) in specs.iter() {
             let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.022).max(0.045);
-            let x = pen + pill_hw;
-            pen = x + pill_hw + 0.024;
+            let x = pill_pen + pill_hw;
+            pill_pen = x + pill_hw + 0.024;
             let pcenter = center + right.scale(x) + up.scale(pill_y);
             let pill_id = format!("pill:{}:{}", agent.id, label);
             let is_hover = hover_id == Some(pill_id.as_str());
@@ -1112,6 +1122,96 @@ fn workbench(
                     half_h: pill_hh,
                 },
             });
+        }
+    }
+
+    // Steer pill: opens the ray-typed keyboard bound to this session's
+    // composer field (`steer:<agent>` — keyboard.rs). Only cards that
+    // project a real, live session get one: the text routes through the
+    // dashboard's session composer path, and a synthetic or recent node
+    // has no session to receive it — an affordance that could only fail
+    // is not drawn.
+    if !agent.session_id.is_empty() && !agent.recent {
+        let pill_hh = 0.020;
+        let label_h = 0.021;
+        let steer_id = format!("steer:{}", agent.id);
+        let is_hover = hover_id == Some(steer_id.as_str());
+        let is_open = entry.open && entry.field_id == steer_id;
+        let pill_hw = (measure.measure("steer", label_h) / 2.0 + 0.022).max(0.045);
+        let pcenter = center + right.scale(pill_pen + pill_hw) + up.scale(pill_y);
+        pill_pen += pill_hw * 2.0 + 0.024;
+        out.panels.push(PanelInstance {
+            center: lift(pcenter, right, up, LIFT_DECOR, floor_y),
+            right,
+            up,
+            half_w: pill_hw,
+            half_h: pill_hh,
+            radius: pill_hh,
+            fill: if is_open {
+                tint(kit::IRIS, 0.18)
+            } else if is_hover {
+                tint(kit::IRIS, 0.30)
+            } else {
+                kit::SURFACE
+            },
+            border: if is_open || is_hover {
+                kit::IRIS
+            } else {
+                tint(kit::IRIS, 0.45)
+            },
+            border_w: if is_open || is_hover { 0.0035 } else { 0.0025 },
+        });
+        out.texts.push(TextRun {
+            origin: lift(
+                pcenter - up.scale(0.008),
+                right,
+                up,
+                LIFT_TEXT + LIFT_DECOR,
+                floor_y,
+            ),
+            right,
+            up,
+            height: label_h,
+            color: kit::IRIS_2,
+            align: TextAlign::Center,
+            max_width: pill_hw * 2.0 - 0.01,
+            text: "steer".to_string(),
+        });
+        out.hits.push(HitTarget {
+            id: steer_id.clone(),
+            kind: HitKind::SteerOpen,
+            agent_id: agent.id.clone(),
+            panel: Panel {
+                center: at_floor(pcenter, floor_y),
+                right,
+                up,
+                half_w: pill_hw,
+                half_h: pill_hh,
+            },
+        });
+        // Honest delivery state beside the pill: what the dashboard's
+        // router reported for the last commit on this field — "sending…"
+        // until it answers, then "sent" or the error itself.
+        if let Some((status, color)) = crate::keyboard::status_line_for(&entry.status, &steer_id) {
+            let cap = (hw - pad - pill_pen).min(0.34);
+            if cap > 0.05 {
+                out.texts.push(TextRun {
+                    origin: lift(
+                        center + right.scale(pill_pen) + up.scale(pill_y - 0.006),
+                        right,
+                        up,
+                        LIFT_TEXT,
+                        floor_y,
+                    ),
+                    right,
+                    up,
+                    height: 0.017,
+                    color,
+                    align: TextAlign::Left,
+                    max_width: cap,
+                    text: status,
+                });
+            }
         }
     }
 }
@@ -1415,6 +1515,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1442,6 +1543,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             false,
             0.0,
             &ApproxMeasure,
@@ -1471,6 +1573,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1483,6 +1586,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             -1.5,
             &ApproxMeasure,
@@ -1527,6 +1631,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1555,6 +1660,7 @@ mod tests {
             None,
             None,
             9999,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1584,6 +1690,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1631,6 +1738,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1669,6 +1777,7 @@ mod tests {
             None,
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1776,6 +1885,7 @@ mod tests {
             Some("card:a1"),
             None,
             0,
+            &Default::default(),
             true,
             0.0,
             &ApproxMeasure,
@@ -1851,6 +1961,141 @@ mod tests {
             }),
             ("recent".into(), kit::TEXT_3)
         );
+    }
+
+    #[test]
+    fn workbench_offers_the_steer_pill_for_live_sessions() {
+        let snap = snapshot();
+        let out = build(&snap, Some("a1"));
+        let steer = out
+            .hits
+            .iter()
+            .find(|h| h.id == "steer:a1")
+            .expect("steer pill on the focused live session");
+        assert_eq!(steer.kind, HitKind::SteerOpen);
+        assert_eq!(steer.agent_id, "a1");
+        assert!(out.texts.iter().any(|t| t.text == "steer"));
+        // Approval agent: approve, deny, and steer share the pill row.
+        let out = build(&snap, Some("a2"));
+        assert!(out.hits.iter().any(|h| h.id == "pill:a2:approve"));
+        assert!(out.hits.iter().any(|h| h.id == "pill:a2:deny"));
+        assert!(out.hits.iter().any(|h| h.id == "steer:a2"));
+        // Recent card (a3, no live session): no steer affordance — it
+        // could only fail.
+        let out = build(&snap, Some("a3"));
+        assert!(out.hits.iter().all(|h| h.kind != HitKind::SteerOpen));
+        // Unselected: no workbench, no steer pill anywhere.
+        let out = build(&snap, None);
+        assert!(out.hits.iter().all(|h| h.kind != HitKind::SteerOpen));
+    }
+
+    #[test]
+    fn open_entry_builds_the_keyboard_and_status_reports_honestly() {
+        let snap = snapshot();
+        let open_entry = crate::keyboard::EntryView {
+            open: true,
+            field_id: "steer:a1".into(),
+            label: "steer · claude-code s1".into(),
+            buffer: "hi".into(),
+            cursor: 2,
+            shift: false,
+            status: None,
+        };
+        let mut out = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            0,
+            &open_entry,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        assert!(out.hits.iter().any(|h| h.id == "key:h"), "keyboard armed");
+        assert!(out.hits.iter().any(|h| h.id == "key:enter"));
+        // The bound pill wears the open state (iris fill, not SURFACE).
+        assert!(out.hits.iter().any(|h| h.id == "steer:a1"));
+
+        // A delivery verdict renders beside the pill even after the
+        // board closed — "sent" green, a failure in rose with its text.
+        let verdict = crate::keyboard::EntryView {
+            status: Some((
+                "steer:a1".into(),
+                crate::keyboard::DeliveryState::Failed("peer not connected".into()),
+            )),
+            ..Default::default()
+        };
+        let mut closed = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a1"),
+            None,
+            None,
+            0,
+            &verdict,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut closed,
+        );
+        let status = closed
+            .texts
+            .iter()
+            .find(|t| t.text == "peer not connected")
+            .expect("failure detail rendered");
+        assert_eq!(status.color, kit::RED);
+        assert!(
+            closed.hits.iter().all(|h| h.kind != HitKind::Key),
+            "closed entry builds no keys"
+        );
+        // The verdict belongs to a1; another card's bench stays quiet.
+        let mut other = SceneBatches::default();
+        build_scene(
+            &snap,
+            &[],
+            Some("a2"),
+            None,
+            None,
+            0,
+            &verdict,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut other,
+        );
+        assert!(!other.texts.iter().any(|t| t.text == "peer not connected"));
+    }
+
+    #[test]
+    fn keyboard_survives_an_empty_feed() {
+        let entry = crate::keyboard::EntryView {
+            open: true,
+            field_id: "steer:a1".into(),
+            label: "steer".into(),
+            ..Default::default()
+        };
+        let mut out = SceneBatches::default();
+        build_scene(
+            &XrSnapshot::default(),
+            &[],
+            None,
+            None,
+            None,
+            0,
+            &entry,
+            true,
+            0.0,
+            &ApproxMeasure,
+            &mut out,
+        );
+        // The waiting note renders AND the draft board stays in hand.
+        assert!(out.texts.iter().any(|t| t.text.contains("waiting")));
+        assert!(out.hits.iter().any(|h| h.id == "key:enter"));
     }
 
     #[test]

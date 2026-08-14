@@ -165,40 +165,22 @@ pub(crate) fn on_select_end(inner: &mut Inner, now_ms: f64) {
             HitKind::TerminalToggle | HitKind::TerminalClose => {
                 crate::terminal::handle_release(inner, hit.kind);
             }
-            // Preview-strip pills: light acts — the pinch on a visible
-            // preview IS the deliberate confirm.
-            HitKind::VoiceUse | HitKind::VoiceDiscard => {
-                handle_voice_release(inner, hit.kind);
+            // Text entry: opening the board and every keystroke are
+            // light, reversible acts (backspace undoes a key) — quick
+            // pinches, resolved on release. The 900 ms confirm hold
+            // stays approvals-only.
+            HitKind::SteerOpen => {
+                let hit = hit.clone();
+                crate::keyboard::open_for_steer(inner, &hit);
+            }
+            HitKind::Key => {
+                let id = hit.id.clone();
+                crate::keyboard::handle_key(inner, &id);
             }
             HitKind::Approve | HitKind::Deny => {}
             // Handled above (unconditional stop), unreachable here.
             HitKind::VoiceTalk => {}
         }
-    }
-}
-
-/// Resolve a released (or name-activated) preview-strip pill. "use"
-/// emits the text-commit action through the ordinary router; "discard"
-/// drops the transcript. Returns true when something happened.
-fn handle_voice_release(inner: &mut Inner, kind: HitKind) -> bool {
-    match kind {
-        HitKind::VoiceUse => {
-            let Some(payload) = crate::voice::commit_payload(inner) else {
-                return false;
-            };
-            emit_action(inner, &payload);
-            crate::voice::on_discard(&mut inner.voice);
-            inner.ui_dirty = true;
-            true
-        }
-        HitKind::VoiceDiscard => {
-            let changed = crate::voice::on_discard(&mut inner.voice);
-            if changed {
-                inner.ui_dirty = true;
-            }
-            changed
-        }
-        _ => false,
     }
 }
 
@@ -251,6 +233,11 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
         HitKind::TerminalToggle | HitKind::TerminalClose => {
             crate::terminal::handle_release(inner, hit.kind)
         }
+        // Text entry: the steer pill toggles the board; keys type into
+        // it. `activate(name)` runs the same arms, so the validator and
+        // accessibility layers type exactly like a pinch does.
+        HitKind::SteerOpen => crate::keyboard::open_for_steer(inner, &hit),
+        HitKind::Key => crate::keyboard::handle_key(inner, &hit.id),
         // Activation by name is the deliberate act (automation and
         // accessibility): the talk pill TOGGLES — one activation starts
         // the capture, the next stops it — with the accidental-pinch
@@ -268,7 +255,6 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
             inner.ui_dirty = true;
             true
         }
-        HitKind::VoiceUse | HitKind::VoiceDiscard => handle_voice_release(inner, hit.kind),
         HitKind::Approve | HitKind::Deny => {
             let decision = if hit.kind == HitKind::Approve {
                 "approve"
@@ -305,9 +291,13 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
 
 /// Call the registered JS action router with one JSON-shaped object.
 /// Failures log and drop — an action must never take the session down.
-fn emit_action(inner: &Inner, payload: &serde_json::Value) {
+/// `pub(crate)` so the keyboard's commit emits through the same seam;
+/// the no-router warn is wasm-only (host tests exercise emitters with
+/// no callback, and web-sys imports panic off-browser).
+pub(crate) fn emit_action(inner: &Inner, payload: &serde_json::Value) {
     use serde::Serialize as _;
     let Some(callback) = inner.action_callback.clone() else {
+        #[cfg(target_arch = "wasm32")]
         web_sys::console::warn_1(&"xr-web: action emitted with no router registered".into());
         return;
     };

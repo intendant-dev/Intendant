@@ -18,8 +18,8 @@ export class XrWeb {
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
      * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`, `voice:talk` — toggles the capture —
-     * `voice:use`, `voice:discard`), the same
+     * `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
+     * toggles the capture), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -33,6 +33,12 @@ export class XrWeb {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.xrweb_activate(this.__wbg_ptr, ptr0, len0);
         return ret !== 0;
+    }
+    /**
+     * Close the text entry without committing (drops the draft).
+     */
+    cancelTextEntry() {
+        wasm.xrweb_cancelTextEntry(this.__wbg_ptr);
     }
     /**
      * QA/introspection hook: JSON string of the facade + engine state.
@@ -64,6 +70,22 @@ export class XrWeb {
         return ret;
     }
     /**
+     * Spike lane: enter with the WebXR DOM Overlay module requested for
+     * `root` (the flag-gated entry passes the whole dashboard body, so
+     * the REGULAR UI composites interactively over the scene where the
+     * runtime supports it). The feature is optional — ungranted runtimes
+     * enter normally; `debugJson().overlay` reports the truth.
+     * @param {string} mode
+     * @param {Element} root
+     * @returns {Promise<any>}
+     */
+    enterWithOverlay(mode, root) {
+        const ptr0 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.xrweb_enterWithOverlay(this.__wbg_ptr, ptr0, len0, root);
+        return ret;
+    }
+    /**
      * End the active immersive session, if any (cleanup and the
      * session-end callback run from the session's own 'end' event).
      */
@@ -86,6 +108,21 @@ export class XrWeb {
         this.__wbg_ptr = ret >>> 0;
         XrWebFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * Open the in-scene text entry bound to a field id, with a human
+     * label for the board's header. The workbench steer pill runs this
+     * same path via `activate("steer:<agent>")`; this direct seam is
+     * for future consumers and deterministic probes.
+     * @param {string} field_id
+     * @param {string} label
+     */
+    openTextEntry(field_id, label) {
+        const ptr0 = passStringToWasm0(field_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(label, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.xrweb_openTextEntry(this.__wbg_ptr, ptr0, len0, ptr1, len1);
     }
     /**
      * Probe `navigator.xr` for immersive-ar / immersive-vr support.
@@ -152,6 +189,22 @@ export class XrWeb {
         wasm.xrweb_setOnSessionEnd(this.__wbg_ptr, callback);
     }
     /**
+     * Delivery verdict for a committed field, reported by the
+     * dashboard's router after it routes a `text_commit` action:
+     * ok → the scene says "sent", !ok → it says why not. Honest state,
+     * never assumed.
+     * @param {string} field_id
+     * @param {boolean} ok
+     * @param {string} detail
+     */
+    textEntryResult(field_id, ok, detail) {
+        const ptr0 = passStringToWasm0(field_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(detail, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.xrweb_textEntryResult(this.__wbg_ptr, ptr0, len0, ok, ptr1, len1);
+    }
+    /**
      * @param {string} source_id
      */
     unregisterDisplaySource(source_id) {
@@ -199,8 +252,11 @@ export class XrWeb {
     }
     /**
      * A captured utterance transcript from the JS capture lane. Lands
-     * as the preview strip's pending result — reviewed and committed by
-     * a deliberate pinch, NEVER auto-sent.
+     * in the ACTIVE text-entry buffer (`keyboard.rs`) — appended at the
+     * cursor when the board is open, else the board opens bound to the
+     * focused session's steer field with the transcript as its draft.
+     * Review and commit go through the keyboard's own enter/cancel —
+     * NEVER auto-sent.
      * @param {string} text
      */
     voiceResult(text) {
@@ -392,6 +448,10 @@ function __wbg_get_imports() {
         __wbg_document_ee35a3d3ae34ef6c: function(arg0) {
             const ret = arg0.document;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_domOverlayState_708ea1750a9e977b: function(arg0) {
+            const ret = arg0.domOverlayState;
+            return ret;
         },
         __wbg_done_57b39ecd9addfe81: function(arg0) {
             const ret = arg0.done;
@@ -928,17 +988,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 39, function: Function { arguments: [F64, Externref], shim_idx: 42, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 41, function: Function { arguments: [F64, Externref], shim_idx: 44, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h95fa55e82713b162, wasm_bindgen__convert__closures_____invoke__h80d27238e69792d0);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 39, function: Function { arguments: [NamedExternref("Event")], shim_idx: 40, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 41, function: Function { arguments: [NamedExternref("Event")], shim_idx: 42, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h95fa55e82713b162, wasm_bindgen__convert__closures_____invoke__h5fa997591c1e8ef4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 78, function: Function { arguments: [Externref], shim_idx: 79, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 83, function: Function { arguments: [Externref], shim_idx: 84, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

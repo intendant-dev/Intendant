@@ -106,17 +106,18 @@ pub(crate) enum HitKind {
     ScrollOlder,
     /// Transcript paging on the workbench: back toward the live tail.
     ScrollNewer,
+    /// Opens the in-scene text entry bound to the target's field
+    /// (`steer:<agent>` on the workbench). A light act — quick pinch.
+    SteerOpen,
+    /// One key on the rendered keyboard (`key:<token>`). Light acts —
+    /// quick pinches, never the deliberate-confirm hold (that grammar
+    /// stays approvals-only).
+    Key,
     /// The hold-to-talk pill: pinch-and-HOLD records, release stops. A
     /// third hold semantic beside quick-pinch (select) and the 900 ms
     /// confirm (approve/deny) — the hold IS the recording window, so it
     /// neither fires on a timer nor cancels on aim drift (`voice.rs`).
     VoiceTalk,
-    /// Preview-strip commit: append the captured transcript to the active
-    /// text buffer's send path. A light act — the deliberate confirm is
-    /// the pinch itself on a visible preview, never an auto-send.
-    VoiceUse,
-    /// Preview-strip discard: drop the captured transcript.
-    VoiceDiscard,
 }
 
 #[derive(Clone, Debug)]
@@ -219,18 +220,24 @@ pub(crate) const TERMINAL_PILL_AZ: f32 = 0.50;
 pub(crate) const TERMINAL_PILL_DIST: f32 = 1.30;
 pub(crate) const TERMINAL_PILL_Y: f32 = 1.05;
 
+/// Text-entry keyboard (`keyboard.rs`): a FIXED near-field slot —
+/// front-low, below the workbench, tilted back so the plate faces the
+/// operator's downward gaze. Deliberately not a movable panel: the
+/// arrangement verbs own movable state; a keyboard that drifts is a
+/// keyboard you hunt for. Key pitch keeps every cap ≥ 35 mm — the
+/// ray-typing legibility/accuracy floor at this distance.
+pub(crate) const KEYBOARD_DIST: f32 = 0.92;
+pub(crate) const KEYBOARD_Y: f32 = 0.84;
+/// Backward tilt in radians (≈ 29°): drafting-table posture.
+pub(crate) const KEYBOARD_TILT: f32 = 0.50;
+pub(crate) const KEY_PITCH: f32 = 0.042;
+pub(crate) const KEY_GAP: f32 = 0.006;
+
 /// Voice talk pill: the left mirror of the terminal summon pill — near
-/// the workbench (and whatever text-entry surface sits under it), inside
-/// the monitor stack's arc.
+/// the workbench and the keyboard slot, inside the monitor stack's arc.
 pub(crate) const VOICE_PILL_AZ: f32 = -0.50;
 pub(crate) const VOICE_PILL_DIST: f32 = 1.30;
 pub(crate) const VOICE_PILL_Y: f32 = 1.05;
-/// Voice preview strip: front-center below the (deep) workbench's bottom
-/// edge — the captured transcript with its use/discard pills.
-pub(crate) const VOICE_STRIP_DIST: f32 = 1.00;
-pub(crate) const VOICE_STRIP_Y: f32 = 0.86;
-pub(crate) const VOICE_STRIP_HALF_W: f32 = 0.30;
-pub(crate) const VOICE_STRIP_HALF_H: f32 = 0.052;
 
 /// Agenda rail: parked intent on the operator's RIGHT, outboard of the
 /// terminal slot (the +38° mirror of the monitors went to the summoned

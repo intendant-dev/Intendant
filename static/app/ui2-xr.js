@@ -27,6 +27,20 @@ function xrEnabled() {
   }
 }
 
+// Spike lane (?xr=overlay): request the WebXR DOM Overlay module with
+// the whole dashboard as the overlay root — the REGULAR UI, composer
+// and all, composited interactively over the spatial scene where the
+// runtime supports it (Quest Horizon Browser does; desktop and the
+// probe shim simply don't grant the optional feature). Flag-gated
+// until the on-device verdict.
+function xrOverlayRequested() {
+  try {
+    return new URLSearchParams(location.search).get('xr') === 'overlay';
+  } catch {
+    return false;
+  }
+}
+
 // Feature probe without loading the WASM: chip visibility must cost
 // nothing on the overwhelmingly common non-XR browser.
 async function xrProbeSupportLight() {
@@ -71,10 +85,17 @@ async function xrBootModule() {
     // hit a live daemon.
     globalThis.xrProbe.lastAction = action;
     if (xrCaptureOnly) return;
+    if (action && action.type === 'text_commit') {
+      // Text-entry commits route through the dashboard's composer path
+      // (the appended text-entry section below), not handleStationAction.
+      xrRouteTextCommit(action);
+      return;
+    }
     try {
-      // Voice-lane actions (voice_talk capture verbs, text_commit) are
-      // consumed by the voice section below; everything else takes the
-      // ordinary router.
+      // Voice capture verbs (voice_talk start/stop/cancel) are consumed
+      // by the voice section below; everything else takes the ordinary
+      // router. (text_commit was already routed above — voice text rides
+      // the text-entry commit path, never a lane of its own.)
       if (typeof xrVoiceHandleAction === 'function' && xrVoiceHandleAction(action)) return;
       if (typeof handleStationAction === 'function') {
         handleStationAction(action);
@@ -207,11 +228,24 @@ async function xrEnter() {
     // Passthrough-first: prefer AR on hardware that has it (Quest 3),
     // fall back to VR (Vision Pro Safari has no immersive-ar).
     const mode = xrSupport.ar ? 'immersive-ar' : 'immersive-vr';
-    await inst.enter(mode);
-    clearTimeout(consentHint);
-    xrStartSnapshotPump();
-    xrSetChipState('active', 'Immersive session running');
-    xrShowStatus('', '');
+    if (xrOverlayRequested() && document.body) {
+      await inst.enterWithOverlay(mode, document.body);
+      const granted = JSON.parse(inst.debugJson()).overlay?.active === true;
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      // The overlay verdict is the whole point of the spike — say it
+      // where the headset user can read it.
+      xrShowStatus(granted ? 'busy' : 'error',
+        granted ? 'dom-overlay active — the regular UI should float over the scene'
+                : 'dom-overlay not granted by this runtime — scene only');
+    } else {
+      await inst.enter(mode);
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      xrShowStatus('', '');
+    }
   } catch (err) {
     clearTimeout(consentHint);
     const detail = (err && (err.message || err.name)) || String(err);
@@ -689,6 +723,10 @@ globalThis.xrProbe.agenda = () => xrAgendaSummary();
 // daemon-side (session log + the broadcast `user_transcript` event);
 // nothing injects it into any conversation, so NO presence pipeline
 // changes are needed and the live voice-model lane stays untouched.
+// Delivery is wasm-side: the transcript lands in the text-entry buffer
+// (keyboard.rs), and the commit rides the keyboard's own enter →
+// text_commit → the text-entry routing section above. Voice adds a
+// capture lane, never a second send path.
 //
 // Capture mechanics: the daemon transcribes in ~3 s chunks gated by an
 // RMS silence check, with no flush verb — so on release this section
@@ -795,16 +833,6 @@ function xrVoiceHandleAction(action) {
         else if (phase === 'cancel') xrVoiceCancel();
       } catch (err) {
         console.warn('[xr] voice action failed', err);
-      }
-    }, 0);
-    return true;
-  }
-  if (action.type === 'text_commit') {
-    const fieldId = String(action.field_id || '');
-    const text = String(action.text || '');
-    setTimeout(() => {
-      try { xrVoiceCommitText(fieldId, text); } catch (err) {
-        console.warn('[xr] voice commit failed', err);
       }
     }, 0);
     return true;
@@ -1003,34 +1031,6 @@ function xrVoiceCancel() {
   xrVoiceReset();
 }
 
-// The strip's "use" landed: route the reviewed transcript through the
-// dashboard's EXISTING send path — focus the target session (the same
-// primitive clicking its window uses; it retargets the composer) and
-// submit through the shared composer core (steer / follow-up / task
-// phase logic included). field_id `composer:<sessionId>` is the
-// reconcile contract with the ray-keyboard seat's TextEntry facade:
-// when that lands, this routing collapses into the field buffer's own
-// commit path and the shape must keep matching.
-function xrVoiceCommitText(fieldId, text) {
-  const t = String(text || '').trim();
-  if (!t) return;
-  const prefix = 'composer:';
-  const sid = String(fieldId || '').startsWith(prefix)
-    ? String(fieldId).slice(prefix.length).trim()
-    : '';
-  let dispatched = false;
-  try {
-    if (sid && typeof focusSessionWindow === 'function') focusSessionWindow(sid);
-    if (typeof submitComposedText === 'function') dispatched = submitComposedText(t) === true;
-  } catch (err) {
-    console.warn('[xr] voice text dispatch failed', err);
-  }
-  if (!dispatched) {
-    // Say so in-scene — the operator is in a headset, not at the toast.
-    try { xrInstance?.voiceFailed('send failed — try again from the dashboard'); } catch (_) { /* fail-soft */ }
-  }
-}
-
 // QA facade extension (same conventions as the terminal seam): direct
 // pushes through the voice facade for deterministic probes — the probe
 // injects fake transcripts here and never depends on a real mic or ASR.
@@ -1046,3 +1046,105 @@ globalThis.xrProbe.voice = {
     chunks: xrVoiceChunks.length,
   }),
 };
+
+// ── XR text entry — the commit routing seam ──
+//
+// Appended section. crates/xr-web/src/keyboard.rs renders the in-scene
+// ray-typed keyboard; committing emits {type:'text_commit', field_id,
+// text} through the action callback above. This section resolves the
+// field and routes the text through the flat dashboard's REAL composer
+// path — never a parallel send lane:
+//
+//   field "steer:<agentId>" — <agentId> is a Station scene-node id
+//   (buildStationSnapshot's vocabulary, the same builder the XR pump
+//   feeds the scene from). Its sessionId picks the composer target:
+//     - local sessions: focusSessionWindow(sid) then
+//       submitComposedText(text) — the exact pair Station's own
+//       op === 'steer' handler runs (34-station-panes.js), so
+//       submitComposedText decides mid-turn steer vs queued follow-up
+//       vs start_task exactly as the flat composer does;
+//     - peer sessions: setPromptTargetPeer(hostId, sid) then
+//       submitComposedText(text) — the composer's own peer lane.
+//   Both retarget the one composer, matching the flat "one composer,
+//   one target" semantics of picking a session.
+//
+// Every outcome reports back through xrInstance.textEntryResult so the
+// scene's status line says what actually happened ("sent" — meaning
+// dispatched to the daemon — or the refusal text). Nothing here assumes
+// delivery, and a routing error must never take the immersive session
+// down. Trust: this section adds NO daemon routes — the text rides the
+// same ControlMsg lanes (steer / start_task / peer session control) the
+// flat composer already uses, so a hosted lease sees exactly the ops
+// its projection already carries.
+
+function xrTextCommitReport(fieldId, ok, detail) {
+  try {
+    if (xrInstance && typeof xrInstance.textEntryResult === 'function') {
+      xrInstance.textEntryResult(String(fieldId || ''), !!ok, String(detail || ''));
+    }
+  } catch (err) {
+    console.warn('[xr] text-entry result report failed', err);
+  }
+}
+
+function xrRouteTextCommit(action) {
+  const fieldId = String((action && action.field_id) || '');
+  try {
+    const text = String((action && action.text) || '').trim();
+    if (!text) {
+      xrTextCommitReport(fieldId, false, 'empty message');
+      return;
+    }
+    if (!fieldId.startsWith('steer:')) {
+      xrTextCommitReport(fieldId, false, `unknown field ${fieldId || '(none)'}`);
+      return;
+    }
+    const agentId = fieldId.slice('steer:'.length);
+    let agent = null;
+    if (typeof buildStationSnapshot === 'function') {
+      const snap = buildStationSnapshot();
+      agent = ((snap && snap.agents) || []).find((a) => a && String(a.id) === agentId) || null;
+    }
+    const sessionId = String((agent && agent.sessionId) || '').trim();
+    if (!sessionId) {
+      xrTextCommitReport(fieldId, false, 'no session behind this card');
+      return;
+    }
+    const hostId = String((agent && agent.hostId) || '').trim();
+    const isLocal = !hostId || hostId === 'local'
+      || (typeof selfPeerId !== 'undefined' && hostId === String(selfPeerId));
+    if (isLocal) {
+      if (typeof focusSessionWindow !== 'function' || typeof submitComposedText !== 'function') {
+        xrTextCommitReport(fieldId, false, 'composer unavailable in this build');
+        return;
+      }
+      focusSessionWindow(sessionId);
+      // Precision gate: submitComposedText sends to the RESOLVED prompt
+      // target. If the session became unusable between the snapshot and
+      // this commit, the resolver would fall back to a different
+      // session — refuse instead of mis-routing the text.
+      const resolved = typeof resolvePromptTargetSessionId === 'function'
+        ? resolvePromptTargetSessionId() : sessionId;
+      if (resolved !== sessionId) {
+        xrTextCommitReport(fieldId, false, 'session is no longer steerable');
+        return;
+      }
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'dispatch refused (connection down?)');
+      return;
+    }
+    // Peer session: the composer's peer lane. setPromptTargetPeer
+    // validates the peer link and refuses unknown hosts.
+    if (typeof setPromptTargetPeer === 'function' && typeof submitComposedText === 'function'
+        && setPromptTargetPeer(hostId, sessionId)) {
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'peer dispatch refused');
+      return;
+    }
+    xrTextCommitReport(fieldId, false, 'peer not connected');
+  } catch (err) {
+    xrTextCommitReport(fieldId, false, String((err && err.message) || err || 'route error').slice(0, 80));
+  }
+}
+
+// ── End of the text-entry section. ──

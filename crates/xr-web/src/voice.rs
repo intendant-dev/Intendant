@@ -1,5 +1,6 @@
 //! Voice input: hold-to-talk capture through the dashboard's existing
-//! server-side transcription lane, previewed for deliberate confirm.
+//! server-side transcription lane, delivered into the in-scene text
+//! entry for deliberate confirm.
 //!
 //! The talk pill is a THIRD hold semantic, kept visually and mechanically
 //! distinct from the other two: a quick pinch selects, the 900 ms
@@ -7,7 +8,7 @@
 //! pill and the hold is the recording window; release stops it. It never
 //! fires on a timer and never cancels on aim drift (your hand wanders
 //! while you speak); releasing the pinch is the only stop, so the mic can
-//! never stay hot behind your back.
+//! never stay hot.
 //!
 //! The capture path is the dashboard's existing one end to end: the JS
 //! glue (`ui2-xr.js` voice section) streams mic PCM over the page's
@@ -17,16 +18,17 @@
 //! lane only logs — nothing daemon-side injects it into any conversation
 //! — so capture needs no presence pipeline changes. The wasm side here
 //! is a pure state machine: Idle → Listening (press) → Transcribing
-//! (release) → Result (transcript) → consumed or discarded.
+//! (release) → delivered.
 //!
-//! The result is NEVER auto-sent. It lands on a preview strip with
-//! use/discard pills; "use" emits `{type:'text_commit', field_id, text}`
-//! through the same action router every other XR act uses, and the JS
-//! glue routes it through the dashboard's existing focus + composer
-//! submit path. (`field_id` is `composer:<sessionId>` — the reconcile
-//! point with the ray-keyboard seat's TextEntry contract: when its
-//! facade lands, the strip's commit collapses into that buffer's commit
-//! path and this shape must keep matching.)
+//! Delivery binds into the text-entry substrate (`keyboard.rs`) — the
+//! transcript is NEVER auto-sent. With the board open, the utterance
+//! appends at the cursor (dictate into the draft you were typing); with
+//! it closed, the board opens bound to the focused session's steer field
+//! carrying the transcript as its draft. Review, edits, and the commit
+//! all go through the keyboard's own grammar — enter emits
+//! `{type:'text_commit', field_id, text}` exactly as a typed draft
+//! would, and cancel discards. Voice adds a capture lane, not a second
+//! send path.
 //!
 //! Honesty: transcription unavailable — config off, mic denied, hosted
 //! Connect lane, dead event stream — renders as a visible status line on
@@ -54,14 +56,16 @@ const PULSE_MS: f64 = 1400.0;
 
 /// Quick-release hint (the accidental-pinch teaching line).
 const HINT_HOLD: &str = "hold to talk — keep pinching while you speak";
-/// Result-strip hint when no session is focused to send to.
-const HINT_NO_TARGET: &str = "select a session to send to";
+/// No open entry and no focused session: nowhere to put the words.
+const HINT_NO_TARGET: &str = "select a session to dictate to";
 /// Transcribe-backstop line.
 const NOTE_TIMEOUT: &str = "transcription timed out — try again";
 
 /// Talk-lane phase. `Listening`/`Transcribing` carry their start time
 /// (the frame/`performance.now()` clock) for the min-hold check, the
-/// pulse, and the transcribe backstop.
+/// pulse, and the transcribe backstop. A delivered transcript folds
+/// back to `Idle` — the text-entry board carrying the draft IS the
+/// result state.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) enum TalkPhase {
     #[default]
@@ -71,9 +75,6 @@ pub(crate) enum TalkPhase {
     },
     Transcribing {
         since_ms: f64,
-    },
-    Result {
-        text: String,
     },
 }
 
@@ -138,26 +139,17 @@ impl VoiceDock {
             TalkPhase::Idle => "idle",
             TalkPhase::Listening { .. } => "listening",
             TalkPhase::Transcribing { .. } => "transcribing",
-            TalkPhase::Result { .. } => "result",
-        }
-    }
-
-    pub(crate) fn result_text(&self) -> Option<&str> {
-        match &self.phase {
-            TalkPhase::Result { text } => Some(text.as_str()),
-            _ => None,
         }
     }
 }
 
-// ---- transitions (pure) --------------------------------------------------
+// ---- transitions ---------------------------------------------------------
 
-/// Talk-pill pinch begins. Idle and Result both start a fresh capture
-/// (pressing talk with a pending result deliberately re-records over
-/// it). Already listening/transcribing: no-op.
+/// Talk-pill pinch begins. Only idle starts a capture; already
+/// listening/transcribing is a no-op.
 pub(crate) fn on_press(dock: &mut VoiceDock, now_ms: f64) -> Option<VoiceCmd> {
     match dock.phase {
-        TalkPhase::Idle | TalkPhase::Result { .. } => {
+        TalkPhase::Idle => {
             dock.phase = TalkPhase::Listening { since_ms: now_ms };
             dock.note.clear();
             Some(VoiceCmd::Start)
@@ -186,24 +178,60 @@ pub(crate) fn on_release(dock: &mut VoiceDock, now_ms: f64, deliberate: bool) ->
     }
 }
 
-/// A transcript arrived from the JS lane. Accepted while listening or
-/// transcribing (a fast daemon can beat the release bookkeeping) and as
-/// a replacement for an unconsumed result. Empty text folds to a failed
-/// capture rather than an empty preview.
-pub(crate) fn apply_result(dock: &mut VoiceDock, text: &str) -> bool {
+/// A transcript arrived from the JS lane: deliver it into the text-entry
+/// substrate. Board open → append at the cursor (a joining space rides
+/// in when the cursor doesn't already sit after whitespace); board
+/// closed → open it bound to the focused session's steer field with the
+/// transcript as the draft; no focused session → the honest no-target
+/// note. Empty text folds to a failed capture. The capture phase folds
+/// to idle in every branch — the board carrying the draft is the result
+/// state, and its enter/cancel are the confirm grammar.
+pub(crate) fn apply_result(inner: &mut Inner, text: &str) {
     let text = text.trim();
     if text.is_empty() {
-        apply_failed(dock, "no speech recognized — try again");
-        return false;
+        apply_failed(&mut inner.voice, "no speech recognized — try again");
+        inner.ui_dirty = true;
+        return;
     }
-    match dock.phase {
-        TalkPhase::Idle => false,
-        _ => {
-            dock.phase = TalkPhase::Result {
-                text: text.to_string(),
-            };
-            true
+    inner.voice.phase = TalkPhase::Idle;
+    inner.voice.note.clear();
+
+    if !inner.text_entry.open {
+        let Some((sid, label)) = selected_session(inner) else {
+            inner.voice.note = HINT_NO_TARGET.to_string();
+            inner.ui_dirty = true;
+            return;
+        };
+        crate::keyboard::open_entry(inner, format!("steer:{sid}"), format!("steer · {label}"));
+    }
+    insert_transcript(inner, text);
+    inner.ui_dirty = true;
+}
+
+/// Append the utterance at the entry cursor, joining with a space when
+/// the cursor sits directly after non-whitespace. Refused inserts (the
+/// entry's buffer cap) surface as an honest truncation note.
+fn insert_transcript(inner: &mut Inner, text: &str) {
+    let e = &mut inner.text_entry;
+    let needs_space = e.cursor > 0
+        && e.buffer
+            .chars()
+            .nth(e.cursor - 1)
+            .is_some_and(|c| !c.is_whitespace());
+    let mut truncated = false;
+    if needs_space && !e.insert_char(' ') {
+        truncated = true;
+    }
+    if !truncated {
+        for c in text.chars() {
+            if !e.insert_char(c) {
+                truncated = true;
+                break;
+            }
         }
+    }
+    if truncated {
+        inner.voice.note = "transcript truncated — the draft is full".to_string();
     }
 }
 
@@ -237,41 +265,18 @@ pub(crate) fn tick(dock: &mut VoiceDock, now_ms: f64) -> bool {
     false
 }
 
-/// Discard the pending result (the strip's discard pill).
-pub(crate) fn on_discard(dock: &mut VoiceDock) -> bool {
-    if matches!(dock.phase, TalkPhase::Result { .. }) {
-        dock.phase = TalkPhase::Idle;
-        true
-    } else {
-        false
-    }
-}
-
-/// The commit payload for the strip's use pill: the pending transcript
-/// aimed at the focused session's composer. `None` without a result or a
-/// focused session (the strip renders the missing-target hint instead of
-/// a use pill). The shape is the text-entry contract:
-/// `{type:'text_commit', field_id: 'composer:<sessionId>', text}`.
-pub(crate) fn commit_payload(inner: &Inner) -> Option<serde_json::Value> {
-    let text = inner.voice.result_text()?.to_string();
-    let sid = selected_session(inner)?;
-    Some(serde_json::json!({
-        "type": "text_commit",
-        "field_id": format!("composer:{sid}"),
-        "text": text,
-    }))
-}
-
-/// The XR-local selection, filtered to real session cards (agenda-rail
-/// selections share `selected_id` but are not sendable targets).
-pub(crate) fn selected_session(inner: &Inner) -> Option<String> {
+/// The dictation target when no entry is open: the XR-local selection
+/// filtered to real session cards (agenda-rail selections share
+/// `selected_id` but are not sendable), with its card label for the
+/// board header.
+fn selected_session(inner: &Inner) -> Option<(String, String)> {
     let sid = inner.selected_id.as_deref()?;
     let model = inner.model.as_ref()?;
     model
         .agents
         .iter()
         .find(|a| a.id == sid)
-        .map(|a| a.id.clone())
+        .map(|a| (a.id.clone(), a.label()))
 }
 
 // ---- facade entry points -------------------------------------------------
@@ -347,12 +352,12 @@ fn at_floor(p: crate::math::Vec3, floor_y: f32) -> crate::math::Vec3 {
 }
 
 /// Append the voice affordances to a built scene: the talk pill always,
-/// the honest status line whenever there is one, the preview strip while
-/// a result is pending. Called from the frame loop's scene rebuild after
-/// `terminal::build_pane`, into the same batches.
+/// the honest status line whenever there is one. Called from the frame
+/// loop's scene rebuild after `terminal::build_pane`, into the same
+/// batches. (The captured transcript renders in the text entry, not
+/// here.)
 pub(crate) fn build_dock(
     dock: &DockView,
-    selected_session: Option<&str>,
     hover_id: Option<&str>,
     time_ms: f64,
     floor_y: f32,
@@ -369,7 +374,6 @@ pub(crate) fn build_dock(
         TalkPhase::Idle => (kit::LINE_2, "talk"),
         TalkPhase::Listening { .. } => (kit::GREEN, "listening…"),
         TalkPhase::Transcribing { .. } => (kit::AMBER, "transcribing…"),
-        TalkPhase::Result { .. } => (kit::IRIS, "ready"),
     };
     let text_h = 0.021;
     let dot_r = 0.006;
@@ -409,7 +413,7 @@ pub(crate) fn build_dock(
     // Listening/transcribing pulse: a ring band around the pill breathing
     // on a fixed period — recording is a state you can SEE from across
     // the room, not an easily missed border tint.
-    if let TalkPhase::Listening { .. } | TalkPhase::Transcribing { .. } = dock.phase {
+    if active {
         let period = (time_ms % PULSE_MS) / PULSE_MS;
         let wave = (period * std::f64::consts::TAU).sin() as f32 * 0.5 + 0.5;
         let grow = 0.006 + 0.006 * wave;
@@ -519,174 +523,6 @@ pub(crate) fn build_dock(
             text: line,
         });
     }
-
-    if let TalkPhase::Result { text } = &dock.phase {
-        build_strip(text, selected_session, hover_id, floor_y, measure, out);
-    }
-}
-
-/// The preview strip: captured transcript + use/discard pills. The
-/// deliberate-confirm surface — text is reviewed here and only a pinch
-/// on "use" sends it anywhere.
-fn build_strip(
-    text: &str,
-    selected_session: Option<&str>,
-    hover_id: Option<&str>,
-    floor_y: f32,
-    measure: &dyn TextMeasure,
-    out: &mut SceneBatches,
-) {
-    use crate::math::v3;
-    let center = v3(0.0, kit::VOICE_STRIP_Y, -kit::VOICE_STRIP_DIST);
-    let right = v3(1.0, 0.0, 0.0);
-    let up = v3(0.0, 1.0, 0.0);
-    let hw = kit::VOICE_STRIP_HALF_W;
-    let hh = kit::VOICE_STRIP_HALF_H;
-    let pad = 0.020;
-
-    out.panels.push(PanelInstance {
-        center: at_floor(center, floor_y),
-        right,
-        up,
-        half_w: hw,
-        half_h: hh,
-        radius: 0.016,
-        fill: kit::SURFACE_2,
-        border: kit::IRIS,
-        border_w: 0.0025,
-    });
-    // Caption: what this surface is (review, then decide).
-    out.texts.push(TextRun {
-        origin: lift(
-            center + right.scale(-hw + pad) + up.scale(hh - 0.017),
-            right,
-            up,
-            LIFT_TEXT,
-            floor_y,
-        ),
-        right,
-        up,
-        height: 0.014,
-        color: kit::TEXT_3,
-        align: TextAlign::Left,
-        max_width: hw * 2.0 - pad * 2.0,
-        text: "voice transcript — review, then use".to_string(),
-    });
-    // The transcript itself.
-    out.texts.push(TextRun {
-        origin: lift(
-            center + right.scale(-hw + pad) + up.scale(0.004),
-            right,
-            up,
-            LIFT_TEXT,
-            floor_y,
-        ),
-        right,
-        up,
-        height: 0.020,
-        color: kit::TEXT,
-        align: TextAlign::Left,
-        max_width: hw * 2.0 - pad * 2.0,
-        text: text.to_string(),
-    });
-
-    // Bottom row: use/discard pills right-aligned; the missing-target
-    // hint replaces the use pill when nothing is focused.
-    let pill_y = -hh + 0.024;
-    let pill_hh = 0.017;
-    let label_h = 0.018;
-    let mut pen = hw - pad;
-    let pill = |label: &str,
-                id: &str,
-                kind: HitKind,
-                color: [f32; 4],
-                pen: &mut f32,
-                out: &mut SceneBatches| {
-        let pill_hw = (measure.measure(label, label_h) / 2.0 + 0.018).max(0.040);
-        let x = *pen - pill_hw;
-        *pen = x - pill_hw - 0.018;
-        let pcenter = center + right.scale(x) + up.scale(pill_y);
-        let is_hover = hover_id == Some(id);
-        out.panels.push(PanelInstance {
-            center: lift(pcenter, right, up, LIFT_DECOR, floor_y),
-            right,
-            up,
-            half_w: pill_hw,
-            half_h: pill_hh,
-            radius: pill_hh,
-            fill: if is_hover {
-                dim(color, 0.30)
-            } else {
-                kit::SURFACE
-            },
-            border: color,
-            border_w: if is_hover { 0.0035 } else { 0.0025 },
-        });
-        out.texts.push(TextRun {
-            origin: lift(
-                pcenter - up.scale(0.007),
-                right,
-                up,
-                LIFT_TEXT + LIFT_DECOR,
-                floor_y,
-            ),
-            right,
-            up,
-            height: label_h,
-            color,
-            align: TextAlign::Center,
-            max_width: pill_hw * 2.0 - 0.008,
-            text: label.to_string(),
-        });
-        out.hits.push(HitTarget {
-            id: id.to_string(),
-            kind,
-            agent_id: String::new(),
-            panel: Panel {
-                center: at_floor(pcenter, floor_y),
-                right,
-                up,
-                half_w: pill_hw,
-                half_h: pill_hh,
-            },
-        });
-    };
-
-    pill(
-        "discard",
-        "voice:discard",
-        HitKind::VoiceDiscard,
-        kit::TEXT_2,
-        &mut pen,
-        out,
-    );
-    if selected_session.is_some() {
-        pill(
-            "use",
-            "voice:use",
-            HitKind::VoiceUse,
-            kit::GREEN,
-            &mut pen,
-            out,
-        );
-    } else {
-        out.texts.push(TextRun {
-            origin: lift(
-                center + right.scale(-hw + pad) + up.scale(pill_y - 0.006),
-                right,
-                up,
-                LIFT_TEXT,
-                floor_y,
-            ),
-            right,
-            up,
-            height: 0.016,
-            color: kit::AMBER,
-            align: TextAlign::Left,
-            max_width: hw * 2.0 - pad * 2.0 - 0.12,
-            text: HINT_NO_TARGET.to_string(),
-        });
-    }
 }
 
 #[cfg(test)]
@@ -696,6 +532,18 @@ mod tests {
 
     fn ids(out: &SceneBatches) -> Vec<String> {
         out.hits.iter().map(|h| h.id.clone()).collect()
+    }
+
+    fn inner_with_session() -> Inner {
+        let mut inner = Inner::new();
+        let snap: crate::model::XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{ "id": "local", "name": "local", "connected": true }],
+            "agents": [{ "id": "sess-1", "hostId": "local", "status": "running" }],
+        }))
+        .unwrap();
+        inner.model = Some(snap);
+        inner.selected_id = Some("sess-1".into());
+        inner
     }
 
     #[test]
@@ -746,56 +594,76 @@ mod tests {
     }
 
     #[test]
-    fn result_lands_and_is_consumed_or_discarded() {
-        let mut dock = VoiceDock::default();
-        on_press(&mut dock, 0.0);
-        on_release(&mut dock, 1000.0, false);
-        assert!(apply_result(&mut dock, "  open the logs  "));
-        assert_eq!(dock.result_text(), Some("open the logs"));
-        assert!(on_discard(&mut dock));
-        assert_eq!(dock.phase_name(), "idle");
-        assert!(!on_discard(&mut dock));
+    fn transcript_opens_the_steer_entry_for_the_focused_session() {
+        let mut inner = inner_with_session();
+        on_press(&mut inner.voice, 0.0);
+        on_release(&mut inner.voice, 1000.0, false);
+        apply_result(&mut inner, "  open the logs  ");
+        assert_eq!(inner.voice.phase_name(), "idle");
+        assert!(inner.text_entry.open);
+        assert_eq!(inner.text_entry.field_id, "steer:sess-1");
+        assert!(inner.text_entry.label.starts_with("steer · "));
+        assert_eq!(inner.text_entry.buffer, "open the logs");
+        assert_eq!(inner.text_entry.cursor, inner.text_entry.char_len());
+        assert!(inner.voice.note.is_empty());
     }
 
     #[test]
-    fn result_can_land_while_still_listening() {
+    fn transcript_appends_into_an_open_draft_at_the_cursor() {
+        let mut inner = inner_with_session();
+        crate::keyboard::open_entry(&mut inner, "steer:sess-1".into(), "steer · s".into());
+        for c in "check ci".chars() {
+            inner.text_entry.insert_char(c);
+        }
+        on_press(&mut inner.voice, 0.0);
+        on_release(&mut inner.voice, 1000.0, false);
+        apply_result(&mut inner, "and the queue");
+        assert_eq!(inner.text_entry.buffer, "check ci and the queue");
+        // Cursor after whitespace: no doubled joining space.
+        inner.text_entry.insert_char(' ');
+        apply_result(&mut inner, "now");
+        assert_eq!(inner.text_entry.buffer, "check ci and the queue now");
+    }
+
+    #[test]
+    fn transcript_with_no_entry_and_no_session_lands_the_no_target_note() {
+        let mut inner = Inner::new();
+        on_press(&mut inner.voice, 0.0);
+        on_release(&mut inner.voice, 1000.0, false);
+        apply_result(&mut inner, "stranded words");
+        assert_eq!(inner.voice.phase_name(), "idle");
+        assert!(!inner.text_entry.open);
+        assert_eq!(inner.voice.note, HINT_NO_TARGET);
+        // Agenda-rail selections are not sendable targets either.
+        let mut inner = inner_with_session();
+        inner.selected_id = Some("agenda:item-1".into());
+        apply_result(&mut inner, "stranded words");
+        assert!(!inner.text_entry.open);
+        assert_eq!(inner.voice.note, HINT_NO_TARGET);
+    }
+
+    #[test]
+    fn transcript_can_land_while_still_listening() {
         // A fast daemon chunk can beat the release bookkeeping; the
         // machine accepts it rather than dropping speech on the floor.
-        let mut dock = VoiceDock::default();
-        on_press(&mut dock, 0.0);
-        assert!(apply_result(&mut dock, "quick words"));
-        assert_eq!(dock.phase_name(), "result");
-        // The now-stale release is a no-op against a landed result.
-        assert_eq!(on_release(&mut dock, 5000.0, false), None);
-        assert_eq!(dock.result_text(), Some("quick words"));
+        let mut inner = inner_with_session();
+        on_press(&mut inner.voice, 0.0);
+        apply_result(&mut inner, "quick words");
+        assert_eq!(inner.voice.phase_name(), "idle");
+        assert_eq!(inner.text_entry.buffer, "quick words");
+        // The now-stale release is a no-op after delivery.
+        assert_eq!(on_release(&mut inner.voice, 5000.0, false), None);
     }
 
     #[test]
-    fn pressing_talk_over_a_result_rerecords() {
-        let mut dock = VoiceDock::default();
-        on_press(&mut dock, 0.0);
-        on_release(&mut dock, 1000.0, false);
-        apply_result(&mut dock, "first take");
-        assert_eq!(on_press(&mut dock, 2000.0), Some(VoiceCmd::Start));
-        assert_eq!(dock.phase_name(), "listening");
-        assert_eq!(dock.result_text(), None);
-    }
-
-    #[test]
-    fn empty_result_folds_to_a_failed_capture() {
-        let mut dock = VoiceDock::default();
-        on_press(&mut dock, 0.0);
-        on_release(&mut dock, 1000.0, false);
-        assert!(!apply_result(&mut dock, "   "));
-        assert_eq!(dock.phase_name(), "idle");
-        assert!(dock.note.contains("no speech"));
-    }
-
-    #[test]
-    fn ignored_result_when_idle() {
-        let mut dock = VoiceDock::default();
-        assert!(!apply_result(&mut dock, "stray transcript"));
-        assert_eq!(dock.phase_name(), "idle");
+    fn empty_transcript_folds_to_a_failed_capture() {
+        let mut inner = inner_with_session();
+        on_press(&mut inner.voice, 0.0);
+        on_release(&mut inner.voice, 1000.0, false);
+        apply_result(&mut inner, "   ");
+        assert_eq!(inner.voice.phase_name(), "idle");
+        assert!(inner.voice.note.contains("no speech"));
+        assert!(!inner.text_entry.open);
     }
 
     #[test]
@@ -824,41 +692,27 @@ mod tests {
     }
 
     #[test]
-    fn commit_payload_needs_a_result_and_a_real_session() {
-        let mut inner = Inner::new();
-        // No result → no payload.
-        assert!(commit_payload(&inner).is_none());
-
+    fn delivered_transcript_commits_through_the_keyboard() {
+        // The whole loop the merge was designed for: dictated text rides
+        // the SAME commit path a typed draft rides — keyboard enter, the
+        // text_commit shape, delivery bookkeeping — no voice send path.
+        let mut inner = inner_with_session();
         on_press(&mut inner.voice, 0.0);
         on_release(&mut inner.voice, 1000.0, false);
-        apply_result(&mut inner.voice, "ship the fix");
-        // Result but no selection → still none.
-        assert!(commit_payload(&inner).is_none());
-
-        let snap: crate::model::XrSnapshot = serde_json::from_value(serde_json::json!({
-            "hosts": [{ "id": "local", "name": "local", "connected": true }],
-            "agents": [{ "id": "sess-1", "hostId": "local", "status": "running" }],
-        }))
-        .unwrap();
-        inner.model = Some(snap);
-        // Agenda-rail selections are not sendable targets.
-        inner.selected_id = Some("agenda:item-1".into());
-        assert!(commit_payload(&inner).is_none());
-
-        inner.selected_id = Some("sess-1".into());
-        let payload = commit_payload(&inner).expect("payload");
-        assert_eq!(payload["type"], "text_commit");
-        assert_eq!(payload["field_id"], "composer:sess-1");
-        assert_eq!(payload["text"], "ship the fix");
+        apply_result(&mut inner, "ship the fix");
+        assert!(crate::keyboard::commit(&mut inner));
+        assert!(!inner.text_entry.open);
+        let (field, state) = inner.text_entry.status.clone().expect("delivery state");
+        assert_eq!(field, "steer:sess-1");
+        assert_eq!(state, crate::keyboard::DeliveryState::Sending);
     }
 
     #[test]
     fn build_dock_always_offers_the_talk_pill() {
         let dock = DockView::default();
         let mut out = SceneBatches::default();
-        build_dock(&dock, None, None, 0.0, 0.0, &ApproxMeasure, &mut out);
+        build_dock(&dock, None, 0.0, 0.0, &ApproxMeasure, &mut out);
         assert!(ids(&out).contains(&"voice:talk".to_string()));
-        assert!(!ids(&out).contains(&"voice:use".to_string()));
         assert!(out.texts.iter().any(|t| t.text == "talk"));
     }
 
@@ -872,7 +726,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = SceneBatches::default();
-        build_dock(&dock, None, None, 0.0, 0.0, &ApproxMeasure, &mut out);
+        build_dock(&dock, None, 0.0, 0.0, &ApproxMeasure, &mut out);
         assert!(out
             .texts
             .iter()
@@ -886,7 +740,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = SceneBatches::default();
-        build_dock(&dock, None, None, 0.0, 0.0, &ApproxMeasure, &mut out);
+        build_dock(&dock, None, 0.0, 0.0, &ApproxMeasure, &mut out);
         assert!(out
             .texts
             .iter()
@@ -900,39 +754,8 @@ mod tests {
             ..Default::default()
         };
         let mut out = SceneBatches::default();
-        build_dock(&dock, None, None, 0.0, 0.0, &ApproxMeasure, &mut out);
+        build_dock(&dock, None, 0.0, 0.0, &ApproxMeasure, &mut out);
         assert!(out.texts.iter().any(|t| t.text == HINT_HOLD));
-    }
-
-    #[test]
-    fn result_strip_offers_use_only_with_a_target() {
-        let dock = DockView {
-            phase: TalkPhase::Result {
-                text: "open the build logs".into(),
-            },
-            ..Default::default()
-        };
-        let mut out = SceneBatches::default();
-        build_dock(
-            &dock,
-            Some("sess-1"),
-            None,
-            0.0,
-            0.0,
-            &ApproxMeasure,
-            &mut out,
-        );
-        let with_target = ids(&out);
-        assert!(with_target.contains(&"voice:use".to_string()));
-        assert!(with_target.contains(&"voice:discard".to_string()));
-        assert!(out.texts.iter().any(|t| t.text == "open the build logs"));
-
-        let mut out = SceneBatches::default();
-        build_dock(&dock, None, None, 0.0, 0.0, &ApproxMeasure, &mut out);
-        let without = ids(&out);
-        assert!(!without.contains(&"voice:use".to_string()));
-        assert!(without.contains(&"voice:discard".to_string()));
-        assert!(out.texts.iter().any(|t| t.text == HINT_NO_TARGET));
     }
 
     #[test]
@@ -945,14 +768,13 @@ mod tests {
         build_dock(
             &DockView::default(),
             None,
-            None,
             0.0,
             0.0,
             &ApproxMeasure,
             &mut base,
         );
         let mut live = SceneBatches::default();
-        build_dock(&dock, None, None, 350.0, 0.0, &ApproxMeasure, &mut live);
+        build_dock(&dock, None, 350.0, 0.0, &ApproxMeasure, &mut live);
         assert!(live.panels.len() > base.panels.len(), "pulse ring present");
         assert!(live.texts.iter().any(|t| t.text == "listening…"));
     }
