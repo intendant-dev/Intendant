@@ -2432,10 +2432,17 @@ class BrowserHarness {
     }
     // Enter (chip click path) and wait for a live stereo loop.
     await this.evaluate('xrProbe.enter()');
-    await this.waitForFunction(
-      'xrProbe.debugJson().then((d) => d.active && d.engine.framesRendered > 20 && d.engine.views === 2)',
-      timeoutMs,
-    );
+    try {
+      await this.waitForFunction(
+        'xrProbe.debugJson().then((d) => d.active && d.engine.framesRendered > 20 && d.engine.views === 2)',
+        timeoutMs,
+      );
+    } catch (error) {
+      const diag = await this.evaluate(
+        "xrProbe.debugJson().then((d) => JSON.stringify({ active: d.active, frames: d.engine.framesRendered, views: d.engine.views, lastError: (globalThis.xrProbe && xrProbe.lastError) || null }))",
+      ).catch(() => 'unavailable');
+      throw new Error(`xr probe: no stereo loop — ${String(diag)} (${error.message})`);
+    }
     // Synthetic snapshot → shelf builds; keep re-pushing so the page's
     // own 300 ms pump (real, mostly-empty dashboard state) can't win the
     // race against the assertions below.
