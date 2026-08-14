@@ -94,9 +94,14 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
         inner.hover_id = new_hover;
         inner.ui_dirty = true;
         // Moving off a held target cancels the hold — confirmation
-        // requires sustained aim, not a drive-by.
+        // requires sustained aim, not a drive-by. The talk hold is the
+        // deliberate exception: it is a RECORDING window, not a confirm,
+        // and a hand drifts while its owner speaks — releasing the pinch
+        // is the only stop (so the mic can never stay hot).
         if let Some(held) = inner.hold_target.clone() {
-            if inner.hover_id.as_deref() != Some(held.as_str()) {
+            if inner.hover_id.as_deref() != Some(held.as_str())
+                && target_kind(inner, &held) != Some(HitKind::VoiceTalk)
+            {
                 inner.hold_target = None;
                 inner.confirm_progress = None;
             }
@@ -104,14 +109,31 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
     }
 
     if let Some(held) = inner.hold_target.clone() {
-        let progress = ((time_ms - inner.hold_started_ms) / CONFIRM_HOLD_MS).clamp(0.0, 1.0);
-        if progress >= 1.0 {
-            inner.hold_target = None;
-            inner.confirm_progress = None;
-            dispatch_target(inner, &held);
+        if target_kind(inner, &held) == Some(HitKind::VoiceTalk) {
+            // Push-to-talk: no confirm timer — the hold lasts exactly as
+            // long as the pinch, and selectend resolves it.
         } else {
-            inner.confirm_progress = Some((held, progress as f32));
+            let progress = ((time_ms - inner.hold_started_ms) / CONFIRM_HOLD_MS).clamp(0.0, 1.0);
+            if progress >= 1.0 {
+                inner.hold_target = None;
+                inner.confirm_progress = None;
+                dispatch_target(inner, &held);
+            } else {
+                inner.confirm_progress = Some((held, progress as f32));
+            }
+            inner.ui_dirty = true;
         }
+    }
+
+    // Voice dock upkeep: the transcribe backstop, and per-frame rebuilds
+    // while the pill is animating (listening/transcribing pulse).
+    if crate::voice::tick(&mut inner.voice, time_ms) {
+        inner.ui_dirty = true;
+    }
+    if matches!(
+        inner.voice.phase,
+        crate::voice::TalkPhase::Listening { .. } | crate::voice::TalkPhase::Transcribing { .. }
+    ) {
         inner.ui_dirty = true;
     }
 }
@@ -166,28 +188,47 @@ fn steer_grab(inner: &mut Inner) {
     }
 }
 
+/// Kind of a (still-present) hit target by id. A rebuilt scene can drop
+/// a held target; `None` then, and the hold resolves as a miss.
+fn target_kind(inner: &Inner, id: &str) -> Option<HitKind> {
+    inner
+        .hit_targets
+        .iter()
+        .find(|h| h.id == id)
+        .map(|h| h.kind)
+}
+
 /// `selectstart`: a pinch on a grab bar starts steering its surface;
-/// anything else hovered begins a hold. Cards and the other light acts
-/// resolve on release (selectend); hold-tier targets resolve by time
-/// (update()).
+/// anything else hovered begins a hold. Light acts resolve on release
+/// (selectend); hold-tier targets resolve by time (update()); the talk
+/// pill starts recording NOW — that hold is the capture window.
 pub(crate) fn on_select_start(inner: &mut Inner, now_ms: f64) {
     if let Some(hovered) = inner.hover_id.clone() {
-        if let Some(hit) = inner.hit_targets.iter().find(|h| h.id == hovered) {
-            if hit.kind == HitKind::Grab {
+        if target_kind(inner, &hovered) == Some(HitKind::Grab) {
+            if let Some(hit) = inner.hit_targets.iter().find(|h| h.id == hovered) {
                 inner.grab_surface = Some(hit.agent_id.clone());
-                inner.ui_dirty = true;
-                return;
             }
+            inner.ui_dirty = true;
+            return;
         }
-        inner.hold_target = Some(hovered);
+        inner.hold_target = Some(hovered.clone());
         inner.hold_started_ms = now_ms;
+        if target_kind(inner, &hovered) == Some(HitKind::VoiceTalk) {
+            if let Some(cmd) = crate::voice::on_press(&mut inner.voice, now_ms) {
+                emit_action(inner, &cmd.payload());
+            }
+            inner.ui_dirty = true;
+        }
     }
 }
 
-/// `selectend`: releasing a grab drops the surface where it is; a
-/// released hold on a light target is a click; an unfinished hold on a
-/// hold-tier target cancels silently.
-pub(crate) fn on_select_end(inner: &mut Inner) {
+/// `selectend`: releasing a grab drops the surface where it is; a talk
+/// hold stops the recording — unconditionally, hovered or not, because
+/// a released pinch must never leave the mic hot; a released hold on a
+/// light target is a click (quick pinches: cards, paging, summon and
+/// dismiss, layout toggles, keys, the steer pill, thread actions,
+/// reopen); an unfinished hold on a hold-tier target cancels silently.
+pub(crate) fn on_select_end(inner: &mut Inner, now_ms: f64) {
     if inner.grab_surface.take().is_some() {
         inner.ui_dirty = true;
         return;
@@ -197,12 +238,21 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
     };
     inner.confirm_progress = None;
     inner.ui_dirty = true;
+    if target_kind(inner, &target) == Some(HitKind::VoiceTalk) {
+        if let Some(cmd) = crate::voice::on_release(&mut inner.voice, now_ms, false) {
+            emit_action(inner, &cmd.payload());
+        }
+        return;
+    }
     let still_hovered = inner.hover_id.as_deref() == Some(target.as_str());
     if !still_hovered {
         return;
     }
     if let Some(hit) = inner.hit_targets.iter().find(|h| h.id == target) {
-        if !is_hold_kind(hit.kind) && hit.kind != HitKind::Grab {
+        // Every remaining light act rides the one dispatch path (the
+        // same arms `activate(name)` runs); grab never arms a hold and
+        // the talk hold resolved above.
+        if !is_hold_kind(hit.kind) && !matches!(hit.kind, HitKind::Grab | HitKind::VoiceTalk) {
             dispatch_target(inner, &target);
         }
     }
@@ -381,6 +431,28 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
         HitKind::TerminalToggle | HitKind::TerminalClose => {
             crate::terminal::handle_release(inner, hit.kind)
         }
+        // Text entry: the steer pill toggles the board; keys type into
+        // it. `activate(name)` runs the same arms, so the validator and
+        // accessibility layers type exactly like a pinch does.
+        HitKind::SteerOpen => crate::keyboard::open_for_steer(inner, &hit),
+        HitKind::Key => crate::keyboard::handle_key(inner, &hit.id),
+        // Activation by name is the deliberate act (automation and
+        // accessibility): the talk pill TOGGLES — one activation starts
+        // the capture, the next stops it — with the accidental-pinch
+        // minimum waived.
+        HitKind::VoiceTalk => {
+            let cmd = if matches!(inner.voice.phase, crate::voice::TalkPhase::Listening { .. }) {
+                crate::voice::on_release(&mut inner.voice, inner.last_raf_time_ms, true)
+            } else {
+                crate::voice::on_press(&mut inner.voice, inner.last_raf_time_ms)
+            };
+            let Some(cmd) = cmd else {
+                return false;
+            };
+            emit_action(inner, &cmd.payload());
+            inner.ui_dirty = true;
+            true
+        }
         HitKind::LayoutToggle => {
             if !kit::LAYOUT_SURFACES.contains(&hit.agent_id.as_str()) {
                 return false;
@@ -419,7 +491,10 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
 
 /// Call the registered JS action router with one JSON-shaped object.
 /// Failures log and drop — an action must never take the session down.
-fn emit_action(inner: &Inner, payload: &serde_json::Value) {
+/// `pub(crate)` so the keyboard's commit emits through the same seam;
+/// the no-router warn is wasm-only (host tests exercise emitters with
+/// no callback, and web-sys imports panic off-browser).
+pub(crate) fn emit_action(inner: &Inner, payload: &serde_json::Value) {
     let Some(callback) = inner.action_callback.clone() else {
         #[cfg(target_arch = "wasm32")]
         web_sys::console::warn_1(&"xr-web: action emitted with no router registered".into());
@@ -645,10 +720,10 @@ mod tests {
         on_select_start(&mut inner, 0.0);
         assert_eq!(inner.grab_surface.as_deref(), Some("terminal"));
         assert!(inner.hold_target.is_none(), "a grab never arms a hold");
-        on_select_end(&mut inner);
+        on_select_end(&mut inner, 0.0);
         assert!(inner.grab_surface.is_none());
         // Release without a grab or hold is inert.
-        on_select_end(&mut inner);
+        on_select_end(&mut inner, 0.0);
     }
 
     #[test]
@@ -702,7 +777,7 @@ mod tests {
         assert_eq!(inner.hold_target.as_deref(), Some("verb:a1:interrupt"));
         // Quick release: the hold cancels silently — no dispatch, no
         // state change beyond clearing the hold.
-        on_select_end(&mut inner);
+        on_select_end(&mut inner, 0.0);
         assert!(inner.hold_target.is_none());
         assert!(inner.confirm_progress.is_none());
     }

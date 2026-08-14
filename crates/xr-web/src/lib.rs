@@ -21,12 +21,14 @@ mod agenda;
 mod atlas;
 pub mod gl;
 mod input;
+mod keyboard;
 mod kit;
 pub mod math;
 mod model;
 mod session;
 mod terminal;
 mod ui;
+mod voice;
 pub mod webxr_sys;
 
 use std::cell::RefCell;
@@ -46,6 +48,10 @@ pub(crate) struct Inner {
     pub(crate) active: bool,
     /// "immersive-ar" / "immersive-vr" while active.
     pub(crate) mode: Option<String>,
+    /// dom-overlay spike lane: whether entry asked for the overlay and
+    /// whether the runtime actually granted it (domOverlayState non-null).
+    pub(crate) overlay_requested: bool,
+    pub(crate) overlay_active: bool,
     /// Monotonic count of snapshots received from the dashboard feed.
     snapshot_generation: u64,
     /// Callback into the dashboard's action router (same JSON vocabulary
@@ -84,6 +90,13 @@ pub(crate) struct Inner {
     /// In-scene terminal pane (read-only mirror of the dashboard's
     /// standalone shell; see `terminal.rs`).
     pub(crate) terminal: terminal::TerminalPane,
+    /// In-scene text entry: the focused-field model + ray-typed
+    /// keyboard (see `keyboard.rs`).
+    pub(crate) text_entry: keyboard::TextEntry,
+    /// Hold-to-talk voice input: talk pill + capture state machine; the
+    /// captured transcript lands in `text_entry`'s buffer (see
+    /// `voice.rs`).
+    pub(crate) voice: voice::VoiceDock,
     /// Per-frame controller/hand rays with their nearest hit distance —
     /// rendered as visible beams + hit markers (the pointer).
     pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
@@ -114,6 +127,8 @@ impl Inner {
             supported_vr: None,
             active: false,
             mode: None,
+            overlay_requested: false,
+            overlay_active: false,
             snapshot_generation: 0,
             action_callback: None,
             session_end_callback: None,
@@ -131,6 +146,8 @@ impl Inner {
             grab_surface: None,
             displays: Vec::new(),
             terminal: terminal::TerminalPane::default(),
+            text_entry: keyboard::TextEntry::default(),
+            voice: voice::VoiceDock::default(),
             pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
@@ -161,6 +178,10 @@ fn debug_state_json(inner: &Inner) -> String {
         },
         "snapshotGeneration": inner.snapshot_generation,
         "hasActionCallback": inner.action_callback.is_some(),
+        "overlay": {
+            "requested": inner.overlay_requested,
+            "active": inner.overlay_active,
+        },
         "engine": {
             "framesRendered": inner.frames_rendered,
             "views": inner.last_view_count,
@@ -181,6 +202,34 @@ fn debug_state_json(inner: &Inner) -> String {
         "layout": {
             "state": inner.layout.to_json(),
             "grabbing": inner.grab_surface,
+        },
+        "textEntry": {
+            "open": inner.text_entry.open,
+            "field": inner.text_entry.field_id,
+            "label": inner.text_entry.label,
+            "bufferLen": inner.text_entry.char_len(),
+            "cursor": inner.text_entry.cursor,
+            "shift": inner.text_entry.shift,
+            "status": inner.text_entry.status.as_ref().map(|(field, state)| {
+                let (state, detail) = match state {
+                    keyboard::DeliveryState::Sending => ("sending", String::new()),
+                    keyboard::DeliveryState::Sent => ("sent", String::new()),
+                    keyboard::DeliveryState::Failed(d) => ("failed", d.clone()),
+                };
+                serde_json::json!({ "field": field, "state": state, "detail": detail })
+            }),
+        },
+        "voice": {
+            "phase": inner.voice.phase_name(),
+            "available": inner.voice.availability.as_ref().map(|a| a.available),
+            "detail": inner
+                .voice
+                .availability
+                .as_ref()
+                .map(|a| a.detail.clone())
+                .unwrap_or_default(),
+            "note": inner.voice.note,
+            "parseErrors": inner.voice.parse_errors,
         },
         "scene": {
             "panels": inner.panels_count,
@@ -268,7 +317,21 @@ impl XrWeb {
     pub fn enter(&self, mode: String) -> js_sys::Promise {
         let inner = Rc::clone(&self.inner);
         wasm_bindgen_futures::future_to_promise(async move {
-            session::enter(inner, mode).await?;
+            session::enter(inner, mode, None).await?;
+            Ok(JsValue::TRUE)
+        })
+    }
+
+    /// Spike lane: enter with the WebXR DOM Overlay module requested for
+    /// `root` (the flag-gated entry passes the whole dashboard body, so
+    /// the REGULAR UI composites interactively over the scene where the
+    /// runtime supports it). The feature is optional — ungranted runtimes
+    /// enter normally; `debugJson().overlay` reports the truth.
+    #[wasm_bindgen(js_name = enterWithOverlay)]
+    pub fn enter_with_overlay(&self, mode: String, root: web_sys::Element) -> js_sys::Promise {
+        let inner = Rc::clone(&self.inner);
+        wasm_bindgen_futures::future_to_promise(async move {
+            session::enter(inner, mode, Some(root)).await?;
             Ok(JsValue::TRUE)
         })
     }
@@ -377,16 +440,50 @@ impl XrWeb {
         }
     }
 
+    /// Standing voice-input availability from the JS glue, which owns
+    /// the truth (daemon transcription config, transport posture, mic
+    /// permission): `{available: bool, detail: string}`. While
+    /// unavailable the talk pill renders `detail` as a visible status
+    /// line — never a silent no-op. Malformed pushes are dropped and
+    /// counted, never fatal.
+    #[wasm_bindgen(js_name = voiceStatus)]
+    pub fn voice_status(&self, status: JsValue) {
+        voice::apply_status_js(&mut self.inner.borrow_mut(), status);
+    }
+
+    /// A captured utterance transcript from the JS capture lane. Lands
+    /// in the ACTIVE text-entry buffer (`keyboard.rs`) — appended at the
+    /// cursor when the board is open, else the board opens bound to the
+    /// focused session's steer field with the transcript as its draft.
+    /// Review and commit go through the keyboard's own enter/cancel —
+    /// NEVER auto-sent.
+    #[wasm_bindgen(js_name = voiceResult)]
+    pub fn voice_result(&self, text: String) {
+        voice::apply_result(&mut self.inner.borrow_mut(), &text);
+    }
+
+    /// The capture attempt ended without a transcript (mic denied, no
+    /// speech recognized, lane down): back to idle with the reason
+    /// rendered under the pill.
+    #[wasm_bindgen(js_name = voiceFailed)]
+    pub fn voice_failed(&self, message: String) {
+        let mut inner = self.inner.borrow_mut();
+        voice::apply_failed(&mut inner.voice, &message);
+        inner.ui_dirty = true;
+    }
+
     /// Activate a scene target by hit-target id (`card:<agent>`,
     /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle` /
     /// `close` / `open` / `kill`, `verb:<agent>:<op>`,
-    /// `agendaop:<item>:<op>`, `layout:<surface>`, `close:<surface>`),
-    /// the same activation-by-name contract the other rendered surface
-    /// gives the validator and accessibility layers. Runs the exact
-    /// dispatch path a completed ray interaction runs — activation by
-    /// name IS the deliberate act, so hold-tier targets (approve/deny,
-    /// interrupt, terminal open/kill, agenda complete) fire without the
-    /// hold. Returns true when the target existed and had an effect.
+    /// `agendaop:<item>:<op>`, `layout:<surface>`, `close:<surface>`,
+    /// `steer:<agent>`, `key:<token>`, `voice:talk` — toggles the
+    /// capture), the same activation-by-name contract the other
+    /// rendered surface gives the validator and accessibility layers.
+    /// Runs the exact dispatch path a completed ray interaction runs —
+    /// activation by name IS the deliberate act, so hold-tier targets
+    /// (approve/deny, interrupt, terminal open/kill, agenda complete)
+    /// fire without the hold. Returns true when the target existed and
+    /// had an effect.
     pub fn activate(&self, name: String) -> bool {
         input::dispatch_target(&mut self.inner.borrow_mut(), &name)
     }
@@ -422,6 +519,30 @@ impl XrWeb {
             inner.ui_dirty = true;
         }
         applied
+    }
+
+    /// Open the in-scene text entry bound to a field id, with a human
+    /// label for the board's header. The workbench steer pill runs this
+    /// same path via `activate("steer:<agent>")`; this direct seam is
+    /// for future consumers and deterministic probes.
+    #[wasm_bindgen(js_name = openTextEntry)]
+    pub fn open_text_entry(&self, field_id: String, label: String) {
+        keyboard::open_entry(&mut self.inner.borrow_mut(), field_id, label);
+    }
+
+    /// Close the text entry without committing (drops the draft).
+    #[wasm_bindgen(js_name = cancelTextEntry)]
+    pub fn cancel_text_entry(&self) {
+        keyboard::cancel_entry(&mut self.inner.borrow_mut());
+    }
+
+    /// Delivery verdict for a committed field, reported by the
+    /// dashboard's router after it routes a `text_commit` action:
+    /// ok → the scene says "sent", !ok → it says why not. Honest state,
+    /// never assumed.
+    #[wasm_bindgen(js_name = textEntryResult)]
+    pub fn text_entry_result(&self, field_id: String, ok: bool, detail: String) {
+        keyboard::apply_result(&mut self.inner.borrow_mut(), &field_id, ok, &detail);
     }
 
     /// QA/introspection hook: JSON string of the facade + engine state.
@@ -462,6 +583,8 @@ mod tests {
         assert!(parsed["supported"]["ar"].is_null());
         assert_eq!(parsed["snapshotGeneration"], 0);
         assert_eq!(parsed["hasActionCallback"], false);
+        assert_eq!(parsed["overlay"]["requested"], false);
+        assert_eq!(parsed["overlay"]["active"], false);
         assert_eq!(parsed["scene"]["agendaItems"], 0);
         assert_eq!(parsed["engine"]["framesRendered"], 0);
         assert_eq!(parsed["engine"]["views"], 0);
@@ -513,6 +636,36 @@ mod tests {
     }
 
     #[test]
+    fn debug_json_reports_text_entry_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], false);
+        assert_eq!(parsed["textEntry"]["field"], "");
+        assert_eq!(parsed["textEntry"]["bufferLen"], 0);
+        assert_eq!(parsed["textEntry"]["shift"], false);
+        assert!(parsed["textEntry"]["status"].is_null());
+
+        keyboard::open_entry(&mut inner, "steer:a1".into(), "steer · card".into());
+        assert!(keyboard::handle_key(&mut inner, "key:h"));
+        assert!(keyboard::handle_key(&mut inner, "key:i"));
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], true);
+        assert_eq!(parsed["textEntry"]["field"], "steer:a1");
+        assert_eq!(parsed["textEntry"]["label"], "steer · card");
+        assert_eq!(parsed["textEntry"]["bufferLen"], 2);
+        assert_eq!(parsed["textEntry"]["cursor"], 2);
+
+        assert!(keyboard::handle_key(&mut inner, "key:enter"));
+        keyboard::apply_result(&mut inner, "steer:a1", false, "no session");
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], false);
+        assert_eq!(parsed["textEntry"]["bufferLen"], 0);
+        assert_eq!(parsed["textEntry"]["status"]["state"], "failed");
+        assert_eq!(parsed["textEntry"]["status"]["detail"], "no session");
+        assert_eq!(parsed["textEntry"]["status"]["field"], "steer:a1");
+    }
+
+    #[test]
     fn debug_json_reports_terminal_pane_state() {
         let mut inner = Inner::new();
         let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
@@ -532,5 +685,48 @@ mod tests {
         assert_eq!(parsed["terminal"]["live"], true);
         assert_eq!(parsed["terminal"]["label"], "shell-0 · This daemon");
         assert_eq!(parsed["terminal"]["canvasGeneration"], 4);
+    }
+
+    #[test]
+    fn debug_json_reports_voice_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "idle");
+        assert!(parsed["voice"]["available"].is_null());
+        assert_eq!(parsed["voice"]["note"], "");
+        assert_eq!(parsed["voice"]["parseErrors"], 0);
+
+        voice::on_press(&mut inner.voice, 0.0);
+        voice::on_release(&mut inner.voice, 1000.0, false);
+        voice::apply_availability(
+            &mut inner.voice,
+            voice::VoiceAvailability {
+                available: false,
+                detail: "transcription is off".into(),
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "transcribing");
+        assert_eq!(parsed["voice"]["available"], false);
+        assert_eq!(parsed["voice"]["detail"], "transcription is off");
+
+        // A delivered transcript folds the capture to idle and lands in
+        // the text entry (the board is the result surface).
+        let snap: crate::model::XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{ "id": "local", "name": "local", "connected": true }],
+            "agents": [{ "id": "sess-1", "hostId": "local", "status": "running" }],
+        }))
+        .unwrap();
+        inner.model = Some(snap);
+        inner.selected_id = Some("sess-1".into());
+        voice::apply_result(&mut inner, "open the logs");
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "idle");
+        assert_eq!(parsed["textEntry"]["open"], true);
+        assert_eq!(parsed["textEntry"]["field"], "steer:sess-1");
+        assert_eq!(
+            parsed["textEntry"]["bufferLen"],
+            "open the logs".chars().count()
+        );
     }
 }

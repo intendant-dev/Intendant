@@ -35,8 +35,17 @@ pub struct ActiveSession {
     _on_selectend: Closure<dyn FnMut(web_sys::Event)>,
 }
 
-/// `{ requiredFeatures, optionalFeatures }` for requestSession.
-fn session_options(required: &[&str], optional: &[&str]) -> JsValue {
+/// `{ requiredFeatures, optionalFeatures, domOverlay? }` for
+/// requestSession. `overlay_root` adds the OPTIONAL 'dom-overlay'
+/// feature with its root element — optional so runtimes without the
+/// module (desktop Chrome, the probe shim) still enter; whether it was
+/// granted is read back from `session.domOverlayState`. Unlike
+/// 'layers', dom-overlay coexists with renderState.baseLayer.
+fn session_options(
+    required: &[&str],
+    optional: &[&str],
+    overlay_root: Option<&web_sys::Element>,
+) -> JsValue {
     let opts = js_sys::Object::new();
     let req = js_sys::Array::new();
     for f in required {
@@ -45,6 +54,12 @@ fn session_options(required: &[&str], optional: &[&str]) -> JsValue {
     let opt = js_sys::Array::new();
     for f in optional {
         opt.push(&JsValue::from_str(f));
+    }
+    if let Some(root) = overlay_root {
+        opt.push(&JsValue::from_str("dom-overlay"));
+        let overlay = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&overlay, &"root".into(), root);
+        let _ = js_sys::Reflect::set(&opts, &"domOverlay".into(), &overlay);
     }
     let _ = js_sys::Reflect::set(&opts, &"requiredFeatures".into(), &req);
     let _ = js_sys::Reflect::set(&opts, &"optionalFeatures".into(), &opt);
@@ -56,6 +71,7 @@ fn session_options(required: &[&str], optional: &[&str]) -> JsValue {
 async fn request_session_with_floor(
     xr_sys: &xr::XrSystem,
     mode: &str,
+    overlay_root: Option<&web_sys::Element>,
 ) -> Result<(xr::XrSession, &'static str), JsValue> {
     // hand-tracking is optional everywhere (controllers-only Quests,
     // Vision Pro, emulators must all enter). Deliberately NOT requested:
@@ -65,13 +81,13 @@ async fn request_session_with_floor(
     // report), and Horizon Browser is exactly the runtime that grants
     // it. The M2 media-layers work re-requests it together with the
     // XRWebGLBinding projection-layer render path it requires.
-    let with_floor = session_options(&["local-floor"], &["hand-tracking"]);
+    let with_floor = session_options(&["local-floor"], &["hand-tracking"], overlay_root);
     match wasm_bindgen_futures::JsFuture::from(xr_sys.request_session(mode, &with_floor)).await {
         Ok(session) => Ok((session.unchecked_into(), "local-floor")),
         Err(_) => {
             // Some runtimes can't promise a floor; fall back to 'local'
             // (origin at head height) and let the scene compensate.
-            let local = session_options(&["local"], &["hand-tracking"]);
+            let local = session_options(&["local"], &["hand-tracking"], overlay_root);
             let session =
                 wasm_bindgen_futures::JsFuture::from(xr_sys.request_session(mode, &local)).await?;
             Ok((session.unchecked_into(), "local"))
@@ -80,8 +96,15 @@ async fn request_session_with_floor(
 }
 
 /// Enter an immersive session and arm the frame loop. On success,
-/// `inner` is active and owns the [`ActiveSession`].
-pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValue> {
+/// `inner` is active and owns the [`ActiveSession`]. `overlay_root`
+/// requests the dom-overlay spike lane: the given element (the whole
+/// dashboard body in the flag-gated entry) composites as an interactive
+/// DOM layer over the scene where the runtime supports it.
+pub async fn enter(
+    inner: Rc<RefCell<Inner>>,
+    mode: String,
+    overlay_root: Option<web_sys::Element>,
+) -> Result<(), JsValue> {
     if inner.borrow().active {
         return Err(JsValue::from_str("xr-web: a session is already active"));
     }
@@ -102,7 +125,16 @@ pub async fn enter(inner: Rc<RefCell<Inner>>, mode: String) -> Result<(), JsValu
         inner.borrow_mut().encoder = Some(encoder);
     }
 
-    let (session, space_kind) = request_session_with_floor(&xr_sys, &mode).await?;
+    let (session, space_kind) =
+        request_session_with_floor(&xr_sys, &mode, overlay_root.as_ref()).await?;
+    // Read back whether the optional overlay was actually granted — the
+    // status surface and debug_json report truth, never the request.
+    {
+        let mut inner_mut = inner.borrow_mut();
+        inner_mut.overlay_requested = overlay_root.is_some();
+        let state = session.dom_overlay_state();
+        inner_mut.overlay_active = !state.is_null() && !state.is_undefined();
+    }
 
     // Everything after the grant runs fallibly: the browser enters its
     // immersive transition the moment the session is created and stays
@@ -222,7 +254,11 @@ async fn configure_and_arm(
         .add_event_listener_with_callback("selectstart", on_selectstart.as_ref().unchecked_ref())?;
     let se_inner = Rc::clone(inner);
     let on_selectend = Closure::new(move |_event: web_sys::Event| {
-        crate::input::on_select_end(&mut se_inner.borrow_mut());
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0);
+        crate::input::on_select_end(&mut se_inner.borrow_mut(), now);
     });
     session.add_event_listener_with_callback("selectend", on_selectend.as_ref().unchecked_ref())?;
 
@@ -236,6 +272,8 @@ async fn configure_and_arm(
             inner.mode = None;
             // A grab can't survive the session that was steering it.
             inner.grab_surface = None;
+            inner.overlay_requested = false;
+            inner.overlay_active = false;
             if let Some(state) = inner.session_state.take() {
                 // Break the frame-callback self-cycle.
                 state.raf_slot.borrow_mut().take();
@@ -405,6 +443,8 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
         let terminal_view = inner.terminal.pane_view();
         let layout = inner.layout.clone();
         let grab = inner.grab_surface.clone();
+        let entry_view = inner.text_entry.view();
+        let voice_view = inner.voice.dock_view();
         let display_meta: Vec<(String, String)> = inner
             .displays
             .iter()
@@ -428,6 +468,7 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
                 transcript_scroll,
+                &entry_view,
                 passthrough,
                 floor_y,
                 &layout,
@@ -443,6 +484,17 @@ fn render_frame(inner: &mut Inner, time_ms: f64, frame: &xr::XrFrame) {
                 grab.as_deref(),
                 hover.as_deref(),
                 confirm.as_ref().map(|(id, p)| (id.as_str(), *p)),
+                floor_y,
+                measure,
+                &mut batches,
+            );
+            // Voice affordances too: the talk pill always, plus the
+            // honest status line whenever there is one (voice.rs; the
+            // captured transcript itself lands in the text entry).
+            crate::voice::build_dock(
+                &voice_view,
+                hover.as_deref(),
+                time_ms,
                 floor_y,
                 measure,
                 &mut batches,

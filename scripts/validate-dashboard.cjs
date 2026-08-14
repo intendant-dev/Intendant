@@ -2398,10 +2398,36 @@ class BrowserHarness {
     }
   }
 
+  /// Activate a feed-anchored XR target, retrying while the page's own
+  /// 300 ms pump (real, mostly-empty dashboard state) races the probe's
+  /// 40 ms synthetic hold: a real-state frame momentarily rebuilds the
+  /// scene without the synthetic cards, so a single-shot activate can
+  /// land in that window and be refused. Entry-state targets (keys)
+  /// don't flap — this is only for card/workbench affordances.
+  async activateXrTarget(name, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await this.waitForFunction(
+        `xrProbe.debugJson().then((d) => d.scene.hitTargets.includes(${JSON.stringify(name)}))`,
+        Math.max(1, deadline - Date.now()),
+      );
+      const ok = await this.evaluate(`xrProbe.activate(${JSON.stringify(name)})`);
+      if (ok === true) return;
+      if (Date.now() >= deadline) {
+        throw new Error(`xr probe: activation of ${name} kept being refused`);
+      }
+    }
+  }
+
   /// --xr-probe: drive the XR surface end to end against the injected
   /// WebXR shim — enter, stereo frames, scene build from a synthetic
-  /// snapshot, activation-by-name selection, and a captured (never
-  /// routed) approval dispatch. Throws on the first failed stage.
+  /// snapshot, activation-by-name selection, a captured (never routed)
+  /// approval dispatch, the text-entry pass (steer pill → ray-typed
+  /// keys → captured text_commit → sending park → clean cancel), the
+  /// voice hold-to-talk pass (captured talk verbs, a shim transcript
+  /// through the real facade seam landing in the text-entry buffer,
+  /// the keyboard's enter committing it — no mic, no ASR), the terminal
+  /// pane pass, and the agenda rail. Throws on the first failed stage.
   async runXrProbe(opts) {
     const timeoutMs = opts.timeoutMs;
     // The chip appears once the async support probe resolves. On failure,
@@ -2418,10 +2444,17 @@ class BrowserHarness {
     }
     // Enter (chip click path) and wait for a live stereo loop.
     await this.evaluate('xrProbe.enter()');
-    await this.waitForFunction(
-      'xrProbe.debugJson().then((d) => d.active && d.engine.framesRendered > 20 && d.engine.views === 2)',
-      timeoutMs,
-    );
+    try {
+      await this.waitForFunction(
+        'xrProbe.debugJson().then((d) => d.active && d.engine.framesRendered > 20 && d.engine.views === 2)',
+        timeoutMs,
+      );
+    } catch (error) {
+      const diag = await this.evaluate(
+        "xrProbe.debugJson().then((d) => JSON.stringify({ active: d.active, frames: d.engine.framesRendered, views: d.engine.views, lastError: (globalThis.xrProbe && xrProbe.lastError) || null }))",
+      ).catch(() => 'unavailable');
+      throw new Error(`xr probe: no stereo loop — ${String(diag)} (${error.message})`);
+    }
     // Synthetic snapshot → shelf builds; keep re-pushing so the page's
     // own 300 ms pump (real, mostly-empty dashboard state) can't win the
     // race against the assertions below.
@@ -2485,6 +2518,165 @@ class BrowserHarness {
     }
     await this.waitForFunction(
       'xrProbe.debugJson().then((d) => d.scene.transcript.scroll === 0)',
+      timeoutMs,
+    );
+    // Text entry: the workbench steer pill opens the ray-typed keyboard,
+    // key activations type through the exact pinch dispatch path, and
+    // enter commits the dashboard's text_commit action — captured, never
+    // routed (captureOnly is still on from the approval leg). Focus the
+    // live-session card first: steer rides the focused workbench.
+    await this.activateXrTarget('card:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a1'"
+        + " && d.scene.hitTargets.includes('steer:xr-probe-a1'))",
+      timeoutMs,
+    );
+    await this.activateXrTarget('steer:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry && d.textEntry.open === true"
+        + " && d.textEntry.field === 'steer:xr-probe-a1'"
+        + " && d.scene.hitTargets.includes('key:h')"
+        + " && d.scene.hitTargets.includes('key:enter'))",
+      timeoutMs,
+    );
+    for (const key of ['key:h', 'key:i']) {
+      const typed = await this.evaluate(`xrProbe.activate('${key}')`);
+      if (typed !== true) {
+        throw new Error(`xr probe: keystroke ${key} was refused`);
+      }
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.textEntry.bufferLen === 2 && d.textEntry.cursor === 2)',
+      timeoutMs,
+    );
+    const committed = await this.evaluate("xrProbe.activate('key:enter')");
+    if (committed !== true) {
+      throw new Error('xr probe: enter (commit) activation was refused');
+    }
+    const commitAction = await this.evaluate('JSON.stringify(xrProbe.lastAction || null)');
+    const parsedCommit = JSON.parse(String(commitAction || 'null'));
+    if (
+      !parsedCommit
+      || parsedCommit.type !== 'text_commit'
+      || parsedCommit.field_id !== 'steer:xr-probe-a1'
+      || parsedCommit.text !== 'hi'
+    ) {
+      throw new Error(`xr probe: captured text_commit malformed: ${commitAction}`);
+    }
+    // Commit closes the board and parks the field at "sending" — under
+    // captureOnly no router ran, so anything else would be a lie.
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === false"
+        + " && d.textEntry.status && d.textEntry.status.state === 'sending'"
+        + " && !d.scene.hitTargets.includes('key:h'))",
+      timeoutMs,
+    );
+    // Cancel path: re-open (a fresh draft — no leftover buffer, verdict
+    // superseded), then cancel closes cleanly and disarms the keys.
+    await this.activateXrTarget('steer:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === true"
+        + " && d.textEntry.bufferLen === 0 && d.textEntry.status === null"
+        + " && d.scene.hitTargets.includes('key:cancel'))",
+      timeoutMs,
+    );
+    const canceled = await this.evaluate("xrProbe.activate('key:cancel')");
+    if (canceled !== true) {
+      throw new Error('xr probe: cancel activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === false"
+        + " && !d.scene.hitTargets.includes('key:h'))",
+      timeoutMs,
+    );
+    // Voice input (hold-to-talk) — the capture lane bound to the text
+    // entry. Deterministic shim lane: activation-by-name toggles the
+    // capture (start/stop verbs captured, never routed; the mic and real
+    // ASR are never touched); a fake transcript injected through the
+    // SAME facade seam the JS capture lane uses must land in the
+    // text-entry buffer (the board opens bound to the focused session's
+    // steer field — still xr-probe-a1 from the steer pass), and the
+    // keyboard's OWN enter commits it as the text_commit contract shape.
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.hitTargets.includes('voice:talk') && d.voice.phase === 'idle')",
+      timeoutMs,
+    );
+    const talkStarted = await this.evaluate("xrProbe.activate('voice:talk')");
+    if (talkStarted !== true) {
+      throw new Error('xr probe: talk activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'listening')",
+      timeoutMs,
+    );
+    const startAction = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (!startAction || startAction.type !== 'voice_talk' || startAction.phase !== 'start') {
+      throw new Error(`xr probe: captured talk-start action malformed: ${JSON.stringify(startAction)}`);
+    }
+    const talkStopped = await this.evaluate("xrProbe.activate('voice:talk')");
+    if (talkStopped !== true) {
+      throw new Error('xr probe: talk stop activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'transcribing')",
+      timeoutMs,
+    );
+    const stopAction = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (!stopAction || stopAction.type !== 'voice_talk' || stopAction.phase !== 'stop') {
+      throw new Error(`xr probe: captured talk-stop action malformed: ${JSON.stringify(stopAction)}`);
+    }
+    // Inject the utterance through the probe seam (the same facade call
+    // the JS capture lane makes): the capture folds to idle and the
+    // transcript lands as the steer board's draft — never auto-sent.
+    await this.evaluate("xrProbe.voice.result('open the build logs')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'idle'"
+        + " && d.textEntry.open === true"
+        + " && d.textEntry.field === 'steer:xr-probe-a1'"
+        + " && d.textEntry.bufferLen === 'open the build logs'.length"
+        + " && d.scene.hitTargets.includes('key:enter'))",
+      timeoutMs,
+    );
+    // The dictated draft commits through the keyboard's own enter — the
+    // exact captured text_commit a typed draft produces (the merge's
+    // whole design: voice adds a capture lane, not a second send path).
+    const dictated = await this.evaluate("xrProbe.activate('key:enter')");
+    if (dictated !== true) {
+      throw new Error('xr probe: dictation enter (commit) was refused');
+    }
+    const voiceCommit = JSON.parse(String(await this.evaluate('JSON.stringify(xrProbe.lastAction || null)') || 'null'));
+    if (
+      !voiceCommit
+      || voiceCommit.type !== 'text_commit'
+      || voiceCommit.field_id !== 'steer:xr-probe-a1'
+      || voiceCommit.text !== 'open the build logs'
+    ) {
+      throw new Error(`xr probe: dictated text_commit malformed: ${JSON.stringify(voiceCommit)}`);
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.textEntry.open === false)',
+      timeoutMs,
+    );
+    // Failed-capture honesty: a capture that ends without a transcript
+    // must fold back to idle with the reason rendered (voice.note).
+    await this.evaluate("xrProbe.activate('voice:talk')");
+    await this.evaluate("xrProbe.activate('voice:talk')");
+    await this.evaluate("xrProbe.voice.failed('no speech recognized — try again')");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.phase === 'idle' && d.voice.note.includes('no speech'))",
+      timeoutMs,
+    );
+    // Unavailability honesty: pushed status renders as the pill's
+    // standing detail line; restore before moving on.
+    await this.evaluate("xrProbe.voice.status({ available: false, detail: 'transcription disabled (probe)' })");
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.voice.available === false && d.voice.detail === 'transcription disabled (probe)'"
+        + ' && d.voice.parseErrors === 0)',
+      timeoutMs,
+    );
+    await this.evaluate("xrProbe.voice.status({ available: true, detail: '' })");
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.voice.available === true)',
       timeoutMs,
     );
     // Terminal pane (slice 1, read-only watching). The summon pill is a
@@ -2765,6 +2957,9 @@ class BrowserHarness {
       "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a2' && d.scene.transcript.rows > 0)",
       timeoutMs,
     );
+    const voiceSummary = await this.evaluate(
+      'xrProbe.debugJson().then((d) => JSON.stringify(d.voice))',
+    );
     const terminalSummary = await this.evaluate(
       'xrProbe.debugJson().then((d) => JSON.stringify(d.terminal))',
     );
@@ -2782,7 +2977,10 @@ class BrowserHarness {
       throw new Error(`xr probe: snapshot parse errors: ${report.parseErrors}`);
     }
     report.action = parsedAction;
+    report.textEntry = { field: parsedCommit.field_id, text: parsedCommit.text, canceled: true };
     report.terminal = JSON.parse(String(terminalSummary || 'null'));
+    report.voice = JSON.parse(String(voiceSummary || 'null'));
+    report.voiceCommit = voiceCommit;
     report.ok = true;
     return report;
   }
@@ -4235,7 +4433,11 @@ function formatXrProbeLine(report) {
   return `xr probe: ok — frames=${report.frames} views=${report.views} panels=${report.panels} `
     + `texts=${report.texts} hits=${report.hits} transcriptRows=${report.transcriptRows} `
     + `passthrough=${report.passthrough} `
-    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'}`;
+    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'} `
+    + `textEntry=${report.textEntry
+      ? `${report.textEntry.field}:${JSON.stringify(report.textEntry.text)}+cancel`
+      : 'none'} `
+    + `voice=${report.voiceCommit ? report.voiceCommit.type + '/' + report.voiceCommit.field_id : 'none'}`;
 }
 
 function waitFunctionExpression(source) {

@@ -87,6 +87,12 @@ same pinned-wasm-pack pipeline as the other browser crates):
   lifecycle pills (held open/restart + held end-shell, quick
   view-dismiss), and the facade seams the dashboard's terminal painter
   feeds.
+- **`keyboard.rs`** — in-scene text entry (below): the focused-field
+  model (`TextEntry` — field id, label, buffer, cursor, one-shot
+  shift), the ray-typed QWERTY board, and the `text_commit` emit path.
+- **`voice.rs`** — hold-to-talk voice input (below): the talk pill and
+  the pure capture state machine; the captured transcript lands in the
+  text entry's buffer for the keyboard's own confirm grammar.
 
 ### Feed and action routing
 
@@ -97,9 +103,14 @@ rendered surface consumes, display-slot mirroring (same 6-arg registration
 shape), and action routing straight into `handleStationAction` — approvals
 emit the dashboard's existing `{type:'approval', host_id, approval_id,
 decision}` shape and land in `send_approval` / `resolvePeerApproval` like
-every other frontend. Deferred deliberately: the voice composer toggle (no
-existing action seam to reuse; needs a designed one, not a hack) and
-compositor media layers (below).
+every other frontend. Two action families are consumed by the
+fragment's own appended sections before that router: `text_commit`
+(the text-entry routing seam — the composer path, below) and the
+`voice_talk` capture verbs (the voice section, below). Deferred
+deliberately: the live voice-composer *conversation* (talking WITH the
+presence AI in XR — a designed seam, not a hack) and compositor media
+layers (below); ray typing and hold-to-talk dictation shipped instead
+as the first text-input slices.
 
 ### Terminal pane (slice 2: watching + lifecycle)
 
@@ -174,6 +185,96 @@ The room is operable, not just watchable:
   daemon's refusal text). Answer and park-with-text wait for the
   keyboard seat.
 
+### Text input (steering a session from the room)
+
+Text entry is a first-class substrate (`keyboard.rs`), not a bolt-on:
+any affordance can open an entry bound to a **field id**, and the
+committed text is one more action through the one router. The first
+consumer is the workbench — a **steer** pill on the focused session's
+bench (only for cards projecting a live session) opens a rendered
+QWERTY board bound to `steer:<agent>`.
+
+The board sits in a fixed near-field slot below the workbench, tilted
+up toward the gaze; every key is ≥ 35 mm at ~0.9 m — the ray-typing
+legibility floor. Typing is hover + **quick pinch** (release-resolved,
+exactly like cards): the 900 ms deliberate-confirm hold stays
+approvals-only, because a keystroke is trivially reversible where an
+approval is not. Shift is one-shot (next character), the preview strip
+shows the buffer with a visible cursor (arrow keys move it), cancel
+drops the draft, and **send** commits.
+
+Commit emits `{type:'text_commit', field_id, text}` through the action
+callback; the `ui2-xr.js` text-entry section resolves the field and
+routes it through the flat dashboard's REAL composer path — for a local
+session `focusSessionWindow(sid)` + `submitComposedText(text)` (the
+exact pair Station's own steer op runs), for a peer session
+`setPromptTargetPeer(hostId, sid)` + `submitComposedText(text)` — so
+mid-turn steer vs queued follow-up vs start_task is decided by the same
+code the flat composer uses, and the one-composer-one-target rule holds
+across surfaces. The router then reports the verdict back
+(`textEntryResult`), and the bench renders it beside the pill —
+"sending…", then "sent" (dispatched to the daemon) or the refusal text.
+Nothing in the scene pretends a send worked.
+
+Trust: this adds **no daemon routes** — commits ride the same session
+Message/Task control operations the flat composer already dispatches,
+so a hosted lease sees exactly the ops its projection already carries
+(and approvals stay behind the action wall regardless).
+`activate("steer:<agent>")` / `activate("key:<token>")` run the same
+dispatch arms for automation and accessibility; `debug_json` exposes a
+`textEntry` section (field, buffer length, cursor, shift, delivery
+status).
+
+### Voice input (hold-to-talk)
+
+A "talk" pill sits below-left of the workbench (mirroring the terminal
+summon pill on the right, beside the keyboard slot). It is the **third
+hold semantic**, kept strictly apart from the other two: a quick pinch
+selects, the 900 ms confirm-hold approves — and the talk hold
+**records**. Pinch-and-hold the pill and the hold is the recording
+window (a pulsing ring says so from across the room); release stops it.
+The talk hold never fires on a timer and never cancels on aim drift — a
+hand wanders while its owner speaks — releasing the pinch is the only
+stop, so the mic can never stay hot. Releases under 300 ms read as
+accidental pinches and cancel with a rendered "hold to talk" hint. Mic
+permission is requested on the FIRST talk press, never at session
+entry, and release always stops the capture tracks (the browser's
+recording indicator goes out).
+
+The capture rides the dashboard's **existing server-side transcription
+lane** end to end: the `ui2-xr.js` voice section streams mic PCM over
+the page's `user_audio` frames into the daemon's Whisper pipeline
+(`transcription.rs`, `[transcription] enabled = true` — off by
+default), and the transcript returns on the broadcast `user_transcript`
+event. That lane only logs daemon-side; nothing injects it into any
+conversation, so voice capture adds **no presence-pipeline changes and
+no daemon changes**. Two lane facts shape the glue: the daemon
+transcribes in fixed ~3 s windows with no flush verb, so release pads
+one full window of silence to flush the spoken tail (pure-silence
+windows are RMS-gated daemon-side and transcribe nothing); and if the
+flat dashboard mic is already streaming (live voice session with
+transcription on), no second capture opens — the section just taps the
+transcripts already flowing.
+
+The transcript is **never auto-sent** — voice is a capture lane into
+the text-entry substrate above, never a second send path. With the
+board open, the utterance appends at the cursor (dictate into the draft
+you were typing); with it closed, the board opens bound to the focused
+session's steer field carrying the transcript as its draft; with no
+session focused, the pill says "select a session to dictate to".
+Review, edits, and the commit all go through the keyboard's own grammar
+— enter emits the same `{type:'text_commit', field_id, text}` a typed
+draft emits, the same routing seam dispatches it, and the same delivery
+verdict comes back. Speak, glance, pinch send.
+
+Honesty contract: every unavailability — transcription off, hosted
+Connect lane (user_audio is not tunneled), dead event stream, no secure
+context, mic denied — renders as a visible status line on the pill,
+never a silent no-op. `debug_json` exposes the capture machine under
+`voice` ({phase, available, detail, note}), and the validator's
+`--xr-probe` drives the full loop through `xrProbe.voice` with a shim
+transcript — no mic or ASR in CI.
+
 ### Availability
 
 The entry chip ships on by default for any browser reporting immersive
@@ -243,25 +344,33 @@ shim (no dependency; it covers exactly the interface surface
 end: chip → immersive entry → stereo frame loop (2 views) →
 synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
-never routed to a live daemon) → transcript paging → the terminal pane
-pass (summon → honest empty state → canvas-seam registration → dismiss) →
-the scene-verbs pass: captured interrupt/thread-action shapes off the
-workbench, the terminal open affordance captured as the navigate action
-(no PTY is ever spawned by the probe) and the held kill's intent, layout
-strip hide/show asserted through `debug_json`'s hidden set and panel
-deltas, grab-move nudges with band clamps via `xrProbe.moveSurface`, and
-the agenda complete/reopen captures. The agenda rail leg rides the same
-snapshot (three cards including a done one). `xrProbe` (the
-`stationProbe`-convention QA facade) and `debugJson()` expose engine/scene
-state for ad-hoc probing.
+never routed to a live daemon) → transcript paging → the text-entry pass
+(steer pill → ray-typed keys → a captured `text_commit` asserted
+field-and-text, plus the honest "sending" park under captureOnly and a
+clean cancel) → the voice pass (talk toggle → captured capture verbs → a
+shim transcript through the real `voiceResult` seam landing in the
+text-entry buffer → the keyboard's enter committing it as a captured
+`text_commit` → failure/unavailability honesty; no mic, no ASR) → the
+terminal pane pass (summon → honest empty state → canvas-seam
+registration → dismiss) → the scene-verbs pass: captured
+interrupt/thread-action shapes off the workbench, the terminal open
+affordance captured as the navigate action (no PTY is ever spawned by
+the probe) and the held kill's intent, layout strip hide/show asserted
+through `debug_json`'s hidden set and panel deltas, grab-move nudges
+with band clamps via `xrProbe.moveSurface`, and the agenda
+complete/reopen captures. The agenda rail leg rides the same snapshot
+(three cards including a done one). `xrProbe` (the
+`stationProbe`-convention QA facade) and `debugJson()` expose
+engine/scene state for ad-hoc probing.
 
 ## Roadmap
 
 - **M2 — the feel:** compositor video via `XRMediaBinding` quad layers where
   the Layers module exists (Quest's most optimized path; requires moving the
   scene to `XRWebGLBinding` projection layers — the current in-scene textured
-  quads remain the universal fallback), the designed voice-composer seam
-  (talking to your agents is the native XR composer), spatialized per-session
+  quads remain the universal fallback), the live voice-composer
+  *conversation* (talking WITH the presence AI in XR; hold-to-talk text
+  input shipped as the first slice), spatialized per-session
   presence audio, hand-tracking polish, multi-monitor walls, comfort and
   legibility tuning on hardware.
 - **M3 — the place:** hosts as arrangeable zones, the timeline as a spatial
@@ -271,6 +380,23 @@ state for ad-hoc probing.
   approve, monitor. Administration (settings, IAM tables, plugin management)
   stays on the 2D dashboard, which a headset can still open as a flat browser
   window at any time.
+
+## DOM-overlay spike (`?xr=overlay`)
+
+Flag-gated experiment toward full-richness XR: entering with `?xr=overlay`
+requests the WebXR DOM Overlay module (an *optional* feature — unlike
+`layers` it coexists with `renderState.baseLayer`) with the entire dashboard
+body as the overlay root. Where the runtime grants it (Quest's Horizon
+Browser ships the module; desktop Chrome and the probe shim don't), the
+regular UI composites as a live, interactive DOM layer over the spatial
+scene — composer, tabs, and (to be verified on-device) the system keyboard
+on focused text fields. The status line beside the chip reports the grant
+verdict at entry, and `debugJson().overlay` carries `{requested, active}`.
+Open on-device questions: input routing quality between overlay DOM and
+scene ray targets (`beforexrselect` gating), keyboard summon inside the
+immersive session, and legibility of the composited page. If the spike
+holds up, "overlay mode" becomes the bridge that keeps every dashboard
+capability reachable in-headset while native spatial surfaces mature.
 
 ## Relationship to Station
 

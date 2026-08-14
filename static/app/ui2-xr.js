@@ -27,6 +27,20 @@ function xrEnabled() {
   }
 }
 
+// Spike lane (?xr=overlay): request the WebXR DOM Overlay module with
+// the whole dashboard as the overlay root — the REGULAR UI, composer
+// and all, composited interactively over the spatial scene where the
+// runtime supports it (Quest Horizon Browser does; desktop and the
+// probe shim simply don't grant the optional feature). Flag-gated
+// until the on-device verdict.
+function xrOverlayRequested() {
+  try {
+    return new URLSearchParams(location.search).get('xr') === 'overlay';
+  } catch {
+    return false;
+  }
+}
+
 // Feature probe without loading the WASM: chip visibility must cost
 // nothing on the overwhelmingly common non-XR browser.
 async function xrProbeSupportLight() {
@@ -74,8 +88,21 @@ async function xrBootModule() {
     // a live daemon.
     globalThis.xrProbe.lastAction = action;
     if (xrCaptureOnly) return;
+    if (action && action.type === 'text_commit') {
+      // Text-entry commits route through the dashboard's composer path
+      // (the appended text-entry section below), not handleStationAction.
+      xrRouteTextCommit(action);
+      return;
+    }
     try {
+      // XR-local action types are consumed by their own appended
+      // sections — scene verbs (agenda_op, terminal_kill) and voice
+      // capture verbs (voice_talk start/stop/cancel); everything else
+      // takes the ordinary router. (text_commit was already routed
+      // above — voice text rides the text-entry commit path, never a
+      // lane of its own.)
       if (xrHandleLocalAction(action)) return;
+      if (typeof xrVoiceHandleAction === 'function' && xrVoiceHandleAction(action)) return;
       if (typeof handleStationAction === 'function') {
         handleStationAction(action);
       } else {
@@ -212,11 +239,24 @@ async function xrEnter() {
     // Passthrough-first: prefer AR on hardware that has it (Quest 3),
     // fall back to VR (Vision Pro Safari has no immersive-ar).
     const mode = xrSupport.ar ? 'immersive-ar' : 'immersive-vr';
-    await inst.enter(mode);
-    clearTimeout(consentHint);
-    xrStartSnapshotPump();
-    xrSetChipState('active', 'Immersive session running');
-    xrShowStatus('', '');
+    if (xrOverlayRequested() && document.body) {
+      await inst.enterWithOverlay(mode, document.body);
+      const granted = JSON.parse(inst.debugJson()).overlay?.active === true;
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      // The overlay verdict is the whole point of the spike — say it
+      // where the headset user can read it.
+      xrShowStatus(granted ? 'busy' : 'error',
+        granted ? 'dom-overlay active — the regular UI should float over the scene'
+                : 'dom-overlay not granted by this runtime — scene only');
+    } else {
+      await inst.enter(mode);
+      clearTimeout(consentHint);
+      xrStartSnapshotPump();
+      xrSetChipState('active', 'Immersive session running');
+      xrShowStatus('', '');
+    }
   } catch (err) {
     clearTimeout(consentHint);
     const detail = (err && (err.message || err.name)) || String(err);
@@ -705,6 +745,443 @@ globalThis.xrProbe.terminal = {
 // literal above stays untouched): the pump's agenda block, on demand.
 globalThis.xrProbe.agenda = () => xrAgendaSummary();
 
+// ── XR voice input (hold-to-talk) ──
+//
+// Appended section: the browser half of the talk pill (voice.rs). The
+// wasm state machine emits `{type:'voice_talk', phase:'start'|'stop'|
+// 'cancel'}` through the ordinary action router; this section owns the
+// capture — mic PCM streamed over the page's EXISTING server-side
+// transcription lane (`app.send_user_audio` → the daemon's Whisper
+// pipeline, `[transcription] enabled = true`) — and hands the assembled
+// utterance transcript back via `voiceResult`. That lane only logs
+// daemon-side (session log + the broadcast `user_transcript` event);
+// nothing injects it into any conversation, so NO presence pipeline
+// changes are needed and the live voice-model lane stays untouched.
+// Delivery is wasm-side: the transcript lands in the text-entry buffer
+// (keyboard.rs), and the commit rides the keyboard's own enter →
+// text_commit → the text-entry routing section above. Voice adds a
+// capture lane, never a second send path.
+//
+// Capture mechanics: the daemon transcribes in ~3 s chunks gated by an
+// RMS silence check, with no flush verb — so on release this section
+// pads the stream with one full window of silence to flush the spoken
+// tail, then collects `user_transcript` events until they settle. If
+// the flat dashboard mic is ALREADY streaming (live voice session with
+// transcription on), no second capture is opened — transcripts already
+// flow and a second PCM stream would interleave garbage into the shared
+// daemon buffer; the section just taps the events ("tap" mode).
+//
+// Honesty: every unavailability (transcription off, Connect mode, dead
+// event stream, no mic, permission denied) lands in the scene as a
+// rendered status line via voiceStatus/voiceFailed — never a silent
+// no-op. Mic permission is requested on the FIRST talk press, never at
+// session entry, and release always stops the capture tracks so the
+// browser's recording indicator goes out.
+//
+// RefCell discipline: voice actions arrive synchronously from INSIDE a
+// wasm borrow (selectstart/selectend handlers, activate()). Re-entering
+// the facade there would panic the RefCell, so xrVoiceHandleAction only
+// schedules — every xrInstance call below runs on a fresh task.
+
+const XR_VOICE_RATE = 16000;          // the daemon transcription buffer's fixed rate
+const XR_VOICE_PAD_BYTES = 96000;     // one full 3 s drain window of PCM16 silence
+const XR_VOICE_SETTLE_MS = 1600;      // quiet gap after the last chunk = utterance done
+const XR_VOICE_TIMEOUT_MS = 9000;     // no transcript after release → honest failure
+const XR_VOICE_MSG = {
+  connectMode: 'voice capture is not available over Hosted Connect yet',
+  transcriptionOff: 'transcription is off on this daemon — enable [transcription] in intendant.toml',
+  eventLaneDown: 'voice needs the direct daemon connection (event stream down)',
+  noMic: 'microphone needs HTTPS or localhost',
+  noSpeech: 'no speech recognized — try again',
+  micPending: 'mic permission was still pending — try again',
+};
+
+let xrVoiceGen = 0;              // capture generation; async completions check it
+let xrVoiceMode = null;          // null | 'arming' | 'mic' | 'tap'
+let xrVoiceCollecting = false;   // accept user_transcript events
+let xrVoiceReleased = false;     // release seen; settle/timeout timers armed
+let xrVoiceStream = null;        // MediaStream while capturing
+let xrVoiceNode = null;          // AudioWorkletNode while capturing
+let xrVoiceSource = null;        // MediaStreamAudioSourceNode while capturing
+let xrVoiceChunks = [];          // collected transcript chunks
+let xrVoiceSettleTimer = null;
+let xrVoiceTimeoutTimer = null;
+let xrVoiceTapInstalled = false;
+let xrVoiceLastPushedStatus = '';
+
+// One line of truth about whether the capture lane can work right now.
+// The JS side owns this: daemon config, transport posture, secure
+// context. (Mic permission is only learnable by asking — that failure
+// surfaces at press time via voiceFailed.)
+function xrVoiceAvailability() {
+  try {
+    if (typeof dashboardConnectModeEnabled === 'function' && dashboardConnectModeEnabled()) {
+      return { available: false, detail: XR_VOICE_MSG.connectMode };
+    }
+    if (!gatewayConfig) {
+      return { available: false, detail: 'waiting for daemon config…' };
+    }
+    if (!gatewayConfig.transcription_enabled) {
+      return { available: false, detail: XR_VOICE_MSG.transcriptionOff };
+    }
+    // user_audio rides the legacy /ws lane only; the status chip is the
+    // page's own truth for it (same predicate the voice status uses).
+    const conn = document.getElementById('sb-conn');
+    if (!conn || !conn.classList.contains('ok')) {
+      return { available: false, detail: XR_VOICE_MSG.eventLaneDown };
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return { available: false, detail: XR_VOICE_MSG.noMic };
+    }
+    return { available: true, detail: '' };
+  } catch (err) {
+    return { available: false, detail: String((err && err.message) || err).slice(0, 120) };
+  }
+}
+
+// Availability pump: push to the wasm on change so the pill's status
+// line stays honest without the wasm ever polling. Cheap key compare,
+// same cadence family as the terminal sync pump.
+setInterval(() => {
+  try {
+    if (!xrInstance || typeof xrInstance.voiceStatus !== 'function') return;
+    const a = xrVoiceAvailability();
+    const key = `${a.available}|${a.detail}`;
+    if (key !== xrVoiceLastPushedStatus) {
+      xrVoiceLastPushedStatus = key;
+      xrInstance.voiceStatus(a);
+    }
+  } catch (_) { /* fail-soft */ }
+}, 1000);
+
+// Router seam: consume voice-lane actions. Handling is DEFERRED — these
+// arrive under a live wasm borrow (see the section header).
+function xrVoiceHandleAction(action) {
+  if (!action || typeof action !== 'object') return false;
+  if (action.type === 'voice_talk') {
+    const phase = String(action.phase || '');
+    setTimeout(() => {
+      try {
+        if (phase === 'start') xrVoiceStart();
+        else if (phase === 'stop') xrVoiceStop();
+        else if (phase === 'cancel') xrVoiceCancel();
+      } catch (err) {
+        console.warn('[xr] voice action failed', err);
+      }
+    }, 0);
+    return true;
+  }
+  return false;
+}
+
+function xrVoiceClearTimers() {
+  if (xrVoiceSettleTimer) { clearTimeout(xrVoiceSettleTimer); xrVoiceSettleTimer = null; }
+  if (xrVoiceTimeoutTimer) { clearTimeout(xrVoiceTimeoutTimer); xrVoiceTimeoutTimer = null; }
+}
+
+// Stop the audio graph and the capture tracks. Privacy contract: the
+// tracks always stop on release/cancel so the browser's recording
+// indicator goes out — same model as the flat stopMic().
+function xrVoiceTeardownAudio() {
+  try {
+    if (xrVoiceNode) {
+      xrVoiceNode.port.postMessage({ type: 'mute' });
+      xrVoiceNode.disconnect();
+    }
+  } catch (_) { /* already gone */ }
+  xrVoiceNode = null;
+  try { if (xrVoiceSource) xrVoiceSource.disconnect(); } catch (_) { /* already gone */ }
+  xrVoiceSource = null;
+  if (xrVoiceStream) {
+    try { xrVoiceStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* already gone */ }
+    xrVoiceStream = null;
+  }
+}
+
+function xrVoiceReset() {
+  xrVoiceClearTimers();
+  xrVoiceTeardownAudio();
+  xrVoiceMode = null;
+  xrVoiceCollecting = false;
+  xrVoiceReleased = false;
+  xrVoiceChunks = [];
+}
+
+function xrVoiceFail(message) {
+  xrVoiceReset();
+  try { xrInstance?.voiceFailed(String(message || 'voice capture failed')); } catch (_) { /* fail-soft */ }
+}
+
+// Tap the page's server-message stream for `user_transcript` events
+// (the daemon broadcast carrying server-side transcription results).
+// Installed once, on first use; inert while not collecting.
+function xrVoiceInstallTap() {
+  if (xrVoiceTapInstalled) return;
+  if (typeof dashboardServerMessageDispatcher !== 'function') return;
+  const prev = dashboardServerMessageDispatcher;
+  dashboardServerMessageDispatcher = (msg) => {
+    try {
+      if (xrVoiceCollecting) {
+        const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
+        if (d && d.event === 'user_transcript' && typeof d.text === 'string' && d.text.trim()) {
+          xrVoiceChunks.push(d.text.trim());
+          if (xrVoiceReleased) xrVoiceArmSettle();
+        }
+      }
+    } catch (_) { /* fail-soft: never break the page dispatcher */ }
+    prev(msg);
+  };
+  xrVoiceTapInstalled = true;
+}
+
+// After release: a fresh chunk re-arms the settle window; silence for
+// XR_VOICE_SETTLE_MS finalizes the utterance.
+function xrVoiceArmSettle() {
+  if (xrVoiceSettleTimer) clearTimeout(xrVoiceSettleTimer);
+  xrVoiceSettleTimer = setTimeout(() => xrVoiceFinalize(), XR_VOICE_SETTLE_MS);
+}
+
+function xrVoiceFinalize() {
+  const joined = xrVoiceChunks.join(' ').replace(/\s+/g, ' ').trim();
+  xrVoiceReset();
+  try {
+    if (joined) xrInstance?.voiceResult(joined);
+    else xrInstance?.voiceFailed(XR_VOICE_MSG.noSpeech);
+  } catch (_) { /* fail-soft */ }
+}
+
+// Talk-press: open the capture lane. Availability is re-checked fresh
+// on every press (config can change under a long session); the mic
+// permission prompt happens HERE on first use, never at entry.
+async function xrVoiceStart() {
+  const avail = xrVoiceAvailability();
+  if (!avail.available) { xrVoiceFail(avail.detail); return; }
+  xrVoiceInstallTap();
+  if (!xrVoiceTapInstalled) { xrVoiceFail('transcript stream unavailable in this build'); return; }
+  xrVoiceGen += 1;
+  const gen = xrVoiceGen;
+  xrVoiceChunks = [];
+  xrVoiceCollecting = true;
+  xrVoiceReleased = false;
+
+  // The flat dashboard mic already streams this page's audio into the
+  // transcription lane while a live voice session is up — a second PCM
+  // stream would interleave into the daemon's shared buffer. Tap the
+  // flowing transcripts instead of double-capturing.
+  if (typeof micActive !== 'undefined' && micActive
+      && typeof modelConnected !== 'undefined' && modelConnected) {
+    xrVoiceMode = 'tap';
+    return;
+  }
+
+  xrVoiceMode = 'arming';
+  try {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    if (!workletReady) {
+      await audioCtx.audioWorklet.addModule('/audio-processor.js');
+      workletReady = true;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true },
+    });
+    if (gen !== xrVoiceGen || xrVoiceMode !== 'arming') {
+      // Released or cancelled while the permission prompt was up: the
+      // capture never ran. Drop the tracks immediately.
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* gone */ }
+      return;
+    }
+    xrVoiceStream = stream;
+    xrVoiceSource = audioCtx.createMediaStreamSource(stream);
+    xrVoiceNode = new AudioWorkletNode(audioCtx, 'audio-capture-processor', {
+      processorOptions: { bufferSize: 4096 },
+    });
+    const nativeSR = audioCtx.sampleRate;
+    xrVoiceNode.port.onmessage = (e) => {
+      if (e.data.type !== 'audio') return;
+      if (gen !== xrVoiceGen || xrVoiceMode !== 'mic' || !app) return;
+      const resampled = downsample(e.data.data, nativeSR, XR_VOICE_RATE);
+      const pcm16 = new Int16Array(resampled.length);
+      for (let i = 0; i < resampled.length; i++) {
+        pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
+      }
+      app.send_user_audio(arrayBufferToBase64(pcm16.buffer));
+    };
+    xrVoiceSource.connect(xrVoiceNode);
+    xrVoiceNode.connect(audioCtx.destination);
+    xrVoiceMode = 'mic';
+  } catch (err) {
+    if (gen !== xrVoiceGen) return;
+    const name = (err && err.name) || '';
+    const msg = (err && err.message) || String(err);
+    xrVoiceFail(name === 'NotAllowedError' || name === 'SecurityError'
+      ? `mic denied: ${msg}`
+      : `mic capture failed: ${msg}`);
+  }
+}
+
+// Talk-release: stop the mic NOW (tracks off, indicator out), flush the
+// daemon's chunk buffer with one window of silence so the spoken tail
+// transcribes, then wait for the transcripts to settle.
+function xrVoiceStop() {
+  if (!xrVoiceMode) return;
+  if (xrVoiceMode === 'arming') {
+    // Permission prompt outlived the hold — nothing was captured.
+    xrVoiceGen += 1;
+    xrVoiceFail(XR_VOICE_MSG.micPending);
+    return;
+  }
+  xrVoiceReleased = true;
+  if (xrVoiceMode === 'mic') {
+    xrVoiceTeardownAudio();
+    // The daemon drains its transcription buffer in fixed ~3 s windows
+    // with no flush verb: pad one full window of PCM16 silence so the
+    // tail chunk (real speech + zeros) drains now. Pure-silence windows
+    // are RMS-gated daemon-side, so the pad itself transcribes nothing.
+    try {
+      if (app) {
+        const chunk = new ArrayBuffer(XR_VOICE_PAD_BYTES / 3);
+        const b64 = arrayBufferToBase64(chunk);
+        for (let i = 0; i < 3; i++) app.send_user_audio(b64);
+      }
+    } catch (err) {
+      console.warn('[xr] voice pad flush failed', err);
+    }
+  }
+  // 'tap' mode: the flat mic keeps streaming on its own cadence —
+  // nothing to stop, nothing to pad; just wait for the window's chunks.
+  if (xrVoiceChunks.length > 0) xrVoiceArmSettle();
+  if (xrVoiceTimeoutTimer) clearTimeout(xrVoiceTimeoutTimer);
+  xrVoiceTimeoutTimer = setTimeout(() => {
+    if (xrVoiceChunks.length > 0) xrVoiceFinalize();
+    else xrVoiceFail(XR_VOICE_MSG.noSpeech);
+  }, XR_VOICE_TIMEOUT_MS);
+}
+
+// Quick-release cancel: the wasm already rendered the teaching hint;
+// tear everything down silently (no result, no failure line).
+function xrVoiceCancel() {
+  xrVoiceGen += 1;
+  xrVoiceReset();
+}
+
+// QA facade extension (same conventions as the terminal seam): direct
+// pushes through the voice facade for deterministic probes — the probe
+// injects fake transcripts here and never depends on a real mic or ASR.
+globalThis.xrProbe.voice = {
+  status: (s) => { if (xrInstance) xrInstance.voiceStatus(s); },
+  result: (text) => { if (xrInstance) xrInstance.voiceResult(String(text)); },
+  failed: (msg) => { if (xrInstance) xrInstance.voiceFailed(String(msg)); },
+  availability: () => xrVoiceAvailability(),
+  capture: () => ({
+    mode: xrVoiceMode,
+    collecting: xrVoiceCollecting,
+    released: xrVoiceReleased,
+    chunks: xrVoiceChunks.length,
+  }),
+};
+
+// ── XR text entry — the commit routing seam ──
+//
+// Appended section. crates/xr-web/src/keyboard.rs renders the in-scene
+// ray-typed keyboard; committing emits {type:'text_commit', field_id,
+// text} through the action callback above. This section resolves the
+// field and routes the text through the flat dashboard's REAL composer
+// path — never a parallel send lane:
+//
+//   field "steer:<agentId>" — <agentId> is a Station scene-node id
+//   (buildStationSnapshot's vocabulary, the same builder the XR pump
+//   feeds the scene from). Its sessionId picks the composer target:
+//     - local sessions: focusSessionWindow(sid) then
+//       submitComposedText(text) — the exact pair Station's own
+//       op === 'steer' handler runs (34-station-panes.js), so
+//       submitComposedText decides mid-turn steer vs queued follow-up
+//       vs start_task exactly as the flat composer does;
+//     - peer sessions: setPromptTargetPeer(hostId, sid) then
+//       submitComposedText(text) — the composer's own peer lane.
+//   Both retarget the one composer, matching the flat "one composer,
+//   one target" semantics of picking a session.
+//
+// Every outcome reports back through xrInstance.textEntryResult so the
+// scene's status line says what actually happened ("sent" — meaning
+// dispatched to the daemon — or the refusal text). Nothing here assumes
+// delivery, and a routing error must never take the immersive session
+// down. Trust: this section adds NO daemon routes — the text rides the
+// same ControlMsg lanes (steer / start_task / peer session control) the
+// flat composer already uses, so a hosted lease sees exactly the ops
+// its projection already carries.
+
+function xrTextCommitReport(fieldId, ok, detail) {
+  try {
+    if (xrInstance && typeof xrInstance.textEntryResult === 'function') {
+      xrInstance.textEntryResult(String(fieldId || ''), !!ok, String(detail || ''));
+    }
+  } catch (err) {
+    console.warn('[xr] text-entry result report failed', err);
+  }
+}
+
+function xrRouteTextCommit(action) {
+  const fieldId = String((action && action.field_id) || '');
+  try {
+    const text = String((action && action.text) || '').trim();
+    if (!text) {
+      xrTextCommitReport(fieldId, false, 'empty message');
+      return;
+    }
+    if (!fieldId.startsWith('steer:')) {
+      xrTextCommitReport(fieldId, false, `unknown field ${fieldId || '(none)'}`);
+      return;
+    }
+    const agentId = fieldId.slice('steer:'.length);
+    let agent = null;
+    if (typeof buildStationSnapshot === 'function') {
+      const snap = buildStationSnapshot();
+      agent = ((snap && snap.agents) || []).find((a) => a && String(a.id) === agentId) || null;
+    }
+    const sessionId = String((agent && agent.sessionId) || '').trim();
+    if (!sessionId) {
+      xrTextCommitReport(fieldId, false, 'no session behind this card');
+      return;
+    }
+    const hostId = String((agent && agent.hostId) || '').trim();
+    const isLocal = !hostId || hostId === 'local'
+      || (typeof selfPeerId !== 'undefined' && hostId === String(selfPeerId));
+    if (isLocal) {
+      if (typeof focusSessionWindow !== 'function' || typeof submitComposedText !== 'function') {
+        xrTextCommitReport(fieldId, false, 'composer unavailable in this build');
+        return;
+      }
+      focusSessionWindow(sessionId);
+      // Precision gate: submitComposedText sends to the RESOLVED prompt
+      // target. If the session became unusable between the snapshot and
+      // this commit, the resolver would fall back to a different
+      // session — refuse instead of mis-routing the text.
+      const resolved = typeof resolvePromptTargetSessionId === 'function'
+        ? resolvePromptTargetSessionId() : sessionId;
+      if (resolved !== sessionId) {
+        xrTextCommitReport(fieldId, false, 'session is no longer steerable');
+        return;
+      }
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'dispatch refused (connection down?)');
+      return;
+    }
+    // Peer session: the composer's peer lane. setPromptTargetPeer
+    // validates the peer link and refuses unknown hosts.
+    if (typeof setPromptTargetPeer === 'function' && typeof submitComposedText === 'function'
+        && setPromptTargetPeer(hostId, sessionId)) {
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'peer dispatch refused');
+      return;
+    }
+    xrTextCommitReport(fieldId, false, 'peer not connected');
+  } catch (err) {
+    xrTextCommitReport(fieldId, false, String((err && err.message) || err || 'route error').slice(0, 80));
+  }
+}
+
+// ── End of the text-entry section. ──
 // ── XR scene verbs (terminal lifecycle, agenda quick-verbs, layout) ──
 //
 // Appended section: the browser half of the scene's verbs. Every daemon
