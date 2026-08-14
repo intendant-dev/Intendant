@@ -64,9 +64,14 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
         inner.hover_id = new_hover;
         inner.ui_dirty = true;
         // Moving off a held target cancels the hold — confirmation
-        // requires sustained aim, not a drive-by.
+        // requires sustained aim, not a drive-by. The talk hold is the
+        // deliberate exception: it is a RECORDING window, not a confirm,
+        // and a hand drifts while its owner speaks — releasing the pinch
+        // is the only stop (so the mic can never stay hot).
         if let Some(held) = inner.hold_target.clone() {
-            if inner.hover_id.as_deref() != Some(held.as_str()) {
+            if inner.hover_id.as_deref() != Some(held.as_str())
+                && target_kind(inner, &held) != Some(HitKind::VoiceTalk)
+            {
                 inner.hold_target = None;
                 inner.confirm_progress = None;
             }
@@ -74,35 +79,77 @@ pub(crate) fn update(inner: &mut Inner, frame: &xr::XrFrame, time_ms: f64) {
     }
 
     if let Some(held) = inner.hold_target.clone() {
-        let progress = ((time_ms - inner.hold_started_ms) / CONFIRM_HOLD_MS).clamp(0.0, 1.0);
-        if progress >= 1.0 {
-            inner.hold_target = None;
-            inner.confirm_progress = None;
-            dispatch_target(inner, &held);
+        if target_kind(inner, &held) == Some(HitKind::VoiceTalk) {
+            // Push-to-talk: no confirm timer — the hold lasts exactly as
+            // long as the pinch, and selectend resolves it.
         } else {
-            inner.confirm_progress = Some((held, progress as f32));
+            let progress = ((time_ms - inner.hold_started_ms) / CONFIRM_HOLD_MS).clamp(0.0, 1.0);
+            if progress >= 1.0 {
+                inner.hold_target = None;
+                inner.confirm_progress = None;
+                dispatch_target(inner, &held);
+            } else {
+                inner.confirm_progress = Some((held, progress as f32));
+            }
+            inner.ui_dirty = true;
         }
+    }
+
+    // Voice dock upkeep: the transcribe backstop, and per-frame rebuilds
+    // while the pill is animating (listening/transcribing pulse).
+    if crate::voice::tick(&mut inner.voice, time_ms) {
+        inner.ui_dirty = true;
+    }
+    if matches!(
+        inner.voice.phase,
+        crate::voice::TalkPhase::Listening { .. } | crate::voice::TalkPhase::Transcribing { .. }
+    ) {
         inner.ui_dirty = true;
     }
 }
 
+/// Kind of a (still-present) hit target by id. A rebuilt scene can drop
+/// a held target; `None` then, and the hold resolves as a miss.
+fn target_kind(inner: &Inner, id: &str) -> Option<HitKind> {
+    inner
+        .hit_targets
+        .iter()
+        .find(|h| h.id == id)
+        .map(|h| h.kind)
+}
+
 /// `selectstart`: begin a hold on whatever is hovered. Cards resolve on
-/// release (selectend); approve/deny resolve by time (update()).
+/// release (selectend); approve/deny resolve by time (update()); the
+/// talk pill starts recording NOW — the hold is the capture window.
 pub(crate) fn on_select_start(inner: &mut Inner, now_ms: f64) {
     if let Some(hovered) = inner.hover_id.clone() {
-        inner.hold_target = Some(hovered);
+        inner.hold_target = Some(hovered.clone());
         inner.hold_started_ms = now_ms;
+        if target_kind(inner, &hovered) == Some(HitKind::VoiceTalk) {
+            if let Some(cmd) = crate::voice::on_press(&mut inner.voice, now_ms) {
+                emit_action(inner, &cmd.payload());
+            }
+            inner.ui_dirty = true;
+        }
     }
 }
 
 /// `selectend`: a released hold on a card/banner is a click (select the
-/// agent); an unfinished hold on approve/deny cancels silently.
-pub(crate) fn on_select_end(inner: &mut Inner) {
+/// agent); an unfinished hold on approve/deny cancels silently; a talk
+/// hold stops the recording — unconditionally, hovered or not, because
+/// a released pinch must never leave the mic hot.
+pub(crate) fn on_select_end(inner: &mut Inner, now_ms: f64) {
     let Some(target) = inner.hold_target.take() else {
         return;
     };
     inner.confirm_progress = None;
     inner.ui_dirty = true;
+    if target_kind(inner, &target) == Some(HitKind::VoiceTalk) {
+        if let Some(cmd) = crate::voice::on_release(&mut inner.voice, now_ms, false) {
+            emit_action(inner, &cmd.payload());
+        }
+        return;
+    }
     let still_hovered = inner.hover_id.as_deref() == Some(target.as_str());
     if !still_hovered {
         return;
@@ -131,6 +178,8 @@ pub(crate) fn on_select_end(inner: &mut Inner) {
                 crate::keyboard::handle_key(inner, &id);
             }
             HitKind::Approve | HitKind::Deny => {}
+            // Handled above (unconditional stop), unreachable here.
+            HitKind::VoiceTalk => {}
         }
     }
 }
@@ -189,6 +238,23 @@ pub(crate) fn dispatch_target(inner: &mut Inner, target_id: &str) -> bool {
         // accessibility layers type exactly like a pinch does.
         HitKind::SteerOpen => crate::keyboard::open_for_steer(inner, &hit),
         HitKind::Key => crate::keyboard::handle_key(inner, &hit.id),
+        // Activation by name is the deliberate act (automation and
+        // accessibility): the talk pill TOGGLES — one activation starts
+        // the capture, the next stops it — with the accidental-pinch
+        // minimum waived.
+        HitKind::VoiceTalk => {
+            let cmd = if matches!(inner.voice.phase, crate::voice::TalkPhase::Listening { .. }) {
+                crate::voice::on_release(&mut inner.voice, inner.last_raf_time_ms, true)
+            } else {
+                crate::voice::on_press(&mut inner.voice, inner.last_raf_time_ms)
+            };
+            let Some(cmd) = cmd else {
+                return false;
+            };
+            emit_action(inner, &cmd.payload());
+            inner.ui_dirty = true;
+            true
+        }
         HitKind::Approve | HitKind::Deny => {
             let decision = if hit.kind == HitKind::Approve {
                 "approve"

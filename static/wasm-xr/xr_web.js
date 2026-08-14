@@ -18,7 +18,8 @@ export class XrWeb {
     /**
      * Activate a scene target by hit-target id (`card:<agent>`,
      * `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-     * `terminal:close`, `steer:<agent>`, `key:<token>`), the same
+     * `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
+     * toggles the capture), the same
      * activation-by-name contract the other rendered surface gives the
      * validator and accessibility layers. Runs the exact dispatch path
      * a completed ray interaction runs — activation by name IS the
@@ -237,6 +238,43 @@ export class XrWeb {
      */
     updateTerminal(state) {
         wasm.xrweb_updateTerminal(this.__wbg_ptr, state);
+    }
+    /**
+     * The capture attempt ended without a transcript (mic denied, no
+     * speech recognized, lane down): back to idle with the reason
+     * rendered under the pill.
+     * @param {string} message
+     */
+    voiceFailed(message) {
+        const ptr0 = passStringToWasm0(message, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_voiceFailed(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * A captured utterance transcript from the JS capture lane. Lands
+     * in the ACTIVE text-entry buffer (`keyboard.rs`) — appended at the
+     * cursor when the board is open, else the board opens bound to the
+     * focused session's steer field with the transcript as its draft.
+     * Review and commit go through the keyboard's own enter/cancel —
+     * NEVER auto-sent.
+     * @param {string} text
+     */
+    voiceResult(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.xrweb_voiceResult(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Standing voice-input availability from the JS glue, which owns
+     * the truth (daemon transcription config, transport posture, mic
+     * permission): `{available: bool, detail: string}`. While
+     * unavailable the talk pill renders `detail` as a visible status
+     * line — never a silent no-op. Malformed pushes are dropped and
+     * counted, never fatal.
+     * @param {any} status
+     */
+    voiceStatus(status) {
+        wasm.xrweb_voiceStatus(this.__wbg_ptr, status);
     }
 }
 if (Symbol.dispose) XrWeb.prototype[Symbol.dispose] = XrWeb.prototype.free;
@@ -960,7 +998,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 81, function: Function { arguments: [Externref], shim_idx: 82, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 83, function: Function { arguments: [Externref], shim_idx: 84, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hb9ef122cd6bafce1, wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44);
             return ret;
         },

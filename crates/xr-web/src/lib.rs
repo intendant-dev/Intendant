@@ -28,6 +28,7 @@ mod model;
 mod session;
 mod terminal;
 mod ui;
+mod voice;
 pub mod webxr_sys;
 
 use std::cell::RefCell;
@@ -85,6 +86,10 @@ pub(crate) struct Inner {
     /// In-scene text entry: the focused-field model + ray-typed
     /// keyboard (see `keyboard.rs`).
     pub(crate) text_entry: keyboard::TextEntry,
+    /// Hold-to-talk voice input: talk pill + capture state machine; the
+    /// captured transcript lands in `text_entry`'s buffer (see
+    /// `voice.rs`).
+    pub(crate) voice: voice::VoiceDock,
     /// Per-frame controller/hand rays with their nearest hit distance —
     /// rendered as visible beams + hit markers (the pointer).
     pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
@@ -133,6 +138,7 @@ impl Inner {
             displays: Vec::new(),
             terminal: terminal::TerminalPane::default(),
             text_entry: keyboard::TextEntry::default(),
+            voice: voice::VoiceDock::default(),
             pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
@@ -199,6 +205,18 @@ fn debug_state_json(inner: &Inner) -> String {
                 };
                 serde_json::json!({ "field": field, "state": state, "detail": detail })
             }),
+        },
+        "voice": {
+            "phase": inner.voice.phase_name(),
+            "available": inner.voice.availability.as_ref().map(|a| a.available),
+            "detail": inner
+                .voice
+                .availability
+                .as_ref()
+                .map(|a| a.detail.clone())
+                .unwrap_or_default(),
+            "note": inner.voice.note,
+            "parseErrors": inner.voice.parse_errors,
         },
         "scene": {
             "panels": inner.panels_count,
@@ -409,9 +427,42 @@ impl XrWeb {
         }
     }
 
+    /// Standing voice-input availability from the JS glue, which owns
+    /// the truth (daemon transcription config, transport posture, mic
+    /// permission): `{available: bool, detail: string}`. While
+    /// unavailable the talk pill renders `detail` as a visible status
+    /// line — never a silent no-op. Malformed pushes are dropped and
+    /// counted, never fatal.
+    #[wasm_bindgen(js_name = voiceStatus)]
+    pub fn voice_status(&self, status: JsValue) {
+        voice::apply_status_js(&mut self.inner.borrow_mut(), status);
+    }
+
+    /// A captured utterance transcript from the JS capture lane. Lands
+    /// in the ACTIVE text-entry buffer (`keyboard.rs`) — appended at the
+    /// cursor when the board is open, else the board opens bound to the
+    /// focused session's steer field with the transcript as its draft.
+    /// Review and commit go through the keyboard's own enter/cancel —
+    /// NEVER auto-sent.
+    #[wasm_bindgen(js_name = voiceResult)]
+    pub fn voice_result(&self, text: String) {
+        voice::apply_result(&mut self.inner.borrow_mut(), &text);
+    }
+
+    /// The capture attempt ended without a transcript (mic denied, no
+    /// speech recognized, lane down): back to idle with the reason
+    /// rendered under the pill.
+    #[wasm_bindgen(js_name = voiceFailed)]
+    pub fn voice_failed(&self, message: String) {
+        let mut inner = self.inner.borrow_mut();
+        voice::apply_failed(&mut inner.voice, &message);
+        inner.ui_dirty = true;
+    }
+
     /// Activate a scene target by hit-target id (`card:<agent>`,
     /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-    /// `terminal:close`, `steer:<agent>`, `key:<token>`), the same
+    /// `terminal:close`, `steer:<agent>`, `key:<token>`, `voice:talk` —
+    /// toggles the capture), the same
     /// activation-by-name contract the other rendered surface gives the
     /// validator and accessibility layers. Runs the exact dispatch path
     /// a completed ray interaction runs — activation by name IS the
@@ -556,5 +607,48 @@ mod tests {
         assert_eq!(parsed["terminal"]["live"], true);
         assert_eq!(parsed["terminal"]["label"], "shell-0 · This daemon");
         assert_eq!(parsed["terminal"]["canvasGeneration"], 4);
+    }
+
+    #[test]
+    fn debug_json_reports_voice_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "idle");
+        assert!(parsed["voice"]["available"].is_null());
+        assert_eq!(parsed["voice"]["note"], "");
+        assert_eq!(parsed["voice"]["parseErrors"], 0);
+
+        voice::on_press(&mut inner.voice, 0.0);
+        voice::on_release(&mut inner.voice, 1000.0, false);
+        voice::apply_availability(
+            &mut inner.voice,
+            voice::VoiceAvailability {
+                available: false,
+                detail: "transcription is off".into(),
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "transcribing");
+        assert_eq!(parsed["voice"]["available"], false);
+        assert_eq!(parsed["voice"]["detail"], "transcription is off");
+
+        // A delivered transcript folds the capture to idle and lands in
+        // the text entry (the board is the result surface).
+        let snap: crate::model::XrSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{ "id": "local", "name": "local", "connected": true }],
+            "agents": [{ "id": "sess-1", "hostId": "local", "status": "running" }],
+        }))
+        .unwrap();
+        inner.model = Some(snap);
+        inner.selected_id = Some("sess-1".into());
+        voice::apply_result(&mut inner, "open the logs");
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["voice"]["phase"], "idle");
+        assert_eq!(parsed["textEntry"]["open"], true);
+        assert_eq!(parsed["textEntry"]["field"], "steer:sess-1");
+        assert_eq!(
+            parsed["textEntry"]["bufferLen"],
+            "open the logs".chars().count()
+        );
     }
 }

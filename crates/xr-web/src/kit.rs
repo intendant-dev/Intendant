@@ -113,6 +113,11 @@ pub(crate) enum HitKind {
     /// quick pinches, never the deliberate-confirm hold (that grammar
     /// stays approvals-only).
     Key,
+    /// The hold-to-talk pill: pinch-and-HOLD records, release stops. A
+    /// third hold semantic beside quick-pinch (select) and the 900 ms
+    /// confirm (approve/deny) — the hold IS the recording window, so it
+    /// neither fires on a timer nor cancels on aim drift (`voice.rs`).
+    VoiceTalk,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +232,12 @@ pub(crate) const KEYBOARD_Y: f32 = 0.84;
 pub(crate) const KEYBOARD_TILT: f32 = 0.50;
 pub(crate) const KEY_PITCH: f32 = 0.042;
 pub(crate) const KEY_GAP: f32 = 0.006;
+
+/// Voice talk pill: the left mirror of the terminal summon pill — near
+/// the workbench and the keyboard slot, inside the monitor stack's arc.
+pub(crate) const VOICE_PILL_AZ: f32 = -0.50;
+pub(crate) const VOICE_PILL_DIST: f32 = 1.30;
+pub(crate) const VOICE_PILL_Y: f32 = 1.05;
 
 /// Agenda rail: parked intent on the operator's RIGHT, outboard of the
 /// terminal slot (the +38° mirror of the monitors went to the summoned

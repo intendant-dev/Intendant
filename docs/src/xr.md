@@ -84,6 +84,9 @@ same pinned-wasm-pack pipeline as the other browser crates):
 - **`keyboard.rs`** — in-scene text entry (below): the focused-field
   model (`TextEntry` — field id, label, buffer, cursor, one-shot
   shift), the ray-typed QWERTY board, and the `text_commit` emit path.
+- **`voice.rs`** — hold-to-talk voice input (below): the talk pill and
+  the pure capture state machine; the captured transcript lands in the
+  text entry's buffer for the keyboard's own confirm grammar.
 
 ### Feed and action routing
 
@@ -94,9 +97,14 @@ rendered surface consumes, display-slot mirroring (same 6-arg registration
 shape), and action routing straight into `handleStationAction` — approvals
 emit the dashboard's existing `{type:'approval', host_id, approval_id,
 decision}` shape and land in `send_approval` / `resolvePeerApproval` like
-every other frontend. Deferred deliberately: the voice composer toggle (no
-existing action seam to reuse; needs a designed one, not a hack) and
-compositor media layers (below).
+every other frontend. Two action families are consumed by the
+fragment's own appended sections before that router: `text_commit`
+(the text-entry routing seam — the composer path, below) and the
+`voice_talk` capture verbs (the voice section, below). Deferred
+deliberately: the live voice-composer *conversation* (talking WITH the
+presence AI in XR — a designed seam, not a hack) and compositor media
+layers (below); ray typing and hold-to-talk dictation shipped instead
+as the first text-input slices.
 
 ### Terminal pane (slice 1: read-only watching)
 
@@ -158,6 +166,56 @@ so a hosted lease sees exactly the ops its projection already carries
 dispatch arms for automation and accessibility; `debug_json` exposes a
 `textEntry` section (field, buffer length, cursor, shift, delivery
 status).
+
+### Voice input (hold-to-talk)
+
+A "talk" pill sits below-left of the workbench (mirroring the terminal
+summon pill on the right, beside the keyboard slot). It is the **third
+hold semantic**, kept strictly apart from the other two: a quick pinch
+selects, the 900 ms confirm-hold approves — and the talk hold
+**records**. Pinch-and-hold the pill and the hold is the recording
+window (a pulsing ring says so from across the room); release stops it.
+The talk hold never fires on a timer and never cancels on aim drift — a
+hand wanders while its owner speaks — releasing the pinch is the only
+stop, so the mic can never stay hot. Releases under 300 ms read as
+accidental pinches and cancel with a rendered "hold to talk" hint. Mic
+permission is requested on the FIRST talk press, never at session
+entry, and release always stops the capture tracks (the browser's
+recording indicator goes out).
+
+The capture rides the dashboard's **existing server-side transcription
+lane** end to end: the `ui2-xr.js` voice section streams mic PCM over
+the page's `user_audio` frames into the daemon's Whisper pipeline
+(`transcription.rs`, `[transcription] enabled = true` — off by
+default), and the transcript returns on the broadcast `user_transcript`
+event. That lane only logs daemon-side; nothing injects it into any
+conversation, so voice capture adds **no presence-pipeline changes and
+no daemon changes**. Two lane facts shape the glue: the daemon
+transcribes in fixed ~3 s windows with no flush verb, so release pads
+one full window of silence to flush the spoken tail (pure-silence
+windows are RMS-gated daemon-side and transcribe nothing); and if the
+flat dashboard mic is already streaming (live voice session with
+transcription on), no second capture opens — the section just taps the
+transcripts already flowing.
+
+The transcript is **never auto-sent** — voice is a capture lane into
+the text-entry substrate above, never a second send path. With the
+board open, the utterance appends at the cursor (dictate into the draft
+you were typing); with it closed, the board opens bound to the focused
+session's steer field carrying the transcript as its draft; with no
+session focused, the pill says "select a session to dictate to".
+Review, edits, and the commit all go through the keyboard's own grammar
+— enter emits the same `{type:'text_commit', field_id, text}` a typed
+draft emits, the same routing seam dispatches it, and the same delivery
+verdict comes back. Speak, glance, pinch send.
+
+Honesty contract: every unavailability — transcription off, hosted
+Connect lane (user_audio is not tunneled), dead event stream, no secure
+context, mic denied — renders as a visible status line on the pill,
+never a silent no-op. `debug_json` exposes the capture machine under
+`voice` ({phase, available, detail, note}), and the validator's
+`--xr-probe` drives the full loop through `xrProbe.voice` with a shim
+transcript — no mic or ASR in CI.
 
 ### Availability
 
@@ -223,8 +281,12 @@ synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
 never routed to a live daemon) → the text-entry pass (steer pill → ray-typed
 keys → a captured `text_commit` asserted field-and-text, plus the honest
-"sending" park under captureOnly and a clean cancel) → the terminal pane
-pass (summon → honest empty state → canvas-seam registration → dismiss).
+"sending" park under captureOnly and a clean cancel) → the voice pass
+(talk toggle → captured capture verbs → a shim transcript through the
+real `voiceResult` seam landing in the text-entry buffer → the keyboard's
+enter committing it as a captured `text_commit` → failure/unavailability
+honesty; no mic, no ASR) → the terminal pane pass (summon → honest empty
+state → canvas-seam registration → dismiss).
 `xrProbe` (the `stationProbe`-convention QA facade) and `debugJson()` expose
 engine/scene state for ad-hoc probing.
 
@@ -233,8 +295,9 @@ engine/scene state for ad-hoc probing.
 - **M2 — the feel:** compositor video via `XRMediaBinding` quad layers where
   the Layers module exists (Quest's most optimized path; requires moving the
   scene to `XRWebGLBinding` projection layers — the current in-scene textured
-  quads remain the universal fallback), the designed voice-composer seam
-  (talking to your agents is the native XR composer), spatialized per-session
+  quads remain the universal fallback), the live voice-composer
+  *conversation* (talking WITH the presence AI in XR; hold-to-talk text
+  input shipped as the first slice), spatialized per-session
   presence audio, hand-tracking polish, multi-monitor walls, comfort and
   legibility tuning on hardware.
 - **M3 — the place:** hosts as arrangeable zones, the timeline as a spatial
