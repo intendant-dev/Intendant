@@ -21,6 +21,7 @@ mod agenda;
 mod atlas;
 pub mod gl;
 mod input;
+mod keyboard;
 mod kit;
 pub mod math;
 mod model;
@@ -81,6 +82,9 @@ pub(crate) struct Inner {
     /// In-scene terminal pane (read-only mirror of the dashboard's
     /// standalone shell; see `terminal.rs`).
     pub(crate) terminal: terminal::TerminalPane,
+    /// In-scene text entry: the focused-field model + ray-typed
+    /// keyboard (see `keyboard.rs`).
+    pub(crate) text_entry: keyboard::TextEntry,
     /// Per-frame controller/hand rays with their nearest hit distance —
     /// rendered as visible beams + hit markers (the pointer).
     pub(crate) pointer_rays: Vec<(math::Ray, Option<f32>)>,
@@ -128,6 +132,7 @@ impl Inner {
             hit_targets: Vec::new(),
             displays: Vec::new(),
             terminal: terminal::TerminalPane::default(),
+            text_entry: keyboard::TextEntry::default(),
             pointer_rays: Vec::new(),
             hold_target: None,
             hold_started_ms: 0.0,
@@ -178,6 +183,22 @@ fn debug_state_json(inner: &Inner) -> String {
             "hasCanvas": inner.terminal.canvas.is_some(),
             "canvasGeneration": inner.terminal.canvas_generation,
             "parseErrors": inner.terminal.parse_errors,
+        },
+        "textEntry": {
+            "open": inner.text_entry.open,
+            "field": inner.text_entry.field_id,
+            "label": inner.text_entry.label,
+            "bufferLen": inner.text_entry.char_len(),
+            "cursor": inner.text_entry.cursor,
+            "shift": inner.text_entry.shift,
+            "status": inner.text_entry.status.as_ref().map(|(field, state)| {
+                let (state, detail) = match state {
+                    keyboard::DeliveryState::Sending => ("sending", String::new()),
+                    keyboard::DeliveryState::Sent => ("sent", String::new()),
+                    keyboard::DeliveryState::Failed(d) => ("failed", d.clone()),
+                };
+                serde_json::json!({ "field": field, "state": state, "detail": detail })
+            }),
         },
         "scene": {
             "panels": inner.panels_count,
@@ -390,7 +411,7 @@ impl XrWeb {
 
     /// Activate a scene target by hit-target id (`card:<agent>`,
     /// `pill:<agent>:<op>`, `banner:<agent>`, `terminal:toggle`,
-    /// `terminal:close`), the same
+    /// `terminal:close`, `steer:<agent>`, `key:<token>`), the same
     /// activation-by-name contract the other rendered surface gives the
     /// validator and accessibility layers. Runs the exact dispatch path
     /// a completed ray interaction runs — activation by name IS the
@@ -398,6 +419,30 @@ impl XrWeb {
     /// true when the target existed and had an effect.
     pub fn activate(&self, name: String) -> bool {
         input::dispatch_target(&mut self.inner.borrow_mut(), &name)
+    }
+
+    /// Open the in-scene text entry bound to a field id, with a human
+    /// label for the board's header. The workbench steer pill runs this
+    /// same path via `activate("steer:<agent>")`; this direct seam is
+    /// for future consumers and deterministic probes.
+    #[wasm_bindgen(js_name = openTextEntry)]
+    pub fn open_text_entry(&self, field_id: String, label: String) {
+        keyboard::open_entry(&mut self.inner.borrow_mut(), field_id, label);
+    }
+
+    /// Close the text entry without committing (drops the draft).
+    #[wasm_bindgen(js_name = cancelTextEntry)]
+    pub fn cancel_text_entry(&self) {
+        keyboard::cancel_entry(&mut self.inner.borrow_mut());
+    }
+
+    /// Delivery verdict for a committed field, reported by the
+    /// dashboard's router after it routes a `text_commit` action:
+    /// ok → the scene says "sent", !ok → it says why not. Honest state,
+    /// never assumed.
+    #[wasm_bindgen(js_name = textEntryResult)]
+    pub fn text_entry_result(&self, field_id: String, ok: bool, detail: String) {
+        keyboard::apply_result(&mut self.inner.borrow_mut(), &field_id, ok, &detail);
     }
 
     /// QA/introspection hook: JSON string of the facade + engine state.
@@ -459,6 +504,36 @@ mod tests {
         assert_eq!(parsed["engine"]["framesRendered"], 42);
         assert_eq!(parsed["engine"]["views"], 2);
         assert_eq!(parsed["engine"]["sceneUploaded"], true);
+    }
+
+    #[test]
+    fn debug_json_reports_text_entry_state() {
+        let mut inner = Inner::new();
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], false);
+        assert_eq!(parsed["textEntry"]["field"], "");
+        assert_eq!(parsed["textEntry"]["bufferLen"], 0);
+        assert_eq!(parsed["textEntry"]["shift"], false);
+        assert!(parsed["textEntry"]["status"].is_null());
+
+        keyboard::open_entry(&mut inner, "steer:a1".into(), "steer · card".into());
+        assert!(keyboard::handle_key(&mut inner, "key:h"));
+        assert!(keyboard::handle_key(&mut inner, "key:i"));
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], true);
+        assert_eq!(parsed["textEntry"]["field"], "steer:a1");
+        assert_eq!(parsed["textEntry"]["label"], "steer · card");
+        assert_eq!(parsed["textEntry"]["bufferLen"], 2);
+        assert_eq!(parsed["textEntry"]["cursor"], 2);
+
+        assert!(keyboard::handle_key(&mut inner, "key:enter"));
+        keyboard::apply_result(&mut inner, "steer:a1", false, "no session");
+        let parsed: serde_json::Value = serde_json::from_str(&debug_state_json(&inner)).unwrap();
+        assert_eq!(parsed["textEntry"]["open"], false);
+        assert_eq!(parsed["textEntry"]["bufferLen"], 0);
+        assert_eq!(parsed["textEntry"]["status"]["state"], "failed");
+        assert_eq!(parsed["textEntry"]["status"]["detail"], "no session");
+        assert_eq!(parsed["textEntry"]["status"]["field"], "steer:a1");
     }
 
     #[test]

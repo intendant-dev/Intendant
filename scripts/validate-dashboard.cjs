@@ -2391,6 +2391,27 @@ class BrowserHarness {
     }
   }
 
+  /// Activate a feed-anchored XR target, retrying while the page's own
+  /// 300 ms pump (real, mostly-empty dashboard state) races the probe's
+  /// 40 ms synthetic hold: a real-state frame momentarily rebuilds the
+  /// scene without the synthetic cards, so a single-shot activate can
+  /// land in that window and be refused. Entry-state targets (keys)
+  /// don't flap — this is only for card/workbench affordances.
+  async activateXrTarget(name, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await this.waitForFunction(
+        `xrProbe.debugJson().then((d) => d.scene.hitTargets.includes(${JSON.stringify(name)}))`,
+        Math.max(1, deadline - Date.now()),
+      );
+      const ok = await this.evaluate(`xrProbe.activate(${JSON.stringify(name)})`);
+      if (ok === true) return;
+      if (Date.now() >= deadline) {
+        throw new Error(`xr probe: activation of ${name} kept being refused`);
+      }
+    }
+  }
+
   /// --xr-probe: drive the XR surface end to end against the injected
   /// WebXR shim — enter, stereo frames, scene build from a synthetic
   /// snapshot, activation-by-name selection, and a captured (never
@@ -2478,6 +2499,75 @@ class BrowserHarness {
     }
     await this.waitForFunction(
       'xrProbe.debugJson().then((d) => d.scene.transcript.scroll === 0)',
+      timeoutMs,
+    );
+    // Text entry: the workbench steer pill opens the ray-typed keyboard,
+    // key activations type through the exact pinch dispatch path, and
+    // enter commits the dashboard's text_commit action — captured, never
+    // routed (captureOnly is still on from the approval leg). Focus the
+    // live-session card first: steer rides the focused workbench.
+    await this.activateXrTarget('card:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.scene.selected === 'xr-probe-a1'"
+        + " && d.scene.hitTargets.includes('steer:xr-probe-a1'))",
+      timeoutMs,
+    );
+    await this.activateXrTarget('steer:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry && d.textEntry.open === true"
+        + " && d.textEntry.field === 'steer:xr-probe-a1'"
+        + " && d.scene.hitTargets.includes('key:h')"
+        + " && d.scene.hitTargets.includes('key:enter'))",
+      timeoutMs,
+    );
+    for (const key of ['key:h', 'key:i']) {
+      const typed = await this.evaluate(`xrProbe.activate('${key}')`);
+      if (typed !== true) {
+        throw new Error(`xr probe: keystroke ${key} was refused`);
+      }
+    }
+    await this.waitForFunction(
+      'xrProbe.debugJson().then((d) => d.textEntry.bufferLen === 2 && d.textEntry.cursor === 2)',
+      timeoutMs,
+    );
+    const committed = await this.evaluate("xrProbe.activate('key:enter')");
+    if (committed !== true) {
+      throw new Error('xr probe: enter (commit) activation was refused');
+    }
+    const commitAction = await this.evaluate('JSON.stringify(xrProbe.lastAction || null)');
+    const parsedCommit = JSON.parse(String(commitAction || 'null'));
+    if (
+      !parsedCommit
+      || parsedCommit.type !== 'text_commit'
+      || parsedCommit.field_id !== 'steer:xr-probe-a1'
+      || parsedCommit.text !== 'hi'
+    ) {
+      throw new Error(`xr probe: captured text_commit malformed: ${commitAction}`);
+    }
+    // Commit closes the board and parks the field at "sending" — under
+    // captureOnly no router ran, so anything else would be a lie.
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === false"
+        + " && d.textEntry.status && d.textEntry.status.state === 'sending'"
+        + " && !d.scene.hitTargets.includes('key:h'))",
+      timeoutMs,
+    );
+    // Cancel path: re-open (a fresh draft — no leftover buffer, verdict
+    // superseded), then cancel closes cleanly and disarms the keys.
+    await this.activateXrTarget('steer:xr-probe-a1', timeoutMs);
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === true"
+        + " && d.textEntry.bufferLen === 0 && d.textEntry.status === null"
+        + " && d.scene.hitTargets.includes('key:cancel'))",
+      timeoutMs,
+    );
+    const canceled = await this.evaluate("xrProbe.activate('key:cancel')");
+    if (canceled !== true) {
+      throw new Error('xr probe: cancel activation was refused');
+    }
+    await this.waitForFunction(
+      "xrProbe.debugJson().then((d) => d.textEntry.open === false"
+        + " && !d.scene.hitTargets.includes('key:h'))",
       timeoutMs,
     );
     // Terminal pane (slice 1, read-only watching). The summon pill is a
@@ -2570,6 +2660,7 @@ class BrowserHarness {
       throw new Error(`xr probe: snapshot parse errors: ${report.parseErrors}`);
     }
     report.action = parsedAction;
+    report.textEntry = { field: parsedCommit.field_id, text: parsedCommit.text, canceled: true };
     report.terminal = JSON.parse(String(terminalSummary || 'null'));
     report.ok = true;
     return report;
@@ -4023,7 +4114,10 @@ function formatXrProbeLine(report) {
   return `xr probe: ok — frames=${report.frames} views=${report.views} panels=${report.panels} `
     + `texts=${report.texts} hits=${report.hits} transcriptRows=${report.transcriptRows} `
     + `passthrough=${report.passthrough} `
-    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'}`;
+    + `action=${report.action ? report.action.type + '/' + report.action.decision : 'none'} `
+    + `textEntry=${report.textEntry
+      ? `${report.textEntry.field}:${JSON.stringify(report.textEntry.text)}+cancel`
+      : 'none'}`;
 }
 
 function waitFunctionExpression(source) {

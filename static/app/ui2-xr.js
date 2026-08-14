@@ -85,6 +85,12 @@ async function xrBootModule() {
     // hit a live daemon.
     globalThis.xrProbe.lastAction = action;
     if (xrCaptureOnly) return;
+    if (action && action.type === 'text_commit') {
+      // Text-entry commits route through the dashboard's composer path
+      // (the appended text-entry section below), not handleStationAction.
+      xrRouteTextCommit(action);
+      return;
+    }
     try {
       if (typeof handleStationAction === 'function') {
         handleStationAction(action);
@@ -699,3 +705,105 @@ globalThis.xrProbe.terminal = {
 // Agenda-rail probe hook (attached beside the facade so the object
 // literal above stays untouched): the pump's agenda block, on demand.
 globalThis.xrProbe.agenda = () => xrAgendaSummary();
+
+// ── XR text entry — the commit routing seam ──
+//
+// Appended section. crates/xr-web/src/keyboard.rs renders the in-scene
+// ray-typed keyboard; committing emits {type:'text_commit', field_id,
+// text} through the action callback above. This section resolves the
+// field and routes the text through the flat dashboard's REAL composer
+// path — never a parallel send lane:
+//
+//   field "steer:<agentId>" — <agentId> is a Station scene-node id
+//   (buildStationSnapshot's vocabulary, the same builder the XR pump
+//   feeds the scene from). Its sessionId picks the composer target:
+//     - local sessions: focusSessionWindow(sid) then
+//       submitComposedText(text) — the exact pair Station's own
+//       op === 'steer' handler runs (34-station-panes.js), so
+//       submitComposedText decides mid-turn steer vs queued follow-up
+//       vs start_task exactly as the flat composer does;
+//     - peer sessions: setPromptTargetPeer(hostId, sid) then
+//       submitComposedText(text) — the composer's own peer lane.
+//   Both retarget the one composer, matching the flat "one composer,
+//   one target" semantics of picking a session.
+//
+// Every outcome reports back through xrInstance.textEntryResult so the
+// scene's status line says what actually happened ("sent" — meaning
+// dispatched to the daemon — or the refusal text). Nothing here assumes
+// delivery, and a routing error must never take the immersive session
+// down. Trust: this section adds NO daemon routes — the text rides the
+// same ControlMsg lanes (steer / start_task / peer session control) the
+// flat composer already uses, so a hosted lease sees exactly the ops
+// its projection already carries.
+
+function xrTextCommitReport(fieldId, ok, detail) {
+  try {
+    if (xrInstance && typeof xrInstance.textEntryResult === 'function') {
+      xrInstance.textEntryResult(String(fieldId || ''), !!ok, String(detail || ''));
+    }
+  } catch (err) {
+    console.warn('[xr] text-entry result report failed', err);
+  }
+}
+
+function xrRouteTextCommit(action) {
+  const fieldId = String((action && action.field_id) || '');
+  try {
+    const text = String((action && action.text) || '').trim();
+    if (!text) {
+      xrTextCommitReport(fieldId, false, 'empty message');
+      return;
+    }
+    if (!fieldId.startsWith('steer:')) {
+      xrTextCommitReport(fieldId, false, `unknown field ${fieldId || '(none)'}`);
+      return;
+    }
+    const agentId = fieldId.slice('steer:'.length);
+    let agent = null;
+    if (typeof buildStationSnapshot === 'function') {
+      const snap = buildStationSnapshot();
+      agent = ((snap && snap.agents) || []).find((a) => a && String(a.id) === agentId) || null;
+    }
+    const sessionId = String((agent && agent.sessionId) || '').trim();
+    if (!sessionId) {
+      xrTextCommitReport(fieldId, false, 'no session behind this card');
+      return;
+    }
+    const hostId = String((agent && agent.hostId) || '').trim();
+    const isLocal = !hostId || hostId === 'local'
+      || (typeof selfPeerId !== 'undefined' && hostId === String(selfPeerId));
+    if (isLocal) {
+      if (typeof focusSessionWindow !== 'function' || typeof submitComposedText !== 'function') {
+        xrTextCommitReport(fieldId, false, 'composer unavailable in this build');
+        return;
+      }
+      focusSessionWindow(sessionId);
+      // Precision gate: submitComposedText sends to the RESOLVED prompt
+      // target. If the session became unusable between the snapshot and
+      // this commit, the resolver would fall back to a different
+      // session — refuse instead of mis-routing the text.
+      const resolved = typeof resolvePromptTargetSessionId === 'function'
+        ? resolvePromptTargetSessionId() : sessionId;
+      if (resolved !== sessionId) {
+        xrTextCommitReport(fieldId, false, 'session is no longer steerable');
+        return;
+      }
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'dispatch refused (connection down?)');
+      return;
+    }
+    // Peer session: the composer's peer lane. setPromptTargetPeer
+    // validates the peer link and refuses unknown hosts.
+    if (typeof setPromptTargetPeer === 'function' && typeof submitComposedText === 'function'
+        && setPromptTargetPeer(hostId, sessionId)) {
+      const ok = submitComposedText(text) === true;
+      xrTextCommitReport(fieldId, ok, ok ? '' : 'peer dispatch refused');
+      return;
+    }
+    xrTextCommitReport(fieldId, false, 'peer not connected');
+  } catch (err) {
+    xrTextCommitReport(fieldId, false, String((err && err.message) || err || 'route error').slice(0, 80));
+  }
+}
+
+// ── End of the text-entry section. ──

@@ -81,6 +81,9 @@ same pinned-wasm-pack pipeline as the other browser crates):
 - **`terminal.rs`** — the in-scene terminal pane (below): summon pill,
   pane layout, the honest empty/warming/watching states, and the
   facade seams the dashboard's terminal painter feeds.
+- **`keyboard.rs`** — in-scene text entry (below): the focused-field
+  model (`TextEntry` — field id, label, buffer, cursor, one-shot
+  shift), the ray-typed QWERTY board, and the `text_commit` emit path.
 
 ### Feed and action routing
 
@@ -115,6 +118,46 @@ shell when none exists), so a page with no terminal session shows
 "no terminals — open one on the dashboard" instead. Input from the
 headset is a later slice (hardware keyboards in immersive sessions are
 unverified on the Quest).
+
+### Text input (steering a session from the room)
+
+Text entry is a first-class substrate (`keyboard.rs`), not a bolt-on:
+any affordance can open an entry bound to a **field id**, and the
+committed text is one more action through the one router. The first
+consumer is the workbench — a **steer** pill on the focused session's
+bench (only for cards projecting a live session) opens a rendered
+QWERTY board bound to `steer:<agent>`.
+
+The board sits in a fixed near-field slot below the workbench, tilted
+up toward the gaze; every key is ≥ 35 mm at ~0.9 m — the ray-typing
+legibility floor. Typing is hover + **quick pinch** (release-resolved,
+exactly like cards): the 900 ms deliberate-confirm hold stays
+approvals-only, because a keystroke is trivially reversible where an
+approval is not. Shift is one-shot (next character), the preview strip
+shows the buffer with a visible cursor (arrow keys move it), cancel
+drops the draft, and **send** commits.
+
+Commit emits `{type:'text_commit', field_id, text}` through the action
+callback; the `ui2-xr.js` text-entry section resolves the field and
+routes it through the flat dashboard's REAL composer path — for a local
+session `focusSessionWindow(sid)` + `submitComposedText(text)` (the
+exact pair Station's own steer op runs), for a peer session
+`setPromptTargetPeer(hostId, sid)` + `submitComposedText(text)` — so
+mid-turn steer vs queued follow-up vs start_task is decided by the same
+code the flat composer uses, and the one-composer-one-target rule holds
+across surfaces. The router then reports the verdict back
+(`textEntryResult`), and the bench renders it beside the pill —
+"sending…", then "sent" (dispatched to the daemon) or the refusal text.
+Nothing in the scene pretends a send worked.
+
+Trust: this adds **no daemon routes** — commits ride the same session
+Message/Task control operations the flat composer already dispatches,
+so a hosted lease sees exactly the ops its projection already carries
+(and approvals stay behind the action wall regardless).
+`activate("steer:<agent>")` / `activate("key:<token>")` run the same
+dispatch arms for automation and accessibility; `debug_json` exposes a
+`textEntry` section (field, buffer length, cursor, shift, delivery
+status).
 
 ### Availability
 
@@ -178,10 +221,12 @@ shim (no dependency; it covers exactly the interface surface
 end: chip → immersive entry → stereo frame loop (2 views) →
 synthetic-snapshot scene build → activation-by-name selection → a captured
 approval dispatch asserted against the dashboard's action shape (captured,
-never routed to a live daemon) → the terminal pane pass (summon → honest
-empty state → canvas-seam registration → dismiss). `xrProbe` (the
-`stationProbe`-convention QA facade) and `debugJson()` expose engine/scene
-state for ad-hoc probing.
+never routed to a live daemon) → the text-entry pass (steer pill → ray-typed
+keys → a captured `text_commit` asserted field-and-text, plus the honest
+"sending" park under captureOnly and a clean cancel) → the terminal pane
+pass (summon → honest empty state → canvas-seam registration → dismiss).
+`xrProbe` (the `stationProbe`-convention QA facade) and `debugJson()` expose
+engine/scene state for ad-hoc probing.
 
 ## Roadmap
 
