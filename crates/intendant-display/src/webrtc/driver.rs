@@ -131,6 +131,22 @@ pub(crate) struct RtpSendState {
     by_rid: HashMap<SimulcastRid, RidRtpState>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
+    /// Negotiated RTP payload type for the active codec, resolved
+    /// lazily from the sender's negotiated parameters (same caching
+    /// pattern as [`Self::mid_ext_id`]) and stamped onto every
+    /// outgoing packet.
+    ///
+    /// rtc 0.9.1's `write_rtp` fuzzy-matched the encoding's codec
+    /// against the negotiated codec list and REWROTE
+    /// `packet.header.payload_type` itself, so the packetizer's
+    /// constructor PT (96) was a placeholder that never reached the
+    /// wire. rtc 0.20.3 instead VALIDATES the caller-stamped PT
+    /// against the negotiated list and rejects mismatches with
+    /// `ErrRTPTransceiverCodecUnsupported` — the stamping duty moved
+    /// to the caller. Without this, H.264 (negotiated PT 125, per the
+    /// media-engine registration in `offer.rs`) fails on every packet;
+    /// VP8 passed only because its registered PT happens to be 96.
+    payload_type: Option<u8>,
     /// The mid as an RTP `sdes:mid` header-extension payload,
     /// precomputed for the same per-packet reason as
     /// [`RidRtpState::rid_ext`].
@@ -278,6 +294,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
             by_rid,
             mid_ext_id: None,
             rid_ext_id: None,
+            payload_type: None,
             mid_ext,
         },
     };
@@ -880,7 +897,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 observed_send_bitrate_tx.send_replace(bitrate);
 
                 // Phase 4d.3a: project remote-inbound-rtp entries
-                // (RR-derived, the field set rtc 0.9 actually
+                // (RR-derived, the field set rtc 0.20 actually
                 // populates per `accumulator/rtp_stream/outbound.rs`)
                 // into per-RID health, mapping outbound SSRCs back
                 // through `state.rtp.by_rid`. Empty map publishes
@@ -901,7 +918,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                             s.fraction_lost,
                             s.received_rtp_stream_stats.packets_lost,
                             s.round_trip_time,
-                            // Phase 4d.3a review fix: rtc 0.9 emits
+                            // Phase 4d.3a review fix: rtc 0.20 emits
                             // default RemoteInboundRTP snapshots for
                             // every outbound stream even pre-RR (all
                             // fields zero). The helper filters on
@@ -971,13 +988,18 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         // Route by connection first, engine stamp second: rtc < 0.9.1
         // stamped DTLS/SCTP transmits `TransportProtocol::UDP` even on a
         // TCP pair, misrouting every post-ICE packet (webrtc-rs/rtc#109,
-        // fixed by our upstream PR #110, released as 0.9.1 — which we
-        // run). Tuple-first routing stays regardless: the tuple is the
-        // engine's own connection key (rtc-shared `FiveTuple`), and it
-        // keeps any future stamping regression from presenting as a
-        // silent DTLS timeout again. (The relay check above stays first: relay
-        // transmits key on our relayed *local* address, which is never a
-        // TCP peer tuple.)
+        // fixed by our upstream PR #110, released as 0.9.1 and carried
+        // forward into the 0.20.x line we run — 0.20.3's ICE handler
+        // additionally stamps `local.base_addr()` instead of the
+        // candidate address, so srflx-selected pairs now stamp the bound
+        // socket the `sockets_by_addr` lookup below expects, and relay
+        // candidates still stamp the relayed address the relay check
+        // above keys on). Tuple-first routing stays regardless: the
+        // tuple is the engine's own connection key (rtc-shared
+        // `FiveTuple`), and it keeps any future stamping regression from
+        // presenting as a silent DTLS timeout again. (The relay check
+        // above stays first: relay transmits key on our relayed *local*
+        // address, which is never a TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
             // freeze() is zero-copy: the writer task borrows the
             // engine's own transmit buffer for the RFC 4571 write.
@@ -1166,7 +1188,7 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
 }
 
 /// **Phase 4d.3a**: project per-SSRC remote-inbound stats (RR-derived,
-/// from rtc 0.9's `RTCRemoteInboundRtpStreamStats` accumulator) onto
+/// from rtc 0.20's `RTCRemoteInboundRtpStreamStats` accumulator) onto
 /// the per-RID SSRC table the driver maintains in `state.rtp.by_rid`.
 /// Returns one [`PeerLayerHealth`] entry per recognized RID; SSRCs not
 /// present in the table (transient renegotiation windows, on-demand
@@ -1177,12 +1199,12 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
 /// Pure: takes flat `(ssrc, fraction_lost, packets_lost, rtt,
 /// rtt_measurements)` tuples rather than
 /// `&RTCRemoteInboundRtpStreamStats` so tests can construct
-/// synthetic inputs directly without the rtc 0.9 `pub(crate)`
+/// synthetic inputs directly without the rtc 0.20 `pub(crate)`
 /// constructor walls. Production projection from
 /// `report.iter_by_type(RTCStatsType::RemoteInboundRTP)` happens at
 /// the caller (the driver's `twcc_poll` branch).
 ///
-/// **Pre-RR filtering**: rtc 0.9 emits a default-valued
+/// **Pre-RR filtering**: rtc 0.20 emits a default-valued
 /// `RemoteInboundRTP` snapshot for every outbound stream even
 /// before any RR has actually been received — all fields are
 /// zero, including `fraction_lost = 0.0` (which would otherwise
@@ -1235,7 +1257,7 @@ pub(crate) fn map_remote_inbound_to_rid_health(
 ///
 /// **What this signals**: how much data the peer is actually pushing
 /// onto the wire right now, summed across simulcast layers + RTX
-/// streams. NOT a congestion-control bandwidth estimate (rtc 0.9
+/// streams. NOT a congestion-control bandwidth estimate (rtc 0.20
 /// doesn't expose one — see `TWCC_POLL_INTERVAL` for why). The
 /// layer-selection aggregator (4d.2) interprets this as "delivery
 /// rate the peer's encoder + network are sustaining." A drop from
@@ -1355,7 +1377,7 @@ pub(crate) fn rid_for_ssrc(ssrc_table: &[(SimulcastRid, u32)], ssrc: u32) -> Opt
 ///
 /// RTCP packet types other than PLI/FIR (NACK, RR, SR, SDES, BYE,
 /// transport-cc, REMB, TWCC) are ignored here — those are handled
-/// by rtc 0.9's interceptor for stats/bandwidth-estimation purposes
+/// by rtc 0.20's interceptor for stats/bandwidth-estimation purposes
 /// and never need to flow through this routing path.
 ///
 /// Lossy `try_send`: if the keyframe-request channel is full, drop.
@@ -1593,6 +1615,7 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     let rid_ext = rid_state.rid_ext.clone();
 
     let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
+    let negotiated_pt = negotiated_payload_type(rtc, state);
     // One sender lookup per frame, not per packet — a 1440p keyframe
     // packetizes into hundreds of packets.
     let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
@@ -1600,6 +1623,15 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     };
     for mut packet in packets {
         packet.header.ssrc = rid_ssrc;
+        // Stamp the negotiated payload type. rtc 0.9.1's `write_rtp`
+        // rewrote the PT itself; 0.20.3 validates the caller's PT
+        // against the negotiated codec list instead, so the
+        // packetizer's constructor PT (96) is only correct for VP8 by
+        // coincidence and H.264 negotiates 125. See
+        // `negotiated_payload_type`.
+        if let Some(pt) = negotiated_pt {
+            packet.header.payload_type = pt;
+        }
         if let Some(id) = mid_ext_id {
             let _ = packet.header.set_extension(id, state.rtp.mid_ext.clone());
         }
@@ -1684,6 +1716,39 @@ pub(crate) fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
         }
     }
     (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
+}
+
+/// Resolve (and cache) the negotiated RTP payload type for the active
+/// codec from the sender's negotiated parameter set, matched by MIME
+/// type — the exact list rtc 0.20.3's `write_rtp` validates
+/// `packet.header.payload_type` against.
+///
+/// rtc 0.9.1 rewrote the PT inside `write_rtp` (fuzzy codec match,
+/// then `packet.header.payload_type = codec.payload_type`); 0.20.3
+/// removed the rewrite and instead REJECTS packets whose PT is not in
+/// the negotiated codec list, so the driver stamps the negotiated PT
+/// itself (see the write loop in `write_video_frame`).
+pub(crate) fn negotiated_payload_type<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    state: &mut DriverState,
+) -> Option<u8> {
+    if state.rtp.payload_type.is_some() {
+        return state.rtp.payload_type;
+    }
+    if let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) {
+        let params = sender.get_parameters();
+        for codec in &params.rtp_parameters.codecs {
+            if codec
+                .rtp_codec
+                .mime_type
+                .eq_ignore_ascii_case(&state.rtp.codec.mime_type)
+            {
+                state.rtp.payload_type = Some(codec.payload_type);
+                break;
+            }
+        }
+    }
+    state.rtp.payload_type
 }
 
 pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
@@ -2894,7 +2959,7 @@ mod tests {
 
     #[test]
     fn map_remote_inbound_filters_pre_rr_default_snapshots() {
-        // **4d.3a review fix regression**: rtc 0.9's accumulator
+        // **4d.3a review fix regression**: rtc 0.20's accumulator
         // emits a default-valued `RemoteInboundRTP` entry for every
         // outbound stream the moment the stream exists, even before
         // any actual RR has been received. All fields default to

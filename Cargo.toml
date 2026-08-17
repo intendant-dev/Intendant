@@ -139,7 +139,7 @@ libc = "0.2"
 # this refuses IPv4 connections. Kept pinned to tokio 1.x's transitive
 # version so there's no risk of dual copies in the dep tree.
 socket2 = "0.6"
-rtc = { version = "=0.9.1" }
+rtc = { version = "=0.20.3" }
 bytes = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Gzip for the web gateway's embedded static assets (app.html, WASM, JS).
@@ -301,7 +301,9 @@ opt-level = 3
 
 # Wire-MTU fix for federated data channels: rtc-sctp's default packet size
 # overflows 1280-MTU (IPv6-minimum / overlay) paths once DTLS+UDP headers
-# are added, and oversized flights blackhole silently. One-constant vendored
-# patch; rationale + exit criteria in vendor/rtc-sctp/INTENDANT-PATCH.md.
+# are added, and oversized flights blackhole silently. Vendored 0.20.3 copy
+# carrying our upstream fix (webrtc-rs/rtc#178 → PR #180: 1191-byte
+# INITIAL_MTU + padded-wire bundling enforcement); rationale + exit
+# criterion in vendor/rtc-sctp/INTENDANT-PATCH.md.
 [patch.crates-io]
 rtc-sctp = { path = "vendor/rtc-sctp" }

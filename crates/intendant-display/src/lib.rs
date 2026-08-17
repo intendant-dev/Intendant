@@ -1466,11 +1466,11 @@ pub struct DisplaySession {
     ///   `spawn_zero_peer_aggregator` provided.
     /// - **Aggregate-TWCC policy** (per-peer cascaded loss):
     ///   votes floor + cascade-projected upper layers. Active on
-    ///   the rtc 0.9 / WKWebView stack via
+    ///   the rtc 0.20 / WKWebView stack via
     ///   [`crate::twcc_tap`].
     /// - **Per-RID RR policy** (per-(peer, RID) `fraction_lost`):
     ///   votes floor + per-RID Wanted-state-projection. Currently
-    ///   inert on the rtc 0.9 stack (RR stats never populate),
+    ///   inert on the rtc 0.20 stack (RR stats never populate),
     ///   stays warm so future stacks that surface fresh RR
     ///   activate it without code changes.
     ///

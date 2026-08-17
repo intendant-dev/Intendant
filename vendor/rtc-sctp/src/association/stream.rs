@@ -5,7 +5,7 @@ use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
 use crate::{ErrorCauseCode, Event, Side};
 use shared::error::{Error, Result};
 
-use crate::util::{ByteSlice, BytesArray, BytesSource};
+use crate::util::{ByteSlice, BytesArray, BytesChunk, BytesSource};
 use bytes::Bytes;
 use log::{debug, error, trace};
 use std::fmt;
@@ -15,9 +15,13 @@ pub type StreamId = u16;
 
 /// Application events about streams
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamEvent {
     /// One or more new streams has been opened
-    Opened { id: StreamId },
+    Opened {
+        /// Which stream was opened.
+        id: StreamId,
+    },
     /// A currently open stream has data or errors waiting to be read
     Readable {
         /// Which stream is now readable
@@ -53,6 +57,17 @@ pub enum StreamEvent {
     BufferedAmountHigh {
         /// Which stream is now readable
         id: StreamId,
+    },
+    /// Outgoing buffered data was released (acknowledged OR abandoned), carrying
+    /// the exact number of user payload bytes freed for this stream. Unlike the
+    /// edge-triggered [`StreamEvent::BufferedAmountLow`], this fires on every
+    /// release with the byte delta, so upper layers can keep their own
+    /// send-buffer accounting (e.g. a synchronous back-pressure counter) exact.
+    BufferedAmountReleased {
+        /// Which stream released buffered bytes
+        id: StreamId,
+        /// User payload bytes released
+        n_bytes: usize,
     },
 }
 
@@ -119,7 +134,7 @@ impl Stream<'_> {
 
     /// write_sctp writes len(p) bytes from p to the DTLS connection
     pub fn write_sctp(&mut self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(p), ppi)
+        self.write_source(&mut BytesChunk::new(p), ppi)
     }
 
     /// Send data on the given stream.
@@ -140,10 +155,23 @@ impl Stream<'_> {
 
     /// write writes len(p) bytes from p with the default Payload Protocol Identifier
     pub fn write_chunk(&mut self, p: &Bytes) -> Result<usize> {
-        self.write_source(
-            &mut ByteSlice::from_slice(p),
-            self.get_default_payload_type()?,
-        )
+        self.write_source(&mut BytesChunk::new(p), self.get_default_payload_type()?)
+    }
+
+    /// Send an owned [`Bytes`] on the stream with a specific payload protocol.
+    ///
+    /// Unlike [`write_with_ppi`](Self::write_with_ppi), which takes a `&[u8]` and
+    /// must copy it into a freshly allocated buffer, this enqueues the payload
+    /// zero-copy: each fragment is a refcounted slice of `data`. Prefer this on the
+    /// hot send path when the caller already owns the payload as `Bytes`.
+    ///
+    /// Returns the number of bytes successfully written.
+    pub fn write_chunk_with_ppi(
+        &mut self,
+        data: &Bytes,
+        ppi: PayloadProtocolIdentifier,
+    ) -> Result<usize> {
+        self.write_source(&mut BytesChunk::new(data), ppi)
     }
 
     /// Send data on the given stream
@@ -204,6 +232,7 @@ impl Stream<'_> {
         }
     }
 
+    /// Whether this stream has data or an error waiting to be read.
     pub fn is_readable(&self) -> bool {
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable
@@ -212,6 +241,7 @@ impl Stream<'_> {
         }
     }
 
+    /// Whether this stream can currently accept more data.
     pub fn is_writable(&self) -> bool {
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Writable || s.state == RecvSendState::ReadWritable

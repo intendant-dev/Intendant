@@ -1,10 +1,31 @@
-# Vendored `rtc-sctp` 0.9.1 (single-constant patch)
+# Vendored `rtc-sctp` 0.20.3 (carrying our filed upstream MTU fix)
 
-Byte-for-byte copy of the crates.io `rtc-sctp` 0.9.1 package (MIT/Apache-2.0,
+Byte-for-byte copy of the crates.io `rtc-sctp` 0.20.3 package (MIT/Apache-2.0,
 webrtc-rs project), wired in via `[patch.crates-io]` in the workspace
-`Cargo.toml`, with **one** functional change:
+`Cargo.toml`, with **one** functional change applied on top: our own fix filed
+upstream as **webrtc-rs/rtc#178 → PR #180**, which 0.20.3 predates.
 
-- `src/config.rs`: `INITIAL_MTU` 1228 → **1192**.
+The patch (`src/config.rs`, `src/association/mod.rs`,
+`src/association/association_test.rs`):
+
+- `INITIAL_MTU` 1228 → **1191** — the exact TURN-relayed IPv6 budget
+  (1280 − 40 IPv6 − 8 UDP − 4 TURN ChannelData − 37 DTLS), the pion/sctp#476
+  derivation that webrtc-rs/webrtc#807 adopted and shipped in webrtc v0.17.2;
+  replacing that sctp implementation with rtc-sctp in the 0.20 architecture
+  reverted the default to 1228.
+- `EndpointConfig::default()`'s `max_payload_size` rounded **down to the SCTP
+  4-byte padding boundary** so a single maximum-size DATA chunk also marshals
+  within `INITIAL_MTU`.
+- `bundle_data_chunks_into_packets` and the fast-retransmit sizing loop decide
+  on **marshalled wire sizes** (chunk header + payload, padded to the 4-byte
+  boundary) instead of raw payload sizes — payload-only accounting admitted
+  bundles that serialized past the MTU the association promised (payloads of
+  1147 + 16 pass a payload-only check at an MTU of 1191 but marshal to a
+  1208-byte packet).
+- Three tests bundle real chunks and measure the emitted packets (the
+  1147+16 counterexample must split; a single maximum-size chunk must fit;
+  a 60-small-chunk burst stays within the MTU), plus a config test pinning
+  the 1191 derivation.
 
 ## Why
 
@@ -26,23 +47,18 @@ packet**, and the flight is lost forever — no error surfaces anywhere
 alongside a large tile-snapshot chunk) silently never arrives, while RTP
 media (independently sized well under the MTU) keeps flowing on the same
 candidate pair. Diagnosed live 2026-07-13 on the Mac ↔ dell federated
-display rig; clamping to 1192 (record ≤ ~1229, wire ≤ ~1277) fixed the
-delivery end-to-end on the first try. libwebrtc pins its usrsctp MTU to
-1200 for exactly this class of path.
+display rig; clamping the assembled-packet size (originally to 1192 on our
+vendored 0.9.1; now 1191, upstream-aligned with the PR #180 derivation)
+fixed the delivery end-to-end on the first try. libwebrtc pins its usrsctp
+MTU to 1200 for exactly this class of path.
 
-`rtc` 0.9.1 builds its SCTP `TransportConfig` with `::default()` and
-plumbs no public knob for `max_payload_size`/MTU through `SettingEngine`,
-so the default itself is the only place to fix it today.
+`rtc` 0.20.3 still builds its SCTP `TransportConfig` with `::default()` and
+plumbs no public knob for `max_payload_size`/MTU through the setting engine,
+so the default itself remains the only place to fix it today.
 
-## Exit criteria
+## Exit criterion
 
-Retire this vendored copy when either lands upstream (webrtc-rs/rtc):
-
-1. a safe default (≤1200-byte SCTP packets), or
-2. a `SettingEngine`/`TransportConfig` knob reachable from
-   `RTCPeerConnection` construction — then set it from
-   `crates/intendant-display/src/webrtc/offer.rs` instead.
-
-Same playbook as the rtc 0.9.1 transport-protocol stamping fix
-(webrtc-rs/rtc#109 → #110): upstream the change, pin the release, drop the
-local carry.
+Retire this vendored copy when a **released** `rtc-sctp` containing
+webrtc-rs/rtc PR #180 ships — then pin that release and drop the local carry.
+Same playbook as the rtc transport-protocol stamping fix (webrtc-rs/rtc#109 →
+#110, released in the line we now consume).

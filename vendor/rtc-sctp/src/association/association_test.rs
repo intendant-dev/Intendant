@@ -15,23 +15,20 @@ fn create_association(config: TransportConfig) -> Association {
     )
 }
 
+// `create_forward_tsn` no longer rescans the in-flight window; it emits the
+// `fwd_tsn_stream_map` that the RFC 3758 C2 loops fill via
+// `note_abandoned_for_forward_tsn` as each chunk is abandoned. These unit tests
+// drive that same entry point directly (ascending TSN, as C2 would); the full
+// window/SACK-driven path is exercised end-to-end by the `endpoint_test`
+// `test_assoc_unreliable_rexmit_*` suite.
 #[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association::default();
 
     a.cumulative_tsn_ack_point = 9;
     a.advanced_peer_tsn_ack_point = 10;
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    // tsn=10, ordered, si=1, ssn=2
+    a.note_abandoned_for_forward_tsn(false, 1, 2);
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -49,39 +46,9 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
 
     a.cumulative_tsn_ack_point = 9;
     a.advanced_peer_tsn_ack_point = 12;
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 11,
-        stream_identifier: 1,
-        stream_sequence_number: 3,
-        user_data: Bytes::from_static(b"DEF"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 12,
-        stream_identifier: 2,
-        stream_sequence_number: 1,
-        user_data: Bytes::from_static(b"123"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    a.note_abandoned_for_forward_tsn(false, 1, 2); // tsn=10
+    a.note_abandoned_for_forward_tsn(false, 1, 3); // tsn=11 -> greatest SSN for si=1
+    a.note_abandoned_for_forward_tsn(false, 2, 1); // tsn=12
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -105,6 +72,76 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
     }
     assert!(si1ok, "si=1 should be present");
     assert!(si2ok, "si=2 should be present");
+
+    Ok(())
+}
+
+#[test]
+fn test_create_forward_tsn_omits_unordered_streams() -> Result<()> {
+    // Unordered chunks carry no meaningful stream-sequence-number: the receiver
+    // advances unordered streams purely by `new_cumulative_tsn` and ignores the
+    // per-stream list (see handle_forward_tsn), so create_forward_tsn must not
+    // report them — only ordered streams contribute.
+    let mut a = Association::default();
+
+    a.cumulative_tsn_ack_point = 9;
+    a.advanced_peer_tsn_ack_point = 11;
+    a.note_abandoned_for_forward_tsn(true, 1, 5); // unordered -> omitted
+    a.note_abandoned_for_forward_tsn(false, 2, 7); // ordered   -> reported
+
+    let fwdtsn = a.create_forward_tsn();
+
+    assert_eq!(11, fwdtsn.new_cumulative_tsn);
+    assert_eq!(
+        1,
+        fwdtsn.streams.len(),
+        "only the ordered stream is reported"
+    );
+    assert_eq!(2, fwdtsn.streams[0].identifier, "si should be 2");
+    assert_eq!(7, fwdtsn.streams[0].sequence, "ssn should be 7");
+
+    Ok(())
+}
+
+// The allocation-avoiding marshal_control_chunk() must produce byte-identical wire
+// output to create_packet(vec![Box::new(chunk)]).marshal(). A 2-stream FORWARD-TSN
+// also exercises ChunkForwardTsn::marshal_to's per-stream marshal_to loop, and a
+// SACK covers the other call site.
+#[test]
+fn test_marshal_control_chunk_byte_identical_to_create_packet() -> Result<()> {
+    let mut a = Association::default();
+    a.peer_verification_tag = 0x1234_5678;
+    a.source_port = 5000;
+    a.destination_port = 5001;
+
+    let fwd_tsn = ChunkForwardTsn {
+        new_cumulative_tsn: 42,
+        streams: vec![
+            ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: 7,
+            },
+            ChunkForwardTsnStream {
+                identifier: 3,
+                sequence: 9,
+            },
+        ],
+    };
+    // Borrow for the helper, then move into create_packet (chunks are not Clone).
+    let via_helper = a.marshal_control_chunk(&fwd_tsn)?;
+    let via_packet = a.create_packet(vec![Box::new(fwd_tsn)]).marshal()?;
+    assert_eq!(
+        via_helper, via_packet,
+        "FORWARD-TSN: marshal_control_chunk must match create_packet(..).marshal()"
+    );
+
+    let sack = a.create_selective_ack_chunk();
+    let sack_via_helper = a.marshal_control_chunk(&sack)?;
+    let sack_via_packet = a.create_packet(vec![Box::new(sack)]).marshal()?;
+    assert_eq!(
+        sack_via_helper, sack_via_packet,
+        "SACK: marshal_control_chunk must match create_packet(..).marshal()"
+    );
 
     Ok(())
 }
@@ -459,4 +496,105 @@ fn test_assoc_max_message_size_explicit() -> Result<()> {
     }
 
     Ok(())
+}
+
+// The MTU-split rule in `bundle_data_chunks_into_packets` must bound every
+// marshalled datagram: bundle decisions are made on padded wire sizes (the
+// chunk header + payload, rounded up to the SCTP 4-byte boundary), never on
+// raw payload sizes. These tests marshal real packets and measure the emitted
+// bytes, so any accounting drift fails here rather than as silent on-path
+// datagram loss.
+
+use crate::EndpointConfig;
+use crate::config::INITIAL_MTU;
+
+fn create_association_with_mtu(mtu: u32) -> Association {
+    Association::new(
+        None,
+        Arc::new(TransportConfig::default()),
+        mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE),
+        0,
+        SocketAddr::from_str("0.0.0.0:0").unwrap(),
+        SocketAddr::from_str("0.0.0.0:0").unwrap(),
+        TransportProtocol::UDP,
+        Instant::now(),
+    )
+}
+
+fn payload_chunk(tsn: u32, len: usize) -> ChunkPayloadData {
+    ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_identifier: 0,
+        stream_sequence_number: 0,
+        user_data: Bytes::from(vec![0u8; len]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn bundle_split_decides_on_padded_wire_sizes() {
+    // Payloads of 1147 + 16 bytes pass a payload-only boundary check at
+    // exactly an MTU of 1191, but the two chunks marshal to
+    // 12 + 1164 + 32 = 1208 bytes — past the MTU the association promised.
+    let a = create_association_with_mtu(1191);
+    let chunks = vec![payload_chunk(1, 1147), payload_chunk(2, 16)];
+    let mut raw_packets = vec![];
+    a.bundle_data_chunks_into_packets(chunks, &mut raw_packets);
+    assert_eq!(
+        raw_packets.len(),
+        2,
+        "a bundle that only fits unpadded must split"
+    );
+    for p in &raw_packets {
+        assert!(
+            p.len() as u32 <= a.mtu,
+            "emitted packet is {} bytes, mtu is {}",
+            p.len(),
+            a.mtu
+        );
+    }
+}
+
+#[test]
+fn single_maximum_size_chunk_marshals_within_initial_mtu() {
+    let max_payload = EndpointConfig::default().get_max_payload_size();
+    let a = create_association_with_mtu(max_payload + COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE);
+    let chunks = vec![payload_chunk(1, max_payload as usize)];
+    let mut raw_packets = vec![];
+    a.bundle_data_chunks_into_packets(chunks, &mut raw_packets);
+    assert_eq!(raw_packets.len(), 1);
+    assert!(
+        raw_packets[0].len() as u32 <= INITIAL_MTU,
+        "a single maximum-size chunk is {} bytes, INITIAL_MTU is {}",
+        raw_packets[0].len(),
+        INITIAL_MTU
+    );
+}
+
+#[test]
+fn many_small_chunks_bundle_within_mtu() {
+    // Per-chunk padding (17-byte payloads: 33 raw, 36 padded) compounds; a
+    // payload-only accounting packed bundles that marshalled well past the
+    // MTU once dozens of small chunks rode one flight.
+    let a = create_association_with_mtu(1191);
+    let chunks: Vec<ChunkPayloadData> = (0..60).map(|i| payload_chunk(i, 17)).collect();
+    let mut raw_packets = vec![];
+    a.bundle_data_chunks_into_packets(chunks, &mut raw_packets);
+    assert!(raw_packets.len() >= 2);
+    let total: usize = raw_packets.iter().map(|p| p.len()).sum();
+    for p in &raw_packets {
+        assert!(
+            p.len() as u32 <= a.mtu,
+            "emitted packet is {} bytes, mtu is {}",
+            p.len(),
+            a.mtu
+        );
+    }
+    // Nothing was dropped: at least every chunk's unpadded wire size plus one
+    // common header per emitted packet.
+    let min_expected = 60 * (DATA_CHUNK_HEADER_SIZE as usize + 17)
+        + raw_packets.len() * COMMON_HEADER_SIZE as usize;
+    assert!(total >= min_expected);
 }

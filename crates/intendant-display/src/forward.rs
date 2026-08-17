@@ -214,7 +214,7 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
 
 /// Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
 /// the m=video section of an Offer SDP. This is the canonical impl
-/// for the recv-simulcast hint that rtc 0.9 (the answer side)
+/// for the recv-simulcast hint that rtc 0.20 (the answer side)
 /// requires before it'll emit `a=simulcast:send` in the answer.
 ///
 /// **Mirror in JS**: `injectRecvSimulcastIntoVideoOffer` in

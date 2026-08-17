@@ -16,12 +16,20 @@ pub(crate) const PAYLOAD_DATA_HEADER_SIZE: usize = 12;
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 pub enum PayloadProtocolIdentifier {
+    /// `WebRTC DCEP` (50): a Data Channel Establishment Protocol control message.
     Dcep = 50,
+    /// `WebRTC String` (51): a non-empty UTF-8 string message.
     String = 51,
+    /// `WebRTC Binary` (53): a non-empty binary message.
     Binary = 53,
+    /// `WebRTC String Empty` (56): an empty string message.
+    ///
+    /// Needed because SCTP cannot carry a zero-length payload.
     StringEmpty = 56,
+    /// `WebRTC Binary Empty` (57): an empty binary message.
     BinaryEmpty = 57,
     #[default]
+    /// An identifier this crate does not recognise.
     Unknown,
 }
 
@@ -183,8 +191,12 @@ impl Chunk for ChunkPayloadData {
         let beginning_fragment = (header.flags & PAYLOAD_DATA_BEGINING_FRAGMENT_BITMASK) != 0;
         let ending_fragment = (header.flags & PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK) != 0;
 
-        if raw.len() < PAYLOAD_DATA_HEADER_SIZE {
+        if raw.len() < CHUNK_HEADER_SIZE + PAYLOAD_DATA_HEADER_SIZE {
             return Err(Error::ErrChunkPayloadSmall);
+        }
+
+        if header.value_length() < PAYLOAD_DATA_HEADER_SIZE {
+            return Err(Error::ErrChunkUnmarshalPayloadData);
         }
 
         let reader = &mut raw.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length());
@@ -225,7 +237,9 @@ impl Chunk for ChunkPayloadData {
         writer.put_u16(self.stream_identifier);
         writer.put_u16(self.stream_sequence_number);
         writer.put_u32(self.payload_type as u32);
-        writer.extend(self.user_data.clone());
+        // NB: `extend(Bytes)` iterates the payload one byte at a time (Bytes is
+        // `IntoIterator<Item = u8>`); `extend_from_slice` does a single bulk copy.
+        writer.extend_from_slice(&self.user_data);
 
         Ok(writer.len())
     }

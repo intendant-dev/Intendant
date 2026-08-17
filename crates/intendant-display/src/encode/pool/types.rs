@@ -54,7 +54,7 @@ pub const RID_QUARTER: &str = "q";
 /// full-resolution H.264 encoder a local viewer spawned, or vice versa.
 ///
 /// Single-encoding only: the federated path narrows to one RID, the
-/// track is built with a single encoding, and rtc 0.9 emits NO
+/// track is built with a single encoding, and rtc 0.20 emits NO
 /// `a=rid` / `a=simulcast` lines for a single encoding (see
 /// `add_sender_sdp`'s `is_simulcast = encodings.len() > 1` gate). So this
 /// non-canonical RID is purely an internal routing/slot key and never
