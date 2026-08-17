@@ -131,6 +131,22 @@ pub(crate) struct RtpSendState {
     by_rid: HashMap<SimulcastRid, RidRtpState>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
+    /// Negotiated RTP payload type for the active codec, resolved
+    /// lazily from the sender's negotiated parameters (same caching
+    /// pattern as [`Self::mid_ext_id`]) and stamped onto every
+    /// outgoing packet.
+    ///
+    /// rtc 0.9.1's `write_rtp` fuzzy-matched the encoding's codec
+    /// against the negotiated codec list and REWROTE
+    /// `packet.header.payload_type` itself, so the packetizer's
+    /// constructor PT (96) was a placeholder that never reached the
+    /// wire. rtc 0.20.3 instead VALIDATES the caller-stamped PT
+    /// against the negotiated list and rejects mismatches with
+    /// `ErrRTPTransceiverCodecUnsupported` — the stamping duty moved
+    /// to the caller. Without this, H.264 (negotiated PT 125, per the
+    /// media-engine registration in `offer.rs`) fails on every packet;
+    /// VP8 passed only because its registered PT happens to be 96.
+    payload_type: Option<u8>,
     /// The mid as an RTP `sdes:mid` header-extension payload,
     /// precomputed for the same per-packet reason as
     /// [`RidRtpState::rid_ext`].
@@ -278,6 +294,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
             by_rid,
             mid_ext_id: None,
             rid_ext_id: None,
+            payload_type: None,
             mid_ext,
         },
     };
@@ -1593,6 +1610,7 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     let rid_ext = rid_state.rid_ext.clone();
 
     let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
+    let negotiated_pt = negotiated_payload_type(rtc, state);
     // One sender lookup per frame, not per packet — a 1440p keyframe
     // packetizes into hundreds of packets.
     let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
@@ -1600,6 +1618,15 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     };
     for mut packet in packets {
         packet.header.ssrc = rid_ssrc;
+        // Stamp the negotiated payload type. rtc 0.9.1's `write_rtp`
+        // rewrote the PT itself; 0.20.3 validates the caller's PT
+        // against the negotiated codec list instead, so the
+        // packetizer's constructor PT (96) is only correct for VP8 by
+        // coincidence and H.264 negotiates 125. See
+        // `negotiated_payload_type`.
+        if let Some(pt) = negotiated_pt {
+            packet.header.payload_type = pt;
+        }
         if let Some(id) = mid_ext_id {
             let _ = packet.header.set_extension(id, state.rtp.mid_ext.clone());
         }
@@ -1684,6 +1711,42 @@ pub(crate) fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
         }
     }
     (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
+}
+
+/// Resolve (and cache) the negotiated RTP payload type for the active
+/// codec from the sender's negotiated parameter set, matched by MIME
+/// type — the exact list rtc 0.20.3's `write_rtp` validates
+/// `packet.header.payload_type` against.
+///
+/// TODO(rtc-020-migration): VERIFY LIVE — rtc 0.9.1 rewrote the PT
+/// inside `write_rtp` (fuzzy codec match, then
+/// `packet.header.payload_type = codec.payload_type`); 0.20.3 removed
+/// the rewrite and instead REJECTS packets whose PT is not in the
+/// negotiated codec list, so the driver now stamps the negotiated PT
+/// itself (see the write loop in `write_video_frame`). Unit tests
+/// can't exercise a fully negotiated send path; confirm H.264 (PT
+/// 125) and VP8 (PT 96) media flow on the live battery.
+pub(crate) fn negotiated_payload_type<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    state: &mut DriverState,
+) -> Option<u8> {
+    if state.rtp.payload_type.is_some() {
+        return state.rtp.payload_type;
+    }
+    if let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) {
+        let params = sender.get_parameters();
+        for codec in &params.rtp_parameters.codecs {
+            if codec
+                .rtp_codec
+                .mime_type
+                .eq_ignore_ascii_case(&state.rtp.codec.mime_type)
+            {
+                state.rtp.payload_type = Some(codec.payload_type);
+                break;
+            }
+        }
+    }
+    state.rtp.payload_type
 }
 
 pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
