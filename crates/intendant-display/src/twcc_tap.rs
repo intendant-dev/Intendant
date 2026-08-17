@@ -1,10 +1,10 @@
 //! `TwccTapInterceptor` — observes browser-side TWCC feedback at
-//! rtc 0.9's interceptor chain and publishes a 1-second health
+//! rtc 0.20's interceptor chain and publishes a 1-second health
 //! aggregate that the capacity policy consumes.
 //!
 //! ## Why this is the signal source
 //!
-//! rtc 0.9's interceptor pipeline consumes inbound RTCP internally
+//! rtc 0.20's interceptor pipeline consumes inbound RTCP internally
 //! and never surfaces it via [`rtc::peer_connection::RTCMessage::RtcpPacket`]
 //! to the application boundary, **and** its
 //! `RTCRemoteInboundRtpStreamStats` accumulator stays at all-zero
@@ -18,7 +18,7 @@
 //!
 //! Tapping inbound RTCP at the same interceptor layer rtc itself
 //! processes it on is the only place we can observe TLC without
-//! patching rtc 0.9.
+//! patching rtc 0.20.
 //!
 //! **rtc 0.20.3 (2026-08 migration): the seam is unchanged.** The
 //! interceptor chain design this tap plugs into survived the
@@ -81,7 +81,7 @@
 //!   received. Behavioural changes from registering the tap are
 //!   zero by construction.
 //! - **No RR processing.** RR-derived stats are not actionable on
-//!   this stack (rtc 0.9 + WKWebView). If a future version
+//!   this stack (rtc 0.20 + WKWebView). If a future version
 //!   surfaces RR usefully, add a sibling `RrTapInterceptor`
 //!   rather than overloading this one.
 //! - **No adaptation decisions.** The tap is a sensor; the

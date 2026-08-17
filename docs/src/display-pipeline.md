@@ -174,9 +174,9 @@ resume requires every active policy to agree**:
   keyframe + burst machinery, so the fallback still paints promptly.
 - **Aggregate-TWCC policy** — per-peer cascaded loss. On sustained packet loss it
   pauses the top layer first, then the middle, reversing on recovery. This is the
-  actionable signal source on the current `rtc` 0.9 + WKWebView stack.
+  actionable signal source on the current `rtc` 0.20 + WKWebView stack.
 - **Per-RID RR policy** — per-`(peer, RID)` `fraction_lost` off receiver reports.
-  Currently inert (`rtc` 0.9 doesn't populate the RR accumulator) but kept warm
+  Currently inert (`rtc` 0.20 doesn't populate the RR accumulator) but kept warm
   for future stacks.
 
 This replaced an earlier design that ran each policy as an independent task
@@ -200,7 +200,7 @@ registries in `tcp_mux.rs`, candidate gathering in `ice.rs`, offer handling +
 construction in `offer.rs`, the driver task in `driver.rs`, and pool glue in
 `pool_glue.rs`) that runs its own tokio **driver task**. The driver holds a
 sans-I/O
-[`rtc` crate](https://crates.io/crates/rtc) (rtc-rs, pinned to `=0.9.0`)
+[`rtc` crate](https://crates.io/crates/rtc) (rtc-rs, pinned to `=0.20.3`)
 `RTCPeerConnection` plus its own UDP/TCP sockets, and pumps everything in a single
 `select!` loop:
 
@@ -221,7 +221,7 @@ owns two responsibilities the library would otherwise hide:
   task can't reach the driver's RTC state).
   `crates/intendant-display/src/forward.rs` is now reduced to
   SDP/codec-preference helpers.
-- **TWCC tapping.** `rtc` 0.9 consumes inbound TWCC (transport-wide congestion
+- **TWCC tapping.** `rtc` 0.20 consumes inbound TWCC (transport-wide congestion
   control) feedback internally and never surfaces it to the application, and its
   remote-inbound stats accumulator stays at zero. The only place to observe the
   signal without patching `rtc` is inside its interceptor chain.
@@ -231,7 +231,7 @@ owns two responsibilities the library would otherwise hide:
   original unchanged. A health aggregator turns that event stream into a 1 s
   `TwccHealth` snapshot the layer-policy coordinator reads. (The driver also
   derives a recent send-bitrate estimate from
-  `bytes_sent` deltas, because `rtc` 0.9's `available_outgoing_bitrate` field is
+  `bytes_sent` deltas, because `rtc` 0.20's `available_outgoing_bitrate` field is
   never written.)
 
 ### Codec negotiation
@@ -294,7 +294,7 @@ On a host with no inbound reachability at all (e.g. a cloud container behind NAT
 with no inbound UDP), even srflx candidates don't pair. The server-side `rtc`
 peer can allocate **its own** relay on the configured coturn and trickle a
 `typ relay` candidate, so media bounces through coturn from both ends. This reuses
-`rtc` 0.9's sans-I/O TURN client and is off the setup critical path: the SDP
+`rtc` 0.20's sans-I/O TURN client and is off the setup critical path: the SDP
 answer returns with host/srflx/ICE-TCP candidates immediately, and the relay
 candidate is trickled later only if the allocation succeeds — an unreachable TURN
 server costs zero added latency.
@@ -584,7 +584,7 @@ Rates are computed over the elapsed window and counters reset on read.
   currently uses the CPU-bound frame-diff path.
 - **Wayland enumeration is portal-limited** — true multi-monitor identity before
   a session opens is not available.
-- **`rtc` 0.9 doesn't surface TWCC or populate RR stats**, hence the interceptor
+- **`rtc` 0.20 doesn't surface TWCC or populate RR stats**, hence the interceptor
   tap and the `bytes_sent`-delta bitrate estimate; per-RID RR-driven layer policy
   is inert on this stack.
 - **No virtual-display equivalent on macOS or Windows** — capture targets the real

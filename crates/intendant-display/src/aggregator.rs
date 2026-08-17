@@ -37,11 +37,11 @@
 //!   pause via [`AggregateLayerCapacity`] + [`step_aggregate_layer_capacity`]
 //!   reading from [`crate::twcc_tap`]. Cascade pauses
 //!   top first, then mid, on sustained loss; reverse on
-//!   recovery. The actionable signal source on the rtc 0.9 +
+//!   recovery. The actionable signal source on the rtc 0.20 +
 //!   WKWebView stack.
 //! - **Per-RID RR policy**: per-(peer, RID)
 //!   [`LayerCapacityState`] off `RTCRemoteInboundRtpStreamStats`
-//!   `fraction_lost`. Currently inert (rtc 0.9 doesn't populate
+//!   `fraction_lost`. Currently inert (rtc 0.20 doesn't populate
 //!   the stats accumulator) but stays warm for future stacks.
 //!
 //! Each policy votes the full current rid set when it has no
@@ -373,7 +373,7 @@ pub fn aggregate_wanted_layers(
 //
 // **Why not per-(peer, RID) like the existing 4d.3c policy:** the
 // existing policy assumes `PeerLayerHealth` per RID — populated from
-// rtc 0.9's `RTCRemoteInboundRtpStreamStats` which doesn't actually
+// rtc 0.20's `RTCRemoteInboundRtpStreamStats` which doesn't actually
 // fire on this stack. The aggregate-loss policy is the practical
 // substitute: one signal per peer (not per layer), driving a peer-
 // wide cascade rather than per-layer adaptation. Per-RID adaptation
@@ -660,13 +660,13 @@ pub enum CapacityAction {
 /// [`step_layer_capacity_state`] as "no signal," which preserves
 /// the layer's current state without advancing the debounce.
 ///
-/// **Why**: rtc 0.9 keeps surfacing the most recent RR-derived
+/// **Why**: rtc 0.20 keeps surfacing the most recent RR-derived
 /// values every poll until the next RR arrives. Without this
 /// freshness check, a single bad RR from minutes ago would be
 /// re-presented every aggregator tick and complete a 5s drop
 /// debounce all on its own — even if the link recovered or the
 /// peer simply stopped sending RRs. Comparing `round_trip_time_measurements`
-/// (monotonically non-decreasing in rtc 0.9's RR processing
+/// (monotonically non-decreasing in rtc 0.20's RR processing
 /// pipeline) against a per-(peer, RID) prev-count snapshot is the
 /// freshness discriminator.
 ///
@@ -2563,7 +2563,7 @@ mod tests {
         let current = vp8_three_layer_set();
         let twcc_union = full_three_layer_union();
         // RR genuinely says half is Dropped (hypothetical — RR
-        // doesn't fire on the rtc 0.9 stack today, but the
+        // doesn't fire on the rtc 0.20 stack today, but the
         // composition logic must still respect it).
         let rr_union: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::quarter()]
             .into_iter()

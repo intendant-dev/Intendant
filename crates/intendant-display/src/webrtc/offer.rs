@@ -6,15 +6,15 @@
 
 use super::*;
 
-/// Sanitize an rtc 0.9-emitted answer SDP, fixing two SDP-writer bugs
+/// Sanitize an rtc 0.20-emitted answer SDP, fixing two SDP-writer bugs
 /// that fire on multi-RID simulcast send (specifically when our peer
 /// answers a browser offer that requested `a=simulcast:recv f;h;q`):
 ///
-///   1. **Duplicate `a=rid:<rid> send` lines.** rtc 0.9 emits each RID
+///   1. **Duplicate `a=rid:<rid> send` lines.** rtc 0.20 emits each RID
 ///      `send` line twice — six lines for f/h/q instead of three.
 ///      Fix: dedupe by full line content within each m= section.
 ///
-///   2. **Malformed `a=simulcast:` attribute.** rtc 0.9 concatenates
+///   2. **Malformed `a=simulcast:` attribute.** rtc 0.20 concatenates
 ///      the direction + RID list as if the answer were bidirectional,
 ///      producing `a=simulcast:send f;h;q send f;h;q` instead of the
 ///      RFC 8853-correct `a=simulcast:send f;h;q`. WebKit's parser
@@ -64,7 +64,7 @@ pub(crate) fn sanitize_answer_sdp(sdp: &str) -> String {
             //   a=simulcast:send f;h;q
             //   a=simulcast:recv f;h;q
             //   a=simulcast:send f;h;q recv x          (bidirectional)
-            // Bug form rtc 0.9 emits:
+            // Bug form rtc 0.20 emits:
             //   a=simulcast:send f;h;q send f;h;q      (same dir twice)
             // Fix: when the second direction equals the first, drop the
             // second pair; otherwise pass through.
@@ -547,7 +547,7 @@ impl WebRtcPeer {
         // Pin the answerer's DTLS role to `Server` so the generated
         // answer carries `a=setup:passive`. Per RFC 5763 § 5 that makes
         // the browser the DTLS client and the initiator of the
-        // handshake — which is the path the rtc 0.9 stack actually
+        // handshake — which is the path the rtc 0.20 stack actually
         // drives. Letting the answer default to `a=setup:active` (the
         // alternative role for an answerer to `actpass`) leaves rtc's
         // DTLS state machine waiting for an event that never fires
@@ -592,7 +592,7 @@ impl WebRtcPeer {
         // emits `a=simulcast:send full;half;quarter` + `a=rid:* send`
         // lines as a consequence of the multi-encoding shape — server-
         // side answer-side simulcast that str0m couldn't do, hence the
-        // migration to rtc 0.9.
+        // str0m → rtc migration.
         //
         // For single-RID (H.264 or VP8 with all simulcast layers
         // dropped below MIN_LAYER_DIM) this produces a single
@@ -628,20 +628,20 @@ impl WebRtcPeer {
             encodings,
         );
 
-        // **Phase 4d.3b — TWCC signal pipeline.** Wire rtc 0.9's
+        // **Phase 4d.3b — TWCC signal pipeline.** Wire rtc 0.20's
         // interceptor registry with SR/RR + TWCC sender + the custom
         // `TwccTapInterceptor`, which observes inbound RTCP at the
         // chain's outermost `handle_read`, downcasts each
         // `TransportLayerCc` packet, and projects a compact
         // [`TwccEvent`] onto an unbounded mpsc channel.
         //
-        // **Why a custom tap, not rtc's stats path:** rtc 0.9 consumes
+        // **Why a custom tap, not rtc's stats path:** rtc 0.20 consumes
         // RTCP internally and never surfaces it via
         // `RTCMessage::RtcpPacket`, and its
         // `RTCRemoteInboundRtpStreamStats` accumulator stays at all-
         // zero defaults regardless of which interceptors are wired.
         // Tapping the interceptor chain is the only place we can
-        // observe TWCC without patching rtc 0.9. See
+        // observe TWCC without patching rtc 0.20. See
         // [`crate::twcc_tap`] module docs for the full
         // background.
         //
@@ -663,7 +663,7 @@ impl WebRtcPeer {
         // advertises `a=rtcp-fb ... nack`, so a browser receiver sends
         // RTCP `TransportLayerNack` for gaps. Until now nothing handled
         // them — the answer promised retransmission and delivered none.
-        // The rtc 0.9 `NackResponderInterceptor` (added here via
+        // The rtc 0.20 `NackResponderInterceptor` (added here via
         // `NackResponderBuilder::new().with_size(2048).build()`)
         // `bind_local_stream`s every outbound video stream whose
         // negotiated feedback includes generic `nack` (it does), buffers
@@ -884,7 +884,7 @@ impl WebRtcPeer {
             .map_err(|e| CallerError::WebRtc(format!("create answer: {e}")))?;
         rtc.set_local_description(answer.clone())
             .map_err(|e| CallerError::WebRtc(format!("set local answer: {e}")))?;
-        // Sanitized-wire-only shim — narrow workaround for two rtc 0.9
+        // Sanitized-wire-only shim — narrow workaround for two rtc 0.20
         // SDP-writer bugs that fire on multi-RID simulcast send:
         //   1. each `a=rid:<rid> send` line emitted twice (six lines for
         //      f/h/q instead of three);
@@ -895,7 +895,7 @@ impl WebRtcPeer {
         // no media flows. See `sanitize_answer_sdp` above for the
         // exact transformation + test coverage.
         //
-        // Why the call sequence is what it is: rtc 0.9 caches the
+        // Why the call sequence is what it is: rtc 0.20 caches the
         // `create_answer` result in `PeerConnectionInternal.last_answer`
         // (peer_connection/mod.rs:944) and `set_local_description`
         // does a direct string-equality check against that cache
@@ -920,7 +920,7 @@ impl WebRtcPeer {
         // proves the hypothesis, the shim stays as a narrow
         // compatibility band-aid until the dep is patched.
         //
-        // Long-term fix: patch rtc 0.9's SDP writer at source — fix
+        // Long-term fix: patch rtc 0.20's SDP writer at source — fix
         // the per-RID `send` line duplication and the doubled-direction
         // `a=simulcast:` emission — and remove this sanitizer call,
         // not the dep's validation gate. Relaxing the gate was
@@ -953,7 +953,7 @@ impl WebRtcPeer {
         let (observed_send_bitrate_tx, observed_send_bitrate_rx) =
             watch::channel::<Option<u64>>(None);
         // Phase 4d.3a: per-peer per-RID receiver-feedback health
-        // (RR-derived, populated from rtc 0.9's
+        // (RR-derived, populated from rtc 0.20's
         // `RTCRemoteInboundRtpStreamStats`). Initial value is the
         // empty map: no RR has arrived yet. Per-RID entries appear
         // as RRs land for each outbound SSRC. Layer-selection
@@ -1169,7 +1169,7 @@ impl WebRtcPeer {
         // offer post-`e815bac` does not include `a=simulcast:recv` — sending an answer
         // declaring 3 RIDs against such an offer produces an
         // `a=simulcast:send f;h;q` answer with no `a=ssrc` declarations
-        // (rtc 0.9 SDP-writer bug), which Chrome / WebKit silently
+        // (rtc 0.20 SDP-writer bug), which Chrome / WebKit silently
         // refuse to decode. Empirical signature: `framesDecoded == 0`
         // forever, `packetsReceived > 0`, `pliCount > 0`. The local
         // [`DisplaySlot`] path injects recv-simulcast before
@@ -1586,7 +1586,7 @@ mod tests {
         );
     }
 
-    /// rtc 0.9 uses rustls 0.23, which requires a process-level
+    /// rtc 0.20 uses rustls 0.23, which requires a process-level
     /// `CryptoProvider`. Production code paths that build an Rtc
     /// transitively need it; the test fixtures call this at the top
     /// of every test that constructs a real `RTCPeerConnection`.
@@ -1596,7 +1596,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    /// **Phase 4c**: synthetic recvonly VP8 offer in the shape rtc 0.9
+    /// **Phase 4c**: synthetic recvonly VP8 offer in the shape rtc 0.20
     /// requires (`a=fingerprint`, `a=ice-ufrag`/`pwd`, `a=setup`,
     /// `a=rtpmap`). Used by the build_with_codec_set integration
     /// tests below to drive `RTCPeerConnection::create_answer`
@@ -1607,7 +1607,7 @@ mod tests {
     /// repaired-rtp-stream-id extmap so the answer-side multi-RID path is
     /// exercised by the test the same way the browser side exercises it when
     /// `DISPLAY_SIMULCAST_RIDS` is switched to `['f','h','q']`.
-    /// Without the offer's `recv` advertisement, rtc 0.9 omits
+    /// Without the offer's `recv` advertisement, rtc 0.20 omits
     /// `a=simulcast:send` from the answer regardless of how many
     /// encodings the track has — see the test's panic message for
     /// the full reasoning.
@@ -1739,9 +1739,9 @@ mod tests {
         // browser:
         //
         //   - exactly ONE `a=simulcast:send f;h;q` line — not two
-        //     (rtc 0.9's doubled-direction emission was sanitized);
+        //     (rtc 0.20's doubled-direction emission was sanitized);
         //   - exactly ONE `a=rid:<rid> send` line per active rid —
-        //     not two (rtc 0.9's per-RID duplication was sanitized);
+        //     not two (rtc 0.20's per-RID duplication was sanitized);
         //   - no `send f;h;q send` substring (the sentinel pattern
         //     of the rtc-0.9 SDP-writer bug);
         //   - the wire answer parses as a valid RTCSessionDescription
@@ -1775,7 +1775,7 @@ mod tests {
                 answer_sdp.matches(&line).count(),
                 1,
                 "wire answer must contain exactly ONE `{line}` line \
-                 (rtc 0.9 emits two; sanitize_answer_sdp dedupes); \
+                 (rtc 0.20 emits two; sanitize_answer_sdp dedupes); \
                  got:\n{answer_sdp}"
             );
         }
@@ -1802,7 +1802,7 @@ mod tests {
 
     /// The answerer's DTLS role MUST be `passive` so the browser
     /// becomes the DTLS client and initiates the handshake. With
-    /// the role left to default to `active`, the rtc 0.9 stack
+    /// the role left to default to `active`, the rtc 0.20 stack
     /// signals `a=setup:active` but never actually emits a
     /// ClientHello over the selected ICE-TCP candidate — the session
     /// stalls at STUN keepalives forever and the dashboard renders
@@ -2068,13 +2068,13 @@ mod tests {
 
     // ----- sanitize_answer_sdp -----------------------------------
     //
-    // Pure-helper tests for the rtc 0.9 SDP-writer workaround.
+    // Pure-helper tests for the rtc 0.20 SDP-writer workaround.
     // See `sanitize_answer_sdp` doc-comment for the bugs being
     // addressed. Each test fixes one input/output pair so a future
     // regression that re-introduces duplicate rids or the doubled
     // simulcast direction fires loudly.
 
-    /// rtc 0.9 emits each `a=rid:<rid> send` line twice for multi-RID
+    /// rtc 0.20 emits each `a=rid:<rid> send` line twice for multi-RID
     /// send. The sanitizer must dedupe each to exactly one occurrence
     /// while preserving line order (first-seen wins) and untouched
     /// surrounding lines.
@@ -2103,7 +2103,7 @@ mod tests {
         assert!(out.contains("a=simulcast:send f;h;q"));
     }
 
-    /// `a=simulcast:send f;h;q send f;h;q` (rtc 0.9 doubled-direction
+    /// `a=simulcast:send f;h;q send f;h;q` (rtc 0.20 doubled-direction
     /// bug) must collapse to `a=simulcast:send f;h;q`. The substring
     /// `send f;h;q send` is the regression marker.
     #[test]

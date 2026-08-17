@@ -1,6 +1,6 @@
 //! Backpressure policy for supersedable tile-delta frames.
 //!
-//! D-4c keeps this deliberately event-driven. The rtc 0.9 wrapper
+//! D-4c keeps this deliberately event-driven. The rtc 0.20 wrapper
 //! exposes buffered-amount high/low events, but not a public
 //! `buffered_amount()` getter. The WebRTC driver sets the SCTP stream
 //! thresholds and feeds those events into [`TileDeltaBackpressure`].

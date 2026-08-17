@@ -130,13 +130,13 @@ const KEYFRAME_REQUEST_CHANNEL: usize = 16;
 /// state); the tradeoff is purely the staleness of the watch-channel
 /// value the layer-selection aggregator (4d.2) reads.
 ///
-/// **Why not `available_outgoing_bitrate`**: rtc 0.9's
+/// **Why not `available_outgoing_bitrate`**: rtc 0.20's
 /// `RTCIceCandidatePairStats::available_outgoing_bitrate` is
 /// initialized to 0.0 by `rtc-ice-0.9.0` and never written to —
-/// rtc 0.9's `update_ice_agent_stats` only copies STUN counters and
+/// rtc 0.20's `update_ice_agent_stats` only copies STUN counters and
 /// RTT, no congestion-control bandwidth estimate flows through.
 /// Polling that field returns 0.0 forever. Deriving from
-/// `bytes_sent` deltas observes a signal rtc 0.9 actually
+/// `bytes_sent` deltas observes a signal rtc 0.20 actually
 /// maintains.
 const TWCC_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -263,9 +263,9 @@ pub struct WebRtcPeer {
     /// TWCC arrival feedback, browser-side `getStats` — see 4d.3.
     observed_send_bitrate_rx: watch::Receiver<Option<u64>>,
     /// **Phase 4d.3a**: per-peer per-RID receiver-feedback health,
-    /// derived from inbound RTCP RR via rtc 0.9's
+    /// derived from inbound RTCP RR via rtc 0.20's
     /// `RTCRemoteInboundRtpStreamStats` (the only RR-derived signal
-    /// rtc 0.9 actually populates — see
+    /// rtc 0.20 actually populates — see
     /// [`Self::observed_send_bitrate_rx`] for why local egress is
     /// the wrong proxy for capacity). Refreshed by the driver every
     /// `TWCC_POLL_INTERVAL` from the same `get_stats` call that
@@ -291,7 +291,7 @@ pub struct WebRtcPeer {
     /// arrives and goes silent across windows.
     ///
     /// This is the actionable capacity signal on this stack —
-    /// rtc 0.9's `RTCRemoteInboundRtpStreamStats` (above) stays
+    /// rtc 0.20's `RTCRemoteInboundRtpStreamStats` (above) stays
     /// at all-zero defaults regardless of received RTCP because
     /// the rtc-interceptor chain consumes RTCP without
     /// surfacing it. The TWCC tap fills that gap by parsing
@@ -349,7 +349,7 @@ pub struct WebRtcPeer {
 /// RR-reported state). Surfaced to the layer-selection aggregator via
 /// [`WebRtcPeer::subscribe_remote_inbound_health`].
 ///
-/// All fields come straight from rtc 0.9's RR accumulator (no delta
+/// All fields come straight from rtc 0.20's RR accumulator (no delta
 /// computation in 4d.3a — 4d.3b decides which signals to use and how).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerLayerHealth {
@@ -370,7 +370,7 @@ pub struct PeerLayerHealth {
     pub round_trip_time_seconds: f64,
     /// Number of RTT measurements ever recorded on this layer
     /// (monotonically non-decreasing). The freshness discriminator:
-    /// rtc 0.9 keeps surfacing the same RR-derived field values
+    /// rtc 0.20 keeps surfacing the same RR-derived field values
     /// every poll until the next RR arrives, so a `fraction_lost`
     /// reading repeated tick after tick may reflect a single RR
     /// from minutes ago — not fresh signal. The 4d.3c aggregator

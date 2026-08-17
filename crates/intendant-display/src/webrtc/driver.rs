@@ -897,7 +897,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 observed_send_bitrate_tx.send_replace(bitrate);
 
                 // Phase 4d.3a: project remote-inbound-rtp entries
-                // (RR-derived, the field set rtc 0.9 actually
+                // (RR-derived, the field set rtc 0.20 actually
                 // populates per `accumulator/rtp_stream/outbound.rs`)
                 // into per-RID health, mapping outbound SSRCs back
                 // through `state.rtp.by_rid`. Empty map publishes
@@ -918,7 +918,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                             s.fraction_lost,
                             s.received_rtp_stream_stats.packets_lost,
                             s.round_trip_time,
-                            // Phase 4d.3a review fix: rtc 0.9 emits
+                            // Phase 4d.3a review fix: rtc 0.20 emits
                             // default RemoteInboundRTP snapshots for
                             // every outbound stream even pre-RR (all
                             // fields zero). The helper filters on
@@ -1188,7 +1188,7 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
 }
 
 /// **Phase 4d.3a**: project per-SSRC remote-inbound stats (RR-derived,
-/// from rtc 0.9's `RTCRemoteInboundRtpStreamStats` accumulator) onto
+/// from rtc 0.20's `RTCRemoteInboundRtpStreamStats` accumulator) onto
 /// the per-RID SSRC table the driver maintains in `state.rtp.by_rid`.
 /// Returns one [`PeerLayerHealth`] entry per recognized RID; SSRCs not
 /// present in the table (transient renegotiation windows, on-demand
@@ -1199,12 +1199,12 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
 /// Pure: takes flat `(ssrc, fraction_lost, packets_lost, rtt,
 /// rtt_measurements)` tuples rather than
 /// `&RTCRemoteInboundRtpStreamStats` so tests can construct
-/// synthetic inputs directly without the rtc 0.9 `pub(crate)`
+/// synthetic inputs directly without the rtc 0.20 `pub(crate)`
 /// constructor walls. Production projection from
 /// `report.iter_by_type(RTCStatsType::RemoteInboundRTP)` happens at
 /// the caller (the driver's `twcc_poll` branch).
 ///
-/// **Pre-RR filtering**: rtc 0.9 emits a default-valued
+/// **Pre-RR filtering**: rtc 0.20 emits a default-valued
 /// `RemoteInboundRTP` snapshot for every outbound stream even
 /// before any RR has actually been received — all fields are
 /// zero, including `fraction_lost = 0.0` (which would otherwise
@@ -1257,7 +1257,7 @@ pub(crate) fn map_remote_inbound_to_rid_health(
 ///
 /// **What this signals**: how much data the peer is actually pushing
 /// onto the wire right now, summed across simulcast layers + RTX
-/// streams. NOT a congestion-control bandwidth estimate (rtc 0.9
+/// streams. NOT a congestion-control bandwidth estimate (rtc 0.20
 /// doesn't expose one — see `TWCC_POLL_INTERVAL` for why). The
 /// layer-selection aggregator (4d.2) interprets this as "delivery
 /// rate the peer's encoder + network are sustaining." A drop from
@@ -1377,7 +1377,7 @@ pub(crate) fn rid_for_ssrc(ssrc_table: &[(SimulcastRid, u32)], ssrc: u32) -> Opt
 ///
 /// RTCP packet types other than PLI/FIR (NACK, RR, SR, SDES, BYE,
 /// transport-cc, REMB, TWCC) are ignored here — those are handled
-/// by rtc 0.9's interceptor for stats/bandwidth-estimation purposes
+/// by rtc 0.20's interceptor for stats/bandwidth-estimation purposes
 /// and never need to flow through this routing path.
 ///
 /// Lossy `try_send`: if the keyframe-request channel is full, drop.
@@ -1723,14 +1723,11 @@ pub(crate) fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
 /// type — the exact list rtc 0.20.3's `write_rtp` validates
 /// `packet.header.payload_type` against.
 ///
-/// TODO(rtc-020-migration): VERIFY LIVE — rtc 0.9.1 rewrote the PT
-/// inside `write_rtp` (fuzzy codec match, then
-/// `packet.header.payload_type = codec.payload_type`); 0.20.3 removed
-/// the rewrite and instead REJECTS packets whose PT is not in the
-/// negotiated codec list, so the driver now stamps the negotiated PT
-/// itself (see the write loop in `write_video_frame`). Unit tests
-/// can't exercise a fully negotiated send path; confirm H.264 (PT
-/// 125) and VP8 (PT 96) media flow on the live battery.
+/// rtc 0.9.1 rewrote the PT inside `write_rtp` (fuzzy codec match,
+/// then `packet.header.payload_type = codec.payload_type`); 0.20.3
+/// removed the rewrite and instead REJECTS packets whose PT is not in
+/// the negotiated codec list, so the driver stamps the negotiated PT
+/// itself (see the write loop in `write_video_frame`).
 pub(crate) fn negotiated_payload_type<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     state: &mut DriverState,
@@ -2962,7 +2959,7 @@ mod tests {
 
     #[test]
     fn map_remote_inbound_filters_pre_rr_default_snapshots() {
-        // **4d.3a review fix regression**: rtc 0.9's accumulator
+        // **4d.3a review fix regression**: rtc 0.20's accumulator
         // emits a default-valued `RemoteInboundRTP` entry for every
         // outbound stream the moment the stream exists, even before
         // any actual RR has been received. All fields default to
