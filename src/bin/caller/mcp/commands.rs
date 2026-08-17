@@ -26,6 +26,12 @@ pub(crate) fn current_autonomy_label(level: AutonomyLevel) -> String {
     level.to_string().to_lowercase()
 }
 
+fn supervised_session_only(action: &str, source: &str, session_id: &str) -> String {
+    format!(
+        "{action} is only available for daemon-supervised sessions (requested: {source} {session_id})"
+    )
+}
+
 pub(crate) async fn emit_control_status(
     state: &SharedMcpState,
     control_tx: &Option<broadcast::Sender<String>>,
@@ -1226,29 +1232,19 @@ pub(crate) async fn handle_control_command_mcp(
             None
         }
         ControlMsg::ResumeSession {
-            source,
-            session_id,
-            task,
-            ..
+            source, session_id, ..
         } => {
-            let action = if task
-                .as_ref()
-                .map(|t| t.trim())
-                .filter(|t| !t.is_empty())
-                .is_some()
-            {
-                "resume dispatched"
-            } else {
-                "session attach requested"
-            };
+            // Resume/attach is implemented by the web daemon's session
+            // supervisor. This standalone MCP loop cannot execute or forward
+            // it, so never turn receipt of the command into a success ack.
             emit_control_result(
                 control_tx,
                 "resume_session",
-                true,
-                format!("{}: {} {}", action, source, session_id),
+                false,
+                supervised_session_only("resume_session", &source, &session_id),
                 None,
             );
-            Some(RESOURCE_STATUS_URI)
+            None
         }
         ControlMsg::ForkSessionAtAnchor {
             source, session_id, ..
@@ -1256,11 +1252,11 @@ pub(crate) async fn handle_control_command_mcp(
             emit_control_result(
                 control_tx,
                 "fork_session_at_anchor",
-                true,
-                format!("fork dispatched: {} {}", source, session_id),
+                false,
+                supervised_session_only("fork_session_at_anchor", &source, &session_id),
                 None,
             );
-            Some(RESOURCE_STATUS_URI)
+            None
         }
         ControlMsg::StopSession { session_id } => {
             emit_control_result(
@@ -1278,11 +1274,11 @@ pub(crate) async fn handle_control_command_mcp(
             emit_control_result(
                 control_tx,
                 "restart_session",
-                true,
-                format!("Restart session requested: {} {}", source, session_id),
+                false,
+                supervised_session_only("restart_session", &source, &session_id),
                 None,
             );
-            Some(RESOURCE_STATUS_URI)
+            None
         }
         ControlMsg::ReloadCredentials { session_id } => {
             // The in-place respawn machinery lives in the daemon's
@@ -1766,6 +1762,60 @@ mod tests {
     use crate::mcp::tests::test_state_with_log_dir;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn standalone_session_lifecycle_commands_refuse_false_success_acks() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+        let cases = [
+            (
+                r#"{"action":"resume_session","source":"codex","session_id":"thread-1","task":"continue"}"#,
+                "resume_session",
+                "resume_session is only available for daemon-supervised sessions (requested: codex thread-1)",
+            ),
+            (
+                r#"{"action":"fork_session_at_anchor","source":"codex","session_id":"thread-1","anchor":{"kind":"turn-boundary","turn":1}}"#,
+                "fork_session_at_anchor",
+                "fork_session_at_anchor is only available for daemon-supervised sessions (requested: codex thread-1)",
+            ),
+            (
+                r#"{"action":"restart_session","source":"codex","session_id":"thread-1"}"#,
+                "restart_session",
+                "restart_session is only available for daemon-supervised sessions (requested: codex thread-1)",
+            ),
+        ];
+
+        for (wire, action, message) in cases {
+            let command: ControlMsg = serde_json::from_str(wire).unwrap();
+            let resource =
+                handle_control_command_mcp(&state, &bus, &Some(control_tx.clone()), command).await;
+
+            assert_eq!(resource, None, "{action} has no standalone status change");
+            let event = timeout(Duration::from_millis(200), control_rx.recv())
+                .await
+                .expect("timed out waiting for command_result")
+                .expect("broadcast recv failed");
+            let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+            assert_eq!(json["event"], "command_result");
+            assert_eq!(json["action"], action);
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["message"], message);
+            assert!(
+                !json["message"].as_str().unwrap().contains("dispatched"),
+                "{action} must not claim a dispatch"
+            );
+        }
+
+        assert!(
+            timeout(Duration::from_millis(50), bus_rx.recv())
+                .await
+                .is_err(),
+            "standalone refusals must not forward lifecycle commands"
+        );
+    }
 
     #[tokio::test]
     async fn control_schedule_restart_rejects_missing_actions() {
