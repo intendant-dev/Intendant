@@ -2,13 +2,21 @@ use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_selective_ack::GapAckBlock;
 use crate::util::*;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 
 #[derive(Default, Debug)]
 pub(crate) struct PayloadQueue {
     // length: usize,
-    chunk_map: HashMap<u32, ChunkPayloadData>,
-    pub(crate) sorted: Vec<u32>,
+    /// Keyed by TSN; per-chunk lookups on both the send (in-flight) and
+    /// receive paths. TSNs are window-bounded, so the faster non-SipHash
+    /// hasher is safe.
+    chunk_map: FxHashMap<u32, ChunkPayloadData>,
+    /// TSNs in serial-number order. A `VecDeque` so that `pop` — which almost
+    /// always removes the front, once per acked/received chunk — is O(1)
+    /// instead of shifting the whole in-flight window left (`Vec::remove(0)`
+    /// showed up as ~9% of the end-to-end transfer profile as memmove).
+    pub(crate) sorted: VecDeque<u32>,
     dup_tsn: Vec<u32>,
     n_bytes: usize,
 }
@@ -18,14 +26,14 @@ impl PayloadQueue {
         PayloadQueue::default()
     }
 
-    pub(crate) fn update_sorted_keys(&mut self) {
-        self.sorted.sort_by(|a, b| {
-            if sna32lt(*a, *b) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        });
+    /// Insert `tsn` into `sorted`, keeping SCTP serial-number order. Binary-search
+    /// the insertion point instead of re-sorting the whole vector on every push:
+    /// re-sorting made a burst of N chunks O(N^2 log N). In-order arrivals — the
+    /// common case, since TSNs are assigned/received sequentially — land at the
+    /// end in O(1) amortized.
+    fn insert_sorted(&mut self, tsn: u32) {
+        let idx = self.sorted.partition_point(|&x| sna32lt(x, tsn));
+        self.sorted.insert(idx, tsn);
     }
 
     pub(crate) fn can_push(&self, p: &ChunkPayloadData, cumulative_tsn: u32) -> bool {
@@ -34,10 +42,9 @@ impl PayloadQueue {
 
     pub(crate) fn push_no_check(&mut self, p: ChunkPayloadData) {
         self.n_bytes += p.user_data.len();
-        self.sorted.push(p.tsn);
+        self.insert_sorted(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
-        self.update_sorted_keys();
     }
 
     /// push pushes a payload data. If the payload data is already in our queue or
@@ -52,18 +59,17 @@ impl PayloadQueue {
         }
 
         self.n_bytes += p.user_data.len();
-        self.sorted.push(p.tsn);
+        self.insert_sorted(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
-        self.update_sorted_keys();
 
         true
     }
 
     /// pop pops only if the oldest chunk's TSN matches the given TSN.
     pub(crate) fn pop(&mut self, tsn: u32) -> Option<ChunkPayloadData> {
-        if !self.sorted.is_empty() && tsn == self.sorted[0] {
-            self.sorted.remove(0);
+        if self.sorted.front() == Some(&tsn) {
+            self.sorted.pop_front();
             if let Some(c) = self.chunk_map.remove(&tsn) {
                 //self.length -= 1;
                 self.n_bytes -= c.user_data.len();
@@ -141,7 +147,7 @@ impl PayloadQueue {
     }
 
     pub(crate) fn get_last_tsn_received(&self) -> Option<&u32> {
-        self.sorted.last()
+        self.sorted.back()
     }
 
     pub(crate) fn mark_all_to_retrasmit(&mut self) {

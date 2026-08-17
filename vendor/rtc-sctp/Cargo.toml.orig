@@ -1,0 +1,42 @@
+[package]
+name = "rtc-sctp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "RTC SCTP in Rust"
+license.workspace = true
+documentation = "https://docs.rs/rtc-sctp"
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Exposes the internal `fuzzing` module (marshal/unmarshal shims) for
+# benchmarks and micro-benchmark harnesses without requiring the `--cfg fuzzing`
+# build flag used by cargo-fuzz.
+bench = []
+
+[dependencies]
+shared = { workspace = true, default-features = false, features = [] }
+
+bytes.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+slab = "0.4.9"
+log.workspace = true
+crc32c = "0.6"
+rustc-hash = "2"
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+lazy_static = "1.4.0"
+
+[[example]]
+name = "sctp_micro"
+required-features = ["bench"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

@@ -18,7 +18,6 @@ use crate::util::*;
 use shared::error::{Error, Result};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crc::{CRC_32_ISCSI, Crc};
 use std::fmt;
 
 ///Packet represents an SCTP packet, defined in https://tools.ietf.org/html/rfc4960#section-3
@@ -133,38 +132,23 @@ impl PartialDecode {
                 return Err(Error::ErrParseSctpChunkNotEnoughData);
             }
 
+            let chunk_buf = slice_chunk(&self.remaining, offset)?;
             let ct = ChunkType(self.remaining[offset]);
             let c: Box<dyn Chunk> = match ct {
-                CT_INIT => Box::new(ChunkInit::unmarshal(&self.remaining.slice(offset..))?),
-                CT_INIT_ACK => Box::new(ChunkInit::unmarshal(&self.remaining.slice(offset..))?),
-                CT_ABORT => Box::new(ChunkAbort::unmarshal(&self.remaining.slice(offset..))?),
-                CT_COOKIE_ECHO => {
-                    Box::new(ChunkCookieEcho::unmarshal(&self.remaining.slice(offset..))?)
-                }
-                CT_COOKIE_ACK => {
-                    Box::new(ChunkCookieAck::unmarshal(&self.remaining.slice(offset..))?)
-                }
-                CT_HEARTBEAT => {
-                    Box::new(ChunkHeartbeat::unmarshal(&self.remaining.slice(offset..))?)
-                }
-                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(
-                    &self.remaining.slice(offset..),
-                )?),
-                CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(
-                    &self.remaining.slice(offset..),
-                )?),
-                CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&self.remaining.slice(offset..))?),
-                CT_FORWARD_TSN => {
-                    Box::new(ChunkForwardTsn::unmarshal(&self.remaining.slice(offset..))?)
-                }
-                CT_ERROR => Box::new(ChunkError::unmarshal(&self.remaining.slice(offset..))?),
-                CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&self.remaining.slice(offset..))?),
-                CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(
-                    &self.remaining.slice(offset..),
-                )?),
-                CT_SHUTDOWN_COMPLETE => Box::new(ChunkShutdownComplete::unmarshal(
-                    &self.remaining.slice(offset..),
-                )?),
+                CT_INIT => Box::new(ChunkInit::unmarshal(&chunk_buf)?),
+                CT_INIT_ACK => Box::new(ChunkInit::unmarshal(&chunk_buf)?),
+                CT_ABORT => Box::new(ChunkAbort::unmarshal(&chunk_buf)?),
+                CT_COOKIE_ECHO => Box::new(ChunkCookieEcho::unmarshal(&chunk_buf)?),
+                CT_COOKIE_ACK => Box::new(ChunkCookieAck::unmarshal(&chunk_buf)?),
+                CT_HEARTBEAT => Box::new(ChunkHeartbeat::unmarshal(&chunk_buf)?),
+                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(&chunk_buf)?),
+                CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&chunk_buf)?),
+                CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&chunk_buf)?),
+                CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&chunk_buf)?),
+                CT_ERROR => Box::new(ChunkError::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN_COMPLETE => Box::new(ChunkShutdownComplete::unmarshal(&chunk_buf)?),
                 _ => return Err(Error::ErrUnmarshalUnknownChunkType),
             };
 
@@ -178,6 +162,17 @@ impl PartialDecode {
             chunks,
         })
     }
+}
+
+fn slice_chunk(raw: &Bytes, offset: usize) -> Result<Bytes> {
+    let chunk_length = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
+    if chunk_length < CHUNK_HEADER_SIZE {
+        return Err(Error::ErrChunkHeaderInvalidLength);
+    }
+    if offset + chunk_length > raw.len() {
+        return Err(Error::ErrChunkHeaderNotEnoughSpace);
+    }
+    Ok(raw.slice(offset..offset + chunk_length))
 }
 
 #[derive(Default, Debug)]
@@ -234,24 +229,23 @@ impl Packet {
                 return Err(Error::ErrParseSctpChunkNotEnoughData);
             }
 
+            let chunk_buf = slice_chunk(raw, offset)?;
             let ct = ChunkType(raw[offset]);
             let c: Box<dyn Chunk> = match ct {
-                CT_INIT => Box::new(ChunkInit::unmarshal(&raw.slice(offset..))?),
-                CT_INIT_ACK => Box::new(ChunkInit::unmarshal(&raw.slice(offset..))?),
-                CT_ABORT => Box::new(ChunkAbort::unmarshal(&raw.slice(offset..))?),
-                CT_COOKIE_ECHO => Box::new(ChunkCookieEcho::unmarshal(&raw.slice(offset..))?),
-                CT_COOKIE_ACK => Box::new(ChunkCookieAck::unmarshal(&raw.slice(offset..))?),
-                CT_HEARTBEAT => Box::new(ChunkHeartbeat::unmarshal(&raw.slice(offset..))?),
-                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(&raw.slice(offset..))?),
-                CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&raw.slice(offset..))?),
-                CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&raw.slice(offset..))?),
-                CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&raw.slice(offset..))?),
-                CT_ERROR => Box::new(ChunkError::unmarshal(&raw.slice(offset..))?),
-                CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&raw.slice(offset..))?),
-                CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(&raw.slice(offset..))?),
-                CT_SHUTDOWN_COMPLETE => {
-                    Box::new(ChunkShutdownComplete::unmarshal(&raw.slice(offset..))?)
-                }
+                CT_INIT => Box::new(ChunkInit::unmarshal(&chunk_buf)?),
+                CT_INIT_ACK => Box::new(ChunkInit::unmarshal(&chunk_buf)?),
+                CT_ABORT => Box::new(ChunkAbort::unmarshal(&chunk_buf)?),
+                CT_COOKIE_ECHO => Box::new(ChunkCookieEcho::unmarshal(&chunk_buf)?),
+                CT_COOKIE_ACK => Box::new(ChunkCookieAck::unmarshal(&chunk_buf)?),
+                CT_HEARTBEAT => Box::new(ChunkHeartbeat::unmarshal(&chunk_buf)?),
+                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(&chunk_buf)?),
+                CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&chunk_buf)?),
+                CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&chunk_buf)?),
+                CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&chunk_buf)?),
+                CT_ERROR => Box::new(ChunkError::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(&chunk_buf)?),
+                CT_SHUTDOWN_COMPLETE => Box::new(ChunkShutdownComplete::unmarshal(&chunk_buf)?),
                 _ => return Err(Error::ErrUnmarshalUnknownChunkType),
             };
 
@@ -270,45 +264,91 @@ impl Packet {
         })
     }
 
+    /// Exact number of bytes `marshal_to` will append: common header plus every
+    /// chunk with its trailing padding. Lets callers size the output buffer in a
+    /// single allocation instead of allocating small and reallocating.
+    pub(crate) fn marshaled_len(&self) -> usize {
+        let body_len: usize = self
+            .chunks
+            .iter()
+            .map(|c| {
+                let n = CHUNK_HEADER_SIZE + c.value_length();
+                n + get_padding_size(n)
+            })
+            .sum();
+        PACKET_HEADER_SIZE + body_len
+    }
+
     pub(crate) fn marshal_to(&self, writer: &mut BytesMut) -> Result<usize> {
-        // Populate static headers
-        // 8-12 is Checksum which will be populated when packet is complete
-        writer.put_u16(self.common_header.source_port);
-        writer.put_u16(self.common_header.destination_port);
-        writer.put_u32(self.common_header.verification_tag);
-
-        // Populate chunks
-        let mut raw = BytesMut::new();
-        for c in &self.chunks {
-            let chunk_raw = c.marshal()?;
-            raw.extend(chunk_raw);
-
-            let padding_needed = get_padding_size(raw.len());
-            if padding_needed != 0 {
-                raw.extend(vec![0u8; padding_needed]);
-            }
-        }
-        let raw = raw.freeze();
-
-        let hasher = Crc::<u32>::new(&CRC_32_ISCSI);
-        let mut digest = hasher.digest();
-        digest.update(writer);
-        digest.update(&FOUR_ZEROES);
-        digest.update(&raw[..]);
-        let checksum = digest.finalize();
-
-        // Checksum is already in BigEndian
-        // Using LittleEndian stops it from being flipped
-        writer.put_u32_le(checksum);
-        writer.extend(raw);
-
-        Ok(writer.len())
+        // Grow the buffer once so appending chunks never reallocates. A direct
+        // caller that passed an undersized buffer gets its single growth here;
+        // `marshal` pre-sizes, so it skips this path entirely.
+        writer.reserve(self.marshaled_len());
+        Self::write_framed(
+            &self.common_header,
+            self.chunks.iter().map(|c| &**c as &dyn Chunk),
+            writer,
+        )
     }
 
     pub(crate) fn marshal(&self) -> Result<Bytes> {
-        let mut buf = BytesMut::with_capacity(PACKET_HEADER_SIZE);
-        self.marshal_to(&mut buf)?;
-        Ok(buf.freeze())
+        // Allocate the exact packet length once, up front. `with_capacity` is a
+        // cheaper direct allocation than growing an empty `BytesMut` via
+        // `reserve`, and `write_framed` needs no further sizing.
+        let mut buf = BytesMut::with_capacity(self.marshaled_len());
+        // `.map`, not `?; Ok(..)`: the result is transformed, not inspected, so
+        // there is no separate error-return branch to leave untested (`write_framed`
+        // only fails if a chunk's own `marshal_to` does). Identical codegen.
+        Self::write_framed(
+            &self.common_header,
+            self.chunks.iter().map(|c| &**c as &dyn Chunk),
+            &mut buf,
+        )
+        .map(|_| buf.freeze())
+    }
+
+    /// Serialize the common header, every chunk (with trailing padding) and the
+    /// CRC-32C into `writer`, appended at its current end. This is the single
+    /// home of the SCTP on-wire packet framing: `marshal`/`marshal_to` feed it
+    /// boxed chunks, and the DATA send path feeds it borrowed `ChunkPayloadData`
+    /// directly (no `Box`). The caller sizes the buffer.
+    pub(crate) fn write_framed<'a>(
+        common_header: &CommonHeader,
+        chunks: impl Iterator<Item = &'a dyn Chunk>,
+        writer: &mut BytesMut,
+    ) -> Result<usize> {
+        let start = writer.len();
+
+        // Populate static headers
+        writer.put_u16(common_header.source_port);
+        writer.put_u16(common_header.destination_port);
+        writer.put_u32(common_header.verification_tag);
+
+        // Checksum placeholder (bytes 8..12). Kept zero while marshalling so the
+        // CRC below is computed over exactly the bytes the receiver validates;
+        // patched in place once the packet is complete.
+        let checksum_offset = writer.len();
+        writer.put_u32(0);
+
+        // Marshal each chunk straight into the output buffer — no per-chunk
+        // intermediate allocation, no byte-by-byte `extend`, no final re-copy.
+        let chunks_start = writer.len();
+        for c in chunks {
+            c.marshal_to(writer)?;
+
+            let padding_needed = get_padding_size(writer.len() - chunks_start);
+            if padding_needed != 0 {
+                writer.put_bytes(0, padding_needed);
+            }
+        }
+
+        // CRC-32C over the whole packet, checksum field still zero.
+        let checksum = crc32c::crc32c(&writer[start..]);
+
+        // Checksum is already in BigEndian; store little-endian so it isn't flipped.
+        writer[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        Ok(writer.len())
     }
 }
 
@@ -422,6 +462,73 @@ mod test {
         Ok(())
     }
 
+    // The boxing-free DATA send path marshals borrowed `ChunkPayloadData` straight
+    // into a shared buffer via `write_framed`; it must produce exactly the same
+    // bytes as building a `Packet` of boxed chunks and calling `marshal` -- both go
+    // through `write_framed`. Also exercises `marshal_to`.
+    #[test]
+    fn test_marshal_data_chunks_matches_packet_marshal() -> Result<()> {
+        use crate::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+
+        let mk_common = || CommonHeader {
+            source_port: 5000,
+            destination_port: 5000,
+            verification_tag: 0xdeadbeef,
+        };
+        let mk_chunk = |tsn: u32, ssn: u16, data: &'static [u8]| ChunkPayloadData {
+            stream_identifier: 1,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            user_data: Bytes::from_static(data),
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_sequence_number: ssn,
+            ..Default::default()
+        };
+
+        // A single chunk, and a two-chunk bundle whose first payload length (5)
+        // forces inter-chunk padding -- so the padding path is covered too.
+        let cases = [
+            vec![mk_chunk(1, 0, b"hello")],
+            vec![mk_chunk(1, 0, b"hello"), mk_chunk(2, 1, b"world!!")],
+        ];
+        for chunks in cases {
+            let direct = {
+                let mut buf = BytesMut::new();
+                Packet::write_framed(
+                    &mk_common(),
+                    chunks.iter().map(|c| c as &dyn Chunk),
+                    &mut buf,
+                )?;
+                buf.freeze()
+            };
+
+            let pkt = Packet {
+                common_header: mk_common(),
+                chunks: chunks
+                    .iter()
+                    .cloned()
+                    .map(|c| Box::new(c) as Box<dyn Chunk>)
+                    .collect(),
+            };
+            assert_eq!(
+                direct,
+                pkt.marshal()?,
+                "write_framed DATA path must equal Packet::marshal"
+            );
+
+            let mut buf = BytesMut::new();
+            pkt.marshal_to(&mut buf)?;
+            assert_eq!(
+                direct,
+                buf.freeze(),
+                "marshal_to must equal the write_framed DATA path"
+            );
+        }
+
+        Ok(())
+    }
+
     /*fn BenchmarkPacketGenerateChecksum(b *testing.B) {
         var data [1024]byte
 
@@ -474,6 +581,95 @@ mod test {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_unmarshal_variable_length_chunks_followed_by_other_chunks() -> Result<()> {
+        use crate::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+        use crate::chunk::{ErrorCause, PROTOCOL_VIOLATION, UNRECOGNIZED_CHUNK_TYPE};
+
+        let original = Packet {
+            common_header: CommonHeader {
+                source_port: 5000,
+                destination_port: 5000,
+                verification_tag: 0xdeadbeef,
+            },
+            chunks: vec![
+                Box::new(ChunkForwardTsn {
+                    new_cumulative_tsn: 3,
+                    streams: vec![],
+                }),
+                Box::new(ChunkAbort {
+                    error_causes: vec![ErrorCause {
+                        code: PROTOCOL_VIOLATION,
+                        ..Default::default()
+                    }],
+                }),
+                Box::new(ChunkError {
+                    error_causes: vec![ErrorCause {
+                        code: UNRECOGNIZED_CHUNK_TYPE,
+                        raw: Bytes::from_static(&[0xc0, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x03]),
+                    }],
+                }),
+                Box::new(ChunkShutdown {
+                    cumulative_tsn_ack: 0x12345678,
+                }),
+                Box::new(ChunkPayloadData {
+                    unordered: true,
+                    beginning_fragment: true,
+                    ending_fragment: true,
+                    tsn: 4,
+                    stream_identifier: 1,
+                    payload_type: PayloadProtocolIdentifier::Binary,
+                    user_data: Bytes::from_static(&[0xaa, 0xbb, 0xcc, 0xdd]),
+                    ..Default::default()
+                }),
+            ],
+        };
+        let raw = original.marshal()?;
+        let parsed = Packet::unmarshal(&raw)?;
+
+        assert_eq!(parsed.chunks.len(), 5);
+
+        let fwd = parsed.chunks[0]
+            .as_any()
+            .downcast_ref::<ChunkForwardTsn>()
+            .expect("chunks[0] should be FORWARD-TSN");
+        assert_eq!(fwd.new_cumulative_tsn, 3);
+        assert!(fwd.streams.is_empty());
+
+        let abort = parsed.chunks[1]
+            .as_any()
+            .downcast_ref::<ChunkAbort>()
+            .expect("chunks[1] should be ABORT");
+        assert_eq!(abort.error_causes.len(), 1);
+        assert_eq!(abort.error_causes[0].error_cause_code(), PROTOCOL_VIOLATION);
+
+        let err = parsed.chunks[2]
+            .as_any()
+            .downcast_ref::<ChunkError>()
+            .expect("chunks[2] should be ERROR");
+        assert_eq!(err.error_causes.len(), 1);
+        assert_eq!(
+            err.error_causes[0].error_cause_code(),
+            UNRECOGNIZED_CHUNK_TYPE
+        );
+
+        let shutdown = parsed.chunks[3]
+            .as_any()
+            .downcast_ref::<ChunkShutdown>()
+            .expect("chunks[3] should be SHUTDOWN");
+        assert_eq!(shutdown.cumulative_tsn_ack, 0x12345678);
+
+        let data = parsed.chunks[4]
+            .as_any()
+            .downcast_ref::<ChunkPayloadData>()
+            .expect("chunks[4] should be DATA");
+        assert_eq!(data.tsn, 4);
+        assert_eq!(data.stream_identifier, 1);
+        assert_eq!(data.payload_type, PayloadProtocolIdentifier::Binary);
+        assert_eq!(&data.user_data[..], &[0xaa, 0xbb, 0xcc, 0xdd]);
         Ok(())
     }
 }
