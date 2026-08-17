@@ -22,6 +22,14 @@ use super::*;
 ///      Fix: when an `a=simulcast:` line repeats the same direction
 ///      twice, keep only the first `<dir> <list>` pair.
 ///
+/// **Still required on rtc 0.20.3** (2026-08 migration): the writer in
+/// 0.20.3's `peer_connection/sdp/mod.rs` still emits `a=rid:` lines
+/// from both the media-section rid map and `add_sender_sdp`, and pushes
+/// two `send <rids>` entries into the `a=simulcast:` attribute, so both
+/// bugs persist. Filed upstream as webrtc-rs/rtc#179 → PR #181; retire
+/// this sanitizer only when a released rtc containing that fix is
+/// adopted.
+///
 /// Pure / idempotent: already-clean SDP is unchanged, single-RID
 /// answers (H.264, VP8 floor-only) are unchanged, and the function
 /// has no side effects. Tested via `sanitize_answer_sdp_*` below.

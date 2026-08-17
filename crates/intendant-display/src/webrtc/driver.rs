@@ -988,13 +988,18 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         // Route by connection first, engine stamp second: rtc < 0.9.1
         // stamped DTLS/SCTP transmits `TransportProtocol::UDP` even on a
         // TCP pair, misrouting every post-ICE packet (webrtc-rs/rtc#109,
-        // fixed by our upstream PR #110, released as 0.9.1 — which we
-        // run). Tuple-first routing stays regardless: the tuple is the
-        // engine's own connection key (rtc-shared `FiveTuple`), and it
-        // keeps any future stamping regression from presenting as a
-        // silent DTLS timeout again. (The relay check above stays first: relay
-        // transmits key on our relayed *local* address, which is never a
-        // TCP peer tuple.)
+        // fixed by our upstream PR #110, released as 0.9.1 and carried
+        // forward into the 0.20.x line we run — 0.20.3's ICE handler
+        // additionally stamps `local.base_addr()` instead of the
+        // candidate address, so srflx-selected pairs now stamp the bound
+        // socket the `sockets_by_addr` lookup below expects, and relay
+        // candidates still stamp the relayed address the relay check
+        // above keys on). Tuple-first routing stays regardless: the
+        // tuple is the engine's own connection key (rtc-shared
+        // `FiveTuple`), and it keeps any future stamping regression from
+        // presenting as a silent DTLS timeout again. (The relay check
+        // above stays first: relay transmits key on our relayed *local*
+        // address, which is never a TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
             // freeze() is zero-copy: the writer task borrows the
             // engine's own transmit buffer for the RFC 4571 write.

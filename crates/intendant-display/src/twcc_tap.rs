@@ -18,7 +18,21 @@
 //!
 //! Tapping inbound RTCP at the same interceptor layer rtc itself
 //! processes it on is the only place we can observe TLC without
-//! patching rtc 0.9. The tap mutates nothing — it observes
+//! patching rtc 0.9.
+//!
+//! **rtc 0.20.3 (2026-08 migration): the seam is unchanged.** The
+//! interceptor chain design this tap plugs into survived the
+//! 0.9.1 → 0.20.3 bump wholesale: `Registry::with` still wraps
+//! outermost, the peer connection's `InterceptorHandler` and the
+//! demux → SRTP-decrypt → `Packet::Rtcp` feed in front of it are
+//! byte-identical between the two releases, and 0.20.3's built-in
+//! stats pass (in that same handler) consumes SR/RR/NACK/PLI/CCFB
+//! but still not `TransportLayerCc` — so this tap remains the only
+//! TWCC observer, and it keeps receiving inbound RTCP exactly as
+//! before. (The interceptor-pipeline redesign anticipated for this
+//! migration lives on rtc master/0.21-alpha, not in 0.20.3.)
+//!
+//! The tap mutates nothing — it observes
 //! [`Packet::Rtcp`], downcasts each [`Box<dyn rtcp::Packet>`] to
 //! `TransportLayerCc`, projects a compact [`TwccEvent`] onto an
 //! `mpsc` channel, and forwards the original packet unchanged so
