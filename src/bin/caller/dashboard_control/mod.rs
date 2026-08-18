@@ -6290,7 +6290,27 @@ mod tests {
             let rest = &entry[at..];
             Some(rest[..rest.find('\'')?].to_string())
         }
-        let mut entries: std::collections::BTreeMap<String, (String, String)> = Default::default();
+        fn quoted_list(entry: &str, key: &str) -> Vec<String> {
+            let marker = format!("{key}: [");
+            let Some(at) = entry.find(&marker).map(|at| at + marker.len()) else {
+                return Vec::new();
+            };
+            let rest = &entry[at..];
+            let list = &rest[..rest.find(']').expect("descriptor list is unterminated")];
+            list.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                        .expect("descriptor list entries must be single-quoted")
+                        .to_string()
+                })
+                .collect()
+        }
+        let mut entries: std::collections::BTreeMap<String, (String, String, Vec<String>)> =
+            Default::default();
         for line in rest[..to].lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
@@ -6304,11 +6324,37 @@ mod tests {
                 .to_string();
             let verb = quoted(line, "verb").unwrap_or_else(|| panic!("{name}: missing verb"));
             let path = quoted(line, "path").unwrap_or_else(|| panic!("{name}: missing path"));
+            let query = quoted_list(line, "query");
             assert!(
-                entries.insert(name.clone(), (verb, path)).is_none(),
+                entries.insert(name.clone(), (verb, path, query)).is_none(),
                 "duplicate descriptor entry: {name}"
             );
         }
+
+        // Agenda windowing and archive pagination are parameters of both
+        // server lanes. Pin the HTTP descriptor's full query contract so
+        // fallback cannot silently discard a live/archive selector or page
+        // cursor while the datachannel lane keeps working.
+        let agenda_query: Vec<&str> = entries
+            .get("api_agenda_list")
+            .expect("api_agenda_list must have an HTTP twin")
+            .2
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            agenda_query,
+            [
+                "since_seq",
+                "shape",
+                "q",
+                "window",
+                "before",
+                "before_id",
+                "limit",
+            ],
+            "api_agenda_list must forward every query parsed by the HTTP and tunnel handlers"
+        );
 
         // Coverage pin: the F1 family's twinned methods (fs + staged
         // uploads), the F2 sessions-family reads (managed-context,
@@ -6501,7 +6547,7 @@ mod tests {
         let actual: std::collections::BTreeSet<&str> = entries.keys().map(String::as_str).collect();
         assert_eq!(actual, expected, "DAEMON_API_HTTP_MAP coverage drifted");
 
-        for (method_name, (verb, template)) in &entries {
+        for (method_name, (verb, template, _query)) in &entries {
             let spec = control_method_spec(method_name).unwrap_or_else(|| {
                 panic!("{method_name}: descriptor entry has no CONTROL_ONLY_METHODS row")
             });
