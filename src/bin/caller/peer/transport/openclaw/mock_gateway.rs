@@ -597,30 +597,38 @@ async fn handle_preauth_frame(
     }
 
     // Pairing gate (only after auth succeeded, so unauthenticated
-    // callers can't mint pairing requests).
+    // callers can't mint pairing requests). The lock scope is a
+    // block that always ends before the awaits below, so the guard
+    // never rides the spawned future across an await point.
     if state.cfg.pairing == PairingMode::PairThenApprove {
-        let mut pairing = state.pairing.lock().expect("pairing lock");
-        if !pairing.approved.contains(&device_id) {
-            // An actively retrying device reuses its pending request.
-            let existing = pairing
-                .pending
-                .iter()
-                .find(|(_, dev)| **dev == device_id)
-                .map(|(req, _)| req.clone());
-            let request_id = match existing {
-                Some(request_id) => request_id,
-                None => {
-                    let request_id = format!(
-                        "pair-req-{}",
-                        state.pair_seq.fetch_add(1, Ordering::Relaxed) + 1
-                    );
-                    pairing
-                        .pending
-                        .insert(request_id.clone(), device_id.clone());
-                    request_id
-                }
-            };
-            drop(pairing);
+        let pending_request = {
+            let mut pairing = state.pairing.lock().expect("pairing lock");
+            if pairing.approved.contains(&device_id) {
+                None
+            } else {
+                // An actively retrying device reuses its pending
+                // request.
+                let existing = pairing
+                    .pending
+                    .iter()
+                    .find(|(_, dev)| **dev == device_id)
+                    .map(|(req, _)| req.clone());
+                Some(match existing {
+                    Some(request_id) => request_id,
+                    None => {
+                        let request_id = format!(
+                            "pair-req-{}",
+                            state.pair_seq.fetch_add(1, Ordering::Relaxed) + 1
+                        );
+                        pairing
+                            .pending
+                            .insert(request_id.clone(), device_id.clone());
+                        request_id
+                    }
+                })
+            }
+        };
+        if let Some(request_id) = pending_request {
             let _ = send_error(
                 state,
                 ws,
@@ -891,6 +899,10 @@ mod tests {
     #[tokio::test]
     async fn full_handshake_transcript_and_rpc_round_trip() {
         let gw = MockGateway::spawn(MockGatewayConfig::default()).await;
+        assert!(
+            gw.local_addr().ip().is_loopback(),
+            "mock gateway must bind loopback only"
+        );
         let mut ws = dial(&gw).await;
 
         let hello = handshake(&mut ws, DEFAULT_BOOTSTRAP_TOKEN, "dev-happy").await;
