@@ -318,6 +318,11 @@ function agendaHoodAskHtml(item) {
         ? 'recorded by a daemon-authored record_ask_delivery op; one info notification raised (title only, never answer text)'
         : 'absent data claims nothing';
     chips.push(agendaChipHtml(label, tone, tip));
+    if (item.answer.acknowledged) {
+      const ack = item.answer.acknowledged;
+      chips.push(agendaChipHtml('pickup acknowledged', 'green',
+        `${agendaActorLabel(ack) || 'unattributed'} · ${agendaRelTime(ack.at_ms)}`));
+    }
   }
   if (!chips.length) return '';
   const note = item.status === 'open'
@@ -348,6 +353,7 @@ function agendaHoodOpVerb(op, envelope) {
     case 'reopen': return 'reopened';
     case 'retire': return 'retired — hidden, never deleted';
     case 'answer': return 'answered';
+    case 'acknowledge_answer': return 'answer pickup acknowledged';
     case 'dismiss': return `dismissed${op.action ? ` (${op.action})` : ''} — still open`;
     case 'annotate': {
       // The self-described label rides the verb (the triage mandate's
@@ -384,7 +390,7 @@ function agendaHoodOpDot(op, known) {
   switch (String(op.type || '')) {
     case 'add': case 'reopen': case 'request_occurrence': return 'iris';
     case 'set_blocker': return 'rose';
-    case 'clear_blocker': case 'approve_effect': case 'answer': case 'complete': return 'green';
+    case 'clear_blocker': case 'approve_effect': case 'answer': case 'acknowledge_answer': case 'complete': return 'green';
     case 'add_ref': case 'remove_ref': case 'record_ask_delivery': return 'sky';
     case 'propose_effect': case 'revoke_effect': case 'withdraw_effect': return 'amber';
     case 'record_occurrence':

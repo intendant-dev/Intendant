@@ -228,6 +228,10 @@ pub(crate) struct SummaryAnswer {
     pub(crate) session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delivered: Option<bool>,
+    /// Explicit pickup receipt. Presence suppresses the awaiting-pickup
+    /// affordance even when no live-session delivery was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) acknowledged: Option<super::types::AgendaAnswerAcknowledgement>,
     /// The structured rich-ask breakdown — answered question cards
     /// render per-question selections ungated (render-completeness law).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -432,6 +436,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             at_ms: answer.at_ms,
             session_id: answer.session_id.clone(),
             delivered: answer.delivered,
+            acknowledged: answer.acknowledged.clone(),
             structured: answer.structured.clone(),
         }),
         ask: item.ask.as_ref().map(|ask| SummaryAsk {

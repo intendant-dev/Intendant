@@ -1613,6 +1613,7 @@ mod tests {
             assert_eq!(
                 ops,
                 [
+                    "acknowledge_answer",
                     "add",
                     "add_part_of",
                     "add_ref",

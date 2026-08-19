@@ -364,6 +364,7 @@ mod tests {
             kind: None,
             structured,
             delivered: None,
+            acknowledged: None,
         }
     }
 

@@ -960,12 +960,13 @@ function agendaCardChips(item) {
         ? `“${w.watcher_title}” picks this up ${agendaRelTime(w.due_ms)} — returns to Needs you if it can’t deliver`
         : `“${w.watcher_title}” is handling this now — returns to Needs you if it can’t deliver`));
   }
-  // Answered ask whose delivery reached no session (the daemon-recorded
-  // `delivered: false` marker; absent data claims nothing).
-  if (item.status === 'done' && item.ask && item.answer
-    && item.answer.delivered === false) {
+  // Answered question still awaiting a consumer. Successful live delivery
+  // or an explicit acknowledgement consumes pickup; merely rendering the
+  // card never does.
+  if (item.status === 'done' && item.answer
+    && item.answer.delivered !== true && !item.answer.acknowledged) {
     chips.push(agendaChipHtml('answered · awaiting pickup', 'sky',
-      'No live session heard the answer — the asker’s successor reads it at session start', true));
+      'No live session received this answer and no consumer has acknowledged it yet', true));
   }
   if (st) {
     if (st.kind === 'running') {
