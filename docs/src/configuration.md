@@ -968,14 +968,23 @@ does not understate what a connecting peer must present.
 
 ### `[[peer]]` — federated peers
 
-Each `[[peer]]` block auto-registers a remote daemon at startup. Only `card_url`
-is required.
+Each `[[peer]]` block auto-registers a remote daemon at startup. Two shapes
+share the block, selected by `transport`: the default card-driven form
+(`transport` absent — only `card_url` is required) and the OpenClaw Gateway
+form (`transport = "openclaw-ws"` — only `url` is required; a gateway serves
+no Agent Card, so the daemon synthesizes one locally). Per-kind validation
+runs at startup: an invalid entry logs a diagnostic and skips that one peer.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
-| `label` | string | from card | Display label override in the dashboard's Access targets |
-| `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token` |
+| `transport` | string | absent | Entry kind: absent = card-driven Intendant federation; `"openclaw-ws"` = direct OpenClaw Gateway entry (docs/src/peer-federation.md § OpenClaw Gateway peers) |
+| `card_url` | string | (required unless `openclaw-ws`) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
+| `url` | string | (required for `openclaw-ws`) | The OpenClaw Gateway's WebSocket endpoint (`ws://host:18789` or `wss://…`); rejected on card-driven entries |
+| `role` | `operator` or `node` | `operator` | Role this daemon takes on the OpenClaw Gateway; `openclaw-ws` entries only |
+| `label` | string | from card (openclaw: gateway `host[:port]`) | Display label override in the dashboard's Access targets; for openclaw entries it is also the registry id suffix (`openclaw:<label>`), so two entries for one gateway need distinct labels |
+| `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token`; prefer the `_env`/`_file` reference forms below |
+| `bearer_token_env` | string | none | Name of an environment variable holding the outbound bearer token — for `openclaw-ws` entries, the gateway's shared bootstrap token used in the pairing handshake. At most one of the three token fields may be set |
+| `bearer_token_file` | string | none | Path to a file whose trimmed contents are the outbound bearer token (same semantics as `bearer_token_env`) |
 | `via_urls` | array | `[]` | Connecting-side WebSocket URL overrides; when set, these replace the transports advertised by the peer's Agent Card |
 | `client_cert` | string | installed access client cert when present | Peer-issued client certificate PEM for outbound mTLS; must be paired with `client_key` |
 | `client_key` | string | installed access client key when present | Private key PEM for `client_cert`; must be paired with `client_cert` |
@@ -1297,6 +1306,13 @@ advertised_transport = "none"
 # client_key = "/etc/intendant/peers/peer-client.key"
 # bearer_token = "legacy-token-if-the-peer-requires-one"
 # certificate_witness_vantage = "remote" # only for a known outside-network peer
+
+# [[peer]]                       # an OpenClaw Gateway (no Agent Card)
+# transport = "openclaw-ws"
+# url = "ws://gateway-host:18789"
+# role = "operator"              # default; "node" is a future slice
+# label = "home-gateway"
+# bearer_token_env = "OPENCLAW_GATEWAY_TOKEN"  # pairing-bootstrap secret reference
 
 [[mcp_servers]]
 name = "filesystem"
