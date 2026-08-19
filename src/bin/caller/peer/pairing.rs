@@ -787,7 +787,7 @@ pub(crate) fn join_peer_invite(
         .config
         .peers
         .iter_mut()
-        .find(|peer| peer.card_url == invite.card_url);
+        .find(|peer| peer.card_url.as_deref() == Some(invite.card_url.as_str()));
     let updated_existing = existing.is_some();
     match existing {
         Some(peer) => {
@@ -808,16 +808,13 @@ pub(crate) fn join_peer_invite(
         }
         None => {
             project.config.peers.push(PeerConfig {
-                card_url: invite.card_url.clone(),
+                card_url: Some(invite.card_url.clone()),
                 label,
-                bearer_token: None,
-                via_urls: Vec::new(),
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
                 identity_public_key: invite.daemon_identity_public_key.clone(),
-                browser_tcp_via_url: None,
-                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+                ..Default::default()
             });
         }
     }
@@ -1298,8 +1295,8 @@ mod tests {
         assert_eq!(project.config.peers.len(), 1);
         let peer = &project.config.peers[0];
         assert_eq!(
-            peer.card_url,
-            "https://peer.example/.well-known/agent-card.json"
+            peer.card_url.as_deref(),
+            Some("https://peer.example/.well-known/agent-card.json")
         );
         assert_eq!(peer.label.as_deref(), Some("Override"));
         assert_eq!(
@@ -1321,16 +1318,11 @@ mod tests {
             root: root.path().to_path_buf(),
             config: ProjectConfig {
                 peers: vec![PeerConfig {
-                    card_url: "https://peer.example/.well-known/agent-card.json".into(),
+                    card_url: Some("https://peer.example/.well-known/agent-card.json".into()),
                     label: Some("Old".into()),
                     bearer_token: Some("legacy".into()),
-                    via_urls: Vec::new(),
-                    client_cert: None,
-                    client_key: None,
-                    pinned_fingerprints: Vec::new(),
-                    identity_public_key: None,
                     browser_tcp_via_url: Some("ws://browser-via/ws".into()),
-                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+                    ..Default::default()
                 }],
                 ..ProjectConfig::default()
             },

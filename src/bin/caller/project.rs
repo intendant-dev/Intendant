@@ -1872,25 +1872,66 @@ impl Default for ServerAuthConfig {
 
 /// A federated peer daemon advertised via `intendant.toml [[peer]]`.
 ///
-/// `card_url` is the only required field — the registry fetches the
-/// peer's Agent Card from that URL at startup, picks a supported
-/// transport, and spawns the actor. `label` is an optional display
-/// override; when absent the card's own `label` field is used.
+/// Two entry shapes share the block, selected by `transport`:
+///
+/// - **Card-driven (default, `transport` absent):** `card_url` is the
+///   only required field — the registry fetches the peer's Agent Card
+///   from that URL at startup, picks a supported transport, and spawns
+///   the actor.
+/// - **`transport = "openclaw-ws"`:** `url` (the gateway's WebSocket
+///   endpoint, default port 18789) is the only required field — an
+///   OpenClaw Gateway serves no Agent Card, so the daemon synthesizes
+///   one locally with a single [`crate::peer::TransportSpec::OpenClawWs`]
+///   entry (`role` defaults to `operator`). Bootstrap auth for the
+///   pairing handshake comes from `bearer_token_env` /
+///   `bearer_token_file` — never inline plaintext.
+///
+/// `label` is an optional display override; when absent the card's own
+/// `label` field is used (for openclaw entries, the gateway host).
 /// `bearer_token` is an advanced compatibility credential this daemon
 /// sends when connecting out to legacy peers that still require
-/// `[server.auth] bearer_token`.
+/// `[server.auth] bearer_token`; prefer the `_env` / `_file` reference
+/// forms, which keep the secret out of the config file.
 /// `via_urls` are optional connecting-side transport overrides. When
 /// non-empty, the registry uses these WebSocket URLs instead of the peer's
 /// advertised transports.
 /// `client_cert` / `client_key` are the normal explicit mTLS path for
 /// daemon-to-daemon peers when the peer issued this daemon a client identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Per-kind validation (which fields are required / rejected for each
+/// `transport` value) happens at boot in
+/// `startup::peer_boot::classify_peer_config`, not at parse time, so an
+/// invalid entry degrades to a clear startup diagnostic for that one
+/// peer instead of failing the whole config load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerConfig {
+    /// Transport-kind selector. Absent (the default) = card-driven
+    /// Intendant federation via `card_url`. `"openclaw-ws"` = direct
+    /// OpenClaw Gateway entry via `url` / `role`. Unrecognized values
+    /// fail that entry loudly at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     /// URL of the peer's Agent Card. Typically
     /// `https://<host>:<port>/.well-known/agent-card.json` or
     /// `http://<host>:<port>/.well-known/agent-card.json` for
-    /// non-TLS local testing.
-    pub card_url: String,
+    /// non-TLS local testing. Required for card-driven entries;
+    /// rejected for `transport = "openclaw-ws"` entries (a gateway
+    /// serves no card).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_url: Option<String>,
+    /// OpenClaw Gateway WebSocket URL (`ws://host:18789` or
+    /// `wss://…`). Required for `transport = "openclaw-ws"` entries;
+    /// rejected otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Role this daemon takes on the OpenClaw Gateway: `"operator"`
+    /// (default — drive sessions, relay messages) or `"node"` (lend
+    /// capabilities back to the gateway; future slice). Only
+    /// meaningful with `transport = "openclaw-ws"`; unrecognized
+    /// values fail that entry loudly at boot rather than hydrating a
+    /// forward-compat `Unknown` role from local config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Optional display label override. Rendered in the dashboard
     /// Daemons panel instead of `card.label` when set. Does not
     /// affect routing — the registry still keys on `card.id`.
@@ -1904,6 +1945,8 @@ pub struct PeerConfig {
     /// Only set this when the peer's Agent Card advertises
     /// `auth.application = Some(Bearer)`. Normal dashboard and
     /// federation access should use TLS/mTLS client certificates.
+    /// Prefer `bearer_token_env` / `bearer_token_file` over this
+    /// inline form — they keep the secret out of the config file.
     ///
     /// Example:
     /// ```toml
@@ -1913,6 +1956,35 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Name of an environment variable holding the outbound bearer
+    /// token — the secret-reference form of `bearer_token` (same
+    /// pattern as `[custom_domain.dns] token_env`): the config names
+    /// where the credential lives, never the credential itself.
+    /// Resolved once at peer registration. For
+    /// `transport = "openclaw-ws"` entries this is the gateway's
+    /// shared bootstrap token used for the pairing handshake
+    /// (`auth.token` in the `connect` frame); once the gateway host
+    /// approves the pairing request, the transport persists the
+    /// granted device token and the bootstrap token stops being
+    /// load-bearing. At most one of `bearer_token`,
+    /// `bearer_token_env`, `bearer_token_file` may be set.
+    ///
+    /// Example:
+    /// ```toml
+    /// [[peer]]
+    /// transport = "openclaw-ws"
+    /// url = "ws://gateway-host:18789"
+    /// bearer_token_env = "OPENCLAW_GATEWAY_TOKEN"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+    /// Path to a file whose (trimmed) contents are the outbound bearer
+    /// token — the file-reference form of `bearer_token`, for
+    /// operators who keep secrets in mode-0600 files instead of the
+    /// environment. Resolved once at peer registration. Mutually
+    /// exclusive with the other two token fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_file: Option<String>,
     /// Connecting-side transport URL overrides. When non-empty, these
     /// replace the transports advertised by the peer's Agent Card.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2522,15 +2594,53 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.peers.len(), 2);
         assert_eq!(
-            config.peers[0].card_url,
-            "https://nicks-mac.local:8443/.well-known/agent-card.json"
+            config.peers[0].card_url.as_deref(),
+            Some("https://nicks-mac.local:8443/.well-known/agent-card.json")
         );
         assert_eq!(config.peers[0].label.as_deref(), Some("Nick's Mac"));
+        // Entries predating the transport-kind selector parse with it
+        // (and the openclaw fields) absent.
+        assert!(config.peers[0].transport.is_none());
+        assert!(config.peers[0].url.is_none());
+        assert!(config.peers[0].role.is_none());
+        assert!(config.peers[0].bearer_token_env.is_none());
+        assert!(config.peers[0].bearer_token_file.is_none());
         assert_eq!(
-            config.peers[1].card_url,
-            "http://127.0.0.1:9000/.well-known/agent-card.json"
+            config.peers[1].card_url.as_deref(),
+            Some("http://127.0.0.1:9000/.well-known/agent-card.json")
         );
         assert!(config.peers[1].label.is_none());
+    }
+
+    /// An `[[peer]]` entry with `transport = "openclaw-ws"` parses: the
+    /// gateway url, role, and the secret-reference token fields land,
+    /// and `card_url` stays absent. (Which fields are *required* per
+    /// kind is boot-time validation in `startup::peer_boot`; parsing
+    /// itself must accept the shape.)
+    #[test]
+    fn parse_openclaw_peer_entry() {
+        let toml_str = r#"
+[[peer]]
+transport = "openclaw-ws"
+url = "ws://gateway-host:18789"
+role = "operator"
+label = "home-gateway"
+bearer_token_env = "OPENCLAW_GATEWAY_TOKEN"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.peers.len(), 1);
+        let peer = &config.peers[0];
+        assert_eq!(peer.transport.as_deref(), Some("openclaw-ws"));
+        assert_eq!(peer.url.as_deref(), Some("ws://gateway-host:18789"));
+        assert_eq!(peer.role.as_deref(), Some("operator"));
+        assert_eq!(peer.label.as_deref(), Some("home-gateway"));
+        assert_eq!(
+            peer.bearer_token_env.as_deref(),
+            Some("OPENCLAW_GATEWAY_TOKEN")
+        );
+        assert!(peer.card_url.is_none());
+        assert!(peer.bearer_token.is_none());
+        assert!(peer.bearer_token_file.is_none());
     }
 
     /// Round-trip: serializing a config with peer entries back to
@@ -2542,20 +2652,12 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         let original = ProjectConfig {
             peers: vec![
                 PeerConfig {
-                    card_url: "http://a.local/.well-known/agent-card.json".into(),
+                    card_url: Some("http://a.local/.well-known/agent-card.json".into()),
                     label: Some("A".into()),
-                    bearer_token: None,
-                    via_urls: Vec::new(),
-                    client_cert: None,
-                    client_key: None,
-                    pinned_fingerprints: Vec::new(),
-                    identity_public_key: None,
-                    browser_tcp_via_url: None,
-                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+                    ..Default::default()
                 },
                 PeerConfig {
-                    card_url: "http://b.local/.well-known/agent-card.json".into(),
-                    label: None,
+                    card_url: Some("http://b.local/.well-known/agent-card.json".into()),
                     bearer_token: Some("secret-for-b".into()),
                     via_urls: vec!["ws://b-tunnel.local:19000/ws".into()],
                     client_cert: Some("/secrets/b-client.crt".into()),
@@ -2563,16 +2665,24 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
-                    identity_public_key: None,
                     browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
                     certificate_witness_vantage: crate::peer::PeerWitnessVantage::Remote,
+                    ..Default::default()
+                },
+                PeerConfig {
+                    transport: Some("openclaw-ws".into()),
+                    url: Some("ws://gateway-host:18789".into()),
+                    role: Some("operator".into()),
+                    label: Some("home-gateway".into()),
+                    bearer_token_env: Some("OPENCLAW_GATEWAY_TOKEN".into()),
+                    ..Default::default()
                 },
             ],
             ..ProjectConfig::default()
         };
         let serialized = toml::to_string(&original).unwrap();
         let parsed: ProjectConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(parsed.peers.len(), 2);
+        assert_eq!(parsed.peers.len(), 3);
         assert_eq!(parsed.peers[0].card_url, original.peers[0].card_url);
         assert_eq!(parsed.peers[0].label, original.peers[0].label);
         assert_eq!(parsed.peers[0].bearer_token, original.peers[0].bearer_token);
@@ -2614,6 +2724,24 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(
             parsed.peers[1].certificate_witness_vantage,
             crate::peer::PeerWitnessVantage::Remote
+        );
+        // The openclaw-ws entry round-trips: kind selector, gateway
+        // url, role, and the env-name token reference all survive, and
+        // the absent card-driven fields stay absent (elided by
+        // skip_serializing_if, reparsed as None).
+        assert_eq!(parsed.peers[2].transport.as_deref(), Some("openclaw-ws"));
+        assert_eq!(parsed.peers[2].url, original.peers[2].url);
+        assert_eq!(parsed.peers[2].role.as_deref(), Some("operator"));
+        assert_eq!(
+            parsed.peers[2].bearer_token_env.as_deref(),
+            Some("OPENCLAW_GATEWAY_TOKEN")
+        );
+        assert!(parsed.peers[2].card_url.is_none());
+        assert!(parsed.peers[2].bearer_token.is_none());
+        assert!(parsed.peers[2].bearer_token_file.is_none());
+        assert!(
+            !serialized.contains("card_url = \"\""),
+            "absent card_url must be elided, not serialized empty: {serialized}"
         );
     }
 

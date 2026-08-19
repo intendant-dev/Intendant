@@ -70,7 +70,7 @@ pub(crate) fn persist_manual_peer(
         .config
         .peers
         .iter_mut()
-        .find(|peer| peer.card_url == req.card_url);
+        .find(|peer| peer.card_url.as_deref() == Some(req.card_url.as_str()));
     match existing {
         Some(peer) => {
             if label.is_some() {
@@ -83,16 +83,13 @@ pub(crate) fn persist_manual_peer(
         }
         None => {
             project.config.peers.push(crate::project::PeerConfig {
-                card_url: req.card_url.clone(),
+                card_url: Some(req.card_url.clone()),
                 label,
                 bearer_token: req.bearer_token.clone(),
                 via_urls: req.via_urls.clone(),
-                client_cert: None,
-                client_key: None,
                 pinned_fingerprints: req.pinned_fingerprints.clone(),
-                identity_public_key: None,
                 browser_tcp_via_url: req.browser_tcp_via_url.clone(),
-                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+                ..Default::default()
             });
         }
     }
@@ -602,7 +599,7 @@ mod tests {
         let project = crate::project::Project::from_root(root.path().to_path_buf()).unwrap();
         assert_eq!(project.config.peers.len(), 1);
         let peer = &project.config.peers[0];
-        assert_eq!(peer.card_url, req.card_url);
+        assert_eq!(peer.card_url.as_deref(), Some(req.card_url.as_str()));
         assert_eq!(peer.label.as_deref(), Some("Peer Display"));
         assert_eq!(peer.via_urls, req.via_urls);
         assert_eq!(peer.bearer_token, req.bearer_token);

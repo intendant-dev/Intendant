@@ -835,7 +835,7 @@ pub(crate) fn install_approved_identity(
         .config
         .peers
         .iter_mut()
-        .find(|peer| peer.card_url == result.card_url);
+        .find(|peer| peer.card_url.as_deref() == Some(result.card_url.as_str()));
     let updated_existing = existing.is_some();
     match existing {
         Some(peer) => {
@@ -854,16 +854,13 @@ pub(crate) fn install_approved_identity(
         }
         None => {
             project.config.peers.push(PeerConfig {
-                card_url: result.card_url.clone(),
+                card_url: Some(result.card_url.clone()),
                 label,
-                bearer_token: None,
-                via_urls: Vec::new(),
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
                 identity_public_key: result.target_daemon_identity_public_key.clone(),
-                browser_tcp_via_url: None,
-                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+                ..Default::default()
             });
         }
     }
@@ -1999,7 +1996,10 @@ mod tests {
         assert!(outcome.client_cert_path.exists());
         assert!(outcome.client_key_path.exists());
         assert_eq!(project.config.peers.len(), 1);
-        assert_eq!(project.config.peers[0].card_url, result.card_url);
+        assert_eq!(
+            project.config.peers[0].card_url.as_deref(),
+            Some(result.card_url.as_str())
+        );
         assert!(
             project.config.peers[0].identity_public_key.is_none(),
             "a pre-B2 result installs without inventing an identity key"
