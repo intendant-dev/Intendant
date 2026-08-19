@@ -87,6 +87,9 @@ The supported commands are:
 - `ask` — park a rich multi-question ask as a durable question item (below);
 - `answer` for an open question (answering also resolves it; `structured`
   optionally carries a rich-ask breakdown);
+- `acknowledge_answer` — explicitly record that a consumer picked up the
+  current answer (`intendant ctl agenda acknowledge ID_PREFIX`); reads never
+  perform this transition;
 - `annotate`, `set_blocker`, `clear_blocker`, `add_relies_on`, and
   `remove_relies_on` — the item's thread and gates (below);
 - `propose_effect`, `approve_effect`, `revoke_effect`, and
@@ -98,6 +101,13 @@ Items use monotonic ULIDs, so lexicographic order is creation order. Titles,
 bodies, tags, and due times have bounded intake. There is no destructive
 delete operation: retirement hides an item from the normal open view while
 preserving its history.
+
+Bare `intendant ctl agenda list` is the working inbox: it includes every open
+item plus answered questions still awaiting pickup. The named lifecycle
+filters remain exact (`--open` is open-only, `--done` is done-only, and so
+on). A successful live-session delivery or an explicit answer acknowledgement
+removes an answered question from the bare list without changing its `done`
+lifecycle status.
 
 A question is the durable, non-blocking counterpart to `ask_user`. Parking it
 does not stop a session. The owner can answer later, and a future session can
@@ -159,11 +169,13 @@ successor — it is recorded, not silent: the daemon appends a
 `record_ask_delivery` op (daemon-authored, like `record_occurrence`)
 marking `answer.delivered: false`, raises one info-urgency notification
 (item title only, never answer text), and the item card wears a quiet
-"answered · awaiting pickup" chip. A successful injection (or an inline
-waiter return) records `delivered: true` instead. The session-start
-agenda ritual remains the pickup path: a session that parked a question
-and died reads the reply from the item next time (reading does not flip
-the marker; only a later successful delivery does).
+"answered · awaiting pickup" chip. Plain answered questions and older
+answers with no delivery fact also remain awaiting pickup. A successful
+injection (or an inline waiter return) records `delivered: true` instead.
+The session-start agenda ritual remains the pickup path: a session that
+parked a question and died reads the reply from the item next time, then
+explicitly runs `intendant ctl agenda acknowledge ID_PREFIX`. Reading does
+not flip either the delivery marker or the acknowledgement receipt.
 
 **Dismissal is not resolution.** Skipping or denying the rail card records
 a dismissal marker (`dismissed`: verb, time, actor) and clears every

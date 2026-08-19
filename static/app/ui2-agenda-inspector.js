@@ -442,9 +442,12 @@ function agendaInspQuestionHtml(item) {
       rows.push(`<div class="ag2-insp-resq"><span class="ag2-restext">${escapeHtml(a.text)}</span></div>`);
     }
     const who = agendaActorLabel(a) || 'unattributed';
-    const delivery = a.delivered === false
-      ? ' · awaiting pickup — no live session heard it'
-      : a.delivered === true ? ' · delivered into the asking session' : '';
+    const acknowledgedBy = a.acknowledged ? (agendaActorLabel(a.acknowledged) || 'unattributed') : '';
+    const delivery = a.delivered === true
+      ? ' · delivered into the asking session'
+      : a.acknowledged
+        ? ` · pickup acknowledged by ${acknowledgedBy}`
+        : ' · awaiting pickup';
     const railView = item.status === 'done' && questions.length
       ? ` <button type="button" class="ag2-linkbtn" data-act="rail-view">View the rail record ›</button>`
       : '';

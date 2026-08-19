@@ -44,13 +44,14 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 26] = [
+const KNOWN_OPS: [&str; 27] = [
     "add",
     "patch",
     "complete",
     "reopen",
     "retire",
     "answer",
+    "acknowledge_answer",
     "dismiss",
     "annotate",
     "set_blocker",
@@ -1691,6 +1692,34 @@ impl AgendaStore {
                         "{id} is retired — reopen it first"
                     ))),
                 }
+            }
+            AgendaCommand::AcknowledgeAnswer { id, source: _ } => {
+                let item = self.require(&id)?;
+                if item.kind != super::types::AgendaKind::Question {
+                    return Err(AgendaError::Invalid(format!(
+                        "{id} is not a question — only question answers can be acknowledged"
+                    )));
+                }
+                if item.status != AgendaStatus::Done {
+                    return Err(AgendaError::Transition(match item.status {
+                        AgendaStatus::Open => format!("{id} has not been answered yet"),
+                        AgendaStatus::Retired => format!("{id} is retired — reopen it first"),
+                        AgendaStatus::Done => unreachable!(),
+                    }));
+                }
+                let Some(answer) = item.answer.as_ref() else {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} was completed without an answer to acknowledge"
+                    )));
+                };
+                if !item.answer_awaiting_pickup() {
+                    return Err(AgendaError::Transition(if answer.delivered == Some(true) {
+                        format!("{id}'s answer was already delivered")
+                    } else {
+                        format!("{id}'s answer is already acknowledged")
+                    }));
+                }
+                Ok(AgendaOp::AcknowledgeAnswer { id })
             }
             AgendaCommand::ProposeEffect {
                 id,
@@ -3806,10 +3835,50 @@ mod tests {
         ));
 
         drop(store);
-        let store = AgendaStore::open(dir.path()).unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
         let reloaded = store.get(&question.id).unwrap();
         assert_eq!(reloaded.answer.as_ref().unwrap().text, "yes, before Friday");
         assert_eq!(reloaded.status, AgendaStatus::Done);
+        assert!(reloaded.answer_awaiting_pickup());
+
+        let acknowledged = store
+            .apply_command(
+                AgendaCommand::AcknowledgeAnswer {
+                    id: question.id.clone(),
+                    source: Some("session-start".into()),
+                },
+                owner(),
+                7,
+            )
+            .unwrap();
+        assert!(!acknowledged.answer_awaiting_pickup());
+        assert_eq!(
+            acknowledged
+                .answer
+                .as_ref()
+                .unwrap()
+                .acknowledged
+                .as_ref()
+                .unwrap()
+                .principal
+                .as_deref(),
+            Some("owner")
+        );
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::AcknowledgeAnswer {
+                    id: question.id.clone(),
+                    source: None,
+                },
+                owner(),
+                8,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
+
+        drop(store);
+        let store = AgendaStore::open(dir.path()).unwrap();
+        assert!(!store.get(&question.id).unwrap().answer_awaiting_pickup());
     }
 
     /// `--source` labels: validated at intake (trimmed, bounded, never
@@ -4491,6 +4560,18 @@ mod tests {
             .record_ask_delivery(&item.id, true, Some("sess-successor".into()), 5)
             .unwrap();
         assert_eq!(flipped.answer.as_ref().unwrap().delivered, Some(true));
+        assert!(!flipped.answer_awaiting_pickup());
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::AcknowledgeAnswer {
+                    id: item.id.clone(),
+                    source: None,
+                },
+                owner(),
+                5,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
 
         // Refold from disk: the marker is durable history.
         drop(store);

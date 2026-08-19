@@ -152,9 +152,30 @@ pub struct AgendaAnswer {
     /// heard — surfaces render it "answered · awaiting pickup"; a later
     /// successful successor delivery flips it true. Additive: `None` on
     /// answers that predate the marker and in logs written by older
-    /// builds (no chip either way — absent data claims nothing).
+    /// builds. Such answers stay in the pickup inbox until explicitly
+    /// acknowledged; absence still makes no transport claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) delivered: Option<bool>,
+    /// Explicit pickup receipt written by an agenda consumer. This is
+    /// deliberately separate from `delivered`: delivery is a daemon-
+    /// observed transport fact, while acknowledgement is an attributed
+    /// act. Merely reading or listing an answer never creates this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acknowledged: Option<AgendaAnswerAcknowledgement>,
+}
+
+/// Who explicitly acknowledged an answered agenda question, and when.
+/// Attribution is copied from the acknowledgement op's trusted envelope;
+/// the full append-only history remains in the op log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaAnswerAcknowledgement {
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
 }
 
 /// The full Ask v2 payload carried by a parked rich question: the wire
@@ -1215,6 +1236,13 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Record that a consumer picked up the current answer. This is an
+    /// explicit write: list/show reads never acknowledge on their own.
+    AcknowledgeAnswer {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Park a rich multi-question ask (the Ask v2 payload — same
     /// vocabulary as `ask_user`'s `questions` form: options, pick bounds,
     /// free-text policy, inline preview sources) as a durable agenda
@@ -1557,6 +1585,17 @@ pub enum AgendaCommand {
 }
 
 impl AgendaItem {
+    /// Whether the current answer still belongs in the default working
+    /// set. Successful live delivery counts as pickup; otherwise only an
+    /// explicit acknowledgement clears it. Reads never alter either fact.
+    pub(crate) fn answer_awaiting_pickup(&self) -> bool {
+        self.kind == AgendaKind::Question
+            && self.status == AgendaStatus::Done
+            && self.answer.as_ref().is_some_and(|answer| {
+                answer.delivered != Some(true) && answer.acknowledged.is_none()
+            })
+    }
+
     /// Every session id this item's attribution views reference (birth
     /// provenance, answer, effect proposals and runs, session-type refs) —
     /// the set a display surface resolves to conversations and names.
@@ -1567,6 +1606,12 @@ impl AgendaItem {
             .as_deref()
             .into_iter()
             .chain(self.answer.as_ref().and_then(|a| a.session_id.as_deref()))
+            .chain(
+                self.answer
+                    .as_ref()
+                    .and_then(|a| a.acknowledged.as_ref())
+                    .and_then(|ack| ack.session_id.as_deref()),
+            )
             .chain(self.effects.iter().flat_map(|effect| {
                 effect.proposed_session_id.as_deref().into_iter().chain(
                     effect
@@ -1619,6 +1664,7 @@ impl AgendaCommand {
             | AgendaCommand::Reopen { source, .. }
             | AgendaCommand::Retire { source, .. }
             | AgendaCommand::Answer { source, .. }
+            | AgendaCommand::AcknowledgeAnswer { source, .. }
             | AgendaCommand::ProposeEffect { source, .. }
             | AgendaCommand::Annotate { source, .. }
             | AgendaCommand::Attest { source, .. }
@@ -1690,6 +1736,12 @@ pub(crate) enum AgendaOp {
         /// and fold the text alone).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         structured: Option<AgendaAskResolution>,
+    },
+    /// Attributed, explicit pickup receipt for the current answer. Older
+    /// builds skip the whole line and therefore keep the answer visible
+    /// for pickup, which is the safe forward-compatible behavior.
+    AcknowledgeAnswer {
+        id: String,
     },
     /// Dismissal marker on an open question (rail skip/deny): recorded as
     /// history, the item stays open. Older builds skip the whole line
@@ -1868,6 +1920,7 @@ impl AgendaOp {
             | AgendaOp::Reopen { id }
             | AgendaOp::Retire { id }
             | AgendaOp::Answer { id, .. }
+            | AgendaOp::AcknowledgeAnswer { id }
             | AgendaOp::Dismiss { id, .. }
             | AgendaOp::Annotate { id, .. }
             | AgendaOp::SetBlocker { id, .. }
@@ -2622,6 +2675,9 @@ pub(crate) fn apply_op(
                         // Delivery is a later fact: the supervisor's
                         // delivery arm records it as its own op.
                         delivered: None,
+                        // Pickup is also a later, explicit act. Reads do
+                        // not mutate this receipt.
+                        acknowledged: None,
                     });
                     // A reply resolves the question (an earlier dismissal
                     // is history the answer supersedes).
@@ -2635,6 +2691,35 @@ pub(crate) fn apply_op(
                     Some(format!("answer on resolved {id} ignored"))
                 }
             }
+        }
+        AgendaOp::AcknowledgeAnswer { id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("acknowledge_answer for unknown {id} ignored"));
+            };
+            if item.kind != AgendaKind::Question || item.status != AgendaStatus::Done {
+                return Some(format!(
+                    "acknowledge_answer on unanswered question {id} ignored"
+                ));
+            }
+            let Some(answer) = item.answer.as_mut() else {
+                return Some(format!(
+                    "acknowledge_answer on {id} without a current answer ignored"
+                ));
+            };
+            if answer.delivered == Some(true) || answer.acknowledged.is_some() {
+                return Some(format!(
+                    "acknowledge_answer on already picked-up {id} ignored"
+                ));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            answer.acknowledged = Some(AgendaAnswerAcknowledgement {
+                at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+            });
+            item.updated_ms = at_ms;
+            None
         }
         AgendaOp::RecordAskDelivery { id, delivered, .. } => {
             let Some(item) = items.get_mut(id) else {
@@ -3527,6 +3612,12 @@ mod tests {
         let complete: AgendaCommand =
             serde_json::from_str(r#"{"op":"complete","id":"01X"}"#).unwrap();
         assert!(matches!(complete, AgendaCommand::Complete { .. }));
+        let acknowledge: AgendaCommand =
+            serde_json::from_str(r#"{"op":"acknowledge_answer","id":"01X"}"#).unwrap();
+        assert!(matches!(
+            acknowledge,
+            AgendaCommand::AcknowledgeAnswer { .. }
+        ));
         let patch: AgendaCommand =
             serde_json::from_str(r#"{"op":"patch","id":"01X","patch":{"due_ms":null}}"#).unwrap();
         match patch {
@@ -3803,6 +3894,86 @@ mod tests {
         );
     }
 
+    /// Pickup is an explicit attributed op, not a side effect of reading.
+    /// It clears the derived inbox state without changing lifecycle or the
+    /// transport-delivery fact, and replay rejects duplicate receipts.
+    #[test]
+    fn answer_acknowledgement_folds_as_an_explicit_pickup_receipt() {
+        let mut items = BTreeMap::new();
+        apply_op(
+            &mut items,
+            &rec(
+                1,
+                AgendaOp::Add {
+                    id: "q".into(),
+                    kind: AgendaKind::Question,
+                    title: "Which grid?".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    ask: None,
+                },
+            ),
+        );
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::Answer {
+                    id: "q".into(),
+                    text: "A".into(),
+                    structured: None,
+                },
+            ),
+        );
+        assert!(items["q"].answer_awaiting_pickup());
+
+        let mut ack = rec(3, AgendaOp::AcknowledgeAnswer { id: "q".into() });
+        ack.actor = Some(AgendaActor {
+            principal: Some("principal:agent".into()),
+            session_id: Some("sess-consumer".into()),
+            kind: Some("agent_session".into()),
+        });
+        assert!(apply_op(&mut items, &ack).is_none());
+        let item = &items["q"];
+        assert_eq!(item.status, AgendaStatus::Done);
+        assert!(!item.answer_awaiting_pickup());
+        assert_eq!(item.answer.as_ref().unwrap().delivered, None);
+        let receipt = item.answer.as_ref().unwrap().acknowledged.as_ref().unwrap();
+        assert_eq!(receipt.at_ms, 3);
+        assert_eq!(receipt.session_id.as_deref(), Some("sess-consumer"));
+        assert!(item
+            .referenced_session_ids()
+            .any(|id| id == "sess-consumer"));
+        assert!(apply_op(&mut items, &ack).is_some());
+    }
+
+    #[test]
+    fn acknowledge_answer_record_line_format_is_pinned() {
+        let record = AgendaOpRecord {
+            v: 1,
+            at_ms: 11,
+            actor: Some(AgendaActor {
+                principal: Some("principal:agent".into()),
+                session_id: Some("sess-consumer".into()),
+                kind: Some("agent_session".into()),
+            }),
+            source: Some("session-start".into()),
+            op: AgendaOp::AcknowledgeAnswer {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":11,"actor":{"principal":"principal:agent","session_id":"sess-consumer","kind":"agent_session"},"source":"session-start","op":{"type":"acknowledge_answer","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            record
+        );
+    }
+
     /// DTO forward-compat for the marker: an answer serialized by an older
     /// build (no `delivered` field) deserializes to `None`, and a `None`
     /// marker stays off the wire (the answered-item pin above carries no
@@ -3811,6 +3982,7 @@ mod tests {
     fn answer_without_delivered_field_deserializes_to_none() {
         let answer: AgendaAnswer = serde_json::from_str(r#"{"text":"A","at_ms":2}"#).unwrap();
         assert_eq!(answer.delivered, None);
+        assert_eq!(answer.acknowledged, None);
         assert!(!serde_json::to_string(&answer)
             .unwrap()
             .contains("delivered"));
@@ -3826,17 +3998,17 @@ mod tests {
     }
 
     /// The dashboard's "answered · awaiting pickup" chip renders from
-    /// exactly this DTO contract: a DONE, ask-backed item whose answer
-    /// carries `delivered === false` (absent = pre-marker history = no
-    /// chip). Pinned against the built SPA so a vocabulary change that
+    /// exactly this DTO contract: a DONE answered item without successful
+    /// delivery or an explicit acknowledgement. Pinned against the built
+    /// SPA so a vocabulary change that
     /// forgets the frontend fails here instead of shipping as drift (the
     /// derive-don't-mirror parity pattern).
     #[test]
     fn awaiting_pickup_chip_condition_is_pinned_in_app_html() {
         let app = include_str!("../../../../static/app.html");
         for marker in [
-            "item.status === 'done' && item.ask && item.answer",
-            "item.answer.delivered === false",
+            "item.status === 'done' && item.answer",
+            "item.answer.delivered !== true && !item.answer.acknowledged",
             "answered · awaiting pickup",
             "agendaChipHtml('answered · awaiting pickup', 'sky'",
         ] {

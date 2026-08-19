@@ -2587,6 +2587,9 @@ async fn run_agenda(
             run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Occurrences).await?
         }
         "complete" | "done" => agenda_transition(client, config, "complete", &raw[1..]).await?,
+        "acknowledge" | "ack" => {
+            agenda_transition(client, config, "acknowledge_answer", &raw[1..]).await?
+        }
         "reopen" => agenda_transition(client, config, "reopen", &raw[1..]).await?,
         "retire" => agenda_transition(client, config, "retire", &raw[1..]).await?,
         "annotate" => {
@@ -3152,20 +3155,32 @@ async fn run_agenda_list(
     )?;
     let blocked_only = args.has("--blocked");
     let frontier_only = args.has("--frontier");
+    let explicit_status = ["--all", "--open", "--done", "--retired"]
+        .iter()
+        .any(|flag| args.has(flag));
+    // Bare list is the working inbox: open work plus answers that no live
+    // session received and no consumer has explicitly acknowledged. The
+    // named filters remain exact; --blocked/--frontier are open-only views.
+    let default_working_set = !explicit_status && !blocked_only && !frontier_only;
     let status = if args.has("--all") {
         None
     } else if args.has("--done") {
         Some("done")
     } else if args.has("--retired") {
         Some("retired")
-    } else {
-        // Default to the working set; --open is accepted for symmetry.
-        // --blocked implies open (blocked is derived only on open items).
+    } else if args.has("--open") || blocked_only || frontier_only {
         Some("open")
+    } else {
+        // The default working set is a union, filtered locally below.
+        None
     };
     let mut tool_args = Map::new();
     insert_string(&mut tool_args, "status", status);
-    if (config.json || config.raw) && args.one("--under").is_none() && !frontier_only {
+    if (config.json || config.raw)
+        && !default_working_set
+        && args.one("--under").is_none()
+        && !frontier_only
+    {
         let response = call_tool(client, config, "agenda_list", Value::Object(tool_args)).await?;
         return print_tool_response(response, config, None);
     }
@@ -3205,9 +3220,8 @@ async fn run_agenda_list(
     let items: Vec<&Value> = all_items
         .iter()
         .filter(|item| {
-            let item_status = item.get("status").and_then(Value::as_str).unwrap_or("");
             let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-            status.is_none_or(|s| item_status == s)
+            agenda_list_status_matches(item, default_working_set, status)
                 && (!blocked_only || agenda_item_is_blocked(&all_items, item))
                 && (!frontier_only || in_frontier(item))
                 && under_subtree.as_ref().is_none_or(|s| s.contains(id))
@@ -3225,10 +3239,11 @@ async fn run_agenda_list(
         if frontier_only {
             println!("frontier empty — nothing awaits triage");
         } else {
-            match (blocked_only, status) {
-                (true, _) => println!("no blocked agenda items"),
-                (false, Some(status)) => println!("no {status} agenda items"),
-                (false, None) => println!("agenda is empty"),
+            match (blocked_only, default_working_set, status) {
+                (true, _, _) => println!("no blocked agenda items"),
+                (false, true, _) => println!("no agenda items awaiting work or pickup"),
+                (false, false, Some(status)) => println!("no {status} agenda items"),
+                (false, false, None) => println!("agenda is empty"),
             }
         }
     }
@@ -3239,8 +3254,46 @@ async fn run_agenda_list(
     let open = counts.get("open").and_then(Value::as_u64).unwrap_or(0);
     let done = counts.get("done").and_then(Value::as_u64).unwrap_or(0);
     let retired = counts.get("retired").and_then(Value::as_u64).unwrap_or(0);
-    println!("{open} open · {done} done · {retired} retired");
+    if default_working_set {
+        let awaiting = items
+            .iter()
+            .filter(|item| agenda_answer_awaiting_pickup(item))
+            .count();
+        println!("{open} open · {awaiting} awaiting pickup · {done} done · {retired} retired");
+    } else {
+        println!("{open} open · {done} done · {retired} retired");
+    }
     Ok(())
+}
+
+/// Print-time twin of the agenda item's `answer_awaiting_pickup` fold. The ctl
+/// receives JSON over MCP, so it derives the same union from the served
+/// answer facts: successful delivery OR an explicit acknowledgement
+/// consumes pickup; a read never does.
+fn agenda_answer_awaiting_pickup(item: &Value) -> bool {
+    if item.get("kind").and_then(Value::as_str) != Some("question")
+        || item.get("status").and_then(Value::as_str) != Some("done")
+    {
+        return false;
+    }
+    let Some(answer) = item.get("answer").and_then(Value::as_object) else {
+        return false;
+    };
+    answer.get("delivered").and_then(Value::as_bool) != Some(true)
+        && answer.get("acknowledged").is_none_or(Value::is_null)
+}
+
+fn agenda_list_status_matches(
+    item: &Value,
+    default_working_set: bool,
+    status: Option<&str>,
+) -> bool {
+    let item_status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    if default_working_set {
+        item_status == "open" || agenda_answer_awaiting_pickup(item)
+    } else {
+        status.is_none_or(|expected| item_status == expected)
+    }
 }
 
 /// Print-time twin of the daemon's `agenda::is_blocked` derivation (the
@@ -3505,6 +3558,7 @@ fn agenda_print_item_detail(item: &Value) {
 
 fn agenda_render_row(item: &Value, blocked: bool, all_items: &[Value]) -> String {
     let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+    let awaiting_pickup = agenda_answer_awaiting_pickup(item);
     let glyph = match (field("status"), field("kind")) {
         ("open", "question") => "?",
         ("done", _) => "✓",
@@ -3514,11 +3568,18 @@ fn agenda_render_row(item: &Value, blocked: bool, all_items: &[Value]) -> String
     let mut row = format!(
         "{glyph} {}  {:<8}  {}",
         field("id"),
-        field("kind"),
+        if field("status") == "done" && field("kind") == "question" {
+            "answered"
+        } else {
+            field("kind")
+        },
         field("title")
     );
     if blocked {
         row.push_str("  [blocked]");
+    }
+    if awaiting_pickup {
+        row.push_str("  [awaiting pickup]");
     }
     if let Some(answer) = item
         .get("answer")
@@ -3623,11 +3684,16 @@ async fn agenda_transition(
     raw: &[String],
 ) -> Result<(), String> {
     let args = parse_command_args(raw, &["--source"], &[])?;
+    let cli_verb = if op == "acknowledge_answer" {
+        "acknowledge"
+    } else {
+        op
+    };
     let id = agenda_resolve_id(
         client,
         config,
         &args,
-        &format!("agenda {op} requires an item id (a unique prefix is enough)"),
+        &format!("agenda {cli_verb} requires an item id (a unique prefix is enough)"),
     )
     .await?;
     let mut map = Map::new();
@@ -5996,6 +6062,7 @@ fn help_agenda() {
       # --consequence names what happens if the question lapses unanswered, and\n\
       # --due doubles as its expiry (when silence starts to mean the consequence)\n\
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
+  intendant ctl agenda acknowledge ID_PREFIX [--source LABEL]   # explicitly consume a listed answer\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
   intendant ctl agenda show ID_PREFIX [--json]   # ONE item, full detail — never fetches the ledger\n\
   intendant ctl agenda annotate ID_PREFIX NOTE... [--source LABEL]\n\
@@ -6253,6 +6320,67 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn agenda_default_working_set_includes_only_unconsumed_answers_beside_open_items() {
+        let open = serde_json::json!({"kind":"task","status":"open"});
+        let plain_answer = serde_json::json!({
+            "kind":"question", "status":"done", "answer":{"text":"A","at_ms":2}
+        });
+        let missed_delivery = serde_json::json!({
+            "kind":"question", "status":"done",
+            "answer":{"text":"A","at_ms":2,"delivered":false}
+        });
+        let delivered = serde_json::json!({
+            "kind":"question", "status":"done",
+            "answer":{"text":"A","at_ms":2,"delivered":true}
+        });
+        let acknowledged = serde_json::json!({
+            "kind":"question", "status":"done",
+            "answer":{"text":"A","at_ms":2,"acknowledged":{"at_ms":3}}
+        });
+        let completed_without_answer = serde_json::json!({"kind":"question","status":"done"});
+
+        assert!(agenda_list_status_matches(&open, true, None));
+        assert!(agenda_list_status_matches(&plain_answer, true, None));
+        assert!(agenda_list_status_matches(&missed_delivery, true, None));
+        assert!(!agenda_list_status_matches(&delivered, true, None));
+        assert!(!agenda_list_status_matches(&acknowledged, true, None));
+        assert!(!agenda_list_status_matches(
+            &completed_without_answer,
+            true,
+            None
+        ));
+
+        // Named lifecycle filters stay exact: --open never grows the
+        // answered pickup union, while --done still includes every done
+        // answer regardless of pickup state.
+        assert!(!agenda_list_status_matches(
+            &plain_answer,
+            false,
+            Some("open")
+        ));
+        assert!(agenda_list_status_matches(
+            &acknowledged,
+            false,
+            Some("done")
+        ));
+    }
+
+    #[test]
+    fn agenda_answered_row_names_kind_and_pickup_state() {
+        let item = serde_json::json!({
+            "id":"01ANSWER",
+            "kind":"question",
+            "status":"done",
+            "title":"Which grid?",
+            "answer":{"text":"Use A","at_ms":2,"delivered":false}
+        });
+        let row = agenda_render_row(&item, false, &[]);
+        assert!(row.contains("answered"), "{row}");
+        assert!(row.contains("[awaiting pickup]"), "{row}");
+        assert!(row.contains("↳ Use A"), "{row}");
     }
 
     /// The approve-while-blocked warning is NAMED (the UX rider: the
