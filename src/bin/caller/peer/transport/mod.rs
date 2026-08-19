@@ -17,6 +17,7 @@
 
 pub mod intendant;
 pub mod multi;
+pub(crate) mod openclaw;
 pub use crate::access::pinning;
 pub(crate) mod tls_client;
 
