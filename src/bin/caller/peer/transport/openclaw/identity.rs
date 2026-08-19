@@ -58,10 +58,6 @@
 //! (the transport seat owns the state-root layout; tests inject
 //! tempdirs per the hermetic-tests law).
 
-// Slice-1 seam: consumed by the OpenClaw transport actor seat landing
-// concurrently with this module. Remove once the transport is wired.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -190,6 +186,10 @@ impl DeviceIdentity {
     }
 
     /// The wire public key: unpadded base64url of the raw 32 bytes.
+    /// Production callers ride [`Self::connect_proof`]; this accessor
+    /// serves the identity tests and the future ctl/dashboard surface
+    /// that shows the operator what to expect in `openclaw devices`.
+    #[allow(dead_code)]
     pub(crate) fn public_key_base64url(&self) -> &str {
         &self.public_key_b64url
     }

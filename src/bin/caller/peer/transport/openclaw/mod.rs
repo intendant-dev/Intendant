@@ -16,11 +16,18 @@
 //!   vendored `protocol.schema.json` snapshot.
 //! - [`identity`] — Ed25519 device identity, challenge signing, and
 //!   the persisted device token.
+//! - [`transport`] — the [`PeerTransport`] implementation (operator
+//!   client: handshake, pairing, keepalive, message relay).
 //! - `mock_gateway` (test-only) — hermetic in-process v4 gateway for
 //!   integration tests.
+//!
+//! [`PeerTransport`]: crate::peer::traits::PeerTransport
 
 pub(crate) mod identity;
+pub(crate) mod transport;
 pub(crate) mod wire;
+
+pub(crate) use transport::OpenClawWsTransport;
 
 #[cfg(test)]
 pub(crate) mod mock_gateway;

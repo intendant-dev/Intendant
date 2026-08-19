@@ -135,6 +135,15 @@ pub(crate) fn build_and_hydrate_peer_registry(
             &access::backend::select_backend().cert_dir(),
         ),
     );
+    // Durable home for OpenClaw device identities + per-gateway device
+    // tokens, beside the other private peer credential material in the
+    // access store (same production-edge resolution as the attestation
+    // floors above; tests inject their own registries + temp dirs).
+    registry.set_openclaw_state_dir(
+        access::backend::select_backend()
+            .cert_dir()
+            .join("openclaw"),
+    );
     for cfg in peer_configs {
         // Per-entry failures degrade to a startup diagnostic and skip
         // that one peer — a typo'd [[peer]] block must not take down

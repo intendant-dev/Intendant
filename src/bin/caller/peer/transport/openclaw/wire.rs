@@ -38,11 +38,8 @@
 //! because the gateway validates `connect` strictly
 //! (`additionalProperties: false`).
 
-// Slice-1 seam: these types are consumed by the OpenClaw transport
 // actor and mock-gateway seats landing concurrently with this module.
 // Remove once the transport impl is wired.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
