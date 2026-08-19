@@ -24,8 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerSharedViewInfo,
-    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
+    MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerPairingInfo,
+    PeerSharedViewInfo, PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
 };
 use crate::peer::handle::{ConnectionState, PeerCommand, PeerGrantInfo, PeerLinkInfo};
 use crate::peer::id::PeerId;
@@ -214,6 +214,13 @@ pub(crate) struct PeerActor {
     /// Connection-scoped like `sessions_tx` — cleared on disconnect;
     /// re-advertised by the peer on every connect.
     pub grant_tx: watch::Sender<Option<PeerGrantInfo>>,
+    /// Published view of the peer-side enrollment gate, folded from
+    /// [`PeerEvent::PairingStateChanged`] (OpenClaw pairing is the
+    /// canonical producer). Deliberately NOT connection-scoped — the
+    /// state exists to explain failed connect attempts, so it survives
+    /// disconnects and clears on the next successful connect (or an
+    /// explicit `pending: None` from the transport).
+    pub pairing_tx: watch::Sender<Option<PeerPairingInfo>>,
     /// Published delegation-receipt ledger, folded from
     /// [`PeerEvent::TaskReceipt`]: delegation id → the peer's local
     /// identity for the accepted task. `PeerHandle::delegate_task`
@@ -313,6 +320,15 @@ impl PeerActor {
                     let _ = self
                         .link_tx
                         .send(PeerLinkInfo::from_spec(self.transport.spec()));
+                    // A successful connect proves any enrollment gate
+                    // (OpenClaw pairing) has been passed — clear the
+                    // pending-pairing fold so the dashboard stops
+                    // telling the operator to approve it.
+                    self.pairing_tx.send_if_modified(|pending| {
+                        let had = pending.is_some();
+                        *pending = None;
+                        had
+                    });
                     let _ = self.connection_tx.send(ConnectionState::Connected);
                     let _ = self.status_tx.send(PeerStatus::Idle);
                     self.emit_event(PeerEvent::Connected { card: new_card })
@@ -381,6 +397,17 @@ impl PeerActor {
             let delay = backoff.next_delay();
             let sleep = tokio::time::sleep(delay);
             tokio::pin!(sleep);
+            // Transports may emit events from *failed* connect attempts
+            // — the OpenClaw transport reports its pairing gate
+            // (`PeerEvent::PairingStateChanged`) before `connect()`
+            // returns the error. Drain and fold those during the
+            // backoff too; otherwise they'd sit queued (invisible to
+            // the dashboard) until the first successful connect, which
+            // for a pairing-gated peer is exactly the moment they stop
+            // mattering. `events_open` guards the branch after the
+            // channel closes so a dropped sender can't busy-loop the
+            // select.
+            let mut events_open = true;
             let cancelled = loop {
                 tokio::select! {
                     _ = &mut sleep => break false,
@@ -396,6 +423,12 @@ impl PeerActor {
                                 // All handles dropped — shut down.
                                 break true;
                             }
+                        }
+                    }
+                    maybe_event = self.events_in_rx.recv(), if events_open => {
+                        match maybe_event {
+                            Some(event) => self.handle_event(event).await,
+                            None => events_open = false,
                         }
                     }
                 }
@@ -498,6 +531,13 @@ impl PeerActor {
                 let mut patched = card.clone();
                 self.apply_operator_overrides(&mut patched);
                 let _ = self.card_tx.send(Arc::new(patched));
+                // Same pairing-clear as the transport-connect path: a
+                // live (re-)announce proves the enrollment gate is open.
+                self.pairing_tx.send_if_modified(|pending| {
+                    let had = pending.is_some();
+                    *pending = None;
+                    had
+                });
             }
             PeerEvent::SessionStarted { session } | PeerEvent::SessionUpdated { session } => {
                 self.sessions
@@ -631,6 +671,20 @@ impl PeerActor {
                     operations: operations.clone(),
                 }));
             }
+            PeerEvent::PairingStateChanged { pending } => {
+                // `send_if_modified` so a transport re-reporting the
+                // same pending request on every retry (the normal
+                // pairing-gated reconnect loop) doesn't push a
+                // redundant PeerStateChanged snapshot per attempt.
+                self.pairing_tx.send_if_modified(|state| {
+                    if state == pending {
+                        false
+                    } else {
+                        state.clone_from(pending);
+                        true
+                    }
+                });
+            }
             PeerEvent::Disconnected { .. } => {
                 if !self.sessions.is_empty() {
                     self.sessions.clear();
@@ -646,6 +700,10 @@ impl PeerActor {
                 // Link + grant are connection-scoped like the folds
                 // above: the next connect re-records the winning
                 // candidate, and the peer re-advertises its grant.
+                // `pairing_tx` is deliberately NOT cleared here — a
+                // pending enrollment gate is what *explains* the
+                // disconnected/reconnecting loop, so it must outlive
+                // the failed attempts (cleared on successful connect).
                 self.link_tx.send_if_modified(|link| {
                     let had = link.is_some();
                     *link = None;
@@ -1044,6 +1102,7 @@ mod tests {
         let (receipts_tx, _receipts_rx) = watch::channel(Arc::new(HashMap::new()));
         let (link_tx, _link_rx) = watch::channel(None);
         let (grant_tx, _grant_rx) = watch::channel(None);
+        let (pairing_tx, _pairing_rx) = watch::channel(None);
         let actor = PeerActor {
             peer_id,
             transport: Box::new(StubTransport(
@@ -1067,6 +1126,7 @@ mod tests {
             shared_view: None,
             link_tx,
             grant_tx,
+            pairing_tx,
             receipts_tx,
             receipts: HashMap::new(),
             receipt_order: VecDeque::new(),
@@ -1133,6 +1193,87 @@ mod tests {
             link_rx.borrow().is_none(),
             "link is connection-scoped and must clear on disconnect"
         );
+    }
+
+    /// The pairing fold has the OPPOSITE clearing semantics of the
+    /// grant/link folds: `PairingStateChanged` sets it, a `Disconnected`
+    /// leaves it standing (a pending enrollment gate is what explains
+    /// the failing reconnect loop), and a `Connected` — proof the gate
+    /// opened — clears it. Re-reports of the same pending request must
+    /// not re-notify the watch (no redundant dashboard snapshots per
+    /// retry).
+    #[tokio::test]
+    async fn pairing_fold_survives_disconnect_and_clears_on_connect() {
+        let (log_tx, _log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        let mut pairing_rx = actor.pairing_tx.subscribe();
+        pairing_rx.mark_unchanged();
+
+        let pending = Some(crate::peer::event::PeerPairingInfo {
+            request_id: "req-7".into(),
+            message: Some("run `openclaw devices approve req-7`".into()),
+        });
+        actor
+            .handle_event(PeerEvent::PairingStateChanged {
+                pending: pending.clone(),
+            })
+            .await;
+        assert!(pairing_rx.has_changed().unwrap(), "first report notifies");
+        {
+            let folded = pairing_rx.borrow_and_update();
+            assert_eq!(
+                folded.as_ref().map(|p| p.request_id.as_str()),
+                Some("req-7")
+            );
+        }
+
+        // Same pending state re-reported (retry loop) → no re-notify.
+        actor
+            .handle_event(PeerEvent::PairingStateChanged {
+                pending: pending.clone(),
+            })
+            .await;
+        assert!(
+            !pairing_rx.has_changed().unwrap(),
+            "identical re-report must not re-notify the watch"
+        );
+
+        // Disconnect leaves the pairing state standing.
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "gateway refused: pairing required".into(),
+            })
+            .await;
+        assert!(
+            pairing_rx.borrow_and_update().is_some(),
+            "pairing state must survive disconnect"
+        );
+
+        // A successful (re-)announce clears it.
+        let card = AgentCard {
+            id: PeerId::new(crate::peer::id::PeerKind::OpenClaw, "gw"),
+            label: "gw".into(),
+            version: "1.0.0".into(),
+            git_sha: None,
+            transports: Vec::new(),
+            capabilities: Vec::new(),
+            auth: crate::peer::card::AuthRequirements::none(),
+            identity_attestation: None,
+        };
+        actor.handle_event(PeerEvent::Connected { card }).await;
+        assert!(
+            pairing_rx.borrow_and_update().is_none(),
+            "pairing state must clear on successful connect"
+        );
+
+        // An explicit transport-side clear also works.
+        actor
+            .handle_event(PeerEvent::PairingStateChanged { pending })
+            .await;
+        actor
+            .handle_event(PeerEvent::PairingStateChanged { pending: None })
+            .await;
+        assert!(pairing_rx.borrow_and_update().is_none());
     }
 
     #[tokio::test]

@@ -74,6 +74,22 @@ pub enum PeerEvent {
         operations: Vec<String>,
     },
 
+    /// The peer's enrollment gate changed: connecting now requires an
+    /// out-of-band approval on the peer's side before a connect can
+    /// succeed (OpenClaw Gateway pairing is the canonical producer —
+    /// a new device's `connect` is answered with `PAIRING_REQUIRED`
+    /// and a request id the gateway host approves with
+    /// `openclaw devices approve <request-id>`). Transports emit
+    /// `Some(info)` when a connect attempt is refused pending
+    /// approval, and may emit `None` to clear explicitly; the actor
+    /// also clears the fold on the next successful connect. Unlike
+    /// the connection-scoped folds, this one deliberately SURVIVES
+    /// disconnect — it exists precisely to explain why the reconnect
+    /// loop keeps failing.
+    PairingStateChanged {
+        pending: Option<PeerPairingInfo>,
+    },
+
     // ---- Activity stream — what the peer is doing right now ----
     /// A unit of work has begun (turn, tool call, sub-agent run, delegated
     /// task, etc). Activities have an opaque id and a kind for routing.
@@ -673,6 +689,32 @@ pub struct PeerSharedViewInfo {
     pub region: Option<crate::types::SharedViewRegion>,
 }
 
+/// A pending out-of-band enrollment approval gating this daemon's
+/// connection to a peer, folded from [`PeerEvent::PairingStateChanged`]
+/// by the per-peer actor and surfaced on
+/// [`crate::peer::handle::PeerSnapshot::pairing`] so the dashboard can
+/// tell the operator exactly what to do ("pairing pending — approve on
+/// the gateway host"). Producer today: the OpenClaw Gateway transport's
+/// `PAIRING_REQUIRED` handshake answer; the shape is transport-neutral
+/// on purpose (any future peer kind with a host-side enrollment
+/// ceremony folds into the same field).
+///
+/// Fold semantics (see the actor): replaced by each
+/// `PairingStateChanged`, cleared on successful connect, NOT cleared on
+/// disconnect — while pairing is pending every connect attempt fails,
+/// so the state must outlive the failed attempts it explains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPairingInfo {
+    /// Peer-side identity of the pending approval — for OpenClaw, the
+    /// pairing request id the host approves with
+    /// `openclaw devices approve <request-id>`.
+    pub request_id: String,
+    /// Optional human-readable next-step text from the peer (OpenClaw's
+    /// `error.details.recommendedNextStep`, when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: String,
@@ -865,6 +907,41 @@ mod tests {
         for evt in [started, progress, completed] {
             let json = serde_json::to_string(&evt).unwrap();
             let _: PeerEvent = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    /// The pairing-state event round-trips and its wire name is pinned:
+    /// the dashboard's per-peer event lane and the durable peers.jsonl
+    /// log both dispatch on the serialized `event` tag, so the string
+    /// is a wire contract, not an implementation detail. The pending
+    /// payload also elides its absent optional message.
+    #[test]
+    fn pairing_state_changed_round_trip_and_wire_name() {
+        let evt = PeerEvent::PairingStateChanged {
+            pending: Some(PeerPairingInfo {
+                request_id: "req-42".into(),
+                message: None,
+            }),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(
+            json.contains(r#""event":"pairing_state_changed""#),
+            "wire tag pinned: {json}"
+        );
+        assert!(!json.contains("message"), "absent message elided: {json}");
+        match serde_json::from_str::<PeerEvent>(&json).unwrap() {
+            PeerEvent::PairingStateChanged { pending } => {
+                assert_eq!(pending.unwrap().request_id, "req-42");
+            }
+            _ => panic!("wrong event variant"),
+        }
+
+        // The explicit-clear form (pending: None) round-trips too.
+        let clear = PeerEvent::PairingStateChanged { pending: None };
+        let json = serde_json::to_string(&clear).unwrap();
+        match serde_json::from_str::<PeerEvent>(&json).unwrap() {
+            PeerEvent::PairingStateChanged { pending } => assert!(pending.is_none()),
+            _ => panic!("wrong event variant"),
         }
     }
 

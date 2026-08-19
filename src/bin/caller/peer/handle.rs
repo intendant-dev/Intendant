@@ -24,8 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerSharedViewInfo,
-    PeerStatus, SessionInfo, TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
+    ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerPairingInfo,
+    PeerSharedViewInfo, PeerStatus, SessionInfo, TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
 use crate::peer::log_writer::EnqueuedPeerEvent;
@@ -352,6 +352,11 @@ struct PeerHandleInner {
     /// [`PeerGrantInfo`]) — connection-scoped; `None` means unknown
     /// (older peer or not yet advertised), not "nothing allowed".
     grant: watch::Receiver<Option<PeerGrantInfo>>,
+    /// The peer-side enrollment gate blocking this daemon's connects
+    /// (see [`PeerPairingInfo`]) — folded from
+    /// [`PeerEvent::PairingStateChanged`]; survives disconnects and
+    /// clears on the next successful connect.
+    pairing: watch::Receiver<Option<PeerPairingInfo>>,
     /// Delegation-receipt ledger folded by the actor from
     /// [`PeerEvent::TaskReceipt`] (delegation id → the peer's local
     /// task/session identity). [`PeerHandle::delegate_task`] awaits an
@@ -428,6 +433,14 @@ impl PeerHandle {
         self.inner.grant.clone()
     }
 
+    /// Subscribe to enrollment-gate changes (see [`PeerPairingInfo`]).
+    /// The registry's state observer folds these into `PeerStateChanged`
+    /// pushes so the dashboard's "pairing pending" pill tracks the gate
+    /// without polling.
+    pub fn pairing_updates(&self) -> watch::Receiver<Option<PeerPairingInfo>> {
+        self.inner.pairing.clone()
+    }
+
     /// Watch the peer's folded shared-view state (see
     /// [`PeerSnapshot::shared_view`]). The registry's state observer
     /// selects on this so every change pushes a fresh `PeerStateChanged`
@@ -482,6 +495,7 @@ impl PeerHandle {
             shared_view: self.inner.shared_view.borrow().clone(),
             link: self.inner.link.borrow().clone(),
             grant: self.inner.grant.borrow().clone(),
+            pairing: self.inner.pairing.borrow().clone(),
         }
     }
 
@@ -1035,6 +1049,16 @@ pub struct PeerSnapshot {
     /// as denial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<PeerGrantInfo>,
+    /// The peer-side enrollment gate blocking this daemon's connects,
+    /// when one is pending (see [`PeerPairingInfo`] — OpenClaw Gateway
+    /// pairing is the canonical producer). The dashboard renders it as
+    /// a "pairing pending" pill carrying the request id the operator
+    /// approves on the peer's side (`openclaw devices approve <id>`).
+    /// `None` = no known gate. Survives disconnects (it explains the
+    /// failing reconnect loop); cleared by the next successful
+    /// connect. `serde(default)` keeps older producers parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<PeerPairingInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,6 +1138,7 @@ where
     let (receipts_tx, receipts_rx) = watch::channel(Arc::new(HashMap::new()));
     let (link_tx, link_rx) = watch::channel(None);
     let (grant_tx, grant_rx) = watch::channel(None);
+    let (pairing_tx, pairing_rx) = watch::channel(None);
 
     let transport = build_transport(events_in_tx);
     let features = transport.features();
@@ -1136,6 +1161,7 @@ where
         shared_view: None,
         link_tx,
         grant_tx,
+        pairing_tx,
         receipts_tx,
         receipts: HashMap::new(),
         receipt_order: std::collections::VecDeque::new(),
@@ -1160,6 +1186,7 @@ where
             shared_view: shared_view_rx,
             link: link_rx,
             grant: grant_rx,
+            pairing: pairing_rx,
             receipts: receipts_rx,
             commands: commands_tx,
             events: events_out_tx,
@@ -1175,9 +1202,9 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Snapshots from daemons predating the link/grant fields (and the
-    /// wire the dashboard round-trips) must keep parsing: both fields
-    /// are `serde(default)` and elided when absent.
+    /// Snapshots from daemons predating the link/grant/pairing fields
+    /// (and the wire the dashboard round-trips) must keep parsing: all
+    /// three fields are `serde(default)` and elided when absent.
     #[test]
     fn peer_snapshot_backcompat_without_link_and_grant() {
         let json = r#"{
@@ -1191,6 +1218,7 @@ mod tests {
         let snap: PeerSnapshot = serde_json::from_str(json).expect("old snapshot parses");
         assert!(snap.link.is_none());
         assert!(snap.grant.is_none());
+        assert!(snap.pairing.is_none());
 
         // And the new fields round-trip when present.
         let mut snap = snap;
@@ -1202,14 +1230,24 @@ mod tests {
             profile: "peer-operator".into(),
             operations: vec!["message.send".into()],
         });
+        snap.pairing = Some(PeerPairingInfo {
+            request_id: "req-9".into(),
+            message: Some("approve on the gateway host".into()),
+        });
         let round = serde_json::to_string(&snap).unwrap();
         assert!(
             round.contains(r#""transport_class":"relayed""#),
             "snake_case wire form for the class: {round}"
         );
+        assert!(
+            round.contains(r#""pairing":{"request_id":"req-9""#),
+            "pairing wire shape pinned (the dashboard pill reads \
+             pairing.request_id): {round}"
+        );
         let back: PeerSnapshot = serde_json::from_str(&round).unwrap();
         assert_eq!(back.link, snap.link);
         assert_eq!(back.grant, snap.grant);
+        assert_eq!(back.pairing, snap.pairing);
     }
 
     #[test]
@@ -1339,6 +1377,113 @@ mod tests {
             ConnectionState::Disconnected,
             "actor didn't transition to Disconnected"
         );
+    }
+
+    /// End-to-end pairing-gate visibility: a transport whose connect
+    /// attempts are refused pending an out-of-band approval (the
+    /// OpenClaw `PAIRING_REQUIRED` shape) reports the gate via
+    /// `PeerEvent::PairingStateChanged` *before* returning the connect
+    /// error — and the pending state must surface on
+    /// `PeerSnapshot::pairing` while the actor sits in the reconnect
+    /// loop, not only after some later successful connect. This pins
+    /// the reconnect-window event drain in `PeerActor::run`: without
+    /// it the event sits queued exactly as long as it matters.
+    #[tokio::test]
+    async fn pairing_gate_surfaces_on_snapshot_while_reconnecting() {
+        use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
+        use crate::peer::event::PeerPairingInfo;
+        use crate::peer::id::{PeerId, PeerKind};
+        use crate::peer::traits::{PeerOp, PeerOpAck, PeerTransport, TransportFeatures};
+        use tokio::sync::mpsc;
+
+        /// Minimal pairing-gated transport: every connect reports the
+        /// pending request and fails.
+        struct PairingGatedTransport {
+            spec: TransportSpec,
+            events_tx: mpsc::Sender<PeerEvent>,
+        }
+
+        #[async_trait::async_trait]
+        impl PeerTransport for PairingGatedTransport {
+            fn spec(&self) -> &TransportSpec {
+                &self.spec
+            }
+            fn features(&self) -> TransportFeatures {
+                TransportFeatures::default()
+            }
+            async fn connect(&mut self) -> Result<AgentCard, PeerError> {
+                let _ = self
+                    .events_tx
+                    .send(PeerEvent::PairingStateChanged {
+                        pending: Some(PeerPairingInfo {
+                            request_id: "pair-req-1".into(),
+                            message: Some("approve on the gateway host".into()),
+                        }),
+                    })
+                    .await;
+                Err(PeerError::Auth("pairing required".into()))
+            }
+            async fn disconnect(&mut self) -> Result<(), PeerError> {
+                Ok(())
+            }
+            fn is_connected(&self) -> bool {
+                false
+            }
+            async fn send(&mut self, _op: PeerOp) -> Result<PeerOpAck, PeerError> {
+                Err(PeerError::NotConnected)
+            }
+        }
+
+        let spec = TransportSpec::OpenClawWs {
+            url: "ws://127.0.0.1:1".into(),
+            role: crate::peer::card::OpenClawRole::Operator,
+        };
+        let initial_card = AgentCard {
+            id: PeerId::new(PeerKind::OpenClaw, "gated-gw"),
+            label: "gated-gw".into(),
+            version: String::new(),
+            git_sha: None,
+            transports: vec![spec.clone()],
+            capabilities: vec![],
+            auth: AuthRequirements::none(),
+            identity_attestation: None,
+        };
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
+        let handle = spawn_peer(
+            initial_card.id.clone(),
+            initial_card,
+            Vec::new(),
+            None,
+            None,
+            crate::peer::PeerWitnessVantage::Unknown,
+            crate::loopback_token::test_transport_credentials(),
+            log_tx,
+            move |events_tx| Box::new(PairingGatedTransport { spec, events_tx }),
+        );
+
+        // The pending gate must land on the pairing watch (and thus the
+        // snapshot) without any successful connect ever happening.
+        let mut pairing_rx = handle.pairing_updates();
+        let seen = tokio::time::timeout(
+            Duration::from_secs(3),
+            pairing_rx.wait_for(|pending| pending.is_some()),
+        )
+        .await;
+        assert!(
+            seen.is_ok(),
+            "pairing state never surfaced — reconnect-window event drain broken?"
+        );
+
+        let snap = handle.snapshot();
+        let pairing = snap.pairing.expect("snapshot carries the pairing gate");
+        assert_eq!(pairing.request_id, "pair-req-1");
+        assert!(
+            !matches!(snap.connection_state, ConnectionState::Connected),
+            "gate surfaced while NOT connected (state: {:?})",
+            snap.connection_state
+        );
+
+        handle.disconnect().await.expect("disconnect");
     }
 
     /// Session events flowing from a live peer fold into the actor's
