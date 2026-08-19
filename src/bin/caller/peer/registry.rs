@@ -480,8 +480,13 @@ impl PeerRegistry {
         .await
     }
 
+    /// The full pre-built-card entry point. `pub(crate)` for the boot
+    /// path's card-less peer kinds (`[[peer]] transport = "openclaw-ws"`
+    /// synthesizes its card locally — a gateway serves no
+    /// `/.well-known/agent-card.json` to fetch) so they get the same
+    /// label-override / witness-vantage plumbing as fetched cards.
     #[allow(clippy::too_many_arguments)]
-    async fn add_peer_with_card_and_auth_and_client_identity(
+    pub(crate) async fn add_peer_with_card_and_auth_and_client_identity(
         &self,
         card: AgentCard,
         via_urls: Vec<String>,
@@ -642,6 +647,10 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let mut card_rx = handle.card_updates();
         let mut link_rx = handle.link_updates();
         let mut grant_rx = handle.grant_updates();
+        // Enrollment-gate changes (pairing pending / cleared) are rare
+        // one-shot facts, so they ride the wholesale-snapshot lane like
+        // shared-view changes below.
+        let mut pairing_rx = handle.pairing_updates();
         // Shared-view changes ride the same wholesale-snapshot lane:
         // they are rare (a handful per collaboration session), so a
         // full PeerStateChanged per change is cheap and saves the
@@ -658,6 +667,7 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let _ = card_rx.borrow_and_update();
         let _ = link_rx.borrow_and_update();
         let _ = grant_rx.borrow_and_update();
+        let _ = pairing_rx.borrow_and_update();
         let _ = shared_view_rx.borrow_and_update();
 
         loop {
@@ -667,6 +677,7 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
                 r = card_rx.changed() => r,
                 r = link_rx.changed() => r,
                 r = grant_rx.changed() => r,
+                r = pairing_rx.changed() => r,
                 r = shared_view_rx.changed() => r,
             };
             if changed.is_err() {

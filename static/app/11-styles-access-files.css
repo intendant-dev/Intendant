@@ -2087,6 +2087,32 @@
 .daemon-row .status-chip.error {
   color: var(--red);
 }
+/* Kind badge for non-Intendant peers (e.g. "openclaw") — same visual
+   weight as the state pill, distinguished by an outline so it reads
+   as identity, not status. */
+.daemon-row .kind-badge {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  color: var(--subtext0);
+  background: transparent;
+  border: 1px solid var(--surface2);
+  padding: 0 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+/* Pending peer-side enrollment gate (OpenClaw pairing): amber and
+   always visible while pending — it carries the request id the
+   operator must approve on the gateway host. */
+.daemon-row .pairing-pill {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  color: var(--yellow);
+  background: var(--surface1);
+  border: 1px solid rgba(249, 226, 175, 0.4);
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
 .daemon-row .caps {
   display: flex;
   gap: 3px;

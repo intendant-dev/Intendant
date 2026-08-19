@@ -391,7 +391,17 @@ fn configure_peer_mode(config: &mut Config, needle: &str) -> Result<reqwest::Cli
         &user_peers_file(),
         needle,
     )?;
-    config.base_url = peer_mcp_endpoint(&peer.card_url)?;
+    // `--peer` drives the peer's stateless `/mcp` endpoint, which is
+    // derived from its Agent Card URL — an entry without one (an
+    // openclaw-ws gateway) has no such endpoint to drive.
+    let card_url = peer.card_url.as_deref().ok_or_else(|| {
+        format!(
+            "peer '{needle}' is a {} entry with no card_url — `ctl --peer` \
+             drives Intendant peers via their Agent Card /mcp endpoint",
+            peer.transport.as_deref().unwrap_or("card-less")
+        )
+    })?;
+    config.base_url = peer_mcp_endpoint(card_url)?;
     config.bearer = peer.bearer_token.clone();
 
     let mut pins = Vec::with_capacity(peer.pinned_fingerprints.len());
@@ -531,7 +541,10 @@ fn resolve_peer<'a>(
 }
 
 fn peer_matches(peer: &crate::project::PeerConfig, needle: &str) -> bool {
-    if needle == peer.card_url || label_or_host_matches(peer, needle) {
+    if peer.card_url.as_deref() == Some(needle)
+        || peer.url.as_deref() == Some(needle)
+        || label_or_host_matches(peer, needle)
+    {
         return true;
     }
     match needle.rsplit_once(':') {
@@ -551,21 +564,30 @@ fn label_or_host_matches(peer: &crate::project::PeerConfig, needle: &str) -> boo
     card_url_host(peer).is_some_and(|host| host.eq_ignore_ascii_case(needle))
 }
 
+/// Host of the entry's address — `card_url` for card-driven peers,
+/// falling back to the gateway `url` for openclaw-ws entries.
 fn card_url_host(peer: &crate::project::PeerConfig) -> Option<String> {
-    reqwest::Url::parse(&peer.card_url)
-        .ok()
+    peer.card_url
+        .as_deref()
+        .or(peer.url.as_deref())
+        .and_then(|raw| reqwest::Url::parse(raw).ok())
         .and_then(|url| url.host_str().map(str::to_string))
 }
 
 /// Render a configured peer for "which peers exist" error listings:
-/// `label (host)` when both are known, else whichever exists, else card_url.
+/// `label (host)` when both are known, else whichever exists, else the
+/// raw configured address.
 fn describe_peer(peer: &crate::project::PeerConfig) -> String {
     let host = card_url_host(peer);
     match (peer.label.as_deref(), host) {
         (Some(label), Some(host)) => format!("{label} ({host})"),
         (Some(label), None) => label.to_string(),
         (None, Some(host)) => host,
-        (None, None) => peer.card_url.clone(),
+        (None, None) => peer
+            .card_url
+            .clone()
+            .or_else(|| peer.url.clone())
+            .unwrap_or_else(|| "<address-less [[peer]] entry>".to_string()),
     }
 }
 
@@ -7508,16 +7530,9 @@ mod tests {
 
     fn peer_config(card_url: &str, label: Option<&str>) -> crate::project::PeerConfig {
         crate::project::PeerConfig {
-            card_url: card_url.to_string(),
+            card_url: Some(card_url.to_string()),
             label: label.map(str::to_string),
-            bearer_token: None,
-            via_urls: Vec::new(),
-            client_cert: None,
-            client_key: None,
-            pinned_fingerprints: Vec::new(),
-            identity_public_key: None,
-            browser_tcp_via_url: None,
-            certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
+            ..Default::default()
         }
     }
 
@@ -7559,8 +7574,8 @@ mod tests {
         ];
         let peer = resolve_peer(&peers, "dell.example").expect("host matches");
         assert_eq!(
-            peer.card_url,
-            "https://dell.example/.well-known/agent-card.json"
+            peer.card_url.as_deref(),
+            Some("https://dell.example/.well-known/agent-card.json")
         );
     }
 
@@ -7577,8 +7592,8 @@ mod tests {
         assert_eq!(by_label.label.as_deref(), Some("nicks-mac"));
         let by_host = resolve_peer(&peers, "intendant:dell.example").expect("suffix host matches");
         assert_eq!(
-            by_host.card_url,
-            "https://dell.example/.well-known/agent-card.json"
+            by_host.card_url.as_deref(),
+            Some("https://dell.example/.well-known/agent-card.json")
         );
     }
 
@@ -7587,7 +7602,7 @@ mod tests {
         let card_url = "http://localhost:8766/.well-known/agent-card.json";
         let peers = vec![peer_config(card_url, None)];
         let peer = resolve_peer(&peers, card_url).expect("exact card_url matches");
-        assert_eq!(peer.card_url, card_url);
+        assert_eq!(peer.card_url.as_deref(), Some(card_url));
     }
 
     #[test]
@@ -7649,8 +7664,8 @@ bearer_token = "tok"
         assert_eq!(peer.label.as_deref(), Some("dell"));
         assert_eq!(peer.bearer_token.as_deref(), Some("tok"));
         assert_eq!(
-            peer.card_url,
-            "https://dell.example/.well-known/agent-card.json"
+            peer.card_url.as_deref(),
+            Some("https://dell.example/.well-known/agent-card.json")
         );
     }
 
@@ -7673,8 +7688,8 @@ bearer_token = "tok"
         )
         .expect("project layer wins");
         assert_eq!(
-            peer.card_url,
-            "https://project.example/.well-known/agent-card.json"
+            peer.card_url.as_deref(),
+            Some("https://project.example/.well-known/agent-card.json")
         );
     }
 

@@ -563,9 +563,9 @@ peer's profile for this daemon is the sole authority (exactly like the
 
 ## Transports
 
-Phase 1 ships the native Intendant↔Intendant transport. A2A, OpenClaw, and
-MCP-as-peer transports slot in as sibling modules behind the same `PeerTransport`
-trait.
+Phase 1 ships the native Intendant↔Intendant transport. OpenClaw Gateway
+support is landing as slice 1 (see below); A2A and MCP-as-peer transports
+slot in as sibling modules behind the same `PeerTransport` trait.
 
 ### Native WebSocket — `IntendantWsTransport`
 
@@ -585,6 +585,54 @@ back online while running on a fallback, the next reconnect picks it up. Before 
 candidate connects, `features()` reports the *union* of all candidates' features
 so coordinator-level checks don't prematurely reject an op a candidate could
 support once connected.
+
+### OpenClaw Gateway peers (slice 1)
+
+An OpenClaw Gateway is configured as a direct `[[peer]]` entry — it serves no
+Agent Card, so the entry names the gateway's WebSocket endpoint and the daemon
+synthesizes a local card with one `openclaw-ws` transport (kind `openclaw` in
+the id, rendered as a kind badge on the Daemons panel):
+
+```toml
+[[peer]]
+transport = "openclaw-ws"
+url = "ws://gateway-host:18789"        # the gateway's multiplexed port
+role = "operator"                       # default; "node" is a future slice
+label = "home-gateway"                  # display name + registry id suffix
+bearer_token_env = "OPENCLAW_GATEWAY_TOKEN"   # or bearer_token_file = "/path"
+```
+
+The bootstrap credential is a **secret reference** — the name of an
+environment variable (`bearer_token_env`) or a file path
+(`bearer_token_file`), never plaintext in the config — resolved once at
+startup and handed to the transport as the `connect` frame's `auth.token`.
+
+**The pairing ceremony (operator's view).** OpenClaw authenticates devices,
+not just tokens: the first connect from this daemon presents a fresh device
+identity, and the gateway answers `PAIRING_REQUIRED` with a pairing request
+id instead of a session. The peer's row on the Daemons panel then shows an
+amber **`pairing pending · <request-id>`** pill while the daemon keeps
+retrying in the background. To let it in, run on the gateway host:
+
+```bash
+openclaw devices list                     # see pending pairing requests
+openclaw devices approve <request-id>     # approve this daemon
+```
+
+The next reconnect completes the handshake, the pill clears, and the granted
+device token is persisted daemon-side — the bootstrap token is no longer
+load-bearing after that. Widening scopes or switching role later mints a
+*new* pairing request (same pill, new id); token rotation alone cannot expand
+what was approved.
+
+**Current capability (slice 1): message relay.** `ctl peer message` /
+`send_message` maps onto the gateway's chat lane, and gateway chat/session
+events surface in the peer's event feed. Task delegation, approvals
+bridging, attachments, and the `node` role (lending this machine's
+capabilities back to the gateway) are later slices. A build whose OpenClaw
+transport hasn't shipped yet degrades cleanly: the configured peer fails
+registration at startup with the standard "advertises no transport this
+build supports" diagnostic — no panic, no silent nothing.
 
 ### Cert pinning over mTLS — `PinnedMutualTls`
 
