@@ -22,8 +22,10 @@
 //!   (`UNSUPPORTED_ROLE`), a device block with a non-empty string
 //!   `id` is required (`INVALID_REQUEST`), `device.nonce` /
 //!   `device.signedAt` must echo the challenge's `nonce` / `ts`
-//!   (`DEVICE_CHALLENGE_MISMATCH`), and `auth.token` must match the
-//!   configured bootstrap token or a previously minted device token
+//!   (`DEVICE_CHALLENGE_MISMATCH`), and the credential must match:
+//!   `auth.token` = the configured bootstrap token, or `auth.token` /
+//!   `auth.deviceToken` = a previously minted device token — both
+//!   lanes, like the real gateway's `resolveSignatureToken`
 //!   (`UNAUTHORIZED`). A non-`connect` first request gets
 //!   `CONNECT_REQUIRED`. Every rejection sends the structured error
 //!   `res`, then closes 1008 (policy violation). Device signatures
@@ -35,7 +37,10 @@
 //! - Pairing: [`PairingMode::Immediate`] answers `hello-ok` at once;
 //!   [`PairingMode::PairThenApprove`] answers the first connect from
 //!   an unapproved device with `ok:false`,
-//!   `error.code = "PAIRING_REQUIRED"`, `error.details.requestId` +
+//!   `error.code = "NOT_PAIRED"` and the discriminator in
+//!   `error.details.code = "PAIRING_REQUIRED"` (the real gateway's
+//!   shape, per `connect-device-pairing.ts`), plus
+//!   `error.details.requestId` +
 //!   `error.details.recommendedNextStep` (the literal
 //!   `wait_then_retry` — the only next-step value evidenced in the
 //!   upstream docs), then closes 1000. An actively retrying device
@@ -55,10 +60,13 @@
 //!   is closed with code 4000 — pre-auth connections included. The
 //!   enforcement default is **off** so cross-seat tests aren't raced
 //!   by the deliberately tiny default tick.
-//! - RPC: `chat.send` → `res ok:true` (empty payload — the response
-//!   shape is undocumented upstream) followed by a `session.message`
-//!   event on the same connection echoing the text with
-//!   `role:"user"` (the transcript echo of the sender's message);
+//! - RPC: `chat.send` (text in the schema-required `message` param) →
+//!   `res ok:true` (empty payload — the response shape is undocumented
+//!   upstream) followed by a `session.message` event on the same
+//!   connection echoing the text as a nested
+//!   `message: {role:"user", content}` object (upstream's
+//!   `SessionMessagePayload` shape — the transcript echo of the
+//!   sender's message);
 //!   `sessions.list` → a canned one-session payload; anything else →
 //!   `UNKNOWN_METHOD`. Response frames always echo the request `id`.
 //! - Knobs: [`MockGateway::drop_next_response`] swallows the next
@@ -577,21 +585,30 @@ async fn handle_preauth_frame(
         .await;
     }
 
-    // Bootstrap token or a previously minted device token.
+    // Bootstrap token or a previously minted device token. Like the
+    // real gateway's resolveSignatureToken, credentials are read from
+    // either lane: `auth.token` (bootstrap or a hoisted device token)
+    // or `auth.deviceToken` (the reference reconnect lane).
     let token = params["auth"]["token"].as_str().unwrap_or("");
-    let device_token_ok = state
+    let device_token = params["auth"]["deviceToken"].as_str().unwrap_or("");
+    let minted = state
         .device_tokens
         .lock()
         .expect("device tokens lock")
         .get(&device_id)
-        .is_some_and(|minted| minted == token);
-    if token.is_empty() || (token != state.cfg.bootstrap_token && !device_token_ok) {
+        .cloned();
+    let device_token_ok = minted
+        .as_deref()
+        .is_some_and(|m| m == token || m == device_token);
+    if (token.is_empty() && device_token.is_empty())
+        || (token != state.cfg.bootstrap_token && !device_token_ok)
+    {
         return reject_connect(
             state,
             ws,
             &id,
             "UNAUTHORIZED",
-            "connect.params.auth.token must be the bootstrap token or an issued deviceToken",
+            "auth.token must be the bootstrap token, or auth.token/auth.deviceToken an issued deviceToken",
         )
         .await;
     }
@@ -633,9 +650,10 @@ async fn handle_preauth_frame(
                 state,
                 ws,
                 &id,
-                "PAIRING_REQUIRED",
+                "NOT_PAIRED",
                 "device pairing is pending approval on the gateway host",
                 Some(json!({
+                    "code": "PAIRING_REQUIRED",
                     "requestId": request_id,
                     "recommendedNextStep": "wait_then_retry",
                 })),
@@ -706,21 +724,26 @@ async fn handle_rpc_frame(state: &MockState, ws: &mut ServerWs, text: &str) -> R
         "chat.send" => {
             let params = &frame["params"];
             let session_key = params["sessionKey"].as_str().unwrap_or("main").to_string();
-            let text = params["text"].as_str().unwrap_or_default().to_string();
+            // Schema truth: the text rides the required `message` field
+            // (`ChatSendParams` in the machine contract), not `text`.
+            let text = params["message"].as_str().unwrap_or_default().to_string();
             // The chat.send response payload shape is undocumented
             // upstream; the mock answers a bare ok.
             send_res(state, ws, &id, true, json!({})).await?;
             // Echo the message back to this connection as the
             // transcript event (deliberately not gated by
             // drop_next_response — that knob drops responses only).
+            // Upstream's SessionMessagePayload nests the message object
+            // (`{role, content}`) rather than flattening role/text into
+            // the payload — mirror that shape so tolerant readers built
+            // against the real gateway parse the echo.
             let event = json!({
                 "type": "event",
                 "event": "session.message",
                 "payload": {
                     "sessionKey": session_key,
                     "messageId": opaque_id("msg"),
-                    "role": "user",
-                    "text": text,
+                    "message": {"role": "user", "content": text},
                 },
             });
             ws.send(Message::Text(event.to_string().into()))
@@ -932,7 +955,7 @@ mod tests {
                 "type": "req",
                 "id": "rpc-1",
                 "method": "chat.send",
-                "params": {"sessionKey": "main", "text": "round trip!"},
+                "params": {"sessionKey": "main", "message": "round trip!"},
             }),
         )
         .await;
@@ -947,7 +970,7 @@ mod tests {
         })
         .await
         .expect("session.message echo");
-        assert_eq!(echo["payload"]["text"], "round trip!");
+        assert_eq!(echo["payload"]["message"]["content"], "round trip!");
         assert_eq!(echo["payload"]["sessionKey"], "main");
         assert!(echo["payload"]["messageId"]
             .as_str()
@@ -1115,7 +1138,8 @@ mod tests {
         let mut ws = dial(&gw).await;
         let res = connect_result(&mut ws, DEFAULT_BOOTSTRAP_TOKEN, "dev-pair").await;
         assert_eq!(res["ok"], false);
-        assert_eq!(res["error"]["code"], "PAIRING_REQUIRED");
+        assert_eq!(res["error"]["code"], "NOT_PAIRED");
+        assert_eq!(res["error"]["details"]["code"], "PAIRING_REQUIRED");
         let request_id = res["error"]["details"]["requestId"]
             .as_str()
             .expect("pairing request id")
@@ -1133,7 +1157,7 @@ mod tests {
         // duplicated.
         let mut ws = dial(&gw).await;
         let res = connect_result(&mut ws, DEFAULT_BOOTSTRAP_TOKEN, "dev-pair").await;
-        assert_eq!(res["error"]["code"], "PAIRING_REQUIRED");
+        assert_eq!(res["error"]["code"], "NOT_PAIRED");
         assert_eq!(res["error"]["details"]["requestId"], request_id.as_str());
 
         // Approving an unknown request id is refused.
@@ -1307,7 +1331,7 @@ mod tests {
                 "type": "req",
                 "id": "dropped-1",
                 "method": "chat.send",
-                "params": {"text": "lost res"},
+                "params": {"message": "lost res"},
             }),
         )
         .await;
@@ -1316,7 +1340,7 @@ mod tests {
         })
         .await
         .expect("echo event still emitted");
-        assert_eq!(echo["payload"]["text"], "lost res");
+        assert_eq!(echo["payload"]["message"]["content"], "lost res");
         assert!(
             wait_frame(&mut ws, Duration::from_millis(400), |frame| {
                 frame["type"] == "res" && frame["id"] == "dropped-1"

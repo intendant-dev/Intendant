@@ -176,6 +176,12 @@ pub struct TransportCredentials {
     /// (anti-rollback, A4). `None` (tests, ad-hoc dials) keeps
     /// monotonicity in-memory-only for the process.
     pub attestation_state_dir: Option<std::path::PathBuf>,
+    /// Durable home for OpenClaw device identities and per-gateway
+    /// device tokens (`registry.set_openclaw_state_dir`, resolved at
+    /// the production edge in peer boot). `None` (tests, ad-hoc
+    /// registries): the OpenClaw transport refuses to connect with a
+    /// clear error rather than scattering key files.
+    pub openclaw_state_dir: Option<std::path::PathBuf>,
     /// The verification policy the last successful
     /// [`resolve_tls_policy`](IntendantWsTransport::resolve_tls_policy)
     /// produced, shared across clones (like [`TransportCredentials::tls`])

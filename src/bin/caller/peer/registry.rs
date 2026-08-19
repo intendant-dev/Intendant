@@ -120,6 +120,12 @@ struct PeerRegistryInner {
     /// [`TransportCredentials`]; `None` (tests, ad-hoc registries)
     /// leaves the transport on its temp-dir fallback.
     attestation_state_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Durable home for OpenClaw device identities + per-gateway device
+    /// tokens, threaded into every peer's [`TransportCredentials`].
+    /// `None` (tests, ad-hoc registries): the OpenClaw transport
+    /// refuses to connect with a clear error instead of writing key
+    /// files to an unowned location.
+    openclaw_state_dir: RwLock<Option<std::path::PathBuf>>,
 }
 
 impl PeerRegistry {
@@ -131,6 +137,7 @@ impl PeerRegistry {
                 log_sink,
                 events,
                 attestation_state_dir: RwLock::new(None),
+                openclaw_state_dir: RwLock::new(None),
             }),
         }
     }
@@ -140,6 +147,14 @@ impl PeerRegistry {
     /// afterwards persist their monotonicity floors there.
     pub fn set_attestation_state_dir(&self, dir: std::path::PathBuf) {
         *self.inner.attestation_state_dir.write().unwrap() = Some(dir);
+    }
+
+    /// Set the durable home for OpenClaw device identities and
+    /// per-gateway device tokens. Called once at boot with the
+    /// access-store location; OpenClaw peers added afterwards persist
+    /// their Ed25519 identity and minted device tokens there.
+    pub fn set_openclaw_state_dir(&self, dir: std::path::PathBuf) {
+        *self.inner.openclaw_state_dir.write().unwrap() = Some(dir);
     }
 
     /// Subscribe to the registry's push event stream. The receiver
@@ -552,10 +567,12 @@ impl PeerRegistry {
                 .map(|key| key.trim().to_string())
                 .filter(|key| !key.is_empty()),
             attestation_state_dir: self.inner.attestation_state_dir.read().unwrap().clone(),
+            openclaw_state_dir: self.inner.openclaw_state_dir.read().unwrap().clone(),
             effective_tls: Default::default(),
             tls: Default::default(),
         };
         let transport_factory_credentials = transport_credentials.clone();
+        let transport_factory_card = card.clone();
 
         let handle = spawn_peer(
             peer_id.clone(),
@@ -576,6 +593,7 @@ impl PeerRegistry {
                     .map(|spec| {
                         build_transport(
                             spec,
+                            &transport_factory_card,
                             events_tx.clone(),
                             transport_factory_credentials.clone(),
                         )
@@ -807,7 +825,16 @@ async fn fetch_card(
 fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec> {
     transports
         .iter()
-        .filter(|spec| matches!(spec, TransportSpec::IntendantWs { .. }))
+        .filter(|spec| match spec {
+            TransportSpec::IntendantWs { .. } => true,
+            // Slice 1 speaks the operator role only; a node-role spec
+            // stays unsupported so the card falls through to the clean
+            // "advertises no transport this build supports" diagnostic.
+            TransportSpec::OpenClawWs { role, .. } => {
+                matches!(role, crate::peer::card::OpenClawRole::Operator)
+            }
+            _ => false,
+        })
         .cloned()
         .collect()
 }
@@ -816,6 +843,7 @@ fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec>
 /// so the closure passed to `spawn_peer` stays readable.
 fn build_transport(
     spec: &TransportSpec,
+    card: &crate::peer::card::AgentCard,
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
     credentials: crate::peer::transport::intendant::TransportCredentials,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
@@ -825,6 +853,21 @@ fn build_transport(
             events_tx,
             credentials,
         )),
+        TransportSpec::OpenClawWs { .. } => {
+            let transport = crate::peer::transport::openclaw::OpenClawWsTransport::new(
+                spec.clone(),
+                card.clone(),
+                credentials.bearer_token.clone(),
+                credentials.openclaw_state_dir.clone(),
+                events_tx,
+            )
+            // Unreachable by construction: `pick_supported_transports`
+            // admits operator-role specs only, and the constructor
+            // rejects nothing else. Same loud-failure convention as
+            // the arm below.
+            .expect("pick_supported_transports admitted an unbuildable openclaw spec");
+            Box::new(transport)
+        }
         other => {
             // Should be unreachable: `pick_supported_transports`
             // filters to variants this function knows. If we get
