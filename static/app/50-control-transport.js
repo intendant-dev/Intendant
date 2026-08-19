@@ -2649,8 +2649,14 @@ function peerSnapshotToUpdateUsage(snap) {
 function snapshotToDaemonEntry(p) {
   return {
     host_id: p.id,
+    // Daemon kind, derived from the id's prefix ("intendant:x",
+    // "openclaw:x", …) — the id is the single source of truth for
+    // kind (PeerId::kind()), so no kind catalog is mirrored here.
+    kind: String(p.id || '').split(':')[0] || '',
     label: p.label,
-    url: wsUrlToBaseUrl(p.ws_url) || '',
+    // Card-less peers (openclaw gateways) have no ws_url; once
+    // connected, the live link's candidate URL is the honest address.
+    url: wsUrlToBaseUrl(p.ws_url) || (p.link && p.link.url) || '',
     connected: p.connection_state && p.connection_state.state === 'connected',
     version: p.version || '',
     git_sha: p.git_sha || '',
@@ -2690,6 +2696,13 @@ function snapshotToDaemonEntry(p) {
     // action pills derive from grant.operations.
     link: p.link || null,
     grant: p.grant || null,
+    // Pending peer-side enrollment gate (PeerSnapshot.pairing):
+    // {request_id, message?} while the peer requires an out-of-band
+    // approval before connects can succeed (OpenClaw pairing), null
+    // otherwise. Survives disconnects server-side; renders as the
+    // amber "pairing pending" pill with the request id the operator
+    // approves on the gateway host.
+    pairing: p.pairing || null,
   };
 }
 
@@ -3109,6 +3122,31 @@ function renderStatePill(connState) {
   return `<span class="state-pill" title="connection state: ${escapeHtml(label)}">${escapeHtml(label)}</span>`;
 }
 
+// Kind badge for non-Intendant peers ("openclaw", and whatever future
+// kinds mint ids under new prefixes). Derived from the row's id prefix
+// — never a hardcoded kind catalog — and suppressed for the default
+// `intendant` kind, which would only be noise on every row.
+function renderKindBadge(kind) {
+  if (!kind || kind === 'intendant') return '';
+  return `<span class="kind-badge" title="peer kind: ${escapeHtml(kind)}">${escapeHtml(kind)}</span>`;
+}
+
+// Amber pill for a pending peer-side enrollment gate
+// (PeerSnapshot.pairing — OpenClaw pairing is the canonical producer).
+// Always visible while pending: it names the request id the operator
+// must approve on the gateway host, which is the one actionable fact
+// when every connect attempt is being refused. The title carries the
+// full ceremony (the gateway's own recommended next step when it sent
+// one, else the standard `openclaw devices approve` invocation).
+function renderPairingPill(pairing) {
+  if (!pairing || !pairing.request_id) return '';
+  const reqId = String(pairing.request_id);
+  const hint = pairing.message
+    ? String(pairing.message)
+    : `Approve on the gateway host: openclaw devices approve ${reqId}`;
+  return `<span class="pairing-pill" title="${escapeHtml(hint)}">pairing pending · ${escapeHtml(reqId)}</span>`;
+}
+
 // Subdued chip showing the peer's PeerStatus. Hidden in the steady-state
 // values (`idle`, `working`) so the chip doesn't compete with the label
 // for attention; only `needs_approval` and `error` surface visibly.
@@ -3173,6 +3211,8 @@ function renderDaemonRow(d, isSelf) {
   // (so if the self entry ever gains them, no further change needed).
   const statePill = isSelf ? '' : renderStatePill(d.server_connection_state);
   const statusChip = isSelf ? '' : renderStatusChip(d.server_status);
+  const kindBadge = isSelf ? '' : renderKindBadge(d.kind);
+  const pairingPill = isSelf ? '' : renderPairingPill(d.pairing);
   const capBadges = renderCapBadges(d.capabilities);
   // Per-peer outbound op controls. Skipped for self — federation ops
   // address other peers, never the daemon hosting the dashboard. The
@@ -3221,7 +3261,9 @@ function renderDaemonRow(d, isSelf) {
       <div class="daemon-row${isSelf ? ' self' : ''}">
         <span class="conn-dot ${dotClass}" title="${escapeHtml(dotTitle)}"></span>
         <span class="label">${peerLabel}${selfMark}</span>
+        ${kindBadge}
         ${statePill}
+        ${pairingPill}
         ${statusChip}
         <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
         ${capBadges}
