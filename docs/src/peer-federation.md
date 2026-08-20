@@ -999,6 +999,12 @@ relationships, not raw endpoints. A daemon relationship has identity, a server
 certificate pin, a peer-scoped client certificate, capability metadata, and local
 policy that can later be changed or revoked.
 
+The accepting gateway must request client certificates: use the default mTLS
+mode or enable `[server.mtls]`. `[server.tls]` and `--tls` are TLS-only and
+cannot accept the peer certificate. Invite creation and request approval still
+succeed so the gateway can be fixed afterward, but Intendant warns while client
+certificate authentication is not armed.
+
 The dashboard's **Access** tab exposes peer relationship management:
 **Invitations** contains onboarding flows, **Peer Trust** shows inbound
 identities and outbound peer routes, and **Daemons** shows peer-routed targets

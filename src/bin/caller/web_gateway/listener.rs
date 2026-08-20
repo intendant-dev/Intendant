@@ -1127,6 +1127,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 
     let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
         config.clone(),
+        tls_client_cert_required,
         broadcast_tx.clone(),
         bus.clone(),
         peer_registry.clone(),

@@ -2396,9 +2396,13 @@ pub(crate) async fn api_peer_dashboard_control_signal_response(
 pub(crate) async fn api_peer_pairing_invite_response(
     id: String,
     params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_invite(&body_text);
+    let (status, body) = crate::web_gateway::peers_pairing_invite(
+        &body_text,
+        runtime.peer_pairing_client_auth_armed,
+    );
     http_body_response(id, status, body, "peer pairing invite")
 }
 
@@ -2487,15 +2491,23 @@ pub(crate) async fn api_peer_pairing_requests_response_from_cert_dir(
 pub(crate) async fn api_peer_pairing_request_decision_response(
     id: String,
     params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let cert_dir = crate::access::backend::select_backend().cert_dir();
-    api_peer_pairing_request_decision_response_from_cert_dir(id, params, &cert_dir).await
+    api_peer_pairing_request_decision_response_from_cert_dir(
+        id,
+        params,
+        &cert_dir,
+        runtime.peer_pairing_client_auth_armed,
+    )
+    .await
 }
 
 pub(crate) async fn api_peer_pairing_request_decision_response_from_cert_dir(
     id: String,
     params: Option<&serde_json::Value>,
     cert_dir: &std::path::Path,
+    peer_pairing_client_auth_armed: bool,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let request_id = string_param(&params, &["request_id", "requestId", "code", "id"]);
@@ -2509,8 +2521,13 @@ pub(crate) async fn api_peer_pairing_request_decision_response_from_cert_dir(
         op
     };
     let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
-    let (status, body) =
-        crate::web_gateway::peers_pairing_request_decision(cert_dir, &request_id, &op, &body_text);
+    let (status, body) = crate::web_gateway::peers_pairing_request_decision(
+        cert_dir,
+        &request_id,
+        &op,
+        &body_text,
+        peer_pairing_client_auth_armed,
+    );
     http_body_response(id, status, body, "peer access request decision")
 }
 
@@ -3876,6 +3893,7 @@ mod tests {
                 &bus,
                 None,
                 None,
+                true,
             )
             .await,
         );
@@ -3904,6 +3922,7 @@ mod tests {
                 &bus,
                 None,
                 None,
+                true,
             )
             .await,
         );
@@ -3913,6 +3932,7 @@ mod tests {
             "parity-decision".to_string(),
             Some(&serde_json::json!({"request_id": "zzz", "op": "badop"})),
             tmp.path(),
+            true,
         )
         .await;
         assert_eq!(frame["ok"], true);
@@ -3928,6 +3948,7 @@ mod tests {
             "parity-decision-missing".to_string(),
             Some(&serde_json::json!({})),
             tmp.path(),
+            true,
         )
         .await;
         assert_eq!(frame["ok"], false);
@@ -3947,6 +3968,7 @@ mod tests {
                 &bus,
                 None,
                 None,
+                true,
             )
             .await,
         );
@@ -3983,6 +4005,7 @@ mod tests {
                 &bus,
                 None,
                 Some(&registry),
+                true,
             )
             .await,
         );
@@ -4014,6 +4037,7 @@ mod tests {
                 &bus,
                 None,
                 Some(&registry),
+                true,
             )
             .await,
         );

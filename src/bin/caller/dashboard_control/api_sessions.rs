@@ -502,7 +502,9 @@ pub(crate) async fn control_request_frame(
         "api_peer_dashboard_control_signal" => {
             api_peer_dashboard_control_signal_response(id, params.as_ref(), &runtime).await
         }
-        "api_peer_pairing_invite" => api_peer_pairing_invite_response(id, params.as_ref()).await,
+        "api_peer_pairing_invite" => {
+            api_peer_pairing_invite_response(id, params.as_ref(), &runtime).await
+        }
         "api_peer_pairing_join" => {
             api_peer_pairing_join_response(id, params.as_ref(), &runtime).await
         }
@@ -514,7 +516,7 @@ pub(crate) async fn control_request_frame(
         }
         "api_peer_pairing_requests" => api_peer_pairing_requests_response(id).await,
         "api_peer_pairing_request_decision" => {
-            api_peer_pairing_request_decision_response(id, params.as_ref()).await
+            api_peer_pairing_request_decision_response(id, params.as_ref(), &runtime).await
         }
         "api_peer_pairing_identities" => api_peer_pairing_identities_response(id).await,
         "api_peer_pairing_identity_revoke" => {

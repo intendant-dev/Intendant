@@ -552,6 +552,7 @@ type TcpFrameSender = mpsc::Sender<Vec<u8>>;
 
 pub struct DashboardControlRegistry {
     config: crate::web_gateway::WebGatewayConfig,
+    peer_pairing_client_auth_armed: bool,
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
@@ -1619,6 +1620,7 @@ impl DashboardControlRegistry {
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
+        peer_pairing_client_auth_armed: bool,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
         peer_registry: Option<crate::peer::PeerRegistry>,
@@ -1638,6 +1640,7 @@ impl DashboardControlRegistry {
     ) -> Self {
         Self {
             config,
+            peer_pairing_client_auth_armed,
             broadcast_tx,
             bus,
             peer_registry,
@@ -1737,6 +1740,7 @@ impl DashboardControlRegistry {
             session_grant,
             client_nonce,
             &self.config,
+            self.peer_pairing_client_auth_armed,
             self.broadcast_tx.clone(),
             self.bus.clone(),
             self.peer_registry.clone(),
@@ -1981,6 +1985,7 @@ impl DashboardControlPeer {
         session_grant: Option<String>,
         client_nonce: Option<String>,
         config: &crate::web_gateway::WebGatewayConfig,
+        peer_pairing_client_auth_armed: bool,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
         peer_registry: Option<crate::peer::PeerRegistry>,
@@ -2098,6 +2103,7 @@ impl DashboardControlPeer {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
+            peer_pairing_client_auth_armed,
             config: Arc::new(
                 serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
             ),
@@ -2183,6 +2189,8 @@ pub(crate) struct ControlRuntime {
     events_subscribed: bool,
     events_sent: u64,
     response_credit_enabled: bool,
+    /// Live gateway truth: unlike persisted config, this includes CLI flags.
+    peer_pairing_client_auth_armed: bool,
     /// Shared, not owned: `ControlRuntime` is cloned per spawned request,
     /// and an owned tree deep-copied this multi-KB JSON every time.
     config: Arc<serde_json::Value>,
@@ -4785,6 +4793,7 @@ mod tests {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
+            peer_pairing_client_auth_armed: true,
             config: Arc::new(serde_json::json!({"provider":"openai"})),
             agent_card: Arc::new(serde_json::json!({
                 "id": "intendant:test-daemon",
