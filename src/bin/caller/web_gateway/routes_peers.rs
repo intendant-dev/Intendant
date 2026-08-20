@@ -147,6 +147,7 @@ pub(crate) async fn handle_peers_sub_router(
 /// every registry-backed leaf returns 503 so the dashboard can render
 /// "peers unavailable" instead of the empty list that a working-but-
 /// empty registry would produce.
+#[allow(clippy::too_many_arguments)] // transport-neutral router dependencies stay explicit at this internal edge
 pub(crate) async fn peers_sub_router_api_response(
     req_method: &str,
     path_token: &str,
