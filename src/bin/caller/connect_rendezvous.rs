@@ -2361,6 +2361,7 @@ mod tests {
         );
         let registry = Arc::new(DashboardControlRegistry::new(
             crate::web_gateway::WebGatewayConfig::default(),
+            true,
             broadcast_tx,
             crate::event::EventBus::new(),
             None,

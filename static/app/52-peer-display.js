@@ -2619,7 +2619,12 @@ async function createDaemonInvite() {
     output.value = result.invite || '';
     if (copyBtn) copyBtn.disabled = !output.value;
     const target = result.card_url ? ` for ${result.card_url}` : '';
-    setDaemonPairingStatus('daemon-invite-status', `Inbound grant invite ready${target}`, 'ok');
+    const success = `Inbound grant invite ready${target}`;
+    setDaemonPairingStatus(
+      'daemon-invite-status',
+      result.warning ? `${success}. Warning: ${result.warning}` : success,
+      result.warning ? 'warn' : 'ok'
+    );
     await loadPeerIdentities();
   } catch (e) {
     setDaemonPairingStatus('daemon-invite-status', `Request failed: ${e.message}`, 'error');
@@ -2908,10 +2913,11 @@ async function decidePeerAccessRequest(requestId, op) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
     }
+    const success = op === 'approve' ? 'Granted inbound access' : 'Denied inbound access';
     setDaemonPairingStatus(
       'daemon-access-requests-status',
-      op === 'approve' ? 'Granted inbound access' : 'Denied inbound access',
-      op === 'approve' ? 'ok' : ''
+      op === 'approve' && result.warning ? `${success}. Warning: ${result.warning}` : success,
+      op === 'approve' ? (result.warning ? 'warn' : 'ok') : ''
     );
     await loadPeerAccessRequests();
     if (op === 'approve') await loadPeerIdentities();

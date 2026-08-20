@@ -2478,6 +2478,7 @@ pub(crate) async fn serve_http_request(
                     bus,
                     project_root,
                     peer_registry,
+                    tls_client_cert_required,
                 )
                 .await;
             }

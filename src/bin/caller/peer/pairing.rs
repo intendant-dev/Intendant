@@ -23,6 +23,32 @@ use crate::project::{PeerConfig, Project};
 const INVITE_PREFIX: &str = "intendant-peer-v1.";
 pub(crate) const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const DEFAULT_WEB_PORT: u16 = intendant_core::net::DEFAULT_GATEWAY_PORT;
+pub(crate) const PEER_CLIENT_AUTH_WARNING: &str =
+    "Peer credentials were issued, but this gateway is not accepting mTLS client certificates. Paired peers cannot connect until the daemon uses its default mTLS gateway or enables [server.mtls].";
+
+/// Whether the configured gateway can accept peer-issued client certificates.
+/// TLS-only is the one incompatible posture; native mTLS is otherwise the
+/// gateway default even when neither section is explicitly enabled.
+pub(crate) fn configured_peer_client_auth_armed(server: &crate::project::ServerConfig) -> bool {
+    server.mtls.enabled || !server.tls.enabled
+}
+
+pub(crate) fn peer_client_auth_warning(client_auth_armed: bool) -> Option<&'static str> {
+    (!client_auth_armed).then_some(PEER_CLIENT_AUTH_WARNING)
+}
+
+/// CLI pairing commands run outside the live web-gateway runtime, so they can
+/// only inspect persisted config (runtime `--tls` flags are not visible here).
+/// Failure to discover a project must never turn successful certificate
+/// issuance into a pairing failure.
+fn warn_if_configured_gateway_not_client_auth_armed() {
+    let Some(warning) = Project::detect().ok().and_then(|project| {
+        peer_client_auth_warning(configured_peer_client_auth_armed(&project.config.server))
+    }) else {
+        return;
+    };
+    eprintln!(":: WARNING: {warning}");
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerInvite {
@@ -365,6 +391,7 @@ fn cmd_invite(args: PeerArgs) -> Result<(), CallerError> {
     println!(":: issued peer invite for {}", invite.card_url);
     println!(":: pinned server cert fingerprint: {server_cert_fingerprint}");
     println!(":: this invite contains a client private key; paste it only to the daemon that should connect");
+    warn_if_configured_gateway_not_client_auth_armed();
     println!("{encoded}");
     Ok(())
 }
@@ -489,6 +516,7 @@ fn cmd_approve(args: PeerArgs) -> Result<(), CallerError> {
             .as_deref()
             .unwrap_or(crate::peer::access_policy::DEFAULT_PROFILE)
     );
+    warn_if_configured_gateway_not_client_auth_armed();
     Ok(())
 }
 
@@ -992,6 +1020,23 @@ mod tests {
             Vec::<String>::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pairing_client_auth_posture_distinguishes_tls_only() {
+        let mut server = crate::project::ServerConfig::default();
+        assert!(configured_peer_client_auth_armed(&server));
+        assert_eq!(peer_client_auth_warning(true), None);
+
+        server.tls.enabled = true;
+        assert!(!configured_peer_client_auth_armed(&server));
+        assert_eq!(
+            peer_client_auth_warning(false),
+            Some(PEER_CLIENT_AUTH_WARNING)
+        );
+
+        server.mtls.enabled = true;
+        assert!(configured_peer_client_auth_armed(&server));
     }
 
     #[test]

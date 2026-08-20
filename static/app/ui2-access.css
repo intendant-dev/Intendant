@@ -983,6 +983,7 @@ html.ui-v2 .daemon-add-row button:hover { background: var(--surface-2); border-c
 html.ui-v2 .daemon-pairing-status { font-size: 11.5px; color: var(--text-3); }
 html.ui-v2 .daemon-pairing-status.error { color: var(--rose); }
 html.ui-v2 .daemon-pairing-status.ok { color: var(--green); }
+html.ui-v2 .daemon-pairing-status.warn { color: var(--amber); font-weight: 600; }
 html.ui-v2 .daemons-status { font-size: 11.5px; color: var(--text-3); }
 html.ui-v2 .daemons-status.error { color: var(--rose); }
 html.ui-v2 .daemons-status.ok { color: var(--green); }

@@ -92,6 +92,7 @@ pub(crate) async fn handle_peers_sub_router(
     bus: EventBus,
     project_root: Option<PathBuf>,
     peer_registry: Option<crate::peer::PeerRegistry>,
+    peer_pairing_client_auth_armed: bool,
 ) {
     // Extract the *path* token from the request line (the second
     // whitespace-separated word) — splitting on `/api/peers` directly
@@ -106,6 +107,7 @@ pub(crate) async fn handle_peers_sub_router(
         &bus,
         project_root.as_deref(),
         peer_registry.as_ref(),
+        peer_pairing_client_auth_armed,
     )
     .await;
     write_api_response(
@@ -153,6 +155,7 @@ pub(crate) async fn peers_sub_router_api_response(
     bus: &EventBus,
     project_root: Option<&Path>,
     peer_registry: Option<&crate::peer::PeerRegistry>,
+    peer_pairing_client_auth_armed: bool,
 ) -> ApiResponse {
     // Split path from query string. `/api/peers/eligible
     // ?capability=display` needs the query stripped before
@@ -168,7 +171,7 @@ pub(crate) async fn peers_sub_router_api_response(
     let segments: Vec<&str> = subpath.split('/').filter(|s| !s.is_empty()).collect();
 
     let (status, body) = if segments == ["pairing", "invite"] && req_method == "POST" {
-        peers_pairing_invite(body_text)
+        peers_pairing_invite(body_text, peer_pairing_client_auth_armed)
     } else if segments == ["pairing", "request-access"] && req_method == "POST" {
         peers_pairing_request_access(cert_dir, body_text).await
     } else if segments == ["pairing", "request-access", "poll"] && req_method == "POST" {
@@ -184,7 +187,13 @@ pub(crate) async fn peers_sub_router_api_response(
         && segments[1] == "requests"
         && req_method == "POST"
     {
-        peers_pairing_request_decision(cert_dir, segments[2], segments[3], body_text)
+        peers_pairing_request_decision(
+            cert_dir,
+            segments[2],
+            segments[3],
+            body_text,
+            peer_pairing_client_auth_armed,
+        )
     } else {
         match peer_registry {
             None => (
@@ -465,7 +474,10 @@ pub(crate) async fn peers_add(
 /// Handle `POST /api/peers/pairing/invite`: issue a peer-scoped mTLS
 /// client identity from this daemon's access CA and return the same
 /// encoded invite string as `intendant peer invite`.
-pub(crate) fn peers_pairing_invite(body_text: &str) -> (u16, String) {
+pub(crate) fn peers_pairing_invite(
+    body_text: &str,
+    peer_pairing_client_auth_armed: bool,
+) -> (u16, String) {
     let req: PairingInviteRequest = if body_text.trim().is_empty() {
         PairingInviteRequest::default()
     } else {
@@ -494,17 +506,19 @@ pub(crate) fn peers_pairing_invite(body_text: &str) -> (u16, String) {
         client_name: req.client_name,
         port,
     }) {
-        Ok(outcome) => (
-            200,
-            serde_json::json!({
+        Ok(outcome) => {
+            let response = serde_json::json!({
                 "invite": outcome.encoded,
                 "card_url": outcome.invite.card_url,
                 "label": outcome.invite.label,
                 "server_cert_fingerprint": outcome.server_cert_fingerprint,
                 "issued_at_unix": outcome.invite.issued_at_unix,
-            })
-            .to_string(),
-        ),
+            });
+            (
+                200,
+                pairing_response_with_client_auth_warning(response, peer_pairing_client_auth_armed),
+            )
+        }
         Err(e) => {
             let status = match &e {
                 crate::error::CallerError::Config(msg) if msg.contains("--card-url") => 400,
@@ -778,6 +792,7 @@ pub(crate) fn peers_pairing_request_decision(
     code_or_id: &str,
     op: &str,
     body_text: &str,
+    peer_pairing_client_auth_armed: bool,
 ) -> (u16, String) {
     let body: PairingAccessRequestDecision = if body_text.trim().is_empty() {
         PairingAccessRequestDecision::default()
@@ -807,12 +822,32 @@ pub(crate) fn peers_pairing_request_decision(
         }
     };
     match result {
-        Ok(request) => (200, access_request_summary_json(request).to_string()),
+        Ok(request) => {
+            let response = access_request_summary_json(request);
+            let body = if op == "approve" {
+                pairing_response_with_client_auth_warning(response, peer_pairing_client_auth_armed)
+            } else {
+                response.to_string()
+            };
+            (200, body)
+        }
         Err(e) => (
             400,
             serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
         ),
     }
+}
+
+fn pairing_response_with_client_auth_warning(
+    mut response: serde_json::Value,
+    peer_pairing_client_auth_armed: bool,
+) -> String {
+    if let Some(warning) =
+        crate::peer::pairing::peer_client_auth_warning(peer_pairing_client_auth_armed)
+    {
+        response["warning"] = serde_json::Value::String(warning.to_string());
+    }
+    response.to_string()
 }
 
 pub(crate) fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String) {
@@ -3004,9 +3039,25 @@ mod tests {
 
     #[test]
     fn test_api_peers_pairing_invite_rejects_bad_json() {
-        let (status, body) = peers_pairing_invite("{not-json");
+        let (status, body) = peers_pairing_invite("{not-json", true);
         assert_eq!(status, 400);
         assert!(body.contains("invalid request body"));
+    }
+
+    #[test]
+    fn pairing_success_warning_tracks_live_client_auth_posture() {
+        let warned =
+            pairing_response_with_client_auth_warning(serde_json::json!({"ok": true}), false);
+        let warned: serde_json::Value = serde_json::from_str(&warned).unwrap();
+        assert_eq!(
+            warned["warning"],
+            crate::peer::pairing::PEER_CLIENT_AUTH_WARNING
+        );
+
+        let armed =
+            pairing_response_with_client_auth_warning(serde_json::json!({"ok": true}), true);
+        let armed: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        assert!(armed.get("warning").is_none());
     }
 
     #[tokio::test]
@@ -3170,6 +3221,7 @@ mod tests {
                 EventBus::new(),
                 None,
                 registry,
+                true,
             )
             .await;
         })

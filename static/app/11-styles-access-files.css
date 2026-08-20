@@ -2432,6 +2432,7 @@
 }
 .daemon-pairing-status.error { color: var(--red); }
 .daemon-pairing-status.ok { color: var(--green); }
+.daemon-pairing-status.warn { color: var(--peach); font-weight: 600; }
 .daemon-pairing-secret {
   color: var(--yellow);
   font-size: 11px;
