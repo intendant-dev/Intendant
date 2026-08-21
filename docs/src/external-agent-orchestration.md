@@ -346,6 +346,18 @@ own native capabilities where the upstream CLIs provide them.
   `sandbox_workspace_write.network_access=true` (only in `workspace-write`), and
   `sandbox_workspace_write.writable_roots=[…]`.
 
+  One shape the overrides cannot express: Codex `-c` overrides deep-merge into
+  the config table (they never replace it), so a user-global
+  `[mcp_servers.intendant]` entry declared as **stdio** (`command = …`) in the
+  Codex home `config.toml` would merge with the injected `type="http"`/`url`
+  keys into an entry Codex rejects wholesale (`JSON-RPC error -32600: url is
+  not supported for stdio`). Intendant preflights the effective Codex home
+  before spawn and fails the session with the remedy
+  (`codex mcp remove intendant`) instead of surfacing that opaque error; an
+  active `oauth:codex` lease additionally drops such an entry from the
+  `config.toml` carried into the materialized `CODEX_HOME`, which only ever
+  serves Intendant-spawned processes.
+
   Codex app-server launches in `managed_context = "managed"` also pass config
   overrides that suppress inherited user-global Codex MCP servers and plugin/app
   connectors by default. This keeps managed startup to Intendant MCP plus

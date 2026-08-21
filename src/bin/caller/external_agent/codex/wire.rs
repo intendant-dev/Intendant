@@ -150,6 +150,50 @@ pub(crate) fn codex_mcp_server_names_from_config_toml(config: &str) -> Vec<Strin
     names
 }
 
+/// The `command` of a `[mcp_servers.intendant]` entry in the Codex home
+/// config, when one exists. Such a stdio-shaped entry cannot coexist with
+/// the per-session `-c mcp_servers.intendant.{type,url}` overrides: Codex
+/// `-c` overrides deep-merge into the config table at every level (they
+/// never replace it, proven against codex-cli 0.147.0), so the merged
+/// entry keeps `command` beside `url` and Codex refuses the whole
+/// configuration — surfaced as an opaque JSON-RPC -32600 ("url is not
+/// supported for stdio") when the first thread starts. Callers detect the
+/// collision before spawn and fail with the remedy instead.
+pub(crate) fn codex_home_conflicting_intendant_stdio_command(home: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    conflicting_intendant_stdio_command_from_config_toml(&config)
+}
+
+pub(crate) fn conflicting_intendant_stdio_command_from_config_toml(config: &str) -> Option<String> {
+    let value = config.parse::<toml::Value>().ok()?;
+    let command = value.get("mcp_servers")?.get("intendant")?.get("command")?;
+    Some(
+        command
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| command.to_string()),
+    )
+}
+
+/// Sanitize a Codex `config.toml` carried into a lease-materialized
+/// `CODEX_HOME`: `Some(rewritten)` with the stdio-shaped
+/// `[mcp_servers.intendant]` entry dropped when the config declares one,
+/// `None` (keep the original bytes) otherwise. The materialized home only
+/// ever serves Intendant-spawned Codex processes, which define the
+/// `intendant` server exclusively through per-session `-c` overrides — a
+/// carried stdio entry would deep-merge with those and make every session
+/// unstartable (see [`codex_home_conflicting_intendant_stdio_command`]).
+pub(crate) fn sanitize_carried_codex_config(bytes: &[u8]) -> Option<Vec<u8>> {
+    let config = std::str::from_utf8(bytes).ok()?;
+    conflicting_intendant_stdio_command_from_config_toml(config)?;
+    let mut value: toml::Value = config.parse().ok()?;
+    value
+        .get_mut("mcp_servers")?
+        .as_table_mut()?
+        .remove("intendant");
+    toml::to_string(&value).ok().map(String::into_bytes)
+}
+
 pub(crate) fn codex_mcp_server_disable_override(server_names: &[String]) -> Option<String> {
     if server_names.is_empty() {
         return None;
@@ -486,6 +530,106 @@ command = "asana-mcp"
                 "mcp_servers={asana-prod={enabled=false},\"linear.com\"={enabled=false},\"gmail workspace\"={enabled=false}}"
             )
         );
+    }
+
+    #[test]
+    fn conflicting_intendant_stdio_command_detects_command_shaped_entry() {
+        let config = r#"
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+
+[mcp_servers.intendant]
+command = "/home/user/projects/intendant/target/release/intendant"
+args = [ "--mcp" ]
+"#;
+        assert_eq!(
+            conflicting_intendant_stdio_command_from_config_toml(config).as_deref(),
+            Some("/home/user/projects/intendant/target/release/intendant")
+        );
+    }
+
+    #[test]
+    fn conflicting_intendant_stdio_command_ignores_http_shape_and_other_servers() {
+        // The sanctioned http shape deep-merges harmlessly with the
+        // per-session overrides; stdio entries under other names are
+        // unrelated servers.
+        for config in [
+            "",
+            "[mcp_servers.intendant]\ntype = \"http\"\nurl = \"http://stale.example.invalid/mcp\"\n",
+            "[mcp_servers.linear]\ncommand = \"linear-mcp\"\n",
+            "[mcp_servers.intendant]\nenabled = false\n",
+            "not valid toml [",
+        ] {
+            assert_eq!(
+                conflicting_intendant_stdio_command_from_config_toml(config),
+                None,
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_home_conflicting_intendant_stdio_command_reads_config_from_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codex_home_conflicting_intendant_stdio_command(tmp.path()),
+            None
+        );
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[mcp_servers.intendant]\ncommand = \"intendant\"\nargs = [\"--mcp\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_home_conflicting_intendant_stdio_command(tmp.path()).as_deref(),
+            Some("intendant")
+        );
+    }
+
+    #[test]
+    fn sanitize_carried_codex_config_drops_only_the_stdio_intendant_entry() {
+        let config = r#"
+model = "gpt-5.6-sol"
+
+[mcp_servers.node_repl]
+command = "node-repl"
+
+[mcp_servers.intendant]
+command = "/home/user/projects/intendant/target/release/intendant"
+args = [ "--mcp" ]
+"#;
+        let rewritten = sanitize_carried_codex_config(config.as_bytes()).expect("rewritten");
+        let value: toml::Value = std::str::from_utf8(&rewritten).unwrap().parse().unwrap();
+        assert_eq!(
+            value.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.6-sol")
+        );
+        let servers = value.get("mcp_servers").unwrap().as_table().unwrap();
+        assert!(servers.contains_key("node_repl"));
+        assert!(!servers.contains_key("intendant"));
+        // The rewrite must itself be conflict-free.
+        assert_eq!(
+            conflicting_intendant_stdio_command_from_config_toml(
+                std::str::from_utf8(&rewritten).unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_carried_codex_config_keeps_non_conflicting_configs_byte_identical() {
+        for config in [
+            "model = \"gpt-5.6-sol\"\n",
+            "[mcp_servers.intendant]\ntype = \"http\"\nurl = \"http://stale.example.invalid/mcp\"\n",
+            "not valid toml [",
+        ] {
+            assert_eq!(
+                sanitize_carried_codex_config(config.as_bytes()),
+                None,
+                "{config:?}"
+            );
+        }
+        assert_eq!(sanitize_carried_codex_config(&[0xff, 0xfe]), None);
     }
 
     #[test]

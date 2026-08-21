@@ -1180,12 +1180,23 @@ fn remove_tree_no_follow(path: &Path, canonical_boundary: &Path) -> Result<(), S
         .map_err(|error| format!("remove directory {}: {error}", canonical.display()))
 }
 
+/// Rewrite applied to a carried config's bytes before they land in a
+/// materialized home: `Some(rewritten)` to substitute, `None` to keep the
+/// original bytes.
+type CarryOverSanitizer = fn(&[u8]) -> Option<Vec<u8>>;
+
 struct MaterializationPlan {
     dir_name: &'static str,
     auth_name: &'static str,
     /// Non-secret config carried over from the agent's real home
     /// (source home, file name) so behavior is preserved.
     carry_over: Option<(PathBuf, &'static str)>,
+    /// Rewrites the carried config's bytes before they land in the
+    /// materialized home (`Some(rewritten)`), or keeps them verbatim
+    /// (`None`). The materialized home only ever serves Intendant-spawned
+    /// agents, so entries that would fight the per-session launch config
+    /// are dropped at the copy instead of poisoning every leased spawn.
+    carry_over_sanitizer: Option<CarryOverSanitizer>,
     /// Message-search source label for staged transcripts.
     source: &'static str,
     /// Transcript subdirectories the agent writes under this home —
@@ -1202,6 +1213,11 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
             auth_name: "auth.json",
             carry_over: crate::session_config::effective_codex_home()
                 .map(|home| (PathBuf::from(home), "config.toml")),
+            // A stdio-shaped `[mcp_servers.intendant]` entry in the real
+            // config would deep-merge with the per-session
+            // `-c mcp_servers.intendant.*` overrides and make every leased
+            // Codex spawn unstartable; drop it from the carried copy.
+            carry_over_sanitizer: Some(crate::external_agent::codex::sanitize_carried_codex_config),
             source: "codex",
             transcript_dirs: &["sessions", "archived_sessions"],
         }),
@@ -1209,6 +1225,7 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
             dir_name: "claude-home",
             auth_name: ".credentials.json",
             carry_over: Some((crate::platform::home_dir().join(".claude"), "settings.json")),
+            carry_over_sanitizer: None,
             source: "claude-code",
             transcript_dirs: &["projects"],
         }),
@@ -1221,6 +1238,7 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
                     .unwrap_or_else(|| crate::platform::home_dir().join(".kimi-code")),
                 "config.toml",
             )),
+            carry_over_sanitizer: None,
             source: "kimi",
             transcript_dirs: &["sessions"],
         }),
@@ -1234,6 +1252,7 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
                     .unwrap_or_else(|| crate::platform::home_dir().join(".pi").join("agent")),
                 "settings.json",
             )),
+            carry_over_sanitizer: None,
             source: "pi",
             transcript_dirs: &["sessions"],
         }),
@@ -1343,7 +1362,11 @@ fn materialize_with_plan(
         validate_regular_or_absent_leaf(&target, "carried config")?;
         let source = source_home.join(config_name);
         let contents = if source != target && source.is_file() {
-            std::fs::read(&source).ok()
+            std::fs::read(&source).ok().map(|bytes| {
+                plan.carry_over_sanitizer
+                    .and_then(|sanitize| sanitize(&bytes))
+                    .unwrap_or(bytes)
+            })
         } else {
             None
         };
@@ -3247,6 +3270,7 @@ mod tests {
                 dir_name: "kimi-home",
                 auth_name: "credentials/kimi-code.json",
                 carry_over: None,
+                carry_over_sanitizer: None,
                 source: "kimi",
                 transcript_dirs: &["sessions"],
             },
@@ -3266,6 +3290,7 @@ mod tests {
                 dir_name: "pi-home",
                 auth_name: "auth.json",
                 carry_over: None,
+                carry_over_sanitizer: None,
                 source: "pi",
                 transcript_dirs: &["sessions"],
             },
@@ -3355,6 +3380,64 @@ mod tests {
         cleanup_kind("oauth:claude-code");
     }
 
+    #[test]
+    fn oauth_codex_materialization_sanitizes_stale_intendant_mcp_entry() {
+        let root = tempfile::TempDir::new().unwrap();
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: root.path().join("test-staging"),
+            active: root.path().join("test-active"),
+        };
+        let source_home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            source_home.path().join("config.toml"),
+            concat!(
+                "model = \"gpt-5.6-sol\"\n\n",
+                "[mcp_servers.node_repl]\ncommand = \"node-repl\"\n\n",
+                "[mcp_servers.intendant]\n",
+                "command = \"/home/user/projects/intendant/target/release/intendant\"\n",
+                "args = [ \"--mcp\" ]\n",
+            ),
+        )
+        .unwrap();
+
+        materialize_with_plan(
+            root.path(),
+            &staging,
+            &MaterializationPlan {
+                dir_name: "codex-home",
+                auth_name: "auth.json",
+                carry_over: Some((source_home.path().to_path_buf(), "config.toml")),
+                carry_over_sanitizer: Some(
+                    crate::external_agent::codex::sanitize_carried_codex_config,
+                ),
+                source: "codex",
+                transcript_dirs: &["sessions", "archived_sessions"],
+            },
+            r#"{"tokens":{}}"#,
+        )
+        .unwrap();
+
+        let carried = root.path().join("codex-home").join("config.toml");
+        let contents = std::fs::read_to_string(&carried).unwrap();
+        let value: toml::Value = contents.parse().unwrap();
+        assert_eq!(
+            value.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.6-sol")
+        );
+        let servers = value.get("mcp_servers").unwrap().as_table().unwrap();
+        assert!(servers.contains_key("node_repl"));
+        assert!(
+            !servers.contains_key("intendant"),
+            "stale stdio intendant entry must not ride into the leased home: {contents}"
+        );
+        // Only the copy is sanitized — the source config is untouched.
+        assert!(
+            std::fs::read_to_string(source_home.path().join("config.toml"))
+                .unwrap()
+                .contains("[mcp_servers.intendant]")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn oauth_materialization_rejects_linked_root_home_parent_and_auth_leaf() {
@@ -3422,6 +3505,7 @@ mod tests {
                 dir_name: "kimi-home",
                 auth_name: "credentials/kimi-code.json",
                 carry_over: None,
+                carry_over_sanitizer: None,
                 source: "kimi",
                 transcript_dirs: &["sessions"],
             },
@@ -3544,6 +3628,7 @@ mod tests {
             dir_name: "kimi-home",
             auth_name: "credentials/kimi-code.json",
             carry_over: None,
+            carry_over_sanitizer: None,
             source: "kimi",
             transcript_dirs: &["sessions"],
         };
