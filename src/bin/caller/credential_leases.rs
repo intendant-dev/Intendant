@@ -1180,6 +1180,11 @@ fn remove_tree_no_follow(path: &Path, canonical_boundary: &Path) -> Result<(), S
         .map_err(|error| format!("remove directory {}: {error}", canonical.display()))
 }
 
+/// Rewrite applied to a carried config's bytes before they land in a
+/// materialized home: `Some(rewritten)` to substitute, `None` to keep the
+/// original bytes.
+type CarryOverSanitizer = fn(&[u8]) -> Option<Vec<u8>>;
+
 struct MaterializationPlan {
     dir_name: &'static str,
     auth_name: &'static str,
@@ -1191,7 +1196,7 @@ struct MaterializationPlan {
     /// (`None`). The materialized home only ever serves Intendant-spawned
     /// agents, so entries that would fight the per-session launch config
     /// are dropped at the copy instead of poisoning every leased spawn.
-    carry_over_sanitizer: Option<fn(&[u8]) -> Option<Vec<u8>>>,
+    carry_over_sanitizer: Option<CarryOverSanitizer>,
     /// Message-search source label for staged transcripts.
     source: &'static str,
     /// Transcript subdirectories the agent writes under this home —
