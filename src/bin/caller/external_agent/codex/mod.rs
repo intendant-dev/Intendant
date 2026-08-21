@@ -1341,6 +1341,31 @@ impl ExternalAgent for CodexAgent {
             &mut command,
             leased_codex_home.as_deref().or(self.codex_home.as_deref()),
         );
+        // Preflight the same home the child resolves (leased materialization
+        // → configured home → inherited CODEX_HOME/~/.codex): a stdio-shaped
+        // `[mcp_servers.intendant]` entry there deep-merges with the
+        // `-c mcp_servers.intendant.*` overrides above into an entry Codex
+        // rejects wholesale — surfaced only as `JSON-RPC error -32600: url
+        // is not supported for stdio` when the first thread starts. Fail
+        // before spawn with the remedy instead.
+        let preflight_home = leased_codex_home
+            .clone()
+            .or_else(|| self.codex_home.clone())
+            .or_else(|| {
+                crate::session_config::effective_codex_home().map(std::path::PathBuf::from)
+            });
+        if let Some(home) = preflight_home {
+            if let Some(stale_command) = codex_home_conflicting_intendant_stdio_command(&home) {
+                return Err(CallerError::ExternalAgent(format!(
+                    "Codex config conflict: {} declares [mcp_servers.intendant] as a stdio server \
+                     (command = {stale_command:?}). Intendant registers its session MCP server \
+                     under that name over HTTP, and Codex config overrides merge instead of \
+                     replacing, so the session cannot start. Remove the stale entry \
+                     (`codex mcp remove intendant`) and retry.",
+                    home.join("config.toml").display()
+                )));
+            }
+        }
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
         if let Some(root) = &self.request_trace_root {
