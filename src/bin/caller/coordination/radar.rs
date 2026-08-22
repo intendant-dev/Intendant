@@ -366,7 +366,11 @@ pub(crate) fn write_space_radar_notes(
                 ttl_s: None,
             });
             if let Err(e) = result {
+                let at_capacity = matches!(e, CoordinationError::CapacityReached(_));
                 errors.push(e.to_string());
+                if at_capacity {
+                    return errors;
+                }
             }
         }
     }
@@ -390,7 +394,11 @@ pub(crate) fn write_space_radar_notes(
             ttl_s: None,
         });
         if let Err(e) = result {
+            let at_capacity = matches!(e, CoordinationError::CapacityReached(_));
             errors.push(e.to_string());
+            if at_capacity {
+                return errors;
+            }
         }
     }
     errors
@@ -1400,6 +1408,26 @@ mod tests {
         let quiet = snap(&inputs(&[], &[], &[], &[]));
         assert!(write_space_radar_notes(&empty_dir, "empty", &quiet).is_empty());
         assert!(!empty_dir.exists(), "quiet spaces stay untouched");
+    }
+
+    #[test]
+    fn radar_note_capacity_stops_after_one_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let space_dir = tmp.path().join("space");
+        let daemon_dir = space_dir.join("messages/daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        for i in 0..messages::MAX_MESSAGES_PER_WRITER {
+            std::fs::write(daemon_dir.join(format!("rn-full-{i}.md")), "occupied").unwrap();
+        }
+        let decls = [
+            declaration("s-a", &["src/a.rs", "src/b.rs"], false),
+            declaration("s-b", &["src/a.rs", "src/b.rs"], false),
+        ];
+        let snapshot = snap(&inputs(&decls, &[], &[], &[]));
+
+        let errors = write_space_radar_notes(&space_dir, "test-space", &snapshot);
+        assert_eq!(errors.len(), 1, "capacity is reported once per pass");
+        assert!(errors[0].contains("capacity reached"), "{errors:?}");
     }
 
     #[test]

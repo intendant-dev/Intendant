@@ -49,14 +49,11 @@ pub(crate) fn sweep_all(coordination_root: &Path, now_ms: u64) -> GcReport {
             return report;
         }
     };
-    for (n, entry) in entries.enumerate() {
-        if n >= MAX_SCAN_ENTRIES {
-            report.errors.push(format!(
-                "{}: exceeds the {MAX_SCAN_ENTRIES}-space scan bound",
-                coordination_root.display()
-            ));
-            break;
-        }
+    // The coordination root is a fleet of independently bounded spaces,
+    // not one protocol directory. Stream every child so an old fleet with
+    // more than MAX_SCAN_ENTRIES projects cannot permanently strand the
+    // tail beyond the per-kind defensive scan bound.
+    for entry in entries {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
@@ -311,6 +308,23 @@ mod tests {
         let report = sweep_all(&root, now + 25 * HOUR_MS);
         assert_eq!(report.spaces, 2);
         assert_eq!(report.declarations_removed, 2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn sweep_all_streams_past_the_per_space_scan_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("coordination");
+        for i in 0..=MAX_SCAN_ENTRIES {
+            let sessions = root.join(format!("space-{i:04}")).join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::write(sessions.join(".orphan.tmp"), "partial").unwrap();
+        }
+
+        let now = crate::coordination::now_ms();
+        let report = sweep_all(&root, now + 2 * HOUR_MS);
+        assert_eq!(report.spaces, MAX_SCAN_ENTRIES + 1);
+        assert_eq!(report.tmp_removed, MAX_SCAN_ENTRIES + 1);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 }
