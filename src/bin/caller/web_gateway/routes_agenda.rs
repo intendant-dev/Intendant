@@ -1075,7 +1075,7 @@ mod tests {
         let done = agenda
             .apply(add("closed with body", &big_body), owner.clone())
             .unwrap();
-        agenda
+        let proposed = agenda
             .apply(
                 crate::agenda::AgendaCommand::ProposeEffect {
                     id: done.id.clone(),
@@ -1091,6 +1091,15 @@ mod tests {
                     project_root: Some(dir.path().display().to_string()),
                     binding_refs: Vec::new(),
                     source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::ApproveEffect {
+                    id: done.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
                 },
                 owner.clone(),
             )
@@ -1160,9 +1169,9 @@ mod tests {
         assert_eq!(body["counts"]["done"], 1);
         assert_eq!(body["counts"]["retired"], 1);
         // S1: the bare response now also carries the fold's seq cursor —
-        // additive, and exactly the ops route's line count (6 ops here:
-        // three adds, one propose, one complete, one retire).
-        assert_eq!(body["seq"], 6);
+        // additive, and exactly the ops route's line count (7 ops here:
+        // three adds, one propose, one approve, one complete, one retire).
+        assert_eq!(body["seq"], 7);
     }
 
     /// Track AS S2: `since_seq` on the list core (HTTP `?since_seq=` and
