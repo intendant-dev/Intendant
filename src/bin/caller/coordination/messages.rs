@@ -314,7 +314,7 @@ impl MessageSpace {
         if !writer_dir.is_dir() {
             let (dirs, _) = writer_dirs(&self.dir)?;
             if dirs.len() >= MAX_WRITER_DIRS {
-                return Err(CoordinationError::WriteRefused(format!(
+                return Err(CoordinationError::CapacityReached(format!(
                     "space holds {} writer dirs; the bound is {MAX_WRITER_DIRS}",
                     dirs.len()
                 )));
@@ -324,7 +324,7 @@ impl MessageSpace {
         restrict_dir_modes(&writer_dir)?;
         let (live, _) = scan::scan_liveness_dir(&writer_dir)?;
         if live.len() >= MAX_MESSAGES_PER_WRITER {
-            return Err(CoordinationError::WriteRefused(format!(
+            return Err(CoordinationError::CapacityReached(format!(
                 "writer {RESERVED_DAEMON_WRITER:?} holds {} messages; the bound is \
                  {MAX_MESSAGES_PER_WRITER} — expiry GC must catch up first",
                 live.len()

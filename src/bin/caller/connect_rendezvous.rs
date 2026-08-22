@@ -861,6 +861,7 @@ async fn run_connect_rendezvous_client(
             status.daemon_id = Some(daemon_id.clone());
         });
     });
+    let mut poll_log = PollLogState::default();
 
     loop {
         // Track HS5 (Q9): only the lease holder speaks for this
@@ -923,6 +924,9 @@ async fn run_connect_rendezvous_client(
                 result = poll_next(&client, &base_url, &config, &daemon_id) => {
                     match result {
                         Ok(Some(event)) => {
+                            if poll_log.note_success() {
+                                eprintln!("[connect] poll recovered");
+                            }
                             if !client_epoch_is_current(epoch) {
                                 return;
                             }
@@ -946,11 +950,16 @@ async fn run_connect_rendezvous_client(
                             false
                         }
                         Ok(None) => {
+                            if poll_log.note_success() {
+                                eprintln!("[connect] poll recovered");
+                            }
                             report_dry_credentials(&client, &base_url, &config, &daemon_id).await;
                             false
                         }
                         Err(e) => {
-                            eprintln!("[connect] poll failed: {e}");
+                            if poll_log.note_failure(&e.to_string()) {
+                                eprintln!("[connect] poll failed: {e}");
+                            }
                             with_current_client_epoch(epoch, || {
                                 with_status(|status| {
                                     status.last_error = Some(format!("poll failed: {e}"));
@@ -1003,6 +1012,28 @@ async fn run_connect_rendezvous_client(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct PollLogState {
+    last_failure: Option<String>,
+}
+
+impl PollLogState {
+    /// Log only the first failure in a run, or a materially different
+    /// failure after the state changes.
+    fn note_failure(&mut self, failure: &str) -> bool {
+        if self.last_failure.as_deref() == Some(failure) {
+            return false;
+        }
+        self.last_failure = Some(failure.to_string());
+        true
+    }
+
+    /// Emit one recovery edge when a successful poll ends a failure run.
+    fn note_success(&mut self) -> bool {
+        self.last_failure.take().is_some()
     }
 }
 
@@ -2333,6 +2364,17 @@ pub(crate) fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_log_is_edge_triggered_and_reports_recovery() {
+        let mut state = PollLogState::default();
+        assert!(state.note_failure("offline"));
+        assert!(!state.note_failure("offline"));
+        assert!(state.note_failure("timed out"));
+        assert!(state.note_success());
+        assert!(!state.note_success());
+        assert!(state.note_failure("offline"));
+    }
 
     fn note_test_fleet_zone_observation(
         response: &RegisterResponse,

@@ -114,6 +114,8 @@ pub(crate) enum CoordinationError {
     WriteRefused(String),
     #[error("coordination read refused: {0}")]
     ReadRefused(String),
+    #[error("coordination capacity reached: {0}")]
+    CapacityReached(String),
     #[error("coordination io: {0}")]
     Io(String),
 }
