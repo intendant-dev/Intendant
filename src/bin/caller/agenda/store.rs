@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Command intake errors. The gateway maps `NotFound` to 404, the two
-/// rejection variants to 400, `NotPermitted` to 403; `Io` is a
+/// rejection variants to 400, authorization variants to 403; `Io` is a
 /// daemon-side 500.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AgendaError {
@@ -36,6 +36,12 @@ pub(crate) enum AgendaError {
          but never approve them — ask the owner to review on the dashboard"
     )]
     NotPermitted { verb: &'static str, actor: String },
+    /// Structural pickup is meaningful only when the gate can attribute
+    /// it to a supervised agent session whose liveness can be joined.
+    #[error(
+        "{verb} requires an attributed live agent session; {actor} actors cannot claim live pickup"
+    )]
+    SessionRequired { verb: &'static str, actor: String },
     #[error("agenda log I/O: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -44,7 +50,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 27] = [
+const KNOWN_OPS: [&str; 28] = [
     "add",
     "patch",
     "complete",
@@ -54,6 +60,7 @@ const KNOWN_OPS: [&str; 27] = [
     "acknowledge_answer",
     "dismiss",
     "annotate",
+    "pick_up",
     "set_blocker",
     "clear_blocker",
     "add_relies_on",
@@ -1954,6 +1961,21 @@ impl AgendaStore {
                     id,
                     text: text.to_string(),
                 })
+            }
+            AgendaCommand::PickUp { id, source: _ } => {
+                let item = self.require(&id)?;
+                if item.status != AgendaStatus::Open {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is not open — only open work can be picked up"
+                    )));
+                }
+                if item.annotations.len() >= MAX_ANNOTATIONS_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "item has {MAX_ANNOTATIONS_PER_ITEM} annotations — retire it or start \
+                         a successor item"
+                    )));
+                }
+                Ok(AgendaOp::PickUp { id })
             }
             AgendaCommand::Attest {
                 id,
@@ -5885,6 +5907,112 @@ mod tests {
         let before = store.item(&id).unwrap();
         let mut reopened = AgendaStore::open(dir.path()).unwrap();
         assert_eq!(reopened.item(&id).unwrap(), before);
+    }
+
+    /// Picking up work is a structural op, not an annotation-text
+    /// convention. Repeating it from one session refreshes the single
+    /// folded marker, while the append-only log keeps both acts.
+    #[test]
+    fn pickup_folds_one_structural_marker_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("picked up work"), owner(), 1000)
+            .unwrap()
+            .id;
+
+        let first = store
+            .apply_command(
+                AgendaCommand::PickUp {
+                    id: id.clone(),
+                    source: None,
+                },
+                session_actor(),
+                1001,
+            )
+            .unwrap();
+        let pickup = first.annotations.last().unwrap();
+        assert!(pickup.pickup);
+        assert!(!pickup.live, "liveness is serving-seam state, never folded");
+        assert_eq!(pickup.session_id.as_deref(), Some("sess-w1"));
+
+        let refreshed = store
+            .apply_command(
+                AgendaCommand::PickUp {
+                    id: id.clone(),
+                    source: None,
+                },
+                session_actor(),
+                1002,
+            )
+            .unwrap();
+        let pickups: Vec<_> = refreshed
+            .annotations
+            .iter()
+            .filter(|note| note.pickup)
+            .collect();
+        assert_eq!(pickups.len(), 1);
+        assert_eq!(pickups[0].at_ms, 1002);
+
+        let page = store
+            .read_ops(0, Some(&id), AGENDA_OPS_DEFAULT_LIMIT)
+            .unwrap();
+        assert_eq!(
+            page.ops
+                .iter()
+                .filter(|entry| entry["op"]["op"]["type"] == "pick_up")
+                .count(),
+            2,
+            "the raw history keeps both pickup acts"
+        );
+    }
+
+    /// Completing an item consumes a still-unapproved proposal in the
+    /// same durable fold event and leaves an attributed explanation in
+    /// the thread. Reopening never resurrects the dead solicitation.
+    #[test]
+    fn completion_moots_a_pending_unapproved_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("live work beat the proposal"), owner(), 1000)
+            .unwrap()
+            .id;
+        store
+            .apply_command(propose_one_shot(&id), session_actor(), 1001)
+            .unwrap();
+
+        let completed = store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: id.clone(),
+                    source: None,
+                },
+                owner(),
+                1002,
+            )
+            .unwrap();
+        assert_eq!(completed.status, AgendaStatus::Done);
+        assert!(completed.effects.is_empty());
+        let note = completed.annotations.last().unwrap();
+        assert!(note.text.contains("proposal mooted by completion"));
+        assert_eq!(note.principal.as_deref(), Some("owner"));
+
+        let reopened = store
+            .apply_command(
+                AgendaCommand::Reopen {
+                    id: id.clone(),
+                    source: None,
+                },
+                owner(),
+                1003,
+            )
+            .unwrap();
+        assert!(reopened.effects.is_empty());
+
+        let mut replayed = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(replayed.item(&id).unwrap(), reopened);
     }
 
     /// The approved side is the owner's revoke, never withdraw: the

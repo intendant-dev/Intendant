@@ -930,6 +930,17 @@ pub struct AgendaAnnotation {
     pub(crate) kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<String>,
+    /// Structural pickup marker written only by the dedicated `pick_up`
+    /// op. Ordinary note text never implies ownership. Additive and
+    /// absent-on-the-wire for every historic annotation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) pickup: bool,
+    /// Display-only liveness decoration for pickup markers. The fold
+    /// always writes `false`; the serving seam stamps it from the live
+    /// session registry, so session death clears the UI without a
+    /// synthetic ledger write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) live: bool,
 }
 
 /// One blocker (F2 fold view): criterion text stated by whoever set it,
@@ -1394,6 +1405,15 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Record that this supervised agent session picked up an open item.
+    /// The tenant edge requires an attributed `agent_session`; the fold
+    /// stores a structural annotation so surfaces never infer pickup from
+    /// prose. Liveness is joined at serving time.
+    PickUp {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// The fired session's self-report on its occurrence (Track AO): a
     /// second axis beside the transport verdict, accepted only from a
     /// session in the occurrence's started lineage (Rider A —
@@ -1620,6 +1640,11 @@ impl AgendaItem {
                         .and_then(|run| run.session_id.as_deref()),
                 )
             }))
+            .chain(self.annotations.iter().filter_map(|note| {
+                (note.pickup && note.live)
+                    .then_some(note.session_id.as_deref())
+                    .flatten()
+            }))
             .chain(self.refs.iter().filter_map(|r| {
                 (r.ref_type == AgendaRefType::Session).then_some(r.locator.as_str())
             }))
@@ -1667,6 +1692,7 @@ impl AgendaCommand {
             | AgendaCommand::AcknowledgeAnswer { source, .. }
             | AgendaCommand::ProposeEffect { source, .. }
             | AgendaCommand::Annotate { source, .. }
+            | AgendaCommand::PickUp { source, .. }
             | AgendaCommand::Attest { source, .. }
             | AgendaCommand::SetBlocker { source, .. }
             | AgendaCommand::ClearBlocker { source, .. }
@@ -1756,6 +1782,12 @@ pub(crate) enum AgendaOp {
     Annotate {
         id: String,
         text: String,
+    },
+    /// Structural live-session pickup. Attribution rides the envelope;
+    /// older builds preserve-skip the unknown op and therefore show no
+    /// potentially stale ownership claim.
+    PickUp {
+        id: String,
     },
     /// Blocker set (F2): `blocker_id` was minted at intake and is recorded
     /// here — replay never mints.
@@ -1923,6 +1955,7 @@ impl AgendaOp {
             | AgendaOp::AcknowledgeAnswer { id }
             | AgendaOp::Dismiss { id, .. }
             | AgendaOp::Annotate { id, .. }
+            | AgendaOp::PickUp { id }
             | AgendaOp::SetBlocker { id, .. }
             | AgendaOp::ClearBlocker { id, .. }
             | AgendaOp::AddReliesOn { id, .. }
@@ -2049,6 +2082,38 @@ pub(crate) fn apply_op(
                 session_id: actor.session_id,
                 kind: actor.kind,
                 source: rec.source.clone(),
+                pickup: false,
+                live: false,
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::PickUp { id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("pick_up for unknown {id} ignored"));
+            };
+            if item.status != AgendaStatus::Open {
+                return Some(format!("pick_up on non-open {id} ignored"));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            let Some(session_id) = actor.session_id.clone() else {
+                return Some(format!("pick_up without a session on {id} ignored"));
+            };
+            // One folded marker per session. Re-pickup refreshes its
+            // timestamp without growing the view; the op log retains the
+            // complete history.
+            item.annotations.retain(|note| {
+                !(note.pickup && note.session_id.as_deref() == Some(session_id.as_str()))
+            });
+            item.annotations.push(AgendaAnnotation {
+                text: "picked up live by this session".to_string(),
+                at_ms,
+                principal: actor.principal,
+                session_id: Some(session_id),
+                kind: actor.kind,
+                source: rec.source.clone(),
+                pickup: true,
+                live: false,
             });
             item.updated_ms = at_ms;
             None
@@ -2310,6 +2375,45 @@ pub(crate) fn apply_op(
             };
             match item.status {
                 AgendaStatus::Open => {
+                    // Completion makes an unapproved proposal inert. Fold
+                    // that consequence into the completion itself: the
+                    // item thread names what happened, a never-fired
+                    // proposal leaves the live view, and fired lineage is
+                    // retained with a withdrawal marker. The complete op
+                    // is the durable history event; no second write can be
+                    // torn away from it.
+                    if let Some(pos) = item
+                        .effects
+                        .iter()
+                        .position(|effect| effect.approval.is_none() && effect.withdrawn.is_none())
+                    {
+                        let actor = rec.actor.clone().unwrap_or_default();
+                        let reason = "item completed before the proposal was approved";
+                        item.annotations.push(AgendaAnnotation {
+                            text: format!(
+                                "scheduled-session proposal mooted by completion — {reason}"
+                            ),
+                            at_ms,
+                            principal: actor.principal.clone(),
+                            session_id: actor.session_id.clone(),
+                            kind: actor.kind.clone(),
+                            source: rec.source.clone(),
+                            pickup: false,
+                            live: false,
+                        });
+                        if item.effects[pos].last_run.is_none() {
+                            item.effects.remove(pos);
+                        } else {
+                            item.effects[pos].withdrawn = Some(AgendaWithdrawal {
+                                at_ms,
+                                principal: actor.principal,
+                                session_id: actor.session_id,
+                                kind: actor.kind,
+                                reason: Some(reason.to_string()),
+                            });
+                            item.effects[pos].requested.clear();
+                        }
+                    }
                     item.status = AgendaStatus::Done;
                     item.completed_ms = Some(at_ms);
                     item.updated_ms = at_ms;
@@ -2484,6 +2588,8 @@ pub(crate) fn apply_op(
                 session_id: actor.session_id.clone(),
                 kind: actor.kind.clone(),
                 source: rec.source.clone(),
+                pickup: false,
+                live: false,
             });
             // Fired history is sacred: a lineage that ever ran keeps its
             // entry — manifest, last_run, attestation, streak — as

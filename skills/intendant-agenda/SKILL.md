@@ -54,6 +54,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda schedule 01KX --goal "Sit with the owner on the release board" --at +1d --interactive   # owner-sitting: fires, opens with the goal, waits for the owner
 "$INTENDANT" ctl agenda withdraw 01KX --reason "superseded by the rewrite"   # take back a PENDING unapproved proposal (yours included); approved = owner's revoke-schedule
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
+"$INTENDANT" ctl agenda pickup 01KX   # supervised session: structurally mark live pickup before starting
 "$INTENDANT" ctl agenda attest 01KX --occurrence 98eb14c2... --outcome partial --note "3 of 5 slices landed" --ref file:$HOME/handoff.md   # fired sessions: self-report your occurrence (rider names its id)
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
 "$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the link)
@@ -173,6 +174,15 @@ dashboard, attributed to your session.
   `relies-on` draws a link to a prerequisite item; a completed
   prerequisite satisfies it automatically at read time, a retired one
   flags the dependent for review. `list --blocked` filters the gated set.
+
+- **Picking up parked work**: after choosing an existing open item to
+  handle, run `ctl agenda pickup <id>` before starting. This is a
+  structural item/session link, not prose: while your supervised session
+  is live, the dashboard shows that work is already underway beside any
+  pending Approve action and warns before starting a duplicate scheduled
+  session. Ordinary annotations never imply pickup. Completion keeps the
+  pickup in history, and automatically records an unapproved proposal as
+  mooted instead of leaving a dead Approve solicitation behind.
 
 - **Refs make items handoff units**: `ref` attaches a typed POINTER —
   a file path (digested at attach; the dashboard shows drift honestly),

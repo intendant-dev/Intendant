@@ -4499,6 +4499,8 @@ mod tests {
             session_id: None,
             kind: Some("daemon".into()),
             source: Some(super::super::types::TRIGGER_CONSUMED_SOURCE.into()),
+            pickup: false,
+            live: false,
         };
         let mut q1 = matching_question("q1", 20_000, None);
         q1.annotations.push(consumed_note(&occ(0)));
@@ -4930,6 +4932,8 @@ mod tests {
             session_id: None,
             kind: Some("daemon".into()),
             source: Some("trigger-evaluator".into()),
+            pickup: false,
+            live: false,
         });
         let mut impostor = matching_question("q-impostor", 21_000, None);
         impostor.annotations.push(AgendaAnnotation {
@@ -4939,6 +4943,8 @@ mod tests {
             session_id: Some("whoever".into()),
             kind: Some("agent_session".into()),
             source: Some("trigger-evaluator".into()),
+            pickup: false,
+            live: false,
         });
         let looped = matching_question("q-loop", 22_000, Some("sess-fired"));
 
@@ -5119,6 +5125,8 @@ mod tests {
                 session_id: None,
                 kind: Some("daemon".into()),
                 source: Some("trigger-evaluator".into()),
+                pickup: false,
+                live: false,
             });
             question
         };

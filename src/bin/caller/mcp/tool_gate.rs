@@ -1627,6 +1627,7 @@ mod tests {
                     "clear_blocker",
                     "complete",
                     "patch",
+                    "pick_up",
                     "place",
                     "propose_effect",
                     "remove_part_of",

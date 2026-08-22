@@ -3572,7 +3572,7 @@ pub(crate) mod tests {
                 owner.clone(),
             )
             .unwrap();
-        handle
+        let proposed = handle
             .apply(
                 crate::agenda::AgendaCommand::ProposeEffect {
                     id: closed.id.clone(),
@@ -3588,6 +3588,15 @@ pub(crate) mod tests {
                     project_root: Some(dir.path().display().to_string()),
                     binding_refs: Vec::new(),
                     source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        handle
+            .apply(
+                crate::agenda::AgendaCommand::ApproveEffect {
+                    id: closed.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
                 },
                 owner.clone(),
             )
@@ -3629,7 +3638,7 @@ pub(crate) mod tests {
             .is_empty());
         assert_eq!(body["counts"]["done"], 1);
         // S1: additive seq cursor on the bare tool response too.
-        assert_eq!(body["seq"], 3);
+        assert_eq!(body["seq"], 4);
     }
 
     /// Track AS S7: `agenda_item` resolves exact ids (always win),

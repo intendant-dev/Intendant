@@ -636,6 +636,7 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
+        ${st.kind === 'pending' ? agendaLivePickupChipHtml(item) : ''}
         ${agendaEffectRevisionChipHtml(e)}
         ${agendaDigestChipHtml(bound ? e.approval.digest : e.digest,
     bound ? 'Your recorded approval covers exactly this manifest revision'
