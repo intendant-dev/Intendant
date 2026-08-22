@@ -269,6 +269,11 @@ function agendaAdoptFullItem(full) {
   const prior = agendaFindItem(full.id);
   const row = Object.assign({}, full, {
     annotations_count: Array.isArray(full.annotations) ? full.annotations.length : 0,
+    active_pickups: Array.isArray(full.annotations)
+      ? full.annotations
+        .filter((note) => note.pickup === true && note.live === true && note.session_id)
+        .map((note) => ({ session_id: note.session_id, at_ms: note.at_ms }))
+      : [],
     blocked: full.status === 'open'
       && Array.isArray(full.blocked_on) && full.blocked_on.length > 0,
     completable: full.completable === true,
@@ -702,6 +707,16 @@ function agendaItemSessionIds(item) {
     if (effect.proposed_session_id) ids.push(effect.proposed_session_id);
     if (effect.last_run && effect.last_run.session_id) ids.push(effect.last_run.session_id);
   });
+  (item.active_pickups || []).forEach((pickup) => {
+    if (pickup.session_id) ids.push(pickup.session_id);
+  });
+  // Full-grain event/detail copies carry the structural marker inside
+  // annotations; summary copies carry the slim active_pickups projection.
+  (item.annotations || []).forEach((note) => {
+    if (note.pickup === true && note.live === true && note.session_id) {
+      ids.push(note.session_id);
+    }
+  });
   return ids;
 }
 
@@ -722,13 +737,12 @@ function agendaOnTabShown() {
 }
 
 async function agendaSendOp(params, button) {
-  // Approve-while-blocked (confirm-not-gate): every approve surface —
-  // card strips, inspector, sheet approve-now, missed-reschedule —
-  // funnels through this emitter, so the ONE named confirm lives here.
-  // Cancel sends nothing; accept proceeds — nothing ever refuses.
-  if (params && params.op === 'approve_effect'
-    && !(await agendaApproveBlockedConfirm(params))) {
-    return false;
+  // Approval advisories (live pickup, then blocked bookkeeping): every
+  // approve surface funnels through this emitter. Cancel sends nothing;
+  // accepting the warnings proceeds — neither advisory is a daemon gate.
+  if (params && params.op === 'approve_effect') {
+    if (!(await agendaApproveLivePickupConfirm(params))) return false;
+    if (!(await agendaApproveBlockedConfirm(params))) return false;
   }
   if (button) button.disabled = true;
   try {
@@ -822,6 +836,59 @@ function agendaLinkState(link) {
 // contract); a row that has never been summarized wears no flag.
 function agendaItemIsBlocked(item) {
   return item.blocked === true;
+}
+
+// Structural pickup is recorded by the dedicated pick_up op and stamped
+// live by the daemon's supervisor join. Never infer it from annotation
+// text: prose remains prose.
+function agendaActivePickups(item) {
+  if (!item) return [];
+  if (Array.isArray(item.active_pickups) && item.active_pickups.length) {
+    return item.active_pickups;
+  }
+  return Array.isArray(item.annotations)
+    ? item.annotations
+      .filter((note) => note.pickup === true && note.live === true && note.session_id)
+      .map((note) => ({ session_id: note.session_id, at_ms: note.at_ms }))
+    : [];
+}
+
+function agendaPickupLabel(pickup) {
+  const session = pickup && agendaSessionInfo(pickup.session_id);
+  return session && session.name
+    ? `“${session.name}”`
+    : `session ${String((pickup && pickup.session_id) || '').slice(0, 8)}`;
+}
+
+function agendaLivePickupChipHtml(item) {
+  const pickups = agendaActivePickups(item);
+  if (!pickups.length) return '';
+  const first = agendaPickupLabel(pickups[0]);
+  const more = pickups.length > 1 ? ` +${pickups.length - 1}` : '';
+  return agendaChipHtml(`in progress · ${first}${more}`, 'iris',
+    'A supervised session structurally picked up this item and is still live. Approving would start another worker; the owner can still proceed after a warning.');
+}
+
+// Duplicate-work warning, not an authority gate: the owner remains able
+// to approve, but must see the live pickup and make that choice explicitly.
+async function agendaApproveLivePickupConfirm(params) {
+  const item = agendaFindItem(params.id)
+    || (typeof agendaFullItemFor === 'function' ? agendaFullItemFor(params.id) : null);
+  const pickups = agendaActivePickups(item);
+  if (!pickups.length) return true;
+  const names = pickups.slice(0, 2).map(agendaPickupLabel).join(' and ');
+  const more = pickups.length > 2 ? ` and ${pickups.length - 2} more` : '';
+  const message = `${names}${more} already picked up this item and is still live. Approve another session anyway?`;
+  if (typeof showDashboardConfirm !== 'function') return window.confirm(message);
+  const choice = await showDashboardConfirm({
+    title: 'Work is already underway',
+    message,
+    warning: 'Approving starts the proposed scheduled session as well. The live pickup is advisory, but continuing may duplicate work.',
+    confirmLabel: 'Approve anyway',
+    cancelLabel: 'Not now',
+    danger: false,
+  });
+  return choice === true;
 }
 
 // Approve-while-blocked (advisory-plus-confirm): ONE named confirm

@@ -1094,6 +1094,7 @@ function agendaCardEffectStrip(item) {
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + (refusal ? ` — not fireable as planned: ${refusal.reason}` : ' — needs your approval');
     actions = agendaEffectRevisionChipHtml(e)
+      + agendaLivePickupChipHtml(item)
       + agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision',
         agendaDigestPulseClass(e.effect_id))
       + (refusal

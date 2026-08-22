@@ -90,8 +90,9 @@ The supported commands are:
 - `acknowledge_answer` — explicitly record that a consumer picked up the
   current answer (`intendant ctl agenda acknowledge ID_PREFIX`); reads never
   perform this transition;
-- `annotate`, `set_blocker`, `clear_blocker`, `add_relies_on`, and
-  `remove_relies_on` — the item's thread and gates (below);
+- `annotate`, `pick_up`, `set_blocker`, `clear_blocker`, `add_relies_on`,
+  and `remove_relies_on` — the item's thread, structural live-session
+  pickup, and gates (below);
 - `propose_effect`, `approve_effect`, `revoke_effect`, and
   `withdraw_effect` for a scheduled session (withdraw takes back a
   still-unapproved proposal — the decline gesture; revoke stays the
@@ -202,6 +203,15 @@ operations in the same append-only log:
   item of any status — the thread under it. Full history folds; surfaces cap
   the render with an expander. Intake caps each note at the body limit and
   an item at 500 annotations (a pathology rail, not a budget).
+- **Live pickup** (`pick_up`; `intendant ctl agenda pickup ID_PREFIX`) is
+  accepted only from an attributed supervised agent session on an open
+  item. It folds as a structurally marked annotation; ordinary note text
+  never implies ownership. At the serving seam the daemon joins that
+  session against the live supervisor registry. While it remains live, a
+  pending approval card says the item is in progress and asks the owner to
+  confirm before starting the proposed session too. The warning is
+  advisory: it prevents accidental duplicate work without taking away the
+  owner's approval lever. A dead session leaves history but no live chip.
 - **Blockers** (`set_blocker` / `clear_blocker`) state a human criterion —
   "api access granted", "waiting on the vendor" — on an open item. **No
   machinery evaluates blockers**: no watchers, no pollers, no condition
@@ -558,6 +568,15 @@ never pending, never planned; approve on it refuses with a re-propose
 pointer). An ordinary re-propose revives the lane either way. Older
 builds skip the unknown op line whole: the proposal stays visible there
 — honest staleness, never a mangled state.
+
+**Completion moots pending review.** If an item is completed while its
+manifest is still unapproved, the `complete` fold performs the same
+view cleanup as withdrawal and appends an attributed thread note saying
+the proposal was mooted by completion. A never-fired proposal disappears
+from the effects view; fired lineage remains marked withdrawn. This is one
+durable completion event, so the lifecycle transition and its consequence
+cannot tear apart. Reopening the item does not silently resurrect the old
+proposal; scheduling again is an explicit fresh proposal.
 
 **Propose-time fireability (2026-07-30): an approvable manifest IS a
 fireable manifest.** One validator (`agenda/fireability.rs`, derived from
@@ -2071,7 +2090,8 @@ tests is the tripwire, not a refactor.
   who-line session ids, answer text on answered questions, UNCLEARED
   blocker criteria, the `part_of`/`relies_on`/`relates_to` edge lists,
   slim refs and effect state (digests included — digest-prefix search
-  keeps resolving), annotation counts, and the serving-seam flags.
+  keeps resolving), annotation counts, structurally active pickup session
+  ids, and the serving-seam flags.
   Bodies and annotation threads never ride it — the inspector fetches
   the item route. Parity with the full DTO is pinned
   (`summary_fields_derive_from_the_full_dto`).

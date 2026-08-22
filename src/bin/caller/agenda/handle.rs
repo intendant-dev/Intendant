@@ -200,6 +200,24 @@ impl AgendaHandle {
         cmd: &AgendaCommand,
         actor: Option<&AgendaActor>,
     ) -> Result<(), AgendaError> {
+        if matches!(cmd, AgendaCommand::PickUp { .. }) {
+            let attributed_session = actor.is_some_and(|actor| {
+                actor.kind.as_deref() == Some("agent_session")
+                    && actor
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+            });
+            if attributed_session {
+                return Ok(());
+            }
+            return Err(AgendaError::SessionRequired {
+                verb: "pick_up",
+                actor: actor
+                    .and_then(|actor| actor.kind.clone())
+                    .unwrap_or_else(|| "unattributed".to_string()),
+            });
+        }
         let verb = match cmd {
             AgendaCommand::ApproveEffect { .. } => "approve_effect",
             AgendaCommand::RevokeEffect { .. } => "revoke_effect",
@@ -1184,6 +1202,25 @@ impl AgendaHandle {
         for (item, (causes, completable)) in items.iter_mut().zip(blocked_views) {
             item.blocked_on = causes;
             item.completable = completable;
+        }
+
+        // Structural live pickup decoration. The op records WHO picked
+        // the item up; the supervisor registry answers whether that
+        // session is alive NOW. Lock contention omits the claim for this
+        // read instead of serving a stale ownership bit. Closed items
+        // keep their pickup history but never advertise active work.
+        let live_sessions = crate::session_supervisor::published_live_session_registry()
+            .and_then(|registry| registry.live_wrapper_ids());
+        for item in items {
+            for note in &mut item.annotations {
+                note.live = item.status == super::types::AgendaStatus::Open
+                    && note.pickup
+                    && note.session_id.as_ref().is_some_and(|session_id| {
+                        live_sessions
+                            .as_ref()
+                            .is_some_and(|live| live.contains(session_id))
+                    });
+            }
         }
     }
 
@@ -2185,6 +2222,33 @@ mod tests {
             session_id: session.map(str::to_string),
             kind: Some(kind.to_string()),
         })
+    }
+
+    #[test]
+    fn pickup_requires_an_attributed_agent_session() {
+        let cmd = AgendaCommand::PickUp {
+            id: "01PICKUP".into(),
+            source: None,
+        };
+        assert!(AgendaHandle::authorize_command(
+            &cmd,
+            actor("agent_session", Some("sess-live")).as_ref()
+        )
+        .is_ok());
+        for denied in [
+            actor("local_process", None),
+            actor("dashboard", None),
+            actor("agent_session", None),
+            None,
+        ] {
+            assert!(matches!(
+                AgendaHandle::authorize_command(&cmd, denied.as_ref()),
+                Err(AgendaError::SessionRequired {
+                    verb: "pick_up",
+                    ..
+                })
+            ));
+        }
     }
 
     /// The steward rider's mandated proof: an agent session can propose a

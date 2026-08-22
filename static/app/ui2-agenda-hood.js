@@ -361,6 +361,7 @@ function agendaHoodOpVerb(op, envelope) {
       const source = envelope.source || op.source || '';
       return source ? `annotated · --source ${source}` : 'annotated';
     }
+    case 'pick_up': return 'picked up live';
     case 'set_blocker': return 'blocker set';
     case 'clear_blocker': return 'blocker cleared';
     case 'add_ref': return `ref attached · ${op.ref_type || 'file'}`;
@@ -390,7 +391,7 @@ function agendaHoodOpDot(op, known) {
   switch (String(op.type || '')) {
     case 'add': case 'reopen': case 'request_occurrence': return 'iris';
     case 'set_blocker': return 'rose';
-    case 'clear_blocker': case 'approve_effect': case 'answer': case 'acknowledge_answer': case 'complete': return 'green';
+    case 'clear_blocker': case 'approve_effect': case 'answer': case 'acknowledge_answer': case 'complete': case 'pick_up': return 'green';
     case 'add_ref': case 'remove_ref': case 'record_ask_delivery': return 'sky';
     case 'propose_effect': case 'revoke_effect': case 'withdraw_effect': return 'amber';
     case 'record_occurrence':

@@ -166,6 +166,11 @@ pub(crate) struct AgendaItemSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) refs: Vec<SummaryRef>,
     pub(crate) annotations_count: u32,
+    /// Structurally recorded pickups whose sessions are live at this
+    /// serving read. The full annotation thread stays off the summary;
+    /// this tiny projection is the dashboard's duplicate-work warning.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) active_pickups: Vec<SummaryPickup>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) effects: Vec<SummaryEffect>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +221,12 @@ pub(crate) struct SummaryProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<String>,
     pub(crate) created_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SummaryPickup {
+    pub(crate) session_id: String,
+    pub(crate) at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -486,6 +497,17 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             })
             .collect(),
         annotations_count: item.annotations.len() as u32,
+        active_pickups: item
+            .annotations
+            .iter()
+            .filter(|note| note.pickup && note.live)
+            .filter_map(|note| {
+                note.session_id.as_ref().map(|session_id| SummaryPickup {
+                    session_id: session_id.clone(),
+                    at_ms: note.at_ms,
+                })
+            })
+            .collect(),
         effects: item
             .effects
             .iter()
@@ -1090,6 +1112,39 @@ mod tests {
         let ask = resolved[0].ask.as_ref().expect("ask history marker");
         assert!(ask.questions.is_none(), "resolved ask slims to the count");
         assert_eq!(ask.questions_count, 1);
+    }
+
+    #[test]
+    fn summary_carries_only_structurally_live_pickups() {
+        let mut item = bare("01PICK", "picked up", AgendaStatus::Open);
+        let pickup = |session_id: &str, live: bool| super::super::types::AgendaAnnotation {
+            text: "picked up live by this session".into(),
+            at_ms: 42,
+            principal: None,
+            session_id: Some(session_id.into()),
+            kind: Some("agent_session".into()),
+            source: None,
+            pickup: true,
+            live,
+        };
+        item.annotations.push(pickup("sess-live", true));
+        item.annotations.push(pickup("sess-ended", false));
+        item.annotations
+            .push(super::super::types::AgendaAnnotation {
+                text: "picked up live (just prose)".into(),
+                at_ms: 43,
+                principal: None,
+                session_id: Some("sess-prose".into()),
+                kind: Some("agent_session".into()),
+                source: None,
+                pickup: false,
+                live: true,
+            });
+
+        let summary = summarize(std::slice::from_ref(&item), std::slice::from_ref(&item));
+        assert_eq!(summary[0].active_pickups.len(), 1);
+        assert_eq!(summary[0].active_pickups[0].session_id, "sess-live");
+        assert_eq!(summary[0].annotations_count, 3);
     }
 
     /// Track AS S6 pin (ruling R-AS5): the serving window is WIRE

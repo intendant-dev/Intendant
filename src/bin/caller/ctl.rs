@@ -2609,6 +2609,7 @@ async fn run_agenda(
             run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Occurrences).await?
         }
         "complete" | "done" => agenda_transition(client, config, "complete", &raw[1..]).await?,
+        "pickup" | "pick-up" => agenda_transition(client, config, "pick_up", &raw[1..]).await?,
         "acknowledge" | "ack" => {
             agenda_transition(client, config, "acknowledge_answer", &raw[1..]).await?
         }
@@ -6088,6 +6089,7 @@ fn help_agenda() {
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
   intendant ctl agenda show ID_PREFIX [--json]   # ONE item, full detail — never fetches the ledger\n\
   intendant ctl agenda annotate ID_PREFIX NOTE... [--source LABEL]\n\
+  intendant ctl agenda pickup ID_PREFIX [--source LABEL]   # supervised session: mark this item as actively being handled\n\
   intendant ctl agenda attest ID_PREFIX --occurrence OCC_ID --outcome achieved|partial|blocked|abandoned\n\
       [--note TEXT] [--ref file:PATH]... [--source LABEL]   # fired session's self-report on its occurrence\n\
   intendant ctl agenda block ID_PREFIX CRITERION... [--source LABEL]\n\
@@ -6160,6 +6162,11 @@ as self-described and never becomes attribution; supervised sessions\n\
 are attributed automatically and don't need it.\n\
 \n\
 `annotate` appends an attributed note (any status — the item's thread).\n\
+`pickup` is for a supervised agent session that starts handling an OPEN\n\
+item. It records a structural item/session link (never guessed from note\n\
+text); while that session remains live, pending approval surfaces warn that\n\
+work is already underway. Repeating it from the same session just refreshes\n\
+that session's marker.\n\
 `block` states a human criterion (e.g. \"api access granted\") on an open\n\
 item; NOTHING evaluates it — the owner clears from the dashboard, or\n\
 `unblock` clears by blocker-id prefix (omit the prefix when only one is\n\
