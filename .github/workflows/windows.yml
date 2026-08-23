@@ -398,6 +398,13 @@ jobs:
       # instances PLUS the interactive agents — stacked full-suite runs
       # starved the label queue at ~55-minute waits). Push-to-main runs
       # are gone entirely (2026-07-10, the `on:` comment).
+      # Keep this as a standalone, non-test invocation: sibling packages and
+      # intendant-core's dev-dependencies enable extra Tokio features, which
+      # would hide a missing feature on the crate's direct dependency.
+      - name: cargo check (intendant-core standalone)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: cargo check -p intendant-core --lib --locked --target ${{ matrix.target }}
+
       - name: cargo check (fast path)
         if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
