@@ -386,6 +386,17 @@ jobs:
         if: runner.environment == 'github-hosted' && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
+      # The native wrapper has no Xcode project. Compile its pure update
+      # helper with a tiny executable matrix so alpha/rc release ordering and
+      # git-describe dev-build classification cannot drift silently.
+      - name: macOS app update checker tests
+        if: runner.os == 'macOS' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: |
+          swiftc -o "$RUNNER_TEMP/update-checker-tests" \
+            macos-app/tests/update-checker/main.swift \
+            macos-app/UpdateChecker.swift
+          "$RUNNER_TEMP/update-checker-tests"
+
       # Fast pre-queue signal vs the real merge gate. Full suites run in
       # exactly two places: the merge group (all three platforms — the
       # actual gate, revalidating the speculative merge state) and the

@@ -31,36 +31,95 @@ enum UpdateChecker {
             ?? "0.0.0-dev"
     }
 
-    /// Release builds are stamped with plain dotted numerics from the tag;
-    /// dev builds carry a suffix ("0.0.0-1a2b3c4d", "1.2.0-4-g1a2b3c4d-dirty").
-    /// Dev builds skip the launch-time check — a local bundle nagging about
-    /// the latest release is noise, not signal.
-    static func isDevBuild(_ version: String) -> Bool {
-        version.isEmpty || version.contains("-")
+    private enum ReleaseStage: Int {
+        case alpha = 0
+        case rc = 1
+        case stable = 2
     }
 
-    /// Compares dotted numeric prefixes ("v1.2.3-whatever" → [1,2,3]);
-    /// suffixes are ignored, and unparseable versions are never "newer"
-    /// (an update prompt must not fire on garbage input).
+    private struct ReleaseVersion {
+        let stage: ReleaseStage
+        let stageNumber: Int
+    }
+
+    /// A release tag is dotted numeric, optionally followed by the alpha/rc
+    /// channels this repository publishes. Everything else — including
+    /// git-describe distance/hash suffixes and `-dirty` — is a development
+    /// build and should not produce a launch-time update prompt.
+    static func isDevBuild(_ version: String) -> Bool {
+        parseReleaseVersion(version) == nil
+    }
+
+    /// Compares dotted numeric cores first, then the published prerelease
+    /// sequence (`alpha.N` < `rc.N` < stable). Git-describe builds retain the
+    /// old core-only behavior: a later release core can be reported by the
+    /// explicit menu check, but an ambiguous suffix on the same core never
+    /// produces an update prompt.
     static func isNewer(remote: String, than local: String) -> Bool {
-        func numericPrefix(_ version: String) -> [Int]? {
-            var core = version
-            if core.hasPrefix("v") || core.hasPrefix("V") {
-                core.removeFirst()
+        guard let remoteCore = numericCore(remote),
+              let localCore = numericCore(local) else { return false }
+
+        for index in 0..<max(remoteCore.count, localCore.count) {
+            let remotePart = index < remoteCore.count ? remoteCore[index] : 0
+            let localPart = index < localCore.count ? localCore[index] : 0
+            if remotePart != localPart {
+                return remotePart > localPart
             }
-            core = core.split(separator: "-").first.map(String.init) ?? core
-            let rawParts = core.split(separator: ".").map { Int($0) }
-            guard !rawParts.isEmpty, !rawParts.contains(nil) else { return nil }
-            return rawParts.compactMap { $0 }
         }
-        guard let remoteParts = numericPrefix(remote),
-              let localParts = numericPrefix(local) else { return false }
-        for i in 0..<max(remoteParts.count, localParts.count) {
-            let r = i < remoteParts.count ? remoteParts[i] : 0
-            let l = i < localParts.count ? localParts[i] : 0
-            if r != l { return r > l }
+
+        guard let remoteRelease = parseReleaseVersion(remote),
+              let localRelease = parseReleaseVersion(local) else { return false }
+        if remoteRelease.stage != localRelease.stage {
+            return remoteRelease.stage.rawValue > localRelease.stage.rawValue
         }
-        return false
+        return remoteRelease.stage != .stable
+            && remoteRelease.stageNumber > localRelease.stageNumber
+    }
+
+    private static func numericCore(_ version: String) -> [Int]? {
+        var candidate = version
+        if candidate.hasPrefix("v") || candidate.hasPrefix("V") {
+            candidate.removeFirst()
+        }
+        guard !candidate.isEmpty else { return nil }
+        let core = candidate.split(
+            separator: "-",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )[0]
+        let rawParts = core.split(separator: ".", omittingEmptySubsequences: false)
+            .map { Int($0) }
+        guard rawParts.count == 3, !rawParts.contains(nil) else { return nil }
+        return rawParts.compactMap { $0 }
+    }
+
+    private static func parseReleaseVersion(_ version: String) -> ReleaseVersion? {
+        var candidate = version
+        if candidate.hasPrefix("v") || candidate.hasPrefix("V") {
+            candidate.removeFirst()
+        }
+        guard !candidate.isEmpty, numericCore(candidate) != nil else { return nil }
+
+        let pieces = candidate.split(
+            separator: "-",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard pieces.count == 2 else {
+            return ReleaseVersion(stage: .stable, stageNumber: 0)
+        }
+
+        let prerelease = pieces[1].split(separator: ".", omittingEmptySubsequences: false)
+        guard prerelease.count == 2,
+              let stageNumber = Int(prerelease[1]),
+              stageNumber >= 0 else { return nil }
+        let stage: ReleaseStage
+        switch prerelease[0].lowercased() {
+        case "alpha": stage = .alpha
+        case "rc": stage = .rc
+        default: return nil
+        }
+        return ReleaseVersion(stage: stage, stageNumber: stageNumber)
     }
 
     /// Origin of the hosted rendezvous whose public transparency log
