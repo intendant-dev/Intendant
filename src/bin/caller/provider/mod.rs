@@ -65,8 +65,8 @@ async fn send_with_retry(
             // consumed. Timeouts are excluded: each attempt already waited
             // the full request timeout, so backoff-retrying them multiplies
             // a hung endpoint into `timeout × (retries+1)` of wall clock.
-            Err(e) if !e.is_timeout() => last_err = Some(CallerError::Http(e)),
-            Err(e) => return Err(CallerError::Http(e)),
+            Err(e) if !e.is_timeout() => last_err = Some(CallerError::http(e)),
+            Err(e) => return Err(CallerError::http(e)),
         }
         if attempt < max_retries {
             tokio::time::sleep(backoff_delay(attempt)).await;
@@ -452,7 +452,9 @@ impl ProviderHttpResponse {
 
     async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, CallerError> {
         match self {
-            ProviderHttpResponse::Direct(response) => Ok(response.json().await?),
+            ProviderHttpResponse::Direct(response) => {
+                response.json().await.map_err(CallerError::http)
+            }
             ProviderHttpResponse::Egress(response) => {
                 let body = response.body_text().await.map_err(CallerError::Provider)?;
                 serde_json::from_str(&body).map_err(CallerError::Json)

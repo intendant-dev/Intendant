@@ -543,7 +543,8 @@ impl ChatProvider for OpenAIProvider {
         // Parse the body once; the typed view and the raw echo-back items
         // both project from the same DOM (this used to re-tokenize the
         // full body a second time).
-        let body: serde_json::Value = serde_json::from_str(&response.text().await?)?;
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.map_err(CallerError::http)?)?;
         // Capture raw output items for verbatim echo-back (reasoning + function_call items)
         let raw_output = body.get("output").and_then(|o| o.as_array()).cloned();
         let resp: OpenAIResponsesResponse = serde_json::from_value(body)?;
