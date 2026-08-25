@@ -34,9 +34,11 @@
 //! which refold could only narrow, is closed structurally by the
 //! active-scheduler lease (`crate::handover`, Track HS2): only the lease
 //! holder runs the firing pass at all, so two live planners never race
-//! one due occurrence. At-least-once remains the honest contract for
-//! crash windows (a `prepared` row without a terminal re-delivers on the
-//! next wake, whichever daemon holds the lease by then).
+//! one due occurrence. A draining predecessor may still journal its
+//! in-flight write-backs after releasing that lease, so occurrence appends
+//! carry their own short cross-process lock. At-least-once remains the
+//! honest contract for crash windows (a `prepared` row without a terminal
+//! re-delivers on the next wake, whichever daemon holds the lease by then).
 
 use super::types::{
     AgendaEffect, AgendaItem, AgendaStatus, AgendaWatchedBy, BindingRef, RecurrenceSpec,
@@ -48,6 +50,7 @@ use std::path::{Path, PathBuf};
 
 const POLICY_FILE: &str = "reminder-policy.json";
 const JOURNAL_FILE: &str = "occurrences.jsonl";
+const JOURNAL_LOCK_FILE: &str = "occurrences.lock";
 
 /// How loudly a reminder may deliver. `Mute` suppresses delivery entirely
 /// (journaled as `suppressed`, so the occurrence is spent). The other
@@ -466,6 +469,10 @@ impl SessionLineageRole {
 pub(crate) struct OccurrenceJournal {
     path: PathBuf,
     file: std::fs::File,
+    /// Cross-process append lock. The active-scheduler lease prevents two
+    /// planners, but a draining predecessor and its successor can both
+    /// journal in-flight write-backs during handover.
+    append_lock: std::fs::File,
     state: BTreeMap<String, OccurrenceProgress>,
     folded_len: u64,
     /// Max lease generation observed across every folded row — the Q1
@@ -481,6 +488,12 @@ impl OccurrenceJournal {
     pub(crate) fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(JOURNAL_FILE);
+        let append_lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(JOURNAL_LOCK_FILE))?;
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -494,6 +507,7 @@ impl OccurrenceJournal {
         Ok(Self {
             path,
             file,
+            append_lock,
             state,
             folded_len,
             max_generation,
@@ -651,12 +665,34 @@ impl OccurrenceJournal {
     /// A set writer stamp fills `generation`/`boot_id` where the record
     /// carries none — construction sites stay stamp-agnostic.
     pub(crate) fn append(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        // The scheduler lease serializes planning, not write-backs: a
+        // draining predecessor continues recording its in-flight sessions
+        // after the successor acquires the lease. Serialize the complete
+        // refresh/repair/append transaction across those writers so a
+        // successor can never mistake a live predecessor's prefix for a
+        // crash-torn tail.
+        std::fs::File::lock(&self.append_lock)?;
+        let result = self.append_locked(record);
+        let unlock = std::fs::File::unlock(&self.append_lock);
+        match result {
+            Err(err) => {
+                let _ = unlock;
+                Err(err)
+            }
+            Ok(()) => {
+                unlock?;
+                Ok(())
+            }
+        }
+    }
+
+    fn append_locked(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
         // Readers deliberately withhold an unterminated tail because it
         // may be another thread's in-flight append. Occurrence writes are
-        // single-writer under the active-scheduler lease, so the next
-        // writer is the safe place to seal a crash-torn tail before adding
-        // a fresh record. Refresh first so our fold absorbs any complete
-        // rows a previous writer landed.
+        // serialized by `append_lock`, so the next lock holder is the safe
+        // place to seal a crash-torn tail before adding a fresh record.
+        // Refresh first so our fold absorbs any complete rows a previous
+        // writer landed.
         self.refresh_if_stale()?;
         if self.terminate_torn_tail()? {
             let bytes = std::fs::read(&self.path)?;
@@ -4114,6 +4150,23 @@ mod tests {
             .occurrences
             .iter()
             .all(|entry| entry["known"] == serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn occurrence_append_lock_serializes_handover_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let predecessor = OccurrenceJournal::open(dir.path()).unwrap();
+        let successor = OccurrenceJournal::open(dir.path()).unwrap();
+
+        std::fs::File::lock(&predecessor.append_lock).unwrap();
+        assert!(matches!(
+            std::fs::File::try_lock(&successor.append_lock),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        std::fs::File::unlock(&predecessor.append_lock).unwrap();
+
+        std::fs::File::lock(&successor.append_lock).unwrap();
+        std::fs::File::unlock(&successor.append_lock).unwrap();
     }
 
     #[test]
