@@ -153,7 +153,8 @@ impl Transcriber for WhisperTranscriber {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(CallerError::http)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -165,7 +166,7 @@ impl Transcriber for WhisperTranscriber {
             )));
         }
 
-        let wr: WhisperResponse = resp.json().await?;
+        let wr: WhisperResponse = resp.json().await.map_err(CallerError::http)?;
         if std::env::var("RUST_LOG").is_ok() {
             eprintln!(
                 "transcription: text={:?} language={:?} duration={:?}",

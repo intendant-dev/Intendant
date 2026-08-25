@@ -13,7 +13,10 @@ pub enum CallerError {
     SubAgent(String),
     Io(std::io::Error),
     Json(serde_json::Error),
-    Http(reqwest::Error),
+    /// An HTTP-layer failure rendered at the networking boundary. Keeping
+    /// the message instead of a concrete client error lets this shared core
+    /// stay independent of any HTTP/TLS stack.
+    Http(String),
     Config(String),
     /// No usable model credential anywhere: no active lease, no browser
     /// relay, no key in the process environment or any searched `.env`.
@@ -48,6 +51,12 @@ impl fmt::Display for CallerError {
 }
 
 impl CallerError {
+    /// Preserve an HTTP client's user-facing error text without making the
+    /// core crate depend on that client's concrete error type.
+    pub fn http(error: impl fmt::Display) -> Self {
+        Self::Http(error.to_string())
+    }
+
     /// Structured class for session-end events (`error_kind` on
     /// SessionEnded): lets UIs attach an action without parsing Display
     /// prose. None for errors with no dedicated surface affordance.
@@ -70,12 +79,6 @@ impl From<std::io::Error> for CallerError {
 impl From<serde_json::Error> for CallerError {
     fn from(e: serde_json::Error) -> Self {
         CallerError::Json(e)
-    }
-}
-
-impl From<reqwest::Error> for CallerError {
-    fn from(e: reqwest::Error) -> Self {
-        CallerError::Http(e)
     }
 }
 
@@ -160,6 +163,16 @@ mod tests {
         match caller_err {
             CallerError::Json(_) => {}
             _ => panic!("expected Json variant"),
+        }
+    }
+
+    #[test]
+    fn http_error_preserves_the_transport_message() {
+        let err = CallerError::http("connection reset");
+        assert_eq!(format!("{}", err), "HTTP error: connection reset");
+        match err {
+            CallerError::Http(message) => assert_eq!(message, "connection reset"),
+            _ => panic!("expected Http variant"),
         }
     }
 

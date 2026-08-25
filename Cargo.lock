@@ -2991,7 +2991,6 @@ dependencies = [
  "dirs",
  "if-addrs",
  "presence-core",
- "reqwest",
  "schemars",
  "serde",
  "serde_json",
