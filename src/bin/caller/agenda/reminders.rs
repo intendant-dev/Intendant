@@ -486,15 +486,11 @@ impl OccurrenceJournal {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let (state, mut folded_len, max_generation) = fold_journal(&bytes);
-        let mut file = std::fs::File::options()
+        let (state, folded_len, max_generation) = fold_journal(&bytes);
+        let file = std::fs::File::options()
             .create(true)
             .append(true)
             .open(&path)?;
-        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-            file.write_all(b"\n")?;
-            folded_len += 1;
-        }
         Ok(Self {
             path,
             file,
@@ -655,6 +651,21 @@ impl OccurrenceJournal {
     /// A set writer stamp fills `generation`/`boot_id` where the record
     /// carries none — construction sites stay stamp-agnostic.
     pub(crate) fn append(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        // Readers deliberately withhold an unterminated tail because it
+        // may be another thread's in-flight append. Occurrence writes are
+        // single-writer under the active-scheduler lease, so the next
+        // writer is the safe place to seal a crash-torn tail before adding
+        // a fresh record. Refresh first so our fold absorbs any complete
+        // rows a previous writer landed.
+        self.refresh_if_stale()?;
+        if self.terminate_torn_tail()? {
+            let bytes = std::fs::read(&self.path)?;
+            let (state, folded_len, max_generation) = fold_journal(&bytes);
+            self.state = state;
+            self.folded_len = folded_len;
+            self.max_generation = max_generation;
+        }
+
         let stamped;
         let record = match &self.stamp {
             Some(stamp) if record.generation.is_none() || record.boot_id.is_none() => {
@@ -690,6 +701,32 @@ impl OccurrenceJournal {
         Ok(())
     }
 
+    /// Put the next append on a fresh line after a crash-torn tail. Returns
+    /// whether a separator was written so the caller can refold the now
+    /// complete final line before folding its new record.
+    fn terminate_torn_tail(&mut self) -> std::io::Result<bool> {
+        use std::io::{Read as _, Seek as _};
+
+        let len = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
+        if len == 0 {
+            return Ok(false);
+        }
+        let mut reader = std::fs::File::open(&self.path)?;
+        reader.seek(std::io::SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        reader.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(false);
+        }
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        Ok(true)
+    }
+
     /// Refold when another co-homed daemon appended (same convergence
     /// trick as the op log; see the module docs for the honest limits).
     pub(crate) fn refresh_if_stale(&mut self) -> std::io::Result<()> {
@@ -706,10 +743,6 @@ impl OccurrenceJournal {
         self.state = state;
         self.folded_len = folded_len;
         self.max_generation = max_generation;
-        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-            self.file.write_all(b"\n")?;
-            self.folded_len += 1;
-        }
         Ok(())
     }
 
@@ -733,15 +766,15 @@ impl OccurrenceJournal {
     /// included); lines without one are excluded under the filter.
     /// Whitespace-only lines keep their seq slot but are never served.
     ///
-    /// Torn reads: the in-process writer (the scheduler's own journal
-    /// instance) appends each record as ONE `write_all` of a complete
-    /// line on an `O_APPEND` handle, so a concurrent read observes whole
-    /// lines — the exact guarantee [`Self::refresh_if_stale`]'s own fold
-    /// (and the co-homed-daemons convergence it exists for) already
-    /// rests on; a crash-torn tail is permanently torn and served as
-    /// `unparseable` history. The caller's lock (`AgendaHandle`'s
-    /// journal mutex) additionally serializes this read against our own
-    /// terminator writes.
+    /// Torn reads: the scheduler writes a complete line through an
+    /// `O_APPEND` handle, but a concurrent reader may still open the file
+    /// between bytes becoming visible and the final newline. Therefore an
+    /// unterminated final line is withheld: it may be an in-flight append,
+    /// and exposing it would invent transient corrupt history. A
+    /// crash-torn tail becomes `unparseable` history after the next writer
+    /// safely seals it before appending a new record.
+    /// The caller's lock (`AgendaHandle`'s journal mutex) additionally
+    /// serializes this read against our own terminator writes.
     pub(crate) fn read_page(
         &mut self,
         since: u64,
@@ -757,7 +790,7 @@ impl OccurrenceJournal {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(complete_journal_prefix(&bytes));
         let mut occurrences: Vec<serde_json::Value> = Vec::new();
         let mut log_len = 0u64;
         // The first seq the scan did not consume; log_len unless the
@@ -875,7 +908,11 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
 }
 
 fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64) {
-    let text = String::from_utf8_lossy(bytes);
+    // An unterminated final line may be a concurrent writer that has not
+    // reached its newline yet. Preserve it on disk but do not let a
+    // transient fragment affect the fold; the next append seals a truly
+    // crash-torn tail as its own line.
+    let text = String::from_utf8_lossy(complete_journal_prefix(bytes));
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
     let mut max_generation = 0u64;
     for line in text.lines() {
@@ -900,6 +937,13 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64
         }
     }
     (state, bytes.len() as u64, max_generation)
+}
+
+fn complete_journal_prefix(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&[], |last_newline| &bytes[..=last_newline])
 }
 
 /// Max lease generation stamped on journal rows under `dir` — the Q1
@@ -3969,9 +4013,9 @@ mod tests {
 
     /// The production topology's torn-read canary: the scheduler writes
     /// through its OWN journal instance while a reader instance pages —
-    /// every served entry is a complete record (whole-line `O_APPEND`
-    /// visibility), never an `unparseable` artifact of an in-flight
-    /// append.
+    /// every served entry is a complete record. The reader withholds an
+    /// unterminated tail rather than relying on `O_APPEND` visibility to
+    /// make a concurrent read atomic.
     #[test]
     fn occurrences_reads_never_split_writer_appends() {
         let dir = tempfile::tempdir().unwrap();
@@ -4024,6 +4068,86 @@ mod tests {
         assert_eq!(page.log_len, APPENDS);
         assert_eq!(page.occurrences.len(), APPENDS as usize);
         assert_eq!(page.next_since, page.log_len);
+    }
+
+    #[test]
+    fn occurrences_read_withholds_an_unterminated_tail_until_it_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = OccurrenceJournal::open(dir.path()).unwrap();
+        let row = |round: u64| OccurrenceRecord {
+            v: 1,
+            at_ms: round + 1,
+            occurrence_id: format!("occ-{round}"),
+            item_id: "01ITEMC".into(),
+            due_ms: round,
+            state: OccurrenceState::Delivered,
+            urgency: Some(ReminderUrgency::Info),
+            session_id: Some("x".repeat(200)),
+            generation: None,
+            boot_id: None,
+            attempt: None,
+        };
+        writer.append(&row(0)).unwrap();
+        let mut reader = OccurrenceJournal::open(dir.path()).unwrap();
+
+        let mut second = serde_json::to_vec(&row(1)).unwrap();
+        second.push(b'\n');
+        let split = second.len() / 2;
+        let mut raw_writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(JOURNAL_FILE))
+            .unwrap();
+        raw_writer.write_all(&second[..split]).unwrap();
+        raw_writer.flush().unwrap();
+
+        let page = reader.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 1, "an in-flight tail has no seq yet");
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(page.occurrences[0]["known"], true);
+
+        raw_writer.write_all(&second[split..]).unwrap();
+        raw_writer.flush().unwrap();
+        let page = reader.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 2);
+        assert_eq!(page.occurrences.len(), 2);
+        assert!(page
+            .occurrences
+            .iter()
+            .all(|entry| entry["known"] == serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn next_occurrence_append_seals_a_crash_torn_tail_as_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL_FILE);
+        std::fs::write(&path, b"{\"v\":1,\"occurrence_id\":\"crash").unwrap();
+
+        let mut journal = OccurrenceJournal::open(dir.path()).unwrap();
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: 2,
+                occurrence_id: "occ-after-crash".into(),
+                item_id: "01ITEMC".into(),
+                due_ms: 1,
+                state: OccurrenceState::Delivered,
+                urgency: Some(ReminderUrgency::Info),
+                session_id: None,
+                generation: None,
+                boot_id: None,
+                attempt: None,
+            })
+            .unwrap();
+
+        let page = journal.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 2);
+        assert_eq!(page.occurrences.len(), 2);
+        assert_eq!(page.occurrences[0]["unparseable"], true);
+        assert_eq!(page.occurrences[1]["known"], true);
+        assert_eq!(
+            page.occurrences[1]["record"]["occurrence_id"],
+            "occ-after-crash"
+        );
     }
 
     // ---- Track T: event triggers ----

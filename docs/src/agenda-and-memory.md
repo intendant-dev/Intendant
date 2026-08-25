@@ -64,7 +64,10 @@ it — so the same `since` line cursor, `item_id` filter, and `limit` paging
 apply, with the same honesty rules: records a newer build wrote are served
 verbatim with `known: false`, non-JSON lines as `unparseable: true`.
 `intendant ctl agenda occurrences [ID_PREFIX]` is the shell view of the same
-page (loopback `/api` read lane, local daemon only).
+page (loopback `/api` read lane, local daemon only). A final line without its
+newline is preserved but withheld because it may still be an in-flight append;
+the next occurrence write seals a genuinely crash-torn tail as its own line,
+after which it is served as `unparseable` rather than joined to the new record.
 
 ### Items and transitions
 
