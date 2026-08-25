@@ -908,11 +908,11 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
 }
 
 fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64) {
-    // An unterminated final line may be a concurrent writer that has not
-    // reached its newline yet. Preserve it on disk but do not let a
-    // transient fragment affect the fold; the next append seals a truly
-    // crash-torn tail as its own line.
-    let text = String::from_utf8_lossy(complete_journal_prefix(bytes));
+    // A fully encoded final record is safe to fold even before its newline
+    // becomes visible. A genuinely partial record fails the typed parse and
+    // is retried when the file grows; unlike the raw serving lane, the fold
+    // has no cursor slot to expose prematurely.
+    let text = String::from_utf8_lossy(bytes);
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
     let mut max_generation = 0u64;
     for line in text.lines() {
