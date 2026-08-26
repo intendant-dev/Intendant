@@ -34,9 +34,11 @@
 //! which refold could only narrow, is closed structurally by the
 //! active-scheduler lease (`crate::handover`, Track HS2): only the lease
 //! holder runs the firing pass at all, so two live planners never race
-//! one due occurrence. At-least-once remains the honest contract for
-//! crash windows (a `prepared` row without a terminal re-delivers on the
-//! next wake, whichever daemon holds the lease by then).
+//! one due occurrence. A draining predecessor may still journal its
+//! in-flight write-backs after releasing that lease, so occurrence appends
+//! carry their own short cross-process lock. At-least-once remains the
+//! honest contract for crash windows (a `prepared` row without a terminal
+//! re-delivers on the next wake, whichever daemon holds the lease by then).
 
 use super::types::{
     AgendaEffect, AgendaItem, AgendaStatus, AgendaWatchedBy, BindingRef, RecurrenceSpec,
@@ -48,6 +50,7 @@ use std::path::{Path, PathBuf};
 
 const POLICY_FILE: &str = "reminder-policy.json";
 const JOURNAL_FILE: &str = "occurrences.jsonl";
+const JOURNAL_LOCK_FILE: &str = "occurrences.lock";
 
 /// How loudly a reminder may deliver. `Mute` suppresses delivery entirely
 /// (journaled as `suppressed`, so the occurrence is spent). The other
@@ -466,6 +469,10 @@ impl SessionLineageRole {
 pub(crate) struct OccurrenceJournal {
     path: PathBuf,
     file: std::fs::File,
+    /// Cross-process append lock. The active-scheduler lease prevents two
+    /// planners, but a draining predecessor and its successor can both
+    /// journal in-flight write-backs during handover.
+    append_lock: std::fs::File,
     state: BTreeMap<String, OccurrenceProgress>,
     folded_len: u64,
     /// Max lease generation observed across every folded row — the Q1
@@ -481,23 +488,26 @@ impl OccurrenceJournal {
     pub(crate) fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(JOURNAL_FILE);
+        let append_lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(JOURNAL_LOCK_FILE))?;
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let (state, mut folded_len, max_generation) = fold_journal(&bytes);
-        let mut file = std::fs::File::options()
+        let (state, folded_len, max_generation) = fold_journal(&bytes);
+        let file = std::fs::File::options()
             .create(true)
             .append(true)
             .open(&path)?;
-        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-            file.write_all(b"\n")?;
-            folded_len += 1;
-        }
         Ok(Self {
             path,
             file,
+            append_lock,
             state,
             folded_len,
             max_generation,
@@ -655,6 +665,43 @@ impl OccurrenceJournal {
     /// A set writer stamp fills `generation`/`boot_id` where the record
     /// carries none — construction sites stay stamp-agnostic.
     pub(crate) fn append(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        // The scheduler lease serializes planning, not write-backs: a
+        // draining predecessor continues recording its in-flight sessions
+        // after the successor acquires the lease. Serialize the complete
+        // refresh/repair/append transaction across those writers so a
+        // successor can never mistake a live predecessor's prefix for a
+        // crash-torn tail.
+        std::fs::File::lock(&self.append_lock)?;
+        let result = self.append_locked(record);
+        let unlock = std::fs::File::unlock(&self.append_lock);
+        match result {
+            Err(err) => {
+                let _ = unlock;
+                Err(err)
+            }
+            Ok(()) => {
+                unlock?;
+                Ok(())
+            }
+        }
+    }
+
+    fn append_locked(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        // Readers deliberately withhold an unterminated tail because it
+        // may be another thread's in-flight append. Occurrence writes are
+        // serialized by `append_lock`, so the next lock holder is the safe
+        // place to seal a crash-torn tail before adding a fresh record.
+        // Refresh first so our fold absorbs any complete rows a previous
+        // writer landed.
+        self.refresh_if_stale()?;
+        if self.terminate_torn_tail()? {
+            let bytes = std::fs::read(&self.path)?;
+            let (state, folded_len, max_generation) = fold_journal(&bytes);
+            self.state = state;
+            self.folded_len = folded_len;
+            self.max_generation = max_generation;
+        }
+
         let stamped;
         let record = match &self.stamp {
             Some(stamp) if record.generation.is_none() || record.boot_id.is_none() => {
@@ -690,6 +737,32 @@ impl OccurrenceJournal {
         Ok(())
     }
 
+    /// Put the next append on a fresh line after a crash-torn tail. Returns
+    /// whether a separator was written so the caller can refold the now
+    /// complete final line before folding its new record.
+    fn terminate_torn_tail(&mut self) -> std::io::Result<bool> {
+        use std::io::{Read as _, Seek as _};
+
+        let len = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
+        if len == 0 {
+            return Ok(false);
+        }
+        let mut reader = std::fs::File::open(&self.path)?;
+        reader.seek(std::io::SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        reader.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(false);
+        }
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        Ok(true)
+    }
+
     /// Refold when another co-homed daemon appended (same convergence
     /// trick as the op log; see the module docs for the honest limits).
     pub(crate) fn refresh_if_stale(&mut self) -> std::io::Result<()> {
@@ -706,10 +779,6 @@ impl OccurrenceJournal {
         self.state = state;
         self.folded_len = folded_len;
         self.max_generation = max_generation;
-        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-            self.file.write_all(b"\n")?;
-            self.folded_len += 1;
-        }
         Ok(())
     }
 
@@ -733,15 +802,15 @@ impl OccurrenceJournal {
     /// included); lines without one are excluded under the filter.
     /// Whitespace-only lines keep their seq slot but are never served.
     ///
-    /// Torn reads: the in-process writer (the scheduler's own journal
-    /// instance) appends each record as ONE `write_all` of a complete
-    /// line on an `O_APPEND` handle, so a concurrent read observes whole
-    /// lines — the exact guarantee [`Self::refresh_if_stale`]'s own fold
-    /// (and the co-homed-daemons convergence it exists for) already
-    /// rests on; a crash-torn tail is permanently torn and served as
-    /// `unparseable` history. The caller's lock (`AgendaHandle`'s
-    /// journal mutex) additionally serializes this read against our own
-    /// terminator writes.
+    /// Torn reads: the scheduler writes a complete line through an
+    /// `O_APPEND` handle, but a concurrent reader may still open the file
+    /// between bytes becoming visible and the final newline. Therefore an
+    /// unterminated final line is withheld: it may be an in-flight append,
+    /// and exposing it would invent transient corrupt history. A
+    /// crash-torn tail becomes `unparseable` history after the next writer
+    /// safely seals it before appending a new record.
+    /// The caller's lock (`AgendaHandle`'s journal mutex) additionally
+    /// serializes this read against our own terminator writes.
     pub(crate) fn read_page(
         &mut self,
         since: u64,
@@ -757,7 +826,7 @@ impl OccurrenceJournal {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(complete_journal_prefix(&bytes));
         let mut occurrences: Vec<serde_json::Value> = Vec::new();
         let mut log_len = 0u64;
         // The first seq the scan did not consume; log_len unless the
@@ -875,6 +944,10 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
 }
 
 fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64) {
+    // A fully encoded final record is safe to fold even before its newline
+    // becomes visible. A genuinely partial record fails the typed parse and
+    // is retried when the file grows; unlike the raw serving lane, the fold
+    // has no cursor slot to expose prematurely.
     let text = String::from_utf8_lossy(bytes);
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
     let mut max_generation = 0u64;
@@ -900,6 +973,13 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64
         }
     }
     (state, bytes.len() as u64, max_generation)
+}
+
+fn complete_journal_prefix(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&[], |last_newline| &bytes[..=last_newline])
 }
 
 /// Max lease generation stamped on journal rows under `dir` — the Q1
@@ -3969,9 +4049,9 @@ mod tests {
 
     /// The production topology's torn-read canary: the scheduler writes
     /// through its OWN journal instance while a reader instance pages —
-    /// every served entry is a complete record (whole-line `O_APPEND`
-    /// visibility), never an `unparseable` artifact of an in-flight
-    /// append.
+    /// every served entry is a complete record. The reader withholds an
+    /// unterminated tail rather than relying on `O_APPEND` visibility to
+    /// make a concurrent read atomic.
     #[test]
     fn occurrences_reads_never_split_writer_appends() {
         let dir = tempfile::tempdir().unwrap();
@@ -4024,6 +4104,103 @@ mod tests {
         assert_eq!(page.log_len, APPENDS);
         assert_eq!(page.occurrences.len(), APPENDS as usize);
         assert_eq!(page.next_since, page.log_len);
+    }
+
+    #[test]
+    fn occurrences_read_withholds_an_unterminated_tail_until_it_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = OccurrenceJournal::open(dir.path()).unwrap();
+        let row = |round: u64| OccurrenceRecord {
+            v: 1,
+            at_ms: round + 1,
+            occurrence_id: format!("occ-{round}"),
+            item_id: "01ITEMC".into(),
+            due_ms: round,
+            state: OccurrenceState::Delivered,
+            urgency: Some(ReminderUrgency::Info),
+            session_id: Some("x".repeat(200)),
+            generation: None,
+            boot_id: None,
+            attempt: None,
+        };
+        writer.append(&row(0)).unwrap();
+        let mut reader = OccurrenceJournal::open(dir.path()).unwrap();
+
+        let mut second = serde_json::to_vec(&row(1)).unwrap();
+        second.push(b'\n');
+        let split = second.len() / 2;
+        let mut raw_writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(JOURNAL_FILE))
+            .unwrap();
+        raw_writer.write_all(&second[..split]).unwrap();
+        raw_writer.flush().unwrap();
+
+        let page = reader.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 1, "an in-flight tail has no seq yet");
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(page.occurrences[0]["known"], true);
+
+        raw_writer.write_all(&second[split..]).unwrap();
+        raw_writer.flush().unwrap();
+        let page = reader.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 2);
+        assert_eq!(page.occurrences.len(), 2);
+        assert!(page
+            .occurrences
+            .iter()
+            .all(|entry| entry["known"] == serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn occurrence_append_lock_serializes_handover_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let predecessor = OccurrenceJournal::open(dir.path()).unwrap();
+        let successor = OccurrenceJournal::open(dir.path()).unwrap();
+
+        std::fs::File::lock(&predecessor.append_lock).unwrap();
+        assert!(matches!(
+            std::fs::File::try_lock(&successor.append_lock),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        std::fs::File::unlock(&predecessor.append_lock).unwrap();
+
+        std::fs::File::lock(&successor.append_lock).unwrap();
+        std::fs::File::unlock(&successor.append_lock).unwrap();
+    }
+
+    #[test]
+    fn next_occurrence_append_seals_a_crash_torn_tail_as_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL_FILE);
+        std::fs::write(&path, b"{\"v\":1,\"occurrence_id\":\"crash").unwrap();
+
+        let mut journal = OccurrenceJournal::open(dir.path()).unwrap();
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: 2,
+                occurrence_id: "occ-after-crash".into(),
+                item_id: "01ITEMC".into(),
+                due_ms: 1,
+                state: OccurrenceState::Delivered,
+                urgency: Some(ReminderUrgency::Info),
+                session_id: None,
+                generation: None,
+                boot_id: None,
+                attempt: None,
+            })
+            .unwrap();
+
+        let page = journal.read_page(0, None, 2000).unwrap();
+        assert_eq!(page.log_len, 2);
+        assert_eq!(page.occurrences.len(), 2);
+        assert_eq!(page.occurrences[0]["unparseable"], true);
+        assert_eq!(page.occurrences[1]["known"], true);
+        assert_eq!(
+            page.occurrences[1]["record"]["occurrence_id"],
+            "occ-after-crash"
+        );
     }
 
     // ---- Track T: event triggers ----

@@ -29,7 +29,8 @@ owner-plane replication.
 <INTENDANT_HOME or ~/.intendant>/agenda/
 ├── agenda.jsonl              append-only item operation log
 ├── reminder-policy.json      owner-controlled delivery policy
-└── occurrences.jsonl         reminder and scheduled-session occurrence journal
+├── occurrences.jsonl         reminder and scheduled-session occurrence journal
+└── occurrences.lock          cross-process occurrence append serialization
 ```
 
 `agenda.jsonl` is folded into the current item view. Unknown newer operations,
@@ -64,7 +65,12 @@ it — so the same `since` line cursor, `item_id` filter, and `limit` paging
 apply, with the same honesty rules: records a newer build wrote are served
 verbatim with `known: false`, non-JSON lines as `unparseable: true`.
 `intendant ctl agenda occurrences [ID_PREFIX]` is the shell view of the same
-page (loopback `/api` read lane, local daemon only).
+page (loopback `/api` read lane, local daemon only). A final line without its
+newline is preserved but withheld because it may still be an in-flight append;
+occurrence writers hold a cross-process lock across tail recovery and append,
+so the next writer can seal a genuinely crash-torn tail as its own line only
+after any draining predecessor has finished its record. The sealed tail is
+then served as `unparseable` rather than joined to the new record.
 
 ### Items and transitions
 
