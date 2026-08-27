@@ -4804,7 +4804,9 @@ mod tests {
             mcp_server: None,
             shared_session: crate::web_gateway::ActiveSessionState::empty(),
             project_root: None,
-            worktree_inventory_cache: Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None)),
+            worktree_inventory_cache: Arc::new(crate::worktree_inventory::WorktreeScanCache::new(
+                None,
+            )),
             terminal_registry: Arc::new(crate::terminal::TerminalRegistry::new(
                 std::env::temp_dir(),
             )),

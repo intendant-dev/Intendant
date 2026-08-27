@@ -511,7 +511,9 @@ pub fn empty_scan() -> WorktreeScan {
 /// Poison-tolerant lock: a panic inside one scan request must not wedge
 /// every later inventory request behind a poisoned mutex.
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Default)]
@@ -3267,7 +3269,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for (name, bytes) in [
             ("torn.json", &br#"{"scanned_at":"2026-"#[..]),
-            ("unstamped.json", serde_json::to_string(&empty_scan()).unwrap().as_bytes()),
+            (
+                "unstamped.json",
+                serde_json::to_string(&empty_scan()).unwrap().as_bytes(),
+            ),
             ("wrong-shape.json", &br#"{"error":"scan failed"}"#[..]),
         ] {
             let path = tmp.path().join(name);
