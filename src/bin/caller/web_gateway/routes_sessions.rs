@@ -514,11 +514,11 @@ pub(crate) fn scan_worktree_inventory_response(home: &Path, project_root: Option
 /// transport edge resolves the real home dir (like the merge adapters
 /// already do), keeping these cores deterministic so tests inject a
 /// temp home instead of scanning the machine they run on.
-pub(crate) fn worktrees_list_api_response(cache: &Arc<Mutex<Option<String>>>) -> ApiResponse {
+pub(crate) fn worktrees_list_api_response(
+    cache: &Arc<crate::worktree_inventory::WorktreeScanCache>,
+) -> ApiResponse {
     let body = cache
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+        .read()
         .unwrap_or_else(empty_worktree_inventory_response);
     ApiResponse::json(200, JsonBody::PreSerialized(body))
 }
@@ -531,25 +531,23 @@ pub(crate) fn worktrees_inspect_api_response(home: &Path, body_text: &str) -> Ap
 pub(crate) fn worktrees_scan_api_response(
     home: &Path,
     project_root: Option<&Path>,
-    cache: &Arc<Mutex<Option<String>>>,
+    cache: &Arc<crate::worktree_inventory::WorktreeScanCache>,
 ) -> ApiResponse {
-    let body = scan_worktree_inventory_response(home, project_root);
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(body.clone());
-    }
+    // Single-flight: stacked scan requests (dashboard retries after a
+    // client timeout) join the running scan instead of piling further
+    // full-disk walks onto an already loaded box.
+    let body = cache.scan_or_join(|| scan_worktree_inventory_response(home, project_root));
     ApiResponse::json(200, JsonBody::PreSerialized(body))
 }
 
 pub(crate) fn worktrees_remove_api_response(
     home: &Path,
     body_text: &str,
-    cache: &Arc<Mutex<Option<String>>>,
+    cache: &Arc<crate::worktree_inventory::WorktreeScanCache>,
 ) -> ApiResponse {
     let (status_line, body) = remove_worktree_inventory_response(home, body_text);
     if status_line == "200 OK" {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = None;
-        }
+        cache.invalidate();
     }
     ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
@@ -557,13 +555,11 @@ pub(crate) fn worktrees_remove_api_response(
 pub(crate) fn worktrees_clean_api_response(
     home: &Path,
     body_text: &str,
-    cache: &Arc<Mutex<Option<String>>>,
+    cache: &Arc<crate::worktree_inventory::WorktreeScanCache>,
 ) -> ApiResponse {
     let (status_line, body) = clean_worktree_inventory_response(home, body_text);
     if status_line == "200 OK" {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = None;
-        }
+        cache.invalidate();
     }
     ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
@@ -4513,7 +4509,7 @@ pub(crate) async fn handle_worktrees_inspect(
 pub(crate) async fn handle_worktrees_remove(
     stream: DemuxStream,
     body_text: String,
-    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
@@ -4541,7 +4537,7 @@ pub(crate) async fn handle_worktrees_remove(
 pub(crate) async fn handle_worktrees_clean(
     stream: DemuxStream,
     body_text: String,
-    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
@@ -4569,7 +4565,7 @@ pub(crate) async fn handle_worktrees_clean(
 pub(crate) async fn handle_worktrees_merge(
     stream: DemuxStream,
     body_text: String,
-    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
@@ -4580,9 +4576,7 @@ pub(crate) async fn handle_worktrees_merge(
         if result.0 == "200 OK" {
             // The merge (and usually the removal) changed the inventory;
             // drop the cached scan like the remove handler does.
-            if let Ok(mut guard) = cache.lock() {
-                *guard = None;
-            }
+            cache.invalidate();
         }
         result
     })
@@ -4608,7 +4602,7 @@ pub(crate) async fn handle_worktrees_merge(
 pub(crate) async fn handle_worktrees_scan(
     stream: DemuxStream,
     project_root: Option<PathBuf>,
-    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
@@ -4636,11 +4630,24 @@ pub(crate) async fn handle_worktrees_scan(
 
 pub(crate) async fn handle_worktrees_list(
     stream: DemuxStream,
-    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = worktrees_list_api_response(&worktree_inventory_cache);
+    // spawn_blocking like every sibling worktree handler: the read can
+    // do the one-time persisted-file load+parse, and the cache mutex it
+    // takes is held across disk IO by a completing scan's store — a
+    // reactor thread must never block on either.
+    let response =
+        tokio::task::spawn_blocking(move || worktrees_list_api_response(&worktree_inventory_cache))
+            .await
+            .unwrap_or_else(|_| {
+                // A failed read task degrades to the cold-cache shape.
+                ApiResponse::json(
+                    200,
+                    JsonBody::PreSerialized(empty_worktree_inventory_response()),
+                )
+            });
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -8260,7 +8267,7 @@ mod tests {
     #[tokio::test]
     async fn golden_worktrees_transcripts() {
         // List with a cold cache: the empty inventory scan body.
-        let cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cache = Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None));
         let response = collect_session_handler_response(|stream| {
             handle_worktrees_list(
                 stream,
@@ -8276,10 +8283,7 @@ mod tests {
         );
 
         // List with a warm cache: served verbatim.
-        {
-            let mut guard = cache.lock().unwrap();
-            *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
-        }
+        cache.store(r#"{"worktrees":[],"cached":true}"#.to_string());
         let response = collect_session_handler_response(|stream| {
             handle_worktrees_list(
                 stream,
@@ -8318,7 +8322,7 @@ mod tests {
             golden_session_json_transcript("400 Bad Request", &body)
         );
 
-        let cache2: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cache2 = Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None));
         let response = collect_session_handler_response(|stream| {
             handle_worktrees_remove(
                 stream,

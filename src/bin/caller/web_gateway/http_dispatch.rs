@@ -32,7 +32,7 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) app_html: Arc<String>,
     pub(crate) app_html_override: Option<Arc<std::path::Path>>,
     pub(crate) app_html_cache: Arc<OnceLock<(String, Vec<u8>)>>,
-    pub(crate) worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    pub(crate) worktree_inventory_cache: Arc<crate::worktree_inventory::WorktreeScanCache>,
     pub(crate) mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     pub(crate) peer_registry: Option<crate::peer::PeerRegistry>,
     pub(crate) project_root: Option<PathBuf>,

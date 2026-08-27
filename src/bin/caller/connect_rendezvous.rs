@@ -2410,7 +2410,7 @@ mod tests {
             None,
             crate::web_gateway::ActiveSessionState::empty(),
             Some(root.to_path_buf()),
-            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None)),
             Arc::new(crate::terminal::TerminalRegistry::new(root.to_path_buf())),
             None,
             serde_json::json!({"id": "intendant:test-hosted-refusal"}),

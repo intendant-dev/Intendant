@@ -575,9 +575,24 @@ function switchSessionsSubtab(name) {
       renderWorktrees(_cachedWorktreeScan);
       if (worktreesLoadInFlight === 'scan') {
         setWorktreesActivityNotice('pending', 'Scanning worktrees...');
+      } else if (!worktreesLoadInFlight && (!worktreesAutoRefreshed || worktreesLastScanFailed)) {
+        // First pane entry this page load (Station may have preloaded
+        // the inventory without refreshing it), or the last background
+        // scan died as a request: freshen behind the rendered data
+        // instead of trusting it.
+        worktreesAutoRefreshed = true;
+        loadWorktrees({ forceScan: true });
+      } else if (!worktreesLoadInFlight) {
+        // Re-entry freshness probe: the browser copy lags the daemon
+        // when a background scan outlived the client timeout (its
+        // result landed server-side after the error) or another tab
+        // scanned — swap in a strictly newer scan, silently otherwise.
+        refreshWorktreesIfServerNewer();
       }
     } else {
-      loadWorktrees({ forceScan: !worktreesLoaded });
+      // First open per page load: cached-first with a background
+      // refresh, never a blocking full scan (auto mode below).
+      loadWorktrees(worktreesLoaded ? {} : { auto: true });
     }
   } else if (!sessionsLoaded) {
     loadSessions();
