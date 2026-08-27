@@ -678,9 +678,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // every GET. Shared by HTTP and the dashboard WebRTC control tunnel,
     // mirrored to disk so a restarted daemon serves the previous scan
     // instead of forcing the pane into a blocking full rescan.
-    let worktree_inventory_cache = Arc::new(crate::worktree_inventory::WorktreeScanCache::new(
-        Some(crate::worktree_inventory::WorktreeScanCache::default_disk_path()),
-    ));
+    let worktree_inventory_cache =
+        Arc::new(crate::worktree_inventory::WorktreeScanCache::new(Some(
+            crate::worktree_inventory::WorktreeScanCache::default_disk_path(
+                project_root.as_deref(),
+            ),
+        )));
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs
