@@ -584,7 +584,7 @@ impl WorktreeScanCache {
             Some(root) => {
                 use sha2::Digest as _;
                 let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-                let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
+                let digest = sha2::Sha256::digest(path_identity_bytes(&canonical));
                 digest[..8].iter().map(|b| format!("{b:02x}")).collect()
             }
             None => "projectless".to_string(),
@@ -698,6 +698,32 @@ impl WorktreeScanCache {
         // scan the caller asked for, as fresh as when it started — it
         // just must not outlive the mutation in the cache.
         json
+    }
+}
+
+/// The platform's lossless byte representation of a path, for hashing
+/// an identity. `to_string_lossy` would map distinct non-UTF-8 paths
+/// (possible on Unix) onto one replacement-charactered string — two
+/// such project roots must not deterministically share a cache file.
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        // WTF-16 code units, little-endian: lossless for unpaired
+        // surrogates, which `to_string_lossy` would also collapse.
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
     }
 }
 
@@ -3421,6 +3447,27 @@ mod tests {
         for path in [&a1, &b, &none] {
             assert!(path.starts_with(crate::platform::intendant_home().join("cache")));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_disk_path_distinguishes_non_utf8_roots() {
+        use std::os::unix::ffi::OsStrExt as _;
+        // Two distinct invalid-UTF-8 roots that to_string_lossy collapses
+        // onto the same replacement-charactered string; canonicalize
+        // fails (nonexistent), so the raw paths carry the identity.
+        let root_a = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/proj-\xff\xfe"));
+        let root_b = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/proj-\xfe\xff"));
+        assert_eq!(
+            root_a.to_string_lossy(),
+            root_b.to_string_lossy(),
+            "precondition: the lossy strings collide"
+        );
+        assert_ne!(
+            WorktreeScanCache::default_disk_path(Some(&root_a)),
+            WorktreeScanCache::default_disk_path(Some(&root_b)),
+            "distinct roots must never share a cache file"
+        );
     }
 
     #[test]

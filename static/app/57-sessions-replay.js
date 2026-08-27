@@ -61,6 +61,56 @@ function setWorktreesLoadPending(pending, mode = '') {
   }
 }
 
+let worktreesFreshnessProbeTimer = null;
+
+function cancelWorktreesFreshnessProbes() {
+  if (worktreesFreshnessProbeTimer) {
+    clearTimeout(worktreesFreshnessProbeTimer);
+    worktreesFreshnessProbeTimer = null;
+  }
+}
+
+// Bounded self-heal after a scan request died client-side (usually the
+// 120s timeout): the server's walk keeps running and lands in the
+// daemon cache, so probe the cheap cached read a few times and swap in
+// a strictly newer scan when it appears. Any explicit load supersedes
+// the probes.
+function scheduleWorktreesFreshnessProbes(delaysMs) {
+  cancelWorktreesFreshnessProbes();
+  const [nextMs, ...restMs] = delaysMs;
+  if (nextMs == null) return;
+  worktreesFreshnessProbeTimer = setTimeout(() => {
+    worktreesFreshnessProbeTimer = null;
+    refreshWorktreesIfServerNewer().then(fresher => {
+      if (!fresher && !worktreesFreshnessProbeTimer) scheduleWorktreesFreshnessProbes(restMs);
+    });
+  }, nextMs);
+}
+
+// One cheap cached GET outside the load/pending machinery: it must
+// never clobber an explicit in-flight load, so it only applies a scan
+// strictly newer than the one on screen and stays silent otherwise.
+// Also the pane's re-entry probe — the browser copy can lag the daemon
+// when a background scan outlived the client timeout or another tab
+// scanned.
+function refreshWorktreesIfServerNewer() {
+  if (worktreesLoadInFlight) return Promise.resolve(false);
+  return daemonApi.request('api_worktrees', {})
+    .then(resp => (resp.ok ? resp.body : null))
+    .then(scan => {
+      if (!worktreeHasScannedData(scan) || worktreesLoadInFlight) return false;
+      const shown = worktreeDate(_cachedWorktreeScan?.scanned_at)?.getTime() || 0;
+      const incoming = worktreeDate(scan.scanned_at)?.getTime() || 0;
+      if (incoming <= shown) return false;
+      _cachedWorktreeScan = scan;
+      worktreesLoaded = true;
+      renderWorktrees(scan);
+      setWorktreesActivityNotice('ok', 'A newer scan finished on the daemon — refreshed.', 2500);
+      return true;
+    })
+    .catch(() => false);
+}
+
 function loadWorktrees(options = {}) {
   const forceScan = !!options.forceScan;
   const listEl = document.getElementById('worktrees-list');
@@ -90,6 +140,7 @@ function loadWorktrees(options = {}) {
   }
   const browserCachedScan = worktreeHasScannedData(_cachedWorktreeScan) ? _cachedWorktreeScan : null;
   const requestSerial = ++worktreesRequestSerial;
+  cancelWorktreesFreshnessProbes();
   worktreesLoadInFlight = forceScan ? 'scan' : 'cache';
   setWorktreesLoadPending(true, worktreesLoadInFlight);
   if (forceScan) {
@@ -140,6 +191,13 @@ function loadWorktrees(options = {}) {
         listEl.innerHTML = '<div class="empty-state">Failed to load worktrees</div>';
       }
       setWorktreesActivityNotice('error', message);
+      if (forceScan) {
+        // The usual death here is the client timer outliving a healthy
+        // walk — the daemon finishes and fills its cache after this
+        // error. Self-heal instead of staying stale until a manual
+        // Cached/Scan click.
+        scheduleWorktreesFreshnessProbes([45000, 90000, 180000]);
+      }
     })
     .finally(() => {
       if (requestSerial !== worktreesRequestSerial) return;

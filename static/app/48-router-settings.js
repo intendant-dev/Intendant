@@ -575,6 +575,12 @@ function switchSessionsSubtab(name) {
       renderWorktrees(_cachedWorktreeScan);
       if (worktreesLoadInFlight === 'scan') {
         setWorktreesActivityNotice('pending', 'Scanning worktrees...');
+      } else if (!worktreesLoadInFlight) {
+        // Re-entry freshness probe: the browser copy lags the daemon
+        // when a background scan outlived the client timeout (its
+        // result landed server-side after the error) or another tab
+        // scanned — swap in a strictly newer scan, silently otherwise.
+        refreshWorktreesIfServerNewer();
       }
     } else {
       // First open per page load: cached-first with a background
