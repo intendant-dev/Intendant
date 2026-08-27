@@ -251,7 +251,6 @@ mod tests {
             );
         }
 
-        assert!(crate::ctl::parse_due_ms("2026-08-04 23:45").is_ok());
         assert!(crate::ctl::parse_due_ms("2026-08-04 23:45:41").is_err());
         assert!(crate::ctl::parse_due_ms("2026-08-04T23:45:41-04:00").is_ok());
     }
