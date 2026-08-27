@@ -105,7 +105,12 @@ dashboard, attributed to your session.
   `--goal` as its task (never raw actions; add `--orchestrate` for the
   orchestration shape, `--interactive` for the owner-sitting shape —
   the fired session opens with the goal as the owner's message and
-  waits for them). **Nothing fires until the owner approves the
+  waits for them). The local wall-clock form is minute-precision only
+  (`YYYY-MM-DD HH:MM` or `YYYY-MM-DDTHH:MM`); a seconds-bearing local
+  form is refused. Scripts should prefer relative `+Nm` forms, or use
+  RFC3339/epoch milliseconds when they need an exact absolute instant,
+  so computed seconds cannot abort a scheduling batch. **Nothing fires
+  until the owner approves the
   manifest**, so propose and move on; the item badges the owner's
   attention rail. Approval is the owner's act alone (dashboard or an
   owner shell) — you may propose, but never attempt `approve` or

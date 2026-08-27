@@ -231,4 +231,28 @@ mod tests {
             }
         }
     }
+
+    /// `ctl agenda schedule --at` accepts minute-precision local wall
+    /// clocks, while seconds require an offset-bearing RFC3339 instant.
+    /// Keep the shipped agenda skill aligned with that parser boundary so a
+    /// generated local timestamp cannot silently abort a scheduling batch.
+    #[test]
+    fn agenda_skill_teaches_schedule_time_precision() {
+        let agenda = embedded("intendant-agenda");
+        for needle in [
+            "minute-precision only",
+            "`YYYY-MM-DD HH:MM`",
+            "relative `+Nm` forms",
+            "RFC3339/epoch milliseconds",
+        ] {
+            assert!(
+                agenda.skill_md.contains(needle),
+                "intendant-agenda lost its schedule-time teaching {needle:?}"
+            );
+        }
+
+        assert!(crate::ctl::parse_due_ms("2026-08-04 23:45").is_ok());
+        assert!(crate::ctl::parse_due_ms("2026-08-04 23:45:41").is_err());
+        assert!(crate::ctl::parse_due_ms("2026-08-04T23:45:41-04:00").is_ok());
+    }
 }
