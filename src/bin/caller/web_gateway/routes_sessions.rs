@@ -4634,7 +4634,20 @@ pub(crate) async fn handle_worktrees_list(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = worktrees_list_api_response(&worktree_inventory_cache);
+    // spawn_blocking like every sibling worktree handler: the read can
+    // do the one-time persisted-file load+parse, and the cache mutex it
+    // takes is held across disk IO by a completing scan's store — a
+    // reactor thread must never block on either.
+    let response =
+        tokio::task::spawn_blocking(move || worktrees_list_api_response(&worktree_inventory_cache))
+            .await
+            .unwrap_or_else(|_| {
+                // A failed read task degrades to the cold-cache shape.
+                ApiResponse::json(
+                    200,
+                    JsonBody::PreSerialized(empty_worktree_inventory_response()),
+                )
+            });
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 

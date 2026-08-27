@@ -841,13 +841,17 @@ directory is safe to delete; it rebuilds on the next scan.
   untouched; a warning notes active sessions first). First open is
   cached-first: the pane paints the daemon's last scan immediately
   (persisted under `~/.intendant/cache/worktree-scan-<key>.json`, keyed
-  per project root so co-resident daemons never overwrite each other's
-  copy; it survives daemon restarts, honestly stamped with its scan
-  time) and refreshes with a real scan in the background; the daemon
-  single-flights concurrent scans, so stacked refreshes join the running
-  walk instead of piling onto a loaded disk. Remove/clean/merge
-  invalidate both the in-memory and persisted copies, and a mutation
-  landing mid-scan discards that walk's result instead of caching it.
+  per project root — co-resident daemons with distinct roots keep
+  separate copies; same-root daemons share one, last scan wins; it
+  survives daemon restarts, honestly stamped with its scan time) and
+  refreshes with a real scan in the background; the daemon
+  single-flights concurrent scans, so stacked refreshes — an explicit
+  Scan clicked mid-walk included — join the running walk instead of
+  piling onto a loaded disk. Remove/clean/merge invalidate both the
+  in-memory and persisted copies, and a dashboard mutation landing
+  mid-scan discards that walk's result instead of caching it
+  (out-of-band mutations — a `git worktree remove` in a terminal —
+  surface at the next scan).
 - **New Session** — start a fresh session from the dashboard.
   Internal-agent launches get an **Execution** control — *Auto* (the
   task-size heuristic decides), *Orchestrate* (delegates to supervised

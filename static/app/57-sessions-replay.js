@@ -62,8 +62,23 @@ function setWorktreesLoadPending(pending, mode = '') {
 }
 
 let worktreesFreshnessProbeTimer = null;
+// Bumped by every cancel: a probe whose timer already fired (and whose
+// GET is mid-flight when an explicit load cancels) checks it before
+// re-arming, so "any explicit load supersedes the probes" holds even
+// in that window.
+let worktreesFreshnessProbeGeneration = 0;
+// The last background/explicit scan REQUEST failed (timeout or error).
+// Pane re-entry then re-issues the scan instead of trusting a probe:
+// a request that never reached the daemon leaves nothing for probes to
+// find (pre-cached-first behavior was retry-on-reentry until success).
+let worktreesLastScanFailed = false;
+// First worktrees-pane entry per page load always freshens in the
+// background, even when Station (or an earlier cached read) already
+// populated the browser copy.
+let worktreesAutoRefreshed = false;
 
 function cancelWorktreesFreshnessProbes() {
+  worktreesFreshnessProbeGeneration += 1;
   if (worktreesFreshnessProbeTimer) {
     clearTimeout(worktreesFreshnessProbeTimer);
     worktreesFreshnessProbeTimer = null;
@@ -77,14 +92,19 @@ function cancelWorktreesFreshnessProbes() {
 // the probes.
 function scheduleWorktreesFreshnessProbes(delaysMs) {
   cancelWorktreesFreshnessProbes();
-  const [nextMs, ...restMs] = delaysMs;
-  if (nextMs == null) return;
-  worktreesFreshnessProbeTimer = setTimeout(() => {
-    worktreesFreshnessProbeTimer = null;
-    refreshWorktreesIfServerNewer().then(fresher => {
-      if (!fresher && !worktreesFreshnessProbeTimer) scheduleWorktreesFreshnessProbes(restMs);
-    });
-  }, nextMs);
+  const generation = worktreesFreshnessProbeGeneration;
+  const arm = (delays) => {
+    const [nextMs, ...restMs] = delays;
+    if (nextMs == null) return;
+    worktreesFreshnessProbeTimer = setTimeout(() => {
+      worktreesFreshnessProbeTimer = null;
+      refreshWorktreesIfServerNewer().then(fresher => {
+        if (generation !== worktreesFreshnessProbeGeneration) return; // superseded mid-flight
+        if (!fresher) arm(restMs);
+      });
+    }, nextMs);
+  };
+  arm(delaysMs);
 }
 
 // One cheap cached GET outside the load/pending machinery: it must
@@ -122,8 +142,16 @@ function loadWorktrees(options = {}) {
     // normal render path when it lands. The pane never blocks its first
     // paint on the full-disk walk, which outlives every client timeout
     // right after a reboot or under disk load.
+    worktreesAutoRefreshed = true;
+    // If a walk is ALREADY running (Station's scan op, an earlier
+    // click), the inner call joins it and its result is the refresh —
+    // chaining another forceScan would queue a duplicate back-to-back
+    // walk the daemon's gate cannot merge.
+    const joinedRunningScan = worktreesLoadInFlight === 'scan';
     return loadWorktrees({}).then(scan => {
-      loadWorktrees({ forceScan: true });
+      if (!joinedRunningScan && worktreesLoadInFlight !== 'scan') {
+        loadWorktrees({ forceScan: true });
+      }
       return scan;
     });
   }
@@ -146,8 +174,10 @@ function loadWorktrees(options = {}) {
   if (forceScan) {
     if (!browserCachedScan) {
       listEl.innerHTML = '';
+      setWorktreesStatus('');
     }
-    setWorktreesStatus('');
+    // With cards on screen, keep the "Last scanned <time>" stamp — the
+    // pane's only staleness cue — visible under the scanning banner.
     setWorktreesActivityNotice('pending', 'Scanning worktrees...');
   } else {
     if (browserCachedScan) {
@@ -167,14 +197,24 @@ function loadWorktrees(options = {}) {
     .then(scan => {
       if (requestSerial !== worktreesRequestSerial) return;
       worktreesLoaded = true;
-      if (!forceScan && !worktreeHasScannedData(scan) && browserCachedScan) {
+      if (!worktreeHasScannedData(scan) && browserCachedScan) {
+        // The historical HTTP scan lane answers a failed walk as 200
+        // with an unstamped error body — an unstamped body must never
+        // replace a good rendered inventory on EITHER lane.
         renderWorktrees(browserCachedScan);
-        setWorktreesStatus('Showing the last browser scan; no server-cached scan is available. Click Scan to refresh from disk.');
+        if (forceScan) {
+          worktreesLastScanFailed = true;
+          setWorktreesStatus('The scan failed server-side; showing the last scan.', 'error');
+          setWorktreesActivityNotice('error', 'The scan failed server-side.');
+        } else {
+          setWorktreesStatus('Showing the last browser scan; no server-cached scan is available. Click Scan to refresh from disk.');
+        }
         return;
       }
       _cachedWorktreeScan = scan;
       renderWorktrees(scan);
       if (forceScan && worktreeHasScannedData(scan)) {
+        worktreesLastScanFailed = false;
         const count = Number(scan?.summary?.worktrees || scan?.worktrees?.length || 0).toLocaleString();
         setWorktreesActivityNotice('ok', `Scan complete. Found ${count} worktree${count === '1' ? '' : 's'}.`, 2500);
       }
@@ -185,13 +225,16 @@ function loadWorktrees(options = {}) {
       const message = err.message || 'Failed to load worktrees';
       if (browserCachedScan) {
         renderWorktrees(browserCachedScan);
-        setWorktreesStatus(`${message}. Showing the last browser scan.`, 'error');
+        const scanned = worktreeDate(browserCachedScan.scanned_at);
+        const age = scanned ? ` from ${scanned.toLocaleString()}` : '';
+        setWorktreesStatus(`${message}. Showing the last scan${age}.`, 'error');
       } else {
         setWorktreesStatus(message, 'error');
         listEl.innerHTML = '<div class="empty-state">Failed to load worktrees</div>';
       }
       setWorktreesActivityNotice('error', message);
       if (forceScan) {
+        worktreesLastScanFailed = true;
         // The usual death here is the client timer outliving a healthy
         // walk — the daemon finishes and fills its cache after this
         // error. Self-heal instead of staying stale until a manual

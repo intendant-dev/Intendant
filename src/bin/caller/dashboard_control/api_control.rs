@@ -819,11 +819,26 @@ pub(crate) async fn api_worktrees_response(
     id: String,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    frame_api_json_body_response(
-        id,
-        crate::web_gateway::worktrees_list_api_response(&runtime.worktree_inventory_cache),
-        "worktrees",
-    )
+    // spawn_blocking like the sibling worktree twins: the read can do
+    // the one-time persisted-file load+parse, and its mutex is held
+    // across disk IO by a completing scan's store.
+    let cache = runtime.worktree_inventory_cache.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::worktrees_list_api_response(&cache)
+    })
+    .await;
+    match result {
+        Ok(response) => frame_api_json_body_response(id, response, "worktrees"),
+        Err(e) => http_body_response(
+            id,
+            500,
+            serde_json::json!({
+                "error": format!("worktree list task failed: {e}")
+            })
+            .to_string(),
+            "worktrees",
+        ),
+    }
 }
 
 pub(crate) async fn api_worktrees_inspect_response(

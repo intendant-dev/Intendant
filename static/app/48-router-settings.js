@@ -575,6 +575,13 @@ function switchSessionsSubtab(name) {
       renderWorktrees(_cachedWorktreeScan);
       if (worktreesLoadInFlight === 'scan') {
         setWorktreesActivityNotice('pending', 'Scanning worktrees...');
+      } else if (!worktreesLoadInFlight && (!worktreesAutoRefreshed || worktreesLastScanFailed)) {
+        // First pane entry this page load (Station may have preloaded
+        // the inventory without refreshing it), or the last background
+        // scan died as a request: freshen behind the rendered data
+        // instead of trusting it.
+        worktreesAutoRefreshed = true;
+        loadWorktrees({ forceScan: true });
       } else if (!worktreesLoadInFlight) {
         // Re-entry freshness probe: the browser copy lags the daemon
         // when a background scan outlived the client timeout (its

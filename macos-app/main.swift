@@ -196,6 +196,10 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
     /// promoted successor's port (main-thread writes; per-request reads).
     var port: Int
     private var stopped = Set<Int>()
+    /// Live proxied requests by scheme-task hash, so stop() can cancel
+    /// the network task instead of letting an abandoned request run to
+    /// the session's idle timeout holding its loopback socket.
+    private var inFlight = [Int: URLSessionDataTask]()
     private let lock = NSLock()
     private let session: URLSession
 
@@ -231,10 +235,11 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
 
         let taskHash = ObjectIdentifier(urlSchemeTask as AnyObject).hashValue
 
-        session.dataTask(with: request) { [weak self] data, response, error in
+        let dataTask = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
             self.lock.lock()
             let wasStopped = self.stopped.remove(taskHash) != nil
+            self.inFlight.removeValue(forKey: taskHash)
             self.lock.unlock()
             if wasStopped { return }
 
@@ -249,14 +254,23 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
                 urlSchemeTask.didReceive(data)
             }
             urlSchemeTask.didFinish()
-        }.resume()
+        }
+        lock.lock()
+        inFlight[taskHash] = dataTask
+        lock.unlock()
+        dataTask.resume()
     }
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
         let taskHash = ObjectIdentifier(urlSchemeTask as AnyObject).hashValue
         lock.lock()
         stopped.insert(taskHash)
+        let dataTask = inFlight.removeValue(forKey: taskHash)
         lock.unlock()
+        // Cancel the network task too: WebKit only promises not to hear
+        // back, but an uncancelled request would keep running to the
+        // session's request timeout holding its loopback socket.
+        dataTask?.cancel()
     }
 }
 

@@ -526,17 +526,14 @@ struct ScanCacheState {
     /// rejected file is not re-read on every list request, and so an
     /// invalidated cache never resurrects the file it just deleted.
     disk_probed: bool,
-    /// Completed-scan counter. Lets a scan request that waited on the
-    /// gate detect that the scan it waited behind already produced a
-    /// result at least as fresh as any it could start now.
-    generation: u64,
-    /// Bumped by every [`WorktreeScanCache::invalidate`]. A scan samples
-    /// it before walking the disk; a mutation landing mid-walk moves it,
-    /// and the walk's pre-mutation result is then served to its caller
-    /// but never cached — otherwise the store would durably overwrite
-    /// the invalidation with an inventory that cannot have seen the
-    /// mutation.
-    invalidation_epoch: u64,
+    /// Bumped by every store AND every invalidate — the one counter both
+    /// interleaving checks read. A gate-waiter that sees it move with
+    /// `json` present joined a finished scan; a walk that sees it move
+    /// after the walk began was overtaken by an invalidation and must
+    /// not store its pre-mutation result (durably overwriting the
+    /// invalidation with an inventory that cannot have seen the
+    /// mutation).
+    version: u64,
 }
 
 /// The daemon-wide cache of the most recent worktree inventory scan,
@@ -573,23 +570,26 @@ impl WorktreeScanCache {
         }
     }
 
-    /// The production disk mirror, next to the other derived caches.
+    /// The disk mirror under an explicit state root (the caller — a
+    /// transport edge or a test — resolves it; this function must never
+    /// touch the ambient environment, per the hermetic-tests seam).
     /// Keyed by the daemon's project-root identity: daemons sharing one
     /// state root (every agent-worktree daemon on a box) must not
     /// overwrite or cross-invalidate each other's persisted scans — the
     /// disk layer mirrors THIS daemon's in-memory cache, so the key is
-    /// per daemon flavor, never per machine.
-    pub fn default_disk_path(project_root: Option<&Path>) -> PathBuf {
+    /// per daemon flavor, never per machine. Daemons with the SAME
+    /// canonical root (or both rootless) deliberately share one file,
+    /// last scan wins — their inventories are the same view.
+    pub fn default_disk_path(state_root: &Path, project_root: Option<&Path>) -> PathBuf {
         let identity = match project_root {
             Some(root) => {
-                use sha2::Digest as _;
                 let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-                let digest = sha2::Sha256::digest(path_identity_bytes(&canonical));
-                digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+                let hex = crate::hosted_verify::sha256_hex(&path_identity_bytes(&canonical));
+                hex[..16].to_string()
             }
             None => "projectless".to_string(),
         };
-        crate::platform::intendant_home()
+        state_root
             .join("cache")
             .join(format!("worktree-scan-{identity}.json"))
     }
@@ -624,16 +624,18 @@ impl WorktreeScanCache {
         self.store_locked(&mut state, json);
     }
 
-    /// The store tail, under an already-held state lock — the epoch
+    /// The store tail, under an already-held state lock — the version
     /// check in [`Self::scan_after_gate`] and the write must share one
     /// lock acquisition or an invalidate could slot between them. Disk
     /// IO stays under the lock for the same reason: memory and mirror
-    /// must never disagree. Best-effort on the file (a full volume must
-    /// not fail the request that just scanned successfully).
+    /// must never disagree (readers block only on blocking threads —
+    /// the list lanes spawn_blocking around [`Self::read`]).
+    /// Best-effort on the file (a full volume must not fail the request
+    /// that just scanned successfully).
     fn store_locked(&self, state: &mut ScanCacheState, json: String) {
         state.json = Some(json);
         state.disk_probed = true;
-        state.generation = state.generation.wrapping_add(1);
+        state.version = state.version.wrapping_add(1);
         if let (Some(path), Some(json)) = (&self.disk_path, &state.json) {
             if let Err(e) = crate::file_watcher::atomic_write(path, json.as_bytes()) {
                 eprintln!("[worktrees] could not persist scan cache: {e}");
@@ -644,21 +646,30 @@ impl WorktreeScanCache {
     /// Drop both layers. Called when an operation changed the inventory
     /// (remove/clean/merge): the cached scan is now wrong about it, and
     /// the persisted mirror must not resurrect it after a restart. Also
-    /// moves the invalidation epoch so a scan already walking the disk
-    /// cannot store its pre-mutation result over this.
+    /// moves the version so a scan already walking the disk cannot
+    /// store its pre-mutation result over this.
     pub fn invalidate(&self) {
         let mut state = lock_unpoisoned(&self.mem);
         state.json = None;
         state.disk_probed = true;
-        state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
+        state.version = state.version.wrapping_add(1);
         if let Some(path) = &self.disk_path {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => eprintln!(
-                    "[worktrees] could not drop persisted scan cache {}: {e}",
-                    path.display()
-                ),
+                Err(e) => {
+                    // Failing open would resurrect the invalidated scan
+                    // at the next boot (Windows AV/indexer holds are the
+                    // known way remove fails). Degrade harder: blank the
+                    // file — an unparseable mirror reads as "no cache".
+                    if let Err(e2) = crate::file_watcher::atomic_write(path, b"") {
+                        eprintln!(
+                            "[worktrees] could not drop persisted scan cache {} \
+                             (remove: {e}; blank: {e2})",
+                            path.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -668,30 +679,37 @@ impl WorktreeScanCache {
     /// the finished scan's result instead of starting their own walk. A
     /// blocking call — run it on a blocking thread, like the scan itself.
     pub fn scan_or_join(&self, compute: impl FnOnce() -> String) -> String {
-        let generation_before = lock_unpoisoned(&self.mem).generation;
+        let version_before = lock_unpoisoned(&self.mem).version;
         let _gate = lock_unpoisoned(&self.scan_gate);
-        self.scan_after_gate(generation_before, compute)
+        self.scan_after_gate(version_before, compute)
     }
 
     /// The post-gate tail of [`Self::scan_or_join`], split out so the
     /// join and invalidation interleavings are testable without racing
-    /// threads: if a scan completed after `generation_before` was
-    /// sampled (this caller waited behind it on the gate), serve its
-    /// result; otherwise run a fresh scan — recorded only if no
-    /// invalidation landed while it walked.
-    fn scan_after_gate(&self, generation_before: u64, compute: impl FnOnce() -> String) -> String {
-        let epoch_before = lock_unpoisoned(&self.mem).invalidation_epoch;
-        if lock_unpoisoned(&self.mem).generation != generation_before {
-            // The scan this request waited behind completed. Serve its
-            // result — unless an invalidation raced in after it, in
-            // which case fall through and really rescan.
-            if let Some(json) = self.read() {
-                return json;
+    /// threads: if a scan completed after `version_before` was sampled
+    /// (this caller waited behind it on the gate), serve its result;
+    /// otherwise run a fresh scan — recorded only if no invalidation
+    /// landed while it walked.
+    fn scan_after_gate(&self, version_before: u64, compute: impl FnOnce() -> String) -> String {
+        let version_at_walk_start = {
+            let state = lock_unpoisoned(&self.mem);
+            if state.version != version_before {
+                // Something happened while this caller waited on the
+                // gate. A present value means the scan it waited behind
+                // completed — serve that. Absent means an invalidation
+                // landed last — fall through and really rescan.
+                if let Some(json) = state.json.clone() {
+                    return json;
+                }
             }
-        }
+            // Re-sampled AFTER the gate: an invalidation before this
+            // point is prior state the fresh walk supersedes; only one
+            // landing DURING the walk may discard it.
+            state.version
+        };
         let json = compute();
         let mut state = lock_unpoisoned(&self.mem);
-        if state.invalidation_epoch == epoch_before {
+        if state.version == version_at_walk_start {
             self.store_locked(&mut state, json.clone());
         }
         // An overtaken result still answers this request — it is the
@@ -3369,15 +3387,15 @@ mod tests {
     #[test]
     fn scan_after_gate_joins_the_scan_it_waited_behind() {
         // The deterministic replay of the stacked-request interleaving:
-        // the joiner samples the generation while the winner's scan is
+        // the joiner samples the version while the winner's scan is
         // still running, waits on the gate, and by the time it holds the
         // gate the winner has stored — the joiner must serve that result,
         // never start a second walk.
         let cache = WorktreeScanCache::new(None);
-        let generation_before = lock_unpoisoned(&cache.mem).generation;
+        let version_before = lock_unpoisoned(&cache.mem).version;
         let winner = stamped_scan_json("winner");
         cache.store(winner.clone());
-        let joined = cache.scan_after_gate(generation_before, || {
+        let joined = cache.scan_after_gate(version_before, || {
             panic!("a joiner behind a completed scan must not rescan")
         });
         assert_eq!(joined, winner);
@@ -3389,11 +3407,11 @@ mod tests {
         // scan before the joiner got the gate: serving the dropped result
         // is impossible and the joiner must really rescan.
         let cache = WorktreeScanCache::new(None);
-        let generation_before = lock_unpoisoned(&cache.mem).generation;
+        let version_before = lock_unpoisoned(&cache.mem).version;
         cache.store(stamped_scan_json("winner"));
         cache.invalidate();
         let fresh = stamped_scan_json("rescan");
-        let joined = cache.scan_after_gate(generation_before, || fresh.clone());
+        let joined = cache.scan_after_gate(version_before, || fresh.clone());
         assert_eq!(joined, fresh);
         assert_eq!(cache.read().as_deref(), Some(fresh.as_str()));
     }
@@ -3432,20 +3450,23 @@ mod tests {
     fn default_disk_path_keys_by_project_root_identity() {
         // Daemons sharing one state root must not share one cache file:
         // same project root → same path; different roots and the
-        // projectless flavor each get their own.
+        // projectless flavor each get their own. The state root is an
+        // explicit parameter (hermetic seam) — nothing here may resolve
+        // the ambient home.
         let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path().join("state");
         let root_a = tmp.path().join("checkout-a");
         let root_b = tmp.path().join("checkout-b");
-        let a1 = WorktreeScanCache::default_disk_path(Some(&root_a));
-        let a2 = WorktreeScanCache::default_disk_path(Some(&root_a));
-        let b = WorktreeScanCache::default_disk_path(Some(&root_b));
-        let none = WorktreeScanCache::default_disk_path(None);
+        let a1 = WorktreeScanCache::default_disk_path(&state_root, Some(&root_a));
+        let a2 = WorktreeScanCache::default_disk_path(&state_root, Some(&root_a));
+        let b = WorktreeScanCache::default_disk_path(&state_root, Some(&root_b));
+        let none = WorktreeScanCache::default_disk_path(&state_root, None);
         assert_eq!(a1, a2, "stable across boots for one daemon");
         assert_ne!(a1, b);
         assert_ne!(a1, none);
         assert_ne!(b, none);
         for path in [&a1, &b, &none] {
-            assert!(path.starts_with(crate::platform::intendant_home().join("cache")));
+            assert!(path.starts_with(state_root.join("cache")));
         }
     }
 
@@ -3456,6 +3477,8 @@ mod tests {
         // Two distinct invalid-UTF-8 roots that to_string_lossy collapses
         // onto the same replacement-charactered string; canonicalize
         // fails (nonexistent), so the raw paths carry the identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path().to_path_buf();
         let root_a = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/proj-\xff\xfe"));
         let root_b = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/proj-\xfe\xff"));
         assert_eq!(
@@ -3464,8 +3487,8 @@ mod tests {
             "precondition: the lossy strings collide"
         );
         assert_ne!(
-            WorktreeScanCache::default_disk_path(Some(&root_a)),
-            WorktreeScanCache::default_disk_path(Some(&root_b)),
+            WorktreeScanCache::default_disk_path(&state_root, Some(&root_a)),
+            WorktreeScanCache::default_disk_path(&state_root, Some(&root_b)),
             "distinct roots must never share a cache file"
         );
     }

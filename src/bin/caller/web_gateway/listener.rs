@@ -486,6 +486,28 @@ fn default_access_cert_dir() -> std::path::PathBuf {
     path
 }
 
+/// The state root the gateway's persisted caches (worktree scan mirror)
+/// live under. Production resolves the real state root here at the
+/// transport edge; unit-test gateways get one isolated per-process temp
+/// root instead — same discipline as [`default_access_cert_dir`] above,
+/// and necessary for the same reason: `intendant-core` compiles without
+/// `cfg(test)` in this crate's test binary, so the ambient
+/// `intendant_home()` would resolve (and CREATE) the runner's live
+/// `~/.intendant` from tests.
+#[cfg(not(test))]
+fn gateway_state_root() -> std::path::PathBuf {
+    crate::platform::intendant_home()
+}
+
+#[cfg(test)]
+fn gateway_state_root() -> std::path::PathBuf {
+    static TEST_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    TEST_ROOT
+        .get_or_init(|| tempfile::tempdir().expect("create isolated gateway state root"))
+        .path()
+        .to_path_buf()
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn spawn_web_gateway(
     listener: TcpListener,
@@ -681,6 +703,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     let worktree_inventory_cache =
         Arc::new(crate::worktree_inventory::WorktreeScanCache::new(Some(
             crate::worktree_inventory::WorktreeScanCache::default_disk_path(
+                &gateway_state_root(),
                 project_root.as_deref(),
             ),
         )));
