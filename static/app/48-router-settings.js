@@ -577,7 +577,9 @@ function switchSessionsSubtab(name) {
         setWorktreesActivityNotice('pending', 'Scanning worktrees...');
       }
     } else {
-      loadWorktrees({ forceScan: !worktreesLoaded });
+      // First open per page load: cached-first with a background
+      // refresh, never a blocking full scan (auto mode below).
+      loadWorktrees(worktreesLoaded ? {} : { auto: true });
     }
   } else if (!sessionsLoaded) {
     loadSessions();

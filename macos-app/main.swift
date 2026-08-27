@@ -464,6 +464,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         NSApp.mainMenu = mainMenu
     }
 
+    /// Proxy request budget: the dashboard's own HTTP and tunnel lanes
+    /// time out at 120s and render honest retry states, so the scheme
+    /// proxy must sit above them — Foundation's 60s default undercut the
+    /// JS timers and killed slow-but-healthy endpoints (the first
+    /// worktree scan after a reboot) with an opaque proxy error first.
+    private func backendSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 180
+        return configuration
+    }
+
     func configureBackendSession() {
         if launchPlan.usesTLS {
             backendTrustDelegate = BackendTrustDelegate(
@@ -472,7 +483,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                 usesMtls: launchPlan.usesMtls
             )
             backendSession = URLSession(
-                configuration: .ephemeral,
+                configuration: backendSessionConfiguration(),
                 delegate: backendTrustDelegate,
                 delegateQueue: nil
             )
@@ -486,7 +497,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                 NSLog("Bundled backend TLS enabled by launch arguments")
             }
         } else {
-            backendSession = URLSession(configuration: .ephemeral)
+            backendSession = URLSession(configuration: backendSessionConfiguration())
             let cert = launchPlan.accessCertDir.appendingPathComponent("server.crt")
             let key = launchPlan.accessCertDir.appendingPathComponent("server.key")
             if FileManager.default.fileExists(atPath: cert.path) ||

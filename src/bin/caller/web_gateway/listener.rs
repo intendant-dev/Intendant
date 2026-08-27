@@ -675,8 +675,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // Cache the most recent worktree inventory scan. Scanning can walk
     // large worktree directories for disk-size accounting, so the
     // dashboard explicitly triggers refreshes instead of doing it on
-    // every GET. Shared by HTTP and the dashboard WebRTC control tunnel.
-    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // every GET. Shared by HTTP and the dashboard WebRTC control tunnel,
+    // mirrored to disk so a restarted daemon serves the previous scan
+    // instead of forcing the pane into a blocking full rescan.
+    let worktree_inventory_cache = Arc::new(crate::worktree_inventory::WorktreeScanCache::new(
+        Some(crate::worktree_inventory::WorktreeScanCache::default_disk_path()),
+    ));
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs

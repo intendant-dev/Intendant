@@ -508,6 +508,165 @@ pub fn empty_scan() -> WorktreeScan {
     }
 }
 
+/// Poison-tolerant lock: a panic inside one scan request must not wedge
+/// every later inventory request behind a poisoned mutex.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Default)]
+struct ScanCacheState {
+    /// The most recent scan JSON; `None` until a scan (or the lazy disk
+    /// load) fills it, and again after [`WorktreeScanCache::invalidate`].
+    json: Option<String>,
+    /// Whether the persisted copy was already consulted — or made moot by
+    /// a store/invalidate. Guards the one-time lazy load so a missing or
+    /// rejected file is not re-read on every list request, and so an
+    /// invalidated cache never resurrects the file it just deleted.
+    disk_probed: bool,
+    /// Completed-scan counter. Lets a scan request that waited on the
+    /// gate detect that the scan it waited behind already produced a
+    /// result at least as fresh as any it could start now.
+    generation: u64,
+}
+
+/// The daemon-wide cache of the most recent worktree inventory scan,
+/// shared by the HTTP lane and the dashboard control tunnel.
+///
+/// Two layers, one mental model — the persisted file is exactly the
+/// in-memory value surviving a daemon restart:
+/// - memory: the most recent scan JSON, dropped on invalidation;
+/// - disk: an atomic mirror (under the state root in production; `None`
+///   keeps tests and fixtures memory-only), loaded lazily on the first
+///   read of a fresh process. A restarted daemon thus serves the
+///   previous scan — honestly stamped by its own `scanned_at` — instead
+///   of an empty inventory that forces the dashboard into a blocking
+///   full rescan, the shape that timed out every client after a reboot.
+///
+/// [`Self::scan_or_join`] additionally single-flights the expensive
+/// filesystem scan: stacked refresh requests (dashboard retries after a
+/// client timeout) run ONE scan and all serve its result, instead of
+/// piling concurrent full-disk walks onto an already loaded box.
+pub struct WorktreeScanCache {
+    mem: Mutex<ScanCacheState>,
+    disk_path: Option<PathBuf>,
+    /// Serializes actual scans; held across the blocking walk. Lock
+    /// order is gate → mem (never the reverse).
+    scan_gate: Mutex<()>,
+}
+
+impl WorktreeScanCache {
+    pub fn new(disk_path: Option<PathBuf>) -> Self {
+        WorktreeScanCache {
+            mem: Mutex::new(ScanCacheState::default()),
+            disk_path,
+            scan_gate: Mutex::new(()),
+        }
+    }
+
+    /// The production disk mirror, next to the other derived caches.
+    pub fn default_disk_path() -> PathBuf {
+        crate::platform::intendant_home()
+            .join("cache")
+            .join("worktree-scan.json")
+    }
+
+    /// The most recent scan JSON, if any — memory first, then the
+    /// one-time lazy disk load.
+    pub fn read(&self) -> Option<String> {
+        let mut state = lock_unpoisoned(&self.mem);
+        if state.json.is_some() {
+            return state.json.clone();
+        }
+        if !state.disk_probed {
+            state.disk_probed = true;
+            if let Some(path) = &self.disk_path {
+                if let Some(json) = load_persisted_scan(path) {
+                    state.json = Some(json.clone());
+                    return Some(json);
+                }
+            }
+        }
+        None
+    }
+
+    /// Record a completed scan: memory, generation, and the disk mirror
+    /// (best-effort — a full volume must not fail the request that just
+    /// scanned successfully). File IO happens under the state lock so a
+    /// concurrent `invalidate` cannot interleave between the memory and
+    /// disk halves and leave them disagreeing.
+    pub fn store(&self, json: String) {
+        let mut state = lock_unpoisoned(&self.mem);
+        state.json = Some(json);
+        state.disk_probed = true;
+        state.generation = state.generation.wrapping_add(1);
+        if let (Some(path), Some(json)) = (&self.disk_path, &state.json) {
+            if let Err(e) = crate::file_watcher::atomic_write(path, json.as_bytes()) {
+                eprintln!("[worktrees] could not persist scan cache: {e}");
+            }
+        }
+    }
+
+    /// Drop both layers. Called when an operation changed the inventory
+    /// (remove/clean/merge): the cached scan is now wrong about it, and
+    /// the persisted mirror must not resurrect it after a restart.
+    pub fn invalidate(&self) {
+        let mut state = lock_unpoisoned(&self.mem);
+        state.json = None;
+        state.disk_probed = true;
+        if let Some(path) = &self.disk_path {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!(
+                    "[worktrees] could not drop persisted scan cache {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    /// Run `compute` (the full scan) with single-flight semantics: while
+    /// one scan runs, further callers block on the gate and then serve
+    /// the finished scan's result instead of starting their own walk. A
+    /// blocking call — run it on a blocking thread, like the scan itself.
+    pub fn scan_or_join(&self, compute: impl FnOnce() -> String) -> String {
+        let generation_before = lock_unpoisoned(&self.mem).generation;
+        let _gate = lock_unpoisoned(&self.scan_gate);
+        self.scan_after_gate(generation_before, compute)
+    }
+
+    /// The post-gate tail of [`Self::scan_or_join`], split out so the
+    /// join interleaving is testable without racing threads: if a scan
+    /// completed after `generation_before` was sampled (this caller
+    /// waited behind it on the gate), serve its result; otherwise run
+    /// and record a fresh scan.
+    fn scan_after_gate(&self, generation_before: u64, compute: impl FnOnce() -> String) -> String {
+        if lock_unpoisoned(&self.mem).generation != generation_before {
+            // The scan this request waited behind completed. Serve its
+            // result — unless an invalidation raced in after it, in
+            // which case fall through and really rescan.
+            if let Some(json) = self.read() {
+                return json;
+            }
+        }
+        let json = compute();
+        self.store(json.clone());
+        json
+    }
+}
+
+/// Load a persisted scan, accepting only a file that parses as a stamped
+/// [`WorktreeScan`] — a torn write or a schema break degrades to "no
+/// cache", never to serving junk.
+fn load_persisted_scan(path: &Path) -> Option<String> {
+    let bytes = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<WorktreeScan>(&bytes) {
+        Ok(scan) if !scan.scanned_at.is_empty() => Some(bytes),
+        _ => None,
+    }
+}
+
 pub fn scan_worktrees(
     home: &Path,
     project_root: Option<&Path>,
@@ -3071,5 +3230,133 @@ mod tests {
         let measure = measure_tree(&dir);
         assert_eq!(measure.files, 3);
         assert_eq!(measure.bytes, single + other_alloc);
+    }
+
+    // ── WorktreeScanCache: the persisted + single-flighted scan cache ──
+
+    /// A minimal JSON body that passes the persisted-load validation
+    /// (parses as a stamped [`WorktreeScan`]); `tag` makes bodies
+    /// distinguishable across store calls.
+    fn stamped_scan_json(tag: &str) -> String {
+        serde_json::to_string(&WorktreeScan {
+            scanned_at: "2026-08-27T00:00:00Z".to_string(),
+            errors: vec![tag.to_string()],
+            ..empty_scan()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn scan_cache_survives_a_daemon_restart_via_the_disk_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache").join("worktree-scan.json");
+        let first = WorktreeScanCache::new(Some(path.clone()));
+        assert_eq!(first.read(), None, "fresh cache with no persisted file");
+        let scan = stamped_scan_json("boot-1");
+        first.store(scan.clone());
+        assert_eq!(first.read().as_deref(), Some(scan.as_str()));
+
+        // A new instance on the same path — a restarted daemon — serves
+        // the previous scan byte-for-byte instead of an empty inventory.
+        let restarted = WorktreeScanCache::new(Some(path));
+        assert_eq!(restarted.read().as_deref(), Some(scan.as_str()));
+    }
+
+    #[test]
+    fn scan_cache_rejects_unstamped_or_corrupt_persisted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("torn.json", &br#"{"scanned_at":"2026-"#[..]),
+            ("unstamped.json", serde_json::to_string(&empty_scan()).unwrap().as_bytes()),
+            ("wrong-shape.json", &br#"{"error":"scan failed"}"#[..]),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let cache = WorktreeScanCache::new(Some(path));
+            assert_eq!(cache.read(), None, "{name} must not be served");
+        }
+    }
+
+    #[test]
+    fn scan_cache_invalidate_drops_memory_and_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("worktree-scan.json");
+        let cache = WorktreeScanCache::new(Some(path.clone()));
+        cache.store(stamped_scan_json("pre-remove"));
+        assert!(path.exists());
+
+        cache.invalidate();
+        assert_eq!(cache.read(), None);
+        assert!(!path.exists(), "the persisted mirror must go too");
+        // A restart after the invalidation must not resurrect anything.
+        assert_eq!(WorktreeScanCache::new(Some(path)).read(), None);
+    }
+
+    #[test]
+    fn scan_after_gate_joins_the_scan_it_waited_behind() {
+        // The deterministic replay of the stacked-request interleaving:
+        // the joiner samples the generation while the winner's scan is
+        // still running, waits on the gate, and by the time it holds the
+        // gate the winner has stored — the joiner must serve that result,
+        // never start a second walk.
+        let cache = WorktreeScanCache::new(None);
+        let generation_before = lock_unpoisoned(&cache.mem).generation;
+        let winner = stamped_scan_json("winner");
+        cache.store(winner.clone());
+        let joined = cache.scan_after_gate(generation_before, || {
+            panic!("a joiner behind a completed scan must not rescan")
+        });
+        assert_eq!(joined, winner);
+    }
+
+    #[test]
+    fn scan_after_gate_rescans_when_the_joined_scan_was_invalidated() {
+        // Same interleaving, but a remove/clean invalidated the finished
+        // scan before the joiner got the gate: serving the dropped result
+        // is impossible and the joiner must really rescan.
+        let cache = WorktreeScanCache::new(None);
+        let generation_before = lock_unpoisoned(&cache.mem).generation;
+        cache.store(stamped_scan_json("winner"));
+        cache.invalidate();
+        let fresh = stamped_scan_json("rescan");
+        let joined = cache.scan_after_gate(generation_before, || fresh.clone());
+        assert_eq!(joined, fresh);
+        assert_eq!(cache.read().as_deref(), Some(fresh.as_str()));
+    }
+
+    #[test]
+    fn scan_or_join_never_overlaps_two_computes() {
+        // The gate property: hammered from many threads, compute bodies
+        // must serialize. Overlap — not timing — is the failure signal,
+        // so the assertion is load-independent.
+        let cache = std::sync::Arc::new(WorktreeScanCache::new(None));
+        let in_compute = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let in_compute = Arc::clone(&in_compute);
+                let overlapped = Arc::clone(&overlapped);
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        cache.scan_or_join(|| {
+                            if in_compute.swap(true, Ordering::SeqCst) {
+                                overlapped.store(true, Ordering::SeqCst);
+                            }
+                            std::thread::yield_now();
+                            in_compute.store(false, Ordering::SeqCst);
+                            stamped_scan_json(&format!("thread-{i}"))
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "two scans ran concurrently past the gate"
+        );
     }
 }

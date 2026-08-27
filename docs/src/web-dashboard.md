@@ -838,7 +838,14 @@ directory is safe to delete; it rebuilds on the next scan.
   Recent with the ID prefilled. Checkouts with a CACHEDIR.TAG-marked Cargo
   `target/` offer **Clean target/** — delete the build directory to
   reclaim its bytes without removing the worktree (sources and git state
-  untouched; a warning notes active sessions first).
+  untouched; a warning notes active sessions first). First open is
+  cached-first: the pane paints the daemon's last scan immediately
+  (persisted at `~/.intendant/cache/worktree-scan.json`, so it survives
+  daemon restarts, honestly stamped with its scan time) and refreshes
+  with a real scan in the background; the daemon single-flights
+  concurrent scans, so stacked refreshes join the running walk instead
+  of piling onto a loaded disk. Remove/clean/merge invalidate both the
+  in-memory and persisted copies.
 - **New Session** — start a fresh session from the dashboard.
   Internal-agent launches get an **Execution** control — *Auto* (the
   task-size heuristic decides), *Orchestrate* (delegates to supervised

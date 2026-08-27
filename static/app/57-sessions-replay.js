@@ -65,6 +65,18 @@ function loadWorktrees(options = {}) {
   const forceScan = !!options.forceScan;
   const listEl = document.getElementById('worktrees-list');
   if (!listEl) return Promise.resolve(null);
+  if (options.auto) {
+    // First open: serve the daemon's cached scan in one cheap round trip
+    // (the daemon persists it across restarts), then freshen with a real
+    // scan in the background — the fresh inventory swaps in through the
+    // normal render path when it lands. The pane never blocks its first
+    // paint on the full-disk walk, which outlives every client timeout
+    // right after a reboot or under disk load.
+    return loadWorktrees({}).then(scan => {
+      loadWorktrees({ forceScan: true });
+      return scan;
+    });
+  }
   if (worktreesLoadInFlight === 'scan') {
     setWorktreesLoadPending(true, 'scan');
     // The activity banner is the single scan-progress surface; the

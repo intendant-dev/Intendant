@@ -942,9 +942,7 @@ pub(crate) async fn api_worktrees_merge_response(
     let result = tokio::task::spawn_blocking(move || {
         let result = crate::web_gateway::merge_session_worktree_response(&home, &body_text);
         if result.0 == "200 OK" {
-            if let Ok(mut guard) = cache.lock() {
-                *guard = None;
-            }
+            cache.invalidate();
         }
         result
     })
@@ -2705,10 +2703,8 @@ mod tests {
     #[tokio::test]
     async fn parity_worktrees_list_serves_the_same_body_on_both_transports() {
         let rt = crate::dashboard_control::tests::runtime();
-        {
-            let mut guard = rt.worktree_inventory_cache.lock().unwrap();
-            *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
-        }
+        rt.worktree_inventory_cache
+            .store(r#"{"worktrees":[],"cached":true}"#.to_string());
         let (status, http_body) = parity_http_status_and_body(
             crate::web_gateway::worktrees_list_api_response(&rt.worktree_inventory_cache),
         );
@@ -2777,13 +2773,15 @@ mod tests {
             body
         };
 
-        let http_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let http_cache =
+            std::sync::Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None));
         let (status, http_body) = parity_http_status_and_body(
             crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &http_cache),
         );
         assert_eq!(status, 200);
 
-        let tunnel_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tunnel_cache =
+            std::sync::Arc::new(crate::worktree_inventory::WorktreeScanCache::new(None));
         let frame = frame_api_json_body_response(
             "parity-wt-scan".to_string(),
             crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &tunnel_cache),
@@ -2803,11 +2801,7 @@ mod tests {
         // The shared cache side-effect holds each lane's served body,
         // byte-exact (same scan produced both).
         for (cache, served) in [(&http_cache, &http_body), (&tunnel_cache, &frame["result"])] {
-            let cached = cache
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("scan must warm the shared cache");
+            let cached = cache.read().expect("scan must warm the shared cache");
             let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
             assert_eq!(&cached, served, "the cache holds the served body");
         }
@@ -5255,16 +5249,13 @@ mod tests {
     #[tokio::test]
     async fn worktree_rpcs_preserve_cache_and_error_status() {
         let rt = runtime();
-        {
-            let mut cache = rt.worktree_inventory_cache.lock().unwrap();
-            *cache = Some(
-                serde_json::json!({
-                    "worktrees": [{ "path": "/tmp/wt", "branch": "feature" }],
-                    "summary": { "worktrees": 1 },
-                })
-                .to_string(),
-            );
-        }
+        rt.worktree_inventory_cache.store(
+            serde_json::json!({
+                "worktrees": [{ "path": "/tmp/wt", "branch": "feature" }],
+                "summary": { "worktrees": 1 },
+            })
+            .to_string(),
+        );
 
         let cached = api_worktrees_response("wt1".to_string(), &rt).await;
         assert_eq!(cached["t"], "response");
