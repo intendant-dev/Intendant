@@ -1203,6 +1203,14 @@ mod tests {
     /// the printed tally shows how many spurious denials the retry
     /// absorbed on this box. Raw `new_durable` under this storm is
     /// what the merge-group Mac leg saw on run 33051392374.
+    ///
+    /// Unix-only by nature: the mechanism under proof IS the Unix
+    /// fork→exec fd-inheritance window — Windows process creation has
+    /// no fork window, and `/usr/bin/true` plus the PTY fork path
+    /// don't exist there. The deterministic sibling above stays
+    /// portable (std file locks and the manufactured-holder class are
+    /// OS-neutral).
+    #[cfg(unix)]
     #[test]
     #[ignore]
     fn reopen_survives_a_fork_storm() {
