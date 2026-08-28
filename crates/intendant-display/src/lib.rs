@@ -899,14 +899,35 @@ pub fn captured_frame_kind(dirty_rects: Option<&[capture::damage::Rect]>) -> Cap
 /// caller can count them — they WERE captured and must show in the
 /// capture rate, or a coalescing window would masquerade as a slow
 /// source.
+///
+/// The surviving frame carries the damage UNION of everything it
+/// superseded: per-frame dirty rects are not cumulative (the tile
+/// bridge accumulates them frame by frame for exactly that reason), so
+/// dropping a coalesced content frame's rects would leave its region
+/// stale in the tile lane until a periodic snapshot. Any unannotated
+/// frame in the run (`None` = damage unknown) poisons the union to
+/// `None` — consumers already treat that as full-frame damage.
 pub fn drain_capture_rx_to_newest(
     rx: &mut mpsc::Receiver<Frame>,
     mut newest: Frame,
 ) -> (Frame, Vec<CapturedFrameKind>) {
     let mut superseded = Vec::new();
+    let mut damage_union = newest.dirty_rects.clone();
+    let mut coalesced_any = false;
     while let Ok(fresher) = rx.try_recv() {
         superseded.push(captured_frame_kind(newest.dirty_rects.as_deref()));
+        damage_union = match (damage_union, fresher.dirty_rects.clone()) {
+            (Some(mut acc), Some(rects)) => {
+                acc.extend(rects);
+                Some(acc)
+            }
+            _ => None,
+        };
         newest = fresher;
+        coalesced_any = true;
+    }
+    if coalesced_any {
+        newest.dirty_rects = damage_union;
     }
     (newest, superseded)
 }
@@ -6897,6 +6918,53 @@ mod tests {
         let (newest, superseded) = drain_capture_rx_to_newest(&mut rx, first);
         assert_eq!(newest.data[0], 0xDD);
         assert!(superseded.is_empty());
+    }
+
+    /// Coalescing must not lose damage: the surviving frame carries the
+    /// UNION of superseded frames' dirty rects (per-frame damage is not
+    /// cumulative — the tile bridge repaints only reported regions), and
+    /// any unannotated frame in the run poisons the union to `None`
+    /// (full-frame damage to consumers).
+    #[tokio::test]
+    async fn drain_capture_rx_unions_superseded_damage() {
+        use capture::damage::Rect;
+        let (tx, mut rx) = mpsc::channel::<Frame>(8);
+        let r1 = Rect::new(0, 0, 2, 2);
+        let r2 = Rect::new(2, 2, 2, 2);
+        let mut a = make_test_bgra(4, 4);
+        a.dirty_rects = Some(vec![r1]);
+        let mut b = make_test_bgra(4, 4);
+        b.dirty_rects = Some(Vec::new()); // SCK Idle delivery
+        let mut c = make_test_bgra(4, 4);
+        c.data[0] = 0xCC;
+        c.dirty_rects = Some(vec![r2]);
+        tx.try_send(a).unwrap();
+        tx.try_send(b).unwrap();
+        tx.try_send(c).unwrap();
+        let first = rx.recv().await.expect("frame a");
+        let (newest, _) = drain_capture_rx_to_newest(&mut rx, first);
+        assert_eq!(newest.data[0], 0xCC);
+        assert_eq!(
+            newest.dirty_rects.as_deref(),
+            Some(&[r1, r2][..]),
+            "the survivor repaints every superseded region"
+        );
+
+        // An unannotated frame anywhere in the run means damage unknown:
+        // the union degrades to full-frame (`None`), never to a subset.
+        let mut e = make_test_bgra(4, 4);
+        e.dirty_rects = Some(vec![r1]);
+        let f = make_test_bgra(4, 4); // dirty_rects: None
+        let mut g = make_test_bgra(4, 4);
+        g.data[0] = 0x66;
+        g.dirty_rects = Some(vec![r2]);
+        tx.try_send(e).unwrap();
+        tx.try_send(f).unwrap();
+        tx.try_send(g).unwrap();
+        let first = rx.recv().await.expect("frame e");
+        let (newest, _) = drain_capture_rx_to_newest(&mut rx, first);
+        assert_eq!(newest.data[0], 0x66);
+        assert_eq!(newest.dirty_rects, None);
     }
 
     /// **3c.3b.3b finding 2 regression test.** Pool-only sessions
