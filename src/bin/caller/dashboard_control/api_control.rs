@@ -1233,13 +1233,30 @@ pub(crate) async fn api_mcp_tool_call_response(
             "mcp tool call",
         );
     }
+    let arguments = params
+        .get("arguments")
+        .or_else(|| params.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     // Layered on top of the dispatch-level `message.send` gate: the named
     // tool must also clear its own IAM operation, so a principal scoped to
     // messaging cannot reach display input or runtime control through the
-    // generic tool-call RPC.
-    let decision = runtime
-        .grant
-        .access_decision(crate::mcp::mcp_tool_operation(&name));
+    // generic tool-call RPC. Facade meta-tools authorize as the RESOLVED
+    // command's operation (resolve-before-authorize); a parse failure is a
+    // 400 and never dispatches.
+    let operation = match crate::mcp::facade_gate_operation(&name, &arguments) {
+        Some(Ok(op)) => op,
+        Some(Err(message)) => {
+            return http_body_response(
+                id,
+                400,
+                mcp_error_body(mcp_id, -32602, &message),
+                "mcp tool call",
+            );
+        }
+        None => crate::mcp::mcp_tool_operation(&name),
+    };
+    let decision = runtime.grant.access_decision(operation);
     if !decision.allowed {
         return http_body_response(
             id,
@@ -1255,11 +1272,6 @@ pub(crate) async fn api_mcp_tool_call_response(
             "mcp tool call",
         );
     }
-    let arguments = params
-        .get("arguments")
-        .or_else(|| params.get("args"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
     let managed_context = optional_managed_context_param(&params);
     match server
         .call_tool_by_name_as_caller(

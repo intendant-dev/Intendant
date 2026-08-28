@@ -70,12 +70,35 @@ served display/CU and shared-view set — its allowlist also names the
 browser-workspace and raw frame tools, which currently have no served
 `tools/list` definitions anywhere and are reachable only by direct call;
 `managed` (alias `managed-context`) advertises `get_status` plus the managed
-rewind/fission set; `full` — or omitting `tool_profile` — keeps the whole
+rewind/fission set; `facade` advertises only the five meta-tools of the
+CLI-shaped facade (next section); `full` — or omitting `tool_profile` —
+keeps the whole
 list, and unknown profile names fall back to the `core` bootstrap set (the
 daemon logs the unknown name, and hidden tools stay callable, so a typoed
 URL stays diagnosable without the full-list context cost). Profile filtering applies to `tools/list` only —
 hidden HTTP tools remain callable (the lazy `ctl tools call` path).
 *Authorization* is separate: see the next section.
+
+### The facade profile
+
+`tool_profile=facade` is the context-efficient control surface: instead of a
+typed schema per capability, it advertises five meta-tools and everything
+else is discovered lazily. `inspect`, `act`, and `authorize` each execute
+one registered command per call, named as an argv array
+(`{"argv":["agenda","list","--status","open"]}`) — risk-split so MCP hosts
+can auto-allow reads and gate authority-class calls per tool. `help` renders
+the command map from the registry (families first, then per-family usage
+lines with each command's lane); `docs` lists and fetches the embedded
+operating skills. A facade call is authorized as the **resolved** command's
+operation against the caller's principal, at every ingress, before any side
+effect — a parse failure never dispatches, and a command invoked through the
+wrong lane is redirected to the right tool by name. Argv values are literal
+strings: no shell, no `@file`/stdin expansion, no local output paths (those
+are `intendant ctl` frontend behaviors and stay client-side). The command
+registry (`mcp/facade.rs`) starts with the operate core — status, approvals,
+input, ask/notify/notes, task start, agenda, memory, display reads — and
+grows family-by-family; the serialized facade listing is budget-pinned in
+tests so the whole advertised surface stays a few kilobytes.
 
 The tables below describe the full daemon HTTP MCP surface. Bare `--mcp`
 stdio mode serves only the thirteen `#[tool]`-router tools — `get_status`,

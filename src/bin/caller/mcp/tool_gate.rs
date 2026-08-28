@@ -215,6 +215,7 @@ pub(crate) fn tool_allowed_for_profile(
             matches!(name, "get_status")
                 || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
+        ToolProfileFamily::Facade => super::facade::is_facade_tool(name),
     }
 }
 
@@ -230,6 +231,9 @@ pub(crate) enum ToolProfileFamily {
     Core,
     Screen,
     Managed,
+    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): five tools,
+    /// everything else discovered lazily through help/docs.
+    Facade,
 }
 
 pub(crate) const TOOL_PROFILE_CATALOG: &[(&str, ToolProfileFamily)] = &[
@@ -242,6 +246,7 @@ pub(crate) const TOOL_PROFILE_CATALOG: &[(&str, ToolProfileFamily)] = &[
     ("display", ToolProfileFamily::Screen),
     ("managed", ToolProfileFamily::Managed),
     ("managed-context", ToolProfileFamily::Managed),
+    ("facade", ToolProfileFamily::Facade),
 ];
 
 /// Case-insensitive, whitespace-tolerant catalog lookup.
@@ -286,6 +291,13 @@ pub(crate) fn known_tool_profile_names() -> String {
 pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::PeerOperation {
     use crate::peer::access_policy::PeerOperation;
     match name {
+        // Facade meta-tools: the live ingress gates authorize these as the
+        // RESOLVED command's operation via `facade_gate_operation` before
+        // dispatch — never through this fixed name map. This arm only
+        // guards a hypothetical ingress that skips gate-side resolution:
+        // it falls to the restrictive default rather than anything
+        // broader, and never authorizes the envelope as a whole.
+        "inspect" | "act" | "authorize" | "help" | "docs" => PeerOperation::RuntimeControl,
         // Daemon/agent status summaries. whoami rides here: it discloses
         // only the caller's own gate-resolved identity — strictly less than
         // get_status already reveals.
@@ -462,6 +474,52 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         );
         tools.push(definition);
     };
+
+    // The facade meta-tools (`tool_profile=facade`): a CLI-shaped,
+    // context-efficient control surface — three risk-lane argv executors
+    // plus lazy discovery. Kept deliberately lean: the whole facade
+    // listing is budget-pinned in tests (the point is that these five
+    // definitions replace dozens of typed schemas).
+    push(
+        "inspect",
+        manual_http_tool_definition!(
+            "inspect",
+            "Run one read-only Intendant control command as an argv array, e.g. {\"argv\":[\"status\"]} or {\"argv\":[\"agenda\",\"list\",\"--status\",\"open\"]}. Discover commands lazily: call the help tool for the family map, help {\"topic\":\"<family>\"} for usage. Values are literal strings — no shell, no file expansion. Mutating commands run on the act tool; approval/authority commands on authorize.",
+            crate::mcp::facade::FacadeRunParams
+        ),
+    );
+    push(
+        "act",
+        manual_http_tool_definition!(
+            "act",
+            "Run one mutating Intendant control command as an argv array, e.g. {\"argv\":[\"notify\",\"build done\"]} or {\"argv\":[\"agenda\",\"add\",\"follow up\",\"--tag\",\"ops\"]}. Authorized per resolved command against the caller's principal. Read-only commands run on inspect; approval/authority commands on authorize; discover with help.",
+            crate::mcp::facade::FacadeRunParams
+        ),
+    );
+    push(
+        "authorize",
+        manual_http_tool_definition!(
+            "authorize",
+            "Run one approval or authority-class Intendant command as an argv array, e.g. {\"argv\":[\"approval\",\"approve\",\"7\"]}. This lane carries the commands that resolve approvals or adjust authority — hosts should gate it accordingly. Authorized per resolved command against the caller's principal; discover with help.",
+            crate::mcp::facade::FacadeRunParams
+        ),
+    );
+    push(
+        "help",
+        manual_http_tool_definition!(
+            "help",
+            "The facade command map, rendered from the command registry: no topic lists the families; a family name (e.g. \"agenda\") or full command path returns usage lines with each command's risk lane.",
+            crate::mcp::facade::FacadeHelpParams
+        ),
+    );
+    push(
+        "docs",
+        manual_http_tool_definition!(
+            "docs",
+            "The embedded Intendant operating skills: no argument lists them; a skill name returns its full text (judgment and workflow guidance beyond command syntax).",
+            crate::mcp::facade::FacadeDocsParams
+        ),
+    );
 
     push(
         "rewind_context",
@@ -877,9 +935,48 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), TOOL_PROFILE_CATALOG.len());
-        for profile in ["", "no-such-profile", "core2", "facade"] {
+        for profile in ["", "no-such-profile", "core2"] {
             assert!(!known_tool_profile(profile), "{profile:?} must be unknown");
         }
+    }
+
+    /// The facade profile advertises exactly the five meta-tools, and the
+    /// whole serialized listing stays inside the context budget — the
+    /// facade's reason to exist (design doc M1 acceptance).
+    #[test]
+    fn facade_profile_listing_stays_under_the_context_budget() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            let served = server
+                .list_tools_json_for_session(None, Some(false), Some("facade"))
+                .await;
+            let names: Vec<&str> = served["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .map(|t| t["name"].as_str().expect("tool name"))
+                .collect();
+            assert_eq!(
+                names.len(),
+                crate::mcp::facade::FACADE_TOOLS.len(),
+                "facade advertises exactly the meta-tools: {names:?}"
+            );
+            for name in crate::mcp::facade::FACADE_TOOLS {
+                assert!(names.contains(&name), "{name} missing from facade listing");
+            }
+            let bytes = serde_json::to_string(&served).expect("serialize").len();
+            assert!(
+                bytes <= 8 * 1024,
+                "facade tools/list is {bytes} B — the budget is 8 KiB"
+            );
+        });
     }
 
     #[test]

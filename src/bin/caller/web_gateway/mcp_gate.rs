@@ -520,7 +520,24 @@ pub(crate) async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            let decision = access.decision(crate::mcp::mcp_tool_operation(name));
+            // Facade meta-tools authorize as the RESOLVED command's
+            // operation (resolve-before-authorize); a facade parse failure
+            // returns as a tool error and never dispatches.
+            let decision = match crate::mcp::facade_gate_operation(name, &args) {
+                Some(Ok(op)) => access.decision(op),
+                Some(Err(message)) => {
+                    return McpHttpOutcome::Response(McpHttpResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "content": [{"type": "text", "text": message}],
+                            "isError": true,
+                        })),
+                        error: None,
+                    });
+                }
+                None => access.decision(crate::mcp::mcp_tool_operation(name)),
+            };
             if !decision.allowed {
                 return McpHttpOutcome::Response(McpHttpResponse {
                     jsonrpc: "2.0".into(),

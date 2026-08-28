@@ -48,7 +48,9 @@ mod events;
 pub(crate) use events::*;
 mod state;
 pub(crate) use state::*;
+mod facade;
 mod tool_gate;
+pub(crate) use facade::facade_gate_operation;
 pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
@@ -592,6 +594,34 @@ impl IntendantServer {
         }
 
         match name {
+            // The facade's risk-lane executors. The live ingress gates
+            // already authorized the RESOLVED command's operation via
+            // `facade_gate_operation` (resolve-before-authorize); this arm
+            // re-plans — pure and deterministic over the same inputs, so
+            // both resolutions name the same command — and executes it
+            // under the caller's own principal. The facade is a router,
+            // not a privilege: a parse failure is a tool error, never a
+            // dispatch.
+            "inspect" | "act" | "authorize" => {
+                return match facade::plan_for_meta(name, &args) {
+                    Ok(planned) => {
+                        Box::pin(self.call_tool_by_name_as_caller(
+                            planned.tool,
+                            planned.args,
+                            session_id,
+                            managed_context_override,
+                            ToolCaller {
+                                trust: caller,
+                                actor,
+                            },
+                        ))
+                        .await
+                    }
+                    Err(message) => Ok(text_tool_error(message)),
+                };
+            }
+            "help" => return Ok(text_tool_result(facade::render_help(&args))),
+            "docs" => return Ok(text_tool_result(facade::render_docs(&args))),
             "get_status" => Ok(text_tool_result(
                 self.get_status_for_session(session_id, managed_context_override)
                     .await,
