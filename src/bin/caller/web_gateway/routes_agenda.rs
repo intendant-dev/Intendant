@@ -264,6 +264,11 @@ pub(crate) async fn handle_agenda_pr_state(
 /// wrapper index to its backend conversation even when superseded; a
 /// dangling id (log dir gone, index pruned) simply has no entry, and every
 /// surface degrades to the raw id.
+/// The item-walk + resolve composition. Production lanes call the two
+/// halves separately (ids collected on the async path, resolution on a
+/// blocking thread via [`agenda_sessions_join_blocking`]); tests join
+/// in one hop.
+#[cfg(test)]
 fn agenda_sessions_join(
     home: &std::path::Path,
     items: &[crate::agenda::AgendaItem],
