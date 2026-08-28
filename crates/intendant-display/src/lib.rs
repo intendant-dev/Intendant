@@ -907,10 +907,18 @@ pub fn captured_frame_kind(dirty_rects: Option<&[capture::damage::Rect]>) -> Cap
 /// stale in the tile lane until a periodic snapshot. Any unannotated
 /// frame in the run (`None` = damage unknown) poisons the union to
 /// `None` — consumers already treat that as full-frame damage.
+///
+/// The union serves CONSUMERS (repaint instructions); the metrics
+/// split serves DELIVERY TRUTH. The survivor's kind is therefore
+/// classified from its original annotation and returned separately —
+/// deriving it from the mutated frame would count an idle delivery
+/// that survived a coalescing run as content and understate
+/// `capture_idle_fps` exactly in the windows the split exists to
+/// classify.
 pub fn drain_capture_rx_to_newest(
     rx: &mut mpsc::Receiver<Frame>,
     mut newest: Frame,
-) -> (Frame, Vec<CapturedFrameKind>) {
+) -> (Frame, CapturedFrameKind, Vec<CapturedFrameKind>) {
     let mut superseded = Vec::new();
     let mut damage_union = newest.dirty_rects.clone();
     let mut coalesced_any = false;
@@ -926,10 +934,11 @@ pub fn drain_capture_rx_to_newest(
         newest = fresher;
         coalesced_any = true;
     }
+    let newest_kind = captured_frame_kind(newest.dirty_rects.as_deref());
     if coalesced_any {
         newest.dirty_rects = damage_union;
     }
-    (newest, superseded)
+    (newest, newest_kind, superseded)
 }
 
 /// Which gate let one pool-feed forward through (see the bridge's
@@ -2342,7 +2351,7 @@ impl DisplaySession {
                         // broadcast) so a starved-runtime window is
                         // legible in the metrics instead of reading as
                         // a slow source.
-                        let (frame, superseded) =
+                        let (frame, frame_kind, superseded) =
                             drain_capture_rx_to_newest(&mut capture_rx, frame);
                         for kind in &superseded {
                             cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
@@ -2354,9 +2363,10 @@ impl DisplaySession {
                             }
                         }
                         cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
-                        if captured_frame_kind(frame.dirty_rects.as_deref())
-                            == CapturedFrameKind::Idle
-                        {
+                        // Delivery truth from the drain, not the frame:
+                        // the damage union may have rewritten an idle
+                        // survivor's annotation for consumers.
+                        if frame_kind == CapturedFrameKind::Idle {
                             cap_counters
                                 .capture_idle_frames
                                 .fetch_add(1, Ordering::Relaxed);
@@ -6901,7 +6911,7 @@ mod tests {
         tx.try_send(c).unwrap();
 
         let first = rx.recv().await.expect("frame a");
-        let (newest, superseded) = drain_capture_rx_to_newest(&mut rx, first);
+        let (newest, _, superseded) = drain_capture_rx_to_newest(&mut rx, first);
         assert_eq!(newest.data[0], 0xCC, "the newest queued frame wins");
         assert_eq!(
             superseded,
@@ -6915,7 +6925,7 @@ mod tests {
         d.data[0] = 0xDD;
         tx.try_send(d).unwrap();
         let first = rx.recv().await.expect("frame d");
-        let (newest, superseded) = drain_capture_rx_to_newest(&mut rx, first);
+        let (newest, _, superseded) = drain_capture_rx_to_newest(&mut rx, first);
         assert_eq!(newest.data[0], 0xDD);
         assert!(superseded.is_empty());
     }
@@ -6942,7 +6952,7 @@ mod tests {
         tx.try_send(b).unwrap();
         tx.try_send(c).unwrap();
         let first = rx.recv().await.expect("frame a");
-        let (newest, _) = drain_capture_rx_to_newest(&mut rx, first);
+        let (newest, _, _) = drain_capture_rx_to_newest(&mut rx, first);
         assert_eq!(newest.data[0], 0xCC);
         assert_eq!(
             newest.dirty_rects.as_deref(),
@@ -6962,9 +6972,31 @@ mod tests {
         tx.try_send(f).unwrap();
         tx.try_send(g).unwrap();
         let first = rx.recv().await.expect("frame e");
-        let (newest, _) = drain_capture_rx_to_newest(&mut rx, first);
+        let (newest, _, _) = drain_capture_rx_to_newest(&mut rx, first);
         assert_eq!(newest.data[0], 0x66);
         assert_eq!(newest.dirty_rects, None);
+
+        // An idle SURVIVOR keeps its delivery-truth classification even
+        // though the union rewrites its annotation for consumers: the
+        // metrics split must not understate idle deliveries exactly in
+        // the coalescing windows it exists to classify.
+        let mut h = make_test_bgra(4, 4);
+        h.dirty_rects = Some(vec![r1]);
+        let mut i = make_test_bgra(4, 4);
+        i.data[0] = 0x11;
+        i.dirty_rects = Some(Vec::new()); // SCK Idle delivery survives
+        tx.try_send(h).unwrap();
+        tx.try_send(i).unwrap();
+        let first = rx.recv().await.expect("frame h");
+        let (newest, newest_kind, superseded) = drain_capture_rx_to_newest(&mut rx, first);
+        assert_eq!(newest.data[0], 0x11);
+        assert_eq!(newest_kind, CapturedFrameKind::Idle, "delivery truth");
+        assert_eq!(
+            newest.dirty_rects.as_deref(),
+            Some(&[r1][..]),
+            "consumers still repaint the superseded region"
+        );
+        assert_eq!(superseded, vec![CapturedFrameKind::Content]);
     }
 
     /// **3c.3b.3b finding 2 regression test.** Pool-only sessions
