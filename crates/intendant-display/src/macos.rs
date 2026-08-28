@@ -734,15 +734,29 @@ impl DisplayBackend for MacOSBackend {
             .with_height(height)
             .with_pixel_format(PixelFormat::BGRA)
             .with_shows_cursor(true)
-            .with_minimum_frame_interval(&frame_interval);
+            .with_minimum_frame_interval(&frame_interval)
+            // SCK's own delivery queue. At the unset default (3), a brief
+            // stall of the callback thread makes ScreenCaptureKit drop
+            // frames UPSTREAM of this process — invisible to bdrops and
+            // indistinguishable from a quiet desktop in the metrics (the
+            // post-boot low-fps class, agenda 01KZ2PM87Q). 8 is the top
+            // of Apple's recommended 3-8 range: WindowServer retains a
+            // few more surfaces per stream and in exchange a busy boot
+            // (Spotlight, login storms) coasts instead of thinning the
+            // stream.
+            .with_queue_depth(8);
 
         // Bounded channel: backend drops frames if consumer is slow. The
         // sender lives in a per-session slot shared with the output handler
         // so `stop_capture` can close the channel promptly (see
         // `CaptureState`); it stays the channel's *only* sender — cloning it
         // out of the slot would let a late callback keep the channel open
-        // past teardown.
-        let (tx, rx) = mpsc::channel::<Frame>(4);
+        // past teardown. Capacity 8 ≈ 266ms of runtime stall at 30fps: the
+        // capture bridge drains the queue to the NEWEST frame on wake, so
+        // depth buys stall tolerance, not latency — overflow (counted via
+        // the drop counter) now means a genuinely wedged consumer, not a
+        // busy scheduler tick.
+        let (tx, rx) = mpsc::channel::<Frame>(8);
         let frame_slot = Arc::new(StdMutex::new(Some(tx)));
 
         // Per-session teardown state (see `CaptureState` for why these must
