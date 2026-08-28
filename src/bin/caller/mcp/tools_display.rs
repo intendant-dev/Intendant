@@ -143,7 +143,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create an agent-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer. Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
+        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
     )]
     pub(crate) async fn create_virtual_display(
         &self,

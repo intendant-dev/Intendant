@@ -674,7 +674,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "create_virtual_display",
         manual_http_tool_definition!(
             "create_virtual_display",
-            "Create an agent-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer. Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
+            "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
             CreateVirtualDisplayParams
         ),
     );
