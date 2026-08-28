@@ -1103,6 +1103,157 @@ mod tests {
         );
     }
 
+    /// Reopen a just-dropped durable plane, absorbing the fork-window
+    /// flock inheritance (the store.rs battery-guard mechanism, which a
+    /// module-local mutex cannot cover here): under plain `cargo test`
+    /// every test shares one process, and any CONCURRENT test that
+    /// forks — PTY spawns (`forkpty`), `pre_exec` commands (both real
+    /// forks on macOS too, where plain `posix_spawn` has no window) —
+    /// briefly duplicates the whole fd table. A `plane.lock` fd
+    /// duplicated in that window keeps the flock alive past this
+    /// thread's drop until the child's exec CLOEXEC sweep, so a raw
+    /// reopen sees a spurious `LockDenied` (live: the merge-group Mac
+    /// leg ejected PR #880's first entry this way, run 33051392374).
+    /// Production doctrine already treats `LockDenied` as transient
+    /// with a bounded retry (`handle.rs`, intake §3.4); tests assert
+    /// the same semantics. The retry exits the moment the lock frees;
+    /// a lock still held at the deadline is a REAL failure and panics.
+    fn reopen_durable_counting(dir: &std::path::Path) -> (MemoryService, u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut denials = 0u32;
+        loop {
+            match MemoryService::new_durable(dir) {
+                Err(super::super::store::StoreError::LockDenied)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    denials += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => {
+                    return (
+                        other.expect("durable reopen (past the fork-window retry)"),
+                        denials,
+                    )
+                }
+            }
+        }
+    }
+
+    fn reopen_durable(dir: &std::path::Path) -> MemoryService {
+        reopen_durable_counting(dir).0
+    }
+
+    /// The fork-window class made deterministic: a forked child's
+    /// inherited fd IS a duplicate open file description holding the
+    /// flock past the owner's drop, so the test manufactures exactly
+    /// that — a second descriptor takes the lock, the raw open denies
+    /// by name, and the bounded retry bridges the hold and succeeds
+    /// the moment it releases. No forks, no timing assumptions beyond
+    /// "120ms hold < 10s deadline"; `denials >= 1` is guaranteed
+    /// because the raw denial is asserted while the holder provably
+    /// still lives.
+    #[test]
+    fn reopen_retry_bridges_a_transient_lock_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plane");
+        drop(MemoryService::new_durable(&dir).unwrap());
+
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("plane.lock"))
+            .unwrap();
+        holder.try_lock().expect("the dropped plane freed its lock");
+        match MemoryService::new_durable(&dir).map(|_| "opened") {
+            Err(super::super::store::StoreError::LockDenied) => {}
+            other => panic!("expected LockDenied under a live holder, got {other:?}"),
+        }
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(holder);
+        });
+        let (mut svc, denials) = reopen_durable_counting(&dir);
+        release.join().expect("release thread");
+        assert!(
+            denials >= 1,
+            "the retry must have observed the transient holder"
+        );
+        // The bridged reopen is a fully working plane.
+        svc.propose(
+            propose_args("post-bridge claim"),
+            &ActorBinding::dashboard(Some("principal:root:dashboard".into())),
+        )
+        .expect("the bridged plane accepts writes");
+    }
+
+    /// On-demand ENVIRONMENTAL proof for the same class (run by name
+    /// with `-- --ignored`; not in CI — it is a deliberate storm and
+    /// the ordinary suite must stay fast): PTY storm threads fork real
+    /// children (`forkpty` — the fork path the terminal tests
+    /// exercise, on macOS too) while this thread loops drop-then-
+    /// reopen through the bounded retry. Every reopen must succeed;
+    /// the printed tally shows how many spurious denials the retry
+    /// absorbed on this box. Raw `new_durable` under this storm is
+    /// what the merge-group Mac leg saw on run 33051392374.
+    #[test]
+    #[ignore]
+    fn reopen_survives_a_fork_storm() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plane");
+        drop(MemoryService::new_durable(&dir).unwrap());
+
+        let storming = std::sync::Arc::new(AtomicBool::new(true));
+        let spawned = std::sync::Arc::new(AtomicU32::new(0));
+        let storms: Vec<_> = (0..4)
+            .map(|_| {
+                let flag = std::sync::Arc::clone(&storming);
+                let spawned = std::sync::Arc::clone(&spawned);
+                std::thread::spawn(move || {
+                    use portable_pty::{CommandBuilder, PtySize};
+                    let pty_system = portable_pty::native_pty_system();
+                    while flag.load(Ordering::Relaxed) {
+                        let pair = pty_system
+                            .openpty(PtySize::default())
+                            .expect("storm openpty");
+                        let mut child = pair
+                            .slave
+                            .spawn_command(CommandBuilder::new("/usr/bin/true"))
+                            .expect("storm forkpty spawn");
+                        spawned.fetch_add(1, Ordering::Relaxed);
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        // Interleave reopens with live forks: at least 20 iterations
+        // AND at least 200 forked children before stopping, hard-capped
+        // at 30s so the battery stays bounded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut iterations = 0u32;
+        let mut absorbed = 0u32;
+        while (iterations < 20 || spawned.load(Ordering::Relaxed) < 200)
+            && std::time::Instant::now() < deadline
+        {
+            let (svc, denials) = reopen_durable_counting(&dir);
+            absorbed += denials;
+            drop(svc);
+            iterations += 1;
+        }
+        storming.store(false, Ordering::Relaxed);
+        for storm in storms {
+            storm.join().expect("storm thread");
+        }
+        assert!(iterations >= 20, "the storm window must cover 20 reopens");
+        println!(
+            "[fork-storm proof] {iterations} reopens clean; {absorbed} spurious \
+             LockDenied absorbed by the retry across {} forked children",
+            spawned.load(Ordering::Relaxed)
+        );
+    }
+
     /// P1.8 exit battery — durable round-trip through the SERVICE with
     /// recovered provenance rules: agent-session principals survive a
     /// restart verbatim (the envelope carries them); owner-surface
@@ -1128,7 +1279,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let mut svc = reopen_durable(&dir);
         let all = svc.search(&SearchArgs {
             query: String::new(),
             limit: 50,
@@ -1190,7 +1341,7 @@ mod tests {
             assert_eq!(old_live.status, "superseded");
             new_live = svc.read(&new.id[..12]).unwrap();
         }
-        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let mut svc = reopen_durable(&dir);
         let old_back = svc.read(&old_live.id[..12]).unwrap();
         let new_back = svc.read(&new_live.id[..12]).unwrap();
         assert_eq!(old_back.status, "superseded", "status re-folds identically");
