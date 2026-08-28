@@ -471,8 +471,8 @@ impl IntendantServer {
             if !known_tool_profile(profile) {
                 eprintln!(
                     "[mcp] unknown tool_profile {profile:?} — advertising the core bootstrap \
-                     set (hidden tools stay callable; known profiles: full, core, codex-core, \
-                     cli, minimal, screen, display, managed, managed-context)"
+                     set (hidden tools stay callable; known profiles: {})",
+                    known_tool_profile_names()
                 );
             }
         }
