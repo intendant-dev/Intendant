@@ -602,26 +602,24 @@ impl IntendantServer {
             // under the caller's own principal. The facade is a router,
             // not a privilege: a parse failure is a tool error, never a
             // dispatch.
-            "inspect" | "act" | "authorize" => {
-                return match facade::plan_for_meta(name, &args) {
-                    Ok(planned) => {
-                        Box::pin(self.call_tool_by_name_as_caller(
-                            planned.tool,
-                            planned.args,
-                            session_id,
-                            managed_context_override,
-                            ToolCaller {
-                                trust: caller,
-                                actor,
-                            },
-                        ))
-                        .await
-                    }
-                    Err(message) => Ok(text_tool_error(message)),
-                };
-            }
-            "help" => return Ok(text_tool_result(facade::render_help(&args))),
-            "docs" => return Ok(text_tool_result(facade::render_docs(&args))),
+            "inspect" | "act" | "authorize" => match facade::plan_for_meta(name, &args) {
+                Ok(planned) => {
+                    Box::pin(self.call_tool_by_name_as_caller(
+                        planned.tool,
+                        planned.args,
+                        session_id,
+                        managed_context_override,
+                        ToolCaller {
+                            trust: caller,
+                            actor,
+                        },
+                    ))
+                    .await
+                }
+                Err(message) => Ok(text_tool_error(message)),
+            },
+            "help" => Ok(text_tool_result(facade::render_help(&args))),
+            "docs" => Ok(text_tool_result(facade::render_docs(&args))),
             "get_status" => Ok(text_tool_result(
                 self.get_status_for_session(session_id, managed_context_override)
                     .await,
