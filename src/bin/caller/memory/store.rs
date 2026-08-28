@@ -707,14 +707,21 @@ mod tests {
     /// TEST BINARY and env-var failpoints — so its tests serialize on
     /// one lock. Under plain `cargo test` (threads in one process, the
     /// CI legs) a concurrently spawned child briefly duplicates the
-    /// whole fd table in Linux's fork→exec window; a `plane.lock`
-    /// dropped by another test thread in that window survives in the
-    /// child until exec's CLOEXEC sweep, and that test's reopen sees a
+    /// whole fd table in the fork→exec window; a `plane.lock` dropped
+    /// by another test thread in that window survives in the child
+    /// until exec's CLOEXEC sweep, and that test's reopen sees a
     /// spurious `lock-denied` (live: two different store tests ejected
-    /// PR #405's queue entry and flaked a Dell repro loop; macOS never
-    /// reproduces — its posix_spawn is a true syscall with no fork
-    /// window). Serializing removes the fd-inheritance overlap; nextest
-    /// (process-per-test) was never exposed.
+    /// PR #405's queue entry and flaked a Dell repro loop). macOS is
+    /// NOT immune, only narrower: plain `Command` spawns ride a
+    /// windowless posix_spawn syscall there, but PTY spawns (`forkpty`)
+    /// and `pre_exec` commands fork for real on every Unix — the
+    /// merge-group MAC leg hit exactly this class in
+    /// `memory::service`'s reopen (run 33051392374). This mutex only
+    /// serializes THIS module's tests against each other; reopens that
+    /// must survive FOREIGN modules' forks use the bounded-retry
+    /// doctrine instead (`service.rs::reopen_durable_counting`,
+    /// matching production's transient-`LockDenied` handling in
+    /// `handle.rs`). nextest (process-per-test) was never exposed.
     static BATTERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn battery_guard() -> std::sync::MutexGuard<'static, ()> {

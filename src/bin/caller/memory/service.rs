@@ -1103,6 +1103,121 @@ mod tests {
         );
     }
 
+    /// Reopen a just-dropped durable plane, absorbing the fork-window
+    /// flock inheritance (the store.rs battery-guard mechanism, which a
+    /// module-local mutex cannot cover here): under plain `cargo test`
+    /// every test shares one process, and any CONCURRENT test that
+    /// forks — PTY spawns (`forkpty`), `pre_exec` commands (both real
+    /// forks on macOS too, where plain `posix_spawn` has no window) —
+    /// briefly duplicates the whole fd table. A `plane.lock` fd
+    /// duplicated in that window keeps the flock alive past this
+    /// thread's drop until the child's exec CLOEXEC sweep, so a raw
+    /// reopen sees a spurious `LockDenied` (live: the merge-group Mac
+    /// leg ejected PR #880's first entry this way, run 33051392374).
+    /// Production doctrine already treats `LockDenied` as transient
+    /// with a bounded retry (`handle.rs`, intake §3.4); tests assert
+    /// the same semantics. The retry exits the moment the lock frees;
+    /// a lock still held at the deadline is a REAL failure and panics.
+    fn reopen_durable_counting_with(
+        dir: &std::path::Path,
+        mut on_denial: impl FnMut(),
+    ) -> (MemoryService, u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut denials = 0u32;
+        loop {
+            match MemoryService::new_durable(dir) {
+                Err(super::super::store::StoreError::LockDenied)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    denials += 1;
+                    on_denial();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => {
+                    return (
+                        other.expect("durable reopen (past the fork-window retry)"),
+                        denials,
+                    )
+                }
+            }
+        }
+    }
+
+    fn reopen_durable(dir: &std::path::Path) -> MemoryService {
+        reopen_durable_counting_with(dir, || {}).0
+    }
+
+    /// The fork-window class made deterministic: a forked child's
+    /// inherited fd IS a duplicate open file description holding the
+    /// flock past the owner's drop, so the test manufactures exactly
+    /// that — a second descriptor takes the lock, the raw open denies
+    /// by name, and the bounded retry bridges the hold and succeeds
+    /// the moment it releases. Fully condition-based: the holder is
+    /// released only AFTER the retry has observably been denied (the
+    /// `on_denial` hook), so `denials >= 1` holds structurally — no
+    /// descheduling of any thread can outrun it.
+    ///
+    /// Environmental evidence from the seat that landed this (a
+    /// forkpty storm battery, since retired — forking the whole test
+    /// binary from its own threaded harness wedges children pre-exec,
+    /// the fork window's own hazard turned on the harness): 146
+    /// interleaved reopens against 204 real forked children measured
+    /// 5 spurious `LockDenied` absorbed by the retry on an M-series
+    /// Mac — any one of them is CI run 33051392374 without this fix.
+    #[test]
+    fn reopen_retry_bridges_a_transient_lock_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plane");
+        drop(MemoryService::new_durable(&dir).unwrap());
+
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("plane.lock"))
+            .unwrap();
+        // BLOCKING acquire: a foreign fork can hold the just-dropped
+        // plane lock for its own fork→exec window (the very class under
+        // test), so a `try_lock` here would be a fresh flake point.
+        // Blocking rides through any transient hold and owns the lock
+        // the instant the true release lands — condition-based, no
+        // retry loop; a genuinely wedged lock surfaces as this test
+        // hanging into the suite timeout, named.
+        holder.lock().expect("locking the freed plane.lock");
+        match MemoryService::new_durable(&dir).map(|_| "opened") {
+            Err(super::super::store::StoreError::LockDenied) => {}
+            other => panic!("expected LockDenied under a live holder, got {other:?}"),
+        }
+
+        // Release ONLY after the retry has observably been denied: no
+        // sleep-based ordering — a maximally descheduled runner cannot
+        // make the holder vanish before the first attempt. The safety
+        // deadline only guards against the helper dying without ever
+        // attempting (its own panic surfaces the real failure then).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let denial_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let denial_flag = std::sync::Arc::clone(&denial_seen);
+        let release = std::thread::spawn(move || {
+            let safety = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !denial_flag.load(Ordering::Relaxed) && std::time::Instant::now() < safety {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            drop(holder);
+        });
+        let (mut svc, denials) =
+            reopen_durable_counting_with(&dir, || denial_seen.store(true, Ordering::Relaxed));
+        release.join().expect("release thread");
+        assert!(
+            denials >= 1,
+            "the retry must have observed the transient holder"
+        );
+        // The bridged reopen is a fully working plane.
+        svc.propose(
+            propose_args("post-bridge claim"),
+            &ActorBinding::dashboard(Some("principal:root:dashboard".into())),
+        )
+        .expect("the bridged plane accepts writes");
+    }
+
     /// P1.8 exit battery — durable round-trip through the SERVICE with
     /// recovered provenance rules: agent-session principals survive a
     /// restart verbatim (the envelope carries them); owner-surface
@@ -1128,7 +1243,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let mut svc = reopen_durable(&dir);
         let all = svc.search(&SearchArgs {
             query: String::new(),
             limit: 50,
@@ -1190,7 +1305,7 @@ mod tests {
             assert_eq!(old_live.status, "superseded");
             new_live = svc.read(&new.id[..12]).unwrap();
         }
-        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let mut svc = reopen_durable(&dir);
         let old_back = svc.read(&old_live.id[..12]).unwrap();
         let new_back = svc.read(&new_live.id[..12]).unwrap();
         assert_eq!(old_back.status, "superseded", "status re-folds identically");
