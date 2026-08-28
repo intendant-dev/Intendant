@@ -1118,7 +1118,10 @@ mod tests {
     /// with a bounded retry (`handle.rs`, intake §3.4); tests assert
     /// the same semantics. The retry exits the moment the lock frees;
     /// a lock still held at the deadline is a REAL failure and panics.
-    fn reopen_durable_counting(dir: &std::path::Path) -> (MemoryService, u32) {
+    fn reopen_durable_counting_with(
+        dir: &std::path::Path,
+        mut on_denial: impl FnMut(),
+    ) -> (MemoryService, u32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut denials = 0u32;
         loop {
@@ -1127,6 +1130,7 @@ mod tests {
                     if std::time::Instant::now() < deadline =>
                 {
                     denials += 1;
+                    on_denial();
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 other => {
@@ -1140,7 +1144,7 @@ mod tests {
     }
 
     fn reopen_durable(dir: &std::path::Path) -> MemoryService {
-        reopen_durable_counting(dir).0
+        reopen_durable_counting_with(dir, || {}).0
     }
 
     /// The fork-window class made deterministic: a forked child's
@@ -1148,10 +1152,10 @@ mod tests {
     /// flock past the owner's drop, so the test manufactures exactly
     /// that — a second descriptor takes the lock, the raw open denies
     /// by name, and the bounded retry bridges the hold and succeeds
-    /// the moment it releases. No forks, no timing assumptions beyond
-    /// "120ms hold < 10s deadline"; `denials >= 1` is guaranteed
-    /// because the raw denial is asserted while the holder provably
-    /// still lives.
+    /// the moment it releases. Fully condition-based: the holder is
+    /// released only AFTER the retry has observably been denied (the
+    /// `on_denial` hook), so `denials >= 1` holds structurally — no
+    /// descheduling of any thread can outrun it.
     ///
     /// Environmental evidence from the seat that landed this (a
     /// forkpty storm battery, since retired — forking the whole test
@@ -1184,11 +1188,23 @@ mod tests {
             other => panic!("expected LockDenied under a live holder, got {other:?}"),
         }
 
+        // Release ONLY after the retry has observably been denied: no
+        // sleep-based ordering — a maximally descheduled runner cannot
+        // make the holder vanish before the first attempt. The safety
+        // deadline only guards against the helper dying without ever
+        // attempting (its own panic surfaces the real failure then).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let denial_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let denial_flag = std::sync::Arc::clone(&denial_seen);
         let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            let safety = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !denial_flag.load(Ordering::Relaxed) && std::time::Instant::now() < safety {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             drop(holder);
         });
-        let (mut svc, denials) = reopen_durable_counting(&dir);
+        let (mut svc, denials) =
+            reopen_durable_counting_with(&dir, || denial_seen.store(true, Ordering::Relaxed));
         release.join().expect("release thread");
         assert!(
             denials >= 1,
