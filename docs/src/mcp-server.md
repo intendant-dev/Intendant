@@ -57,20 +57,31 @@ HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises `get_status`; `whoami`
 (the caller's own identity, for provenance in memory/agenda writes); the
 agent-to-user collaboration primitives (`post_session_note`, `ask_user`,
-`notify_user`); Agenda and Memory list/read/propose tools; the shared-view
-tools; and the minimal real-display/CU set (`list_displays`,
-`grant_user_display`, `request_user_display`, `revoke_user_display`,
-`take_screenshot`, `read_screen`, `execute_cu_actions`,
+`notify_user`); the Agenda tools (`agenda_list`, `agenda_item`, `agenda_op`)
+and the Memory retrieval/propose tools; the shared-view
+tools; and the minimal display/CU set (`list_displays`,
+`create_virtual_display`, `grant_user_display`, `request_user_display`,
+`revoke_user_display`, `take_screenshot`, `read_screen`, `execute_cu_actions`,
 `display_readiness`) — managed and vanilla alike. Managed context additionally
-advertises rewind/backout and fission tools. Omitting `tool_profile` keeps the
-historical full tool list. Profile filtering applies to `tools/list` only —
+advertises rewind/backout and fission tools. The other profile names
+(`tool_allowed_for_profile` in `mcp/tool_gate.rs`): `codex-core`, `cli`, and
+`minimal` are aliases of `core`; `screen` (alias `display`) advertises the
+served display/CU and shared-view set — its allowlist also names the
+browser-workspace and raw frame tools, which currently have no served
+`tools/list` definitions anywhere and are reachable only by direct call;
+`managed` (alias `managed-context`) advertises `get_status` plus the managed
+rewind/fission set; `full` — or omitting `tool_profile` — keeps the whole
+list, and unknown profile names fail open so a typoed URL does not silently
+hide tools. Profile filtering applies to `tools/list` only —
 hidden HTTP tools remain callable (the lazy `ctl tools call` path).
 *Authorization* is separate: see the next section.
 
-The tables below describe the full daemon HTTP MCP surface as well as the
-stdio-backed tools. Bare `--mcp` stdio mode does not carry the daemon's Agenda
-or Memory service handles and does not advertise those HTTP-only definitions;
-the wired daemon `/mcp` surface is the shape that exposes them.
+The tables below describe the full daemon HTTP MCP surface. Bare `--mcp`
+stdio mode serves only the thirteen `#[tool]`-router tools — `get_status`,
+`get_logs`, `get_pending_approval`, `get_pending_input`, `approve`, `deny`,
+`skip`, `approve_all`, `respond`, `set_autonomy`, `set_verbosity`, `quit`,
+and `start_task`. It does not carry the daemon's Agenda or Memory service
+handles; everything else below is served by the wired daemon `/mcp` surface.
 
 ### /mcp authorization
 
@@ -107,7 +118,9 @@ wired up by the owner's own client config, always counts as an owner surface. Se
    the macOS app scheme) and then bind like any dashboard HTTP request
    (an enrolled mTLS certificate principal or trusted-local root). Foreign origins
    get 403 — same posture as the rest of `/api/*`.
-4. **Tokenless loopback** processes bind to
+4. **mTLS client certificates** bind to their IAM principal.
+5. **Tokenless loopback** processes must present the daemon's per-boot
+   loopback admission token (below) and bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are
    refused. Once any `agent_session` binding exists — even one whose grant
    has since expired or been revoked — this path **fails closed** (401)
@@ -116,6 +129,28 @@ wired up by the owner's own client config, always counts as an owner surface. Se
    and re-enter as the root-compatible local default, making its grant
    decorative. A lapsed `local_process` grant likewise denies rather than
    restoring the open default.
+
+Two transport details back that ladder. First, loopback reachability alone
+is no longer a credential: the daemon mints a fresh random **loopback
+admission token** each boot (`loopback_token.rs`), persists it 0600 at
+`<state root>/loopback-tokens/<port>.token`, and owner-posture loopback
+surfaces — the tokenless `/mcp` rung included — refuse loopback requests
+that do not present it (`x-intendant-loopback-token` header, `?token=`
+query parameter, or a bearer). Same-uid owner processes such as `intendant
+ctl` read the file (clients may override via `INTENDANT_LOOPBACK_TOKEN`;
+the daemon itself never reads that variable). The token admits a caller to
+the loopback owner posture without creating any new principal class, and it
+is deliberately independent of the MCP token ladder above. Second, the
+daemon also binds a dedicated **session-MCP loopback listener** on a
+kernel-assigned `127.0.0.1` port: it serves only `/mcp`, and its access
+ladder has exactly one rung — a session-scoped token binds that agent
+session; everything else (peer identity, the shared process token, browser
+origins, mTLS certificates, tokenless loopback) is refused by name. The
+`INTENDANT_MCP_URL` injected into a supervised native session's runtime
+children targets this listener (external backends keep the main gateway
+port), so sandboxed `ctl` calls keep working where the sandbox blocks the
+daemon's main port; nothing reachable through it exceeds the calling
+session's own gate-resolved authority.
 
 The rule across all of these: **once a principal is named, its authority
 comes only from grants, and a lapsed grant means "no" — never "back to
@@ -177,6 +212,9 @@ evaluator are.
 CORS on `/mcp` matches the gate: responses echo `Access-Control-Allow-Origin`
 only for the daemon's own origin or the app-bundle scheme (which genuinely
 needs it); foreign origins and non-browser clients get no CORS grant at all.
+`POST /mcp` bodies are read and capped before dispatch at 16 MB
+(`MCP_BODY_CAP_BYTES` in `gateway_routes.rs`) — tool calls legitimately
+carry file-sized arguments.
 With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
 new Codex thread while inheriting the lineage prompt-cache key from the saved
 rollout; same-thread `restore` remains available when the current thread should
@@ -238,21 +276,26 @@ Agenda is the durable, append-only parking ledger; Memory is a bounded
 provenance-labeled claim plane. Both render their text as quoted data, never
 instructions. Agenda effect approval/revocation is owner-only even though
 agents and peers may propose an effect. Memory proposals enter the candidate
-lane; this slice exposes no judgment command.
+lane; judging them is the owner's act — `memory_judge` refuses agent and
+peer callers, so an agent that disagrees with a claim proposes a countering
+claim instead.
 
 | Tool | Description | Params |
 |------|-------------|--------|
-| `agenda_list` | List oldest-first items plus Open / Done / Retired counts; optionally filter by status. | `status?` |
-| `agenda_op` | Apply one tagged operation: `add`, `answer`, `patch`, `complete`, `reopen`, `retire`, `propose_effect`, `approve_effect`, or `revoke_effect`. | operation-specific `op` shape |
+| `agenda_list` | List oldest-first items plus Open / Done / Retired counts; filter by status or server-side query, choose full or summary grain, delta-poll with a previous response's `seq`, and page the live/archive windows. | `status?`, `q?`, `shape?`, `since_seq?`, `window?`, `before?`, `before_id?`, `limit?` |
+| `agenda_item` | Fetch one item at full detail by id or unique id prefix: body, tags, provenance, the annotation thread, blockers, dependency/relation edges, refs, effects with manifests and run history, ask payload, and answer. | `id` |
+| `agenda_op` | Apply one tagged operation (the `AgendaCommand` vocabulary in `agenda/types.rs`). Item lifecycle: `add`, `ask`, `answer`, `acknowledge_answer`, `patch`, `complete`, `reopen`, `retire`, `annotate`, `pick_up`, `attest`. Blockers and dependencies: `set_blocker`, `clear_blocker`, `add_relies_on`, `remove_relies_on`. Structure, links, and refs: `add_part_of`, `remove_part_of`, `place`, `add_relates_to`, `remove_relates_to`, `add_ref`, `remove_ref`. Effects: `propose_effect`, `stamp`, `withdraw_effect`, plus the owner-surface-only `approve_effect`, `revoke_effect`, `request_occurrence`, and `start_now`. | operation-specific `op` shape |
 | `memory_search` | Bounded claim search (default 10, maximum 50); candidates are excluded unless explicitly requested. Responses report effective durability. | `query?`, `limit?`, `include_candidates?` |
 | `memory_read` | Read one claim by an id prefix of at least eight hex characters. | `id` |
 | `memory_propose` | Propose a typed, sensitivity-labeled candidate. Authorship comes from the gate-bound caller, not writer-supplied context fields. | `kind`, `statement`, `sensitivity?`, `session?`, `project?`, `model?`, `labels?` |
+| `memory_judge` | Owner curation: judge one claim (`accept`/`dispute`/`retire`/`supersede`); dashboard and owner-shell surfaces only — agent and peer callers are refused. `supersede` names a replacement claim, which holds only while the replacement's derived status is accepted; status is re-derived by the fold, never edited. | `verdict`, `id`, `reason?`, `replacement?` |
 
 ### Display, computer use & frames
 
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
+| `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
 | `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
 | `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
@@ -323,6 +366,26 @@ active holder.
 | `acquire_browser_workspace`   | Acquire a workspace lease. | `workspace_id`, `holder_id`, `holder_kind?`, `note?`, `force?` |
 | `release_browser_workspace`   | Release a workspace lease. | `workspace_id`, `holder_id?`, `note?` |
 | `close_browser_workspace`     | Close a workspace and terminate its local browser process when owned here. | `workspace_id`, `reason?` |
+
+### Remote compute & Codex Cloud workers
+
+`remote_command` offloads heavy platform-neutral compilation and testing to
+a provider-neutral remote host — today Codex Cloud workers, reached through
+the daemon host's authenticated Codex CLI — while the three Codex Cloud
+tools manage the underlying provider tasks as tracked Intendant worker
+leases. None of these ride the scoped profiles: `remote_command` was
+deliberately dropped from the `core` bootstrap set (its schema was the
+largest single item there while consumers stayed rare — context rent;
+supervised backends reach the same lane, with the same session-bound
+identity, as `intendant ctl remote`), and the Codex Cloud tools appear only
+in the unscoped/full listing. All four stay callable by name.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `remote_command` | Start, inspect, wait for, or cancel a remote command job. `start` runs an argv command (never a shell string) against a pushed `git_revision` or an explicit bounded `working_tree` snapshot and returns immediately with acquisition stage/deadline detail; `status`/`wait` return bounded output and exact terminal/cache results. The whole tool is gated as shell spawn. | `op`: `start` (`argv`, `host?`, `branch?`, `cwd?`, `env?`, `source?`, `expected_revision?`, `require_clean?`, `cache?`, `timeout_s?`), `status`/`wait`/`cancel` (`job_id`, `wait_s?`) |
+| `list_codex_cloud_workers` | Refresh Codex Cloud tasks into the local worker-lease store and list them, including tracked leases with live attachments outside the provider window; never modifies a Cloud task. | `environment_id?`, `limit?` |
+| `submit_codex_cloud_task` | Submit a new Codex Cloud task and track it as an ephemeral Intendant worker lease. | `environment_id`, `prompt`, `branch?`, `attempts?`, `title?` |
+| `follow_up_codex_cloud_task` | Send a follow-up turn into an existing Cloud task, reusing its warm worker and incremental build state; refuses tasks with an active turn and fails closed on schema drift. | `task_id`, `prompt` |
 
 ### Live audio
 
