@@ -411,7 +411,6 @@ pub(crate) fn mcp_permission_denied_result(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Protocol revisions the stateless HTTP `/mcp` endpoint fully implements,
 /// newest first. A revision is listed only when every MUST that applies to a
 /// stateless, tools-only POST server is actually implemented here: 2025-03-26
@@ -437,6 +436,7 @@ pub(crate) fn negotiated_mcp_protocol_version(requested: Option<&str>) -> &'stat
         .unwrap_or(SUPPORTED_MCP_PROTOCOL_VERSIONS[0])
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
