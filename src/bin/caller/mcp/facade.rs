@@ -714,6 +714,28 @@ pub(crate) fn facade_gate_operation(
     }
 }
 
+/// Whether a facade tool should be ADVERTISED to a principal, given its
+/// per-operation decision. `help`/`docs` ride the fixed read operation; an
+/// executor lane is advertised when the principal passes at least one of
+/// its commands — so `tools/list` keeps the "advertised == something is
+/// callable" contract that the per-tool filter maintains for typed tools.
+/// `None`: not a facade tool (callers fall back to the fixed name map).
+pub(crate) fn facade_tool_advertised(
+    name: &str,
+    mut allowed: impl FnMut(PeerOperation) -> bool,
+) -> Option<bool> {
+    match name {
+        "help" | "docs" => Some(allowed(PeerOperation::StatsRead)),
+        "inspect" | "act" | "authorize" => Some(
+            COMMANDS
+                .iter()
+                .filter(|spec| spec.lane.tool_name() == name)
+                .any(|spec| allowed(crate::mcp::mcp_tool_operation(spec.tool))),
+        ),
+        _ => None,
+    }
+}
+
 fn usage_line(spec: &CommandSpec) -> String {
     let mut out = spec.path.join(" ");
     for pos in spec.positionals {
@@ -962,6 +984,44 @@ mod tests {
             planned.args["options"],
             serde_json::json!([{ "label": "A" }, { "label": "B" }])
         );
+    }
+
+    /// Listing availability derives from the facade's own model — help/docs
+    /// at the fixed read operation, each executor lane advertised iff the
+    /// principal passes at least one of its commands — so a scoped
+    /// principal without runtime.control still discovers the facade
+    /// (review round 1's P1: the fixed name map must never hide the
+    /// listing from exactly the principals the facade serves).
+    #[test]
+    fn advertisement_follows_lane_availability_not_the_envelope_default() {
+        use crate::peer::access_policy::PeerOperation as Op;
+        let read_only = |op: Op| {
+            matches!(
+                op,
+                Op::StatsRead
+                    | Op::SessionInspect
+                    | Op::AgendaRead
+                    | Op::MemoryRead
+                    | Op::DisplayView
+            )
+        };
+        assert_eq!(facade_tool_advertised("help", read_only), Some(true));
+        assert_eq!(facade_tool_advertised("docs", read_only), Some(true));
+        assert_eq!(facade_tool_advertised("inspect", read_only), Some(true));
+        assert_eq!(facade_tool_advertised("act", read_only), Some(false));
+        assert_eq!(facade_tool_advertised("authorize", read_only), Some(false));
+        let approvals_only = |op: Op| op == Op::Approval;
+        assert_eq!(
+            facade_tool_advertised("authorize", approvals_only),
+            Some(true)
+        );
+        assert_eq!(
+            facade_tool_advertised("inspect", approvals_only),
+            Some(false)
+        );
+        let nothing = |_: Op| false;
+        assert_eq!(facade_tool_advertised("help", nothing), Some(false));
+        assert_eq!(facade_tool_advertised("get_status", read_only), None);
     }
 
     #[test]

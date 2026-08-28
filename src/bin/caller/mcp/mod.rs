@@ -50,7 +50,7 @@ mod state;
 pub(crate) use state::*;
 mod facade;
 mod tool_gate;
-pub(crate) use facade::facade_gate_operation;
+pub(crate) use facade::{facade_gate_operation, facade_tool_advertised};
 pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;

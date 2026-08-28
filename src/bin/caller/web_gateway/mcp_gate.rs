@@ -381,9 +381,18 @@ pub(crate) fn filter_mcp_tools_by_access(
             tool.get("name")
                 .and_then(serde_json::Value::as_str)
                 .map(|name| {
-                    access
-                        .decision(crate::mcp::mcp_tool_operation(name))
-                        .allowed
+                    // Facade meta-tools advertise by their own model — a
+                    // lane is listed when the principal passes at least one
+                    // of its commands — because the fixed name map only
+                    // guards calls on ingresses without gate-side
+                    // resolution and would otherwise hide the whole facade
+                    // from exactly the scoped principals it serves.
+                    crate::mcp::facade_tool_advertised(name, |op| access.decision(op).allowed)
+                        .unwrap_or_else(|| {
+                            access
+                                .decision(crate::mcp::mcp_tool_operation(name))
+                                .allowed
+                        })
                 })
                 .unwrap_or(false)
         });
