@@ -66,7 +66,9 @@ tools; and the minimal display/CU set (`list_displays`,
 advertises rewind/backout and fission tools. The other profile names
 (`tool_allowed_for_profile` in `mcp/tool_gate.rs`): `codex-core`, `cli`, and
 `minimal` are aliases of `core`; `screen` (alias `display`) advertises the
-display/CU/frame set, the browser-workspace tools, and the shared-view tools;
+served display/CU and shared-view set — its allowlist also names the
+browser-workspace and raw frame tools, which currently have no served
+`tools/list` definitions anywhere and are reachable only by direct call;
 `managed` (alias `managed-context`) advertises `get_status` plus the managed
 rewind/fission set; `full` — or omitting `tool_profile` — keeps the whole
 list, and unknown profile names fail open so a typoed URL does not silently
