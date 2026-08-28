@@ -210,10 +210,37 @@ pub(crate) fn tool_allowed_for_profile(
             matches!(name, "get_status")
                 || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
-        // Unknown profiles fail open so typoed third-party URLs do not silently
-        // hide tools. Intendant-generated URLs use known profile names.
-        _ => true,
+        // Unknown profiles fall back to the `core` bootstrap set. This used
+        // to fail open to the full surface so a typoed third-party URL would
+        // not silently hide tools — but the full unfiltered list is itself
+        // the failure mode now (tens of KB of schemas swamping a session's
+        // context before any work starts), and profile shaping never gates
+        // calls: hidden tools stay callable, so `core` keeps a typo
+        // diagnosable (the standard operating set is still advertised, and
+        // the listing edge logs the unknown name) without the blowout.
+        // Intendant-generated URLs use known profile names.
+        _ => tool_allowed_for_profile(name, managed_context, Some("core")),
     }
+}
+
+/// Whether `profile` names a defined advertisement profile. Kept beside the
+/// match in [`tool_allowed_for_profile`] — when a profile arm is added or
+/// renamed there, update this list in the same change (a unit test pins the
+/// known set, and the listing edge uses this to log unknown names before
+/// they fall back to `core`).
+pub(crate) fn known_tool_profile(profile: &str) -> bool {
+    matches!(
+        profile.trim().to_ascii_lowercase().as_str(),
+        "full"
+            | "core"
+            | "codex-core"
+            | "cli"
+            | "minimal"
+            | "screen"
+            | "display"
+            | "managed"
+            | "managed-context"
+    )
 }
 
 /// The IAM permission gate a given MCP tool call must clear.
@@ -761,6 +788,75 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unknown profiles used to fail open to the full surface; they now fall
+    /// back to the `core` bootstrap set (the full-list context blowout was
+    /// the real failure mode). Pin the fallback through the real serving
+    /// path in both managed-context states.
+    #[test]
+    fn unknown_profile_advertises_exactly_the_core_set() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            for managed_context in [false, true] {
+                let names = |served: &serde_json::Value| -> Vec<String> {
+                    served["tools"]
+                        .as_array()
+                        .expect("tools array")
+                        .iter()
+                        .map(|t| t["name"].as_str().expect("tool name").to_string())
+                        .collect()
+                };
+                let unknown = server
+                    .list_tools_json_for_session(
+                        None,
+                        Some(managed_context),
+                        Some("no-such-profile"),
+                    )
+                    .await;
+                let core = server
+                    .list_tools_json_for_session(None, Some(managed_context), Some("core"))
+                    .await;
+                assert_eq!(
+                    names(&unknown),
+                    names(&core),
+                    "unknown profile must advertise the core set \
+                     (managed_context={managed_context})"
+                );
+            }
+        });
+    }
+
+    /// The known-profile list the listing edge logs against stays in sync
+    /// with the named arms of `tool_allowed_for_profile` — update both
+    /// together (adding a profile arm without extending this list makes the
+    /// daemon mislabel the new profile as unknown in its log line).
+    #[test]
+    fn known_tool_profile_pins_the_named_arms() {
+        for profile in [
+            "full",
+            "core",
+            "codex-core",
+            "cli",
+            "minimal",
+            "screen",
+            "display",
+            "managed",
+            "managed-context",
+            " Core ", // trimmed + case-insensitive, like the filter itself
+        ] {
+            assert!(known_tool_profile(profile), "{profile:?} must be known");
+        }
+        for profile in ["", "no-such-profile", "core2", "facade"] {
+            assert!(!known_tool_profile(profile), "{profile:?} must be unknown");
+        }
+    }
 
     #[test]
     fn codex_cloud_tools_are_full_profile_only_with_explicit_iam_classes() {
@@ -1470,8 +1566,8 @@ mod tests {
     /// lacks `"type": "object"` rejects the ENTIRE list and the session
     /// registers zero Intendant tools (the live 2026-07 `agenda_op`
     /// regression). Iterate every profile branch of
-    /// [`tool_allowed_for_profile`] (plus the no-profile and unknown-profile
-    /// fail-open surfaces) x managed-context through the real serving path
+    /// [`tool_allowed_for_profile`] (plus the no-profile default and the
+    /// unknown-profile core fallback) x managed-context through the real serving path
     /// and fail on any served schema that is not explicitly object-typed.
     #[test]
     fn every_profile_serves_only_object_typed_tool_schemas() {
@@ -1485,8 +1581,8 @@ mod tests {
         rt.block_on(async {
             let (_home, server) = test_server(test_state(), EventBus::new());
             // Every named arm of `tool_allowed_for_profile`, the profile-less
-            // default, and an unknown profile (which fails open to the full
-            // surface).
+            // default, and an unknown profile (which falls back to the core
+            // set).
             let profiles = [
                 None,
                 Some("full"),
