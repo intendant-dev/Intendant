@@ -1163,7 +1163,14 @@ mod tests {
             .write(true)
             .open(dir.join("plane.lock"))
             .unwrap();
-        holder.try_lock().expect("the dropped plane freed its lock");
+        // BLOCKING acquire: a foreign fork can hold the just-dropped
+        // plane lock for its own fork→exec window (the very class under
+        // test), so a `try_lock` here would be a fresh flake point.
+        // Blocking rides through any transient hold and owns the lock
+        // the instant the true release lands — condition-based, no
+        // retry loop; a genuinely wedged lock surfaces as this test
+        // hanging into the suite timeout, named.
+        holder.lock().expect("locking the freed plane.lock");
         match MemoryService::new_durable(&dir).map(|_| "opened") {
             Err(super::super::store::StoreError::LockDenied) => {}
             other => panic!("expected LockDenied under a live holder, got {other:?}"),
