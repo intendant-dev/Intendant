@@ -705,6 +705,14 @@ pub struct DisplayMetricsCounters {
     /// counter to the backend via
     /// [`DisplayBackend::install_capture_frame_drop_counter`].
     pub capture_backend_drops: Arc<AtomicU64>,
+    /// Of `capture_frames`, the frames the capture bridge received but
+    /// superseded without broadcasting because a fresher frame was
+    /// already queued behind them (the drain-to-newest pass on each
+    /// bridge wake). Every consumer of the frame bus keeps latest-wins
+    /// state, so replaying a stale burst serially would only add
+    /// latency; a nonzero window here is the "runtime was starved and
+    /// recovered" signal — capture kept pace, the scheduler did not.
+    pub capture_coalesced: AtomicU64,
 
     /// Total frames successfully VP8-encoded.
     pub encode_frames: AtomicU64,
@@ -797,6 +805,7 @@ impl DisplayMetricsCounters {
             capture_drops: AtomicU64::new(0),
             capture_idle_frames: AtomicU64::new(0),
             capture_backend_drops: Arc::new(AtomicU64::new(0)),
+            capture_coalesced: AtomicU64::new(0),
             encode_frames: AtomicU64::new(0),
             encode_drops: AtomicU64::new(0),
             encode_freshness_us_sum: AtomicU64::new(0),
@@ -876,6 +885,30 @@ pub fn captured_frame_kind(dirty_rects: Option<&[capture::damage::Rect]>) -> Cap
         Some([]) => CapturedFrameKind::Idle,
         _ => CapturedFrameKind::Content,
     }
+}
+
+/// Drain the backend channel to the newest immediately-available frame.
+///
+/// A runtime stall (post-boot CPU storms are the live specimen —
+/// agenda 01KZ2PM87Q) queues captured frames behind a starved capture
+/// bridge; replaying them serially on wake would broadcast stale
+/// content one scheduling gap late, and every consumer of the frame
+/// bus keeps latest-wins state anyway. Skipping straight to the newest
+/// bounds recovery latency at one frame. Returns the newest frame plus
+/// the damage kinds of the frames it superseded (oldest first) so the
+/// caller can count them — they WERE captured and must show in the
+/// capture rate, or a coalescing window would masquerade as a slow
+/// source.
+pub fn drain_capture_rx_to_newest(
+    rx: &mut mpsc::Receiver<Frame>,
+    mut newest: Frame,
+) -> (Frame, Vec<CapturedFrameKind>) {
+    let mut superseded = Vec::new();
+    while let Ok(fresher) = rx.try_recv() {
+        superseded.push(captured_frame_kind(newest.dirty_rects.as_deref()));
+        newest = fresher;
+    }
+    (newest, superseded)
 }
 
 /// Which gate let one pool-feed forward through (see the bridge's
@@ -967,6 +1000,12 @@ pub struct DisplayMetricsSnapshot {
     /// zero — rendered as `n/a` in the log line).
     #[serde(default)]
     pub capture_backend_drops: Option<u64>,
+    /// Frames the capture bridge superseded in its drain-to-newest pass
+    /// this window (counted in `capture_fps`, never broadcast). Nonzero
+    /// = the runtime stalled behind capture and recovered by skipping
+    /// stale frames instead of replaying them late.
+    #[serde(default)]
+    pub capture_coalesced: u64,
     pub encode_fps: f64,
     pub encode_freshness_avg_ms: f64,
     pub encode_drops: u64,
@@ -1026,6 +1065,7 @@ impl DisplayMetricsSnapshot {
         let capture_drops = counters.capture_drops.swap(0, Ordering::Relaxed);
         let capture_idle_frames = counters.capture_idle_frames.swap(0, Ordering::Relaxed);
         let capture_backend_drops = counters.capture_backend_drops.swap(0, Ordering::Relaxed);
+        let capture_coalesced = counters.capture_coalesced.swap(0, Ordering::Relaxed);
         let pool_feed_push_changed = counters.pool_feed_push_changed.swap(0, Ordering::Relaxed);
         let pool_feed_push_heartbeat = counters.pool_feed_push_heartbeat.swap(0, Ordering::Relaxed);
         let pool_feed_push_burst = counters.pool_feed_push_burst.swap(0, Ordering::Relaxed);
@@ -1070,6 +1110,7 @@ impl DisplayMetricsSnapshot {
             // session-level `metrics()` downgrades to `None` when the
             // backend never acknowledged the install (unwired = unknown).
             capture_backend_drops: Some(capture_backend_drops),
+            capture_coalesced,
             encode_fps: encode_frames as f64 / elapsed_secs,
             encode_freshness_avg_ms,
             encode_drops,
@@ -2273,6 +2314,24 @@ impl DisplaySession {
                             );
                             break;
                         };
+                        // Recover from scheduling stalls by skipping to
+                        // the newest queued frame; superseded frames
+                        // count toward the capture rate (they arrived)
+                        // and the coalesced counter (they were never
+                        // broadcast) so a starved-runtime window is
+                        // legible in the metrics instead of reading as
+                        // a slow source.
+                        let (frame, superseded) =
+                            drain_capture_rx_to_newest(&mut capture_rx, frame);
+                        for kind in &superseded {
+                            cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
+                            cap_counters.capture_coalesced.fetch_add(1, Ordering::Relaxed);
+                            if *kind == CapturedFrameKind::Idle {
+                                cap_counters
+                                    .capture_idle_frames
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
                         if captured_frame_kind(frame.dirty_rects.as_deref())
                             == CapturedFrameKind::Idle
@@ -2652,7 +2711,7 @@ impl DisplaySession {
                             "[display/metrics] id={} capture={:.1}fps encode={:.1}fps \
                              drops=cap:{}/enc:{}/peer:{} peers={} freshness_avg={:.1}ms res={}x{} \
                              tile=dirty:{}r/{}t/{:.3} delta={:.1}fps/{:.1}kbps/{}rec/skips:{} \
-                             snap={}f/{:.1}kbps/{}rec up={}s idle={:.1}fps bdrops={} \
+                             snap={}f/{:.1}kbps/{}rec up={}s idle={:.1}fps bdrops={} coal={} \
                              push=c{}/h{}/b{} paused=[{}] consumer={}",
                             m.display_id,
                             m.capture_fps,
@@ -2680,6 +2739,7 @@ impl DisplaySession {
                                 None => "n/a".to_string(),
                                 Some(n) => n.to_string(),
                             },
+                            m.capture_coalesced,
                             m.pool_feed_pushes_changed,
                             m.pool_feed_pushes_heartbeat,
                             m.pool_feed_pushes_burst,
@@ -5701,6 +5761,7 @@ mod tests {
             capture_drops: 5,
             capture_idle_fps: 1.5,
             capture_backend_drops: Some(3),
+            capture_coalesced: 4,
             encode_fps: 28.5,
             encode_freshness_avg_ms: 4.2,
             encode_drops: 2,
@@ -6797,6 +6858,45 @@ mod tests {
             timestamp: Instant::now(),
             dirty_rects: None,
         }
+    }
+
+    /// The stall-recovery drain: given queued frames behind the one just
+    /// received, the bridge must keep the NEWEST and report every
+    /// superseded frame's damage kind (oldest first) for counting.
+    #[tokio::test]
+    async fn drain_capture_rx_keeps_newest_and_reports_superseded_kinds() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(8);
+        // Distinguishable frames: first byte tags identity; the middle
+        // frame is an SCK-style Idle delivery (empty dirty set).
+        let mut a = make_test_bgra(4, 4);
+        a.data[0] = 0xAA;
+        let mut b = make_test_bgra(4, 4);
+        b.data[0] = 0xBB;
+        b.dirty_rects = Some(Vec::new());
+        let mut c = make_test_bgra(4, 4);
+        c.data[0] = 0xCC;
+        tx.try_send(a).unwrap();
+        tx.try_send(b).unwrap();
+        tx.try_send(c).unwrap();
+
+        let first = rx.recv().await.expect("frame a");
+        let (newest, superseded) = drain_capture_rx_to_newest(&mut rx, first);
+        assert_eq!(newest.data[0], 0xCC, "the newest queued frame wins");
+        assert_eq!(
+            superseded,
+            vec![CapturedFrameKind::Content, CapturedFrameKind::Idle],
+            "superseded kinds arrive oldest first with the idle split intact"
+        );
+
+        // An empty queue coalesces nothing: the received frame passes
+        // through untouched.
+        let mut d = make_test_bgra(4, 4);
+        d.data[0] = 0xDD;
+        tx.try_send(d).unwrap();
+        let first = rx.recv().await.expect("frame d");
+        let (newest, superseded) = drain_capture_rx_to_newest(&mut rx, first);
+        assert_eq!(newest.data[0], 0xDD);
+        assert!(superseded.is_empty());
     }
 
     /// **3c.3b.3b finding 2 regression test.** Pool-only sessions
