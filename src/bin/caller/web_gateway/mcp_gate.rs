@@ -381,9 +381,18 @@ pub(crate) fn filter_mcp_tools_by_access(
             tool.get("name")
                 .and_then(serde_json::Value::as_str)
                 .map(|name| {
-                    access
-                        .decision(crate::mcp::mcp_tool_operation(name))
-                        .allowed
+                    // Facade meta-tools advertise by their own model — a
+                    // lane is listed when the principal passes at least one
+                    // of its commands — because the fixed name map only
+                    // guards calls on ingresses without gate-side
+                    // resolution and would otherwise hide the whole facade
+                    // from exactly the scoped principals it serves.
+                    crate::mcp::facade_tool_advertised(name, |op| access.decision(op).allowed)
+                        .unwrap_or_else(|| {
+                            access
+                                .decision(crate::mcp::mcp_tool_operation(name))
+                                .allowed
+                        })
                 })
                 .unwrap_or(false)
         });
@@ -520,7 +529,14 @@ pub(crate) async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            let decision = access.decision(crate::mcp::mcp_tool_operation(name));
+            // Facade meta-tools authorize as the RESOLVED command's
+            // operation (resolve-before-authorize); a parse failure
+            // authorizes at the read floor and surfaces from dispatch,
+            // where the rewind-only pressure gate is applied first.
+            let decision = match crate::mcp::facade_gate_operation(name, &args) {
+                Some(op) => access.decision(op),
+                None => access.decision(crate::mcp::mcp_tool_operation(name)),
+            };
             if !decision.allowed {
                 return McpHttpOutcome::Response(McpHttpResponse {
                     jsonrpc: "2.0".into(),

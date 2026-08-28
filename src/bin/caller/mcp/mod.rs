@@ -48,7 +48,9 @@ mod events;
 pub(crate) use events::*;
 mod state;
 pub(crate) use state::*;
+mod facade;
 mod tool_gate;
+pub(crate) use facade::{facade_gate_operation, facade_tool_advertised};
 pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
@@ -572,12 +574,22 @@ impl IntendantServer {
                 .map_err(|e| e.to_string())
         }
 
-        if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
-            name,
-            session_id,
-            managed_context_override,
-        ) {
-            return Ok(text_tool_error(message));
+        // The rewind-only pressure gate applies to the RESOLVED tool for
+        // the facade executors: they recurse with the resolved name and
+        // meet this same gate there, so recovery commands (`context
+        // rewind` et al.) stay reachable through the facade while every
+        // other resolved command still gets the pressure guidance.
+        // `help`/`docs` answer directly (no recursion), so they stay
+        // behind the envelope gate — under pressure they would only add
+        // context.
+        if !facade::is_facade_executor(name) {
+            if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
+                name,
+                session_id,
+                managed_context_override,
+            ) {
+                return Ok(text_tool_error(message));
+            }
         }
         if (managed_context_tool(name) || fission_tool(name))
             && !self
@@ -592,6 +604,45 @@ impl IntendantServer {
         }
 
         match name {
+            // The facade's risk-lane executors. The live ingress gates
+            // already authorized the RESOLVED command's operation via
+            // `facade_gate_operation` (resolve-before-authorize); this arm
+            // re-plans — pure and deterministic over the same inputs, so
+            // both resolutions name the same command — and executes it
+            // under the caller's own principal. The facade is a router,
+            // not a privilege: a parse failure is a tool error, never a
+            // dispatch.
+            "inspect" | "act" | "authorize" => match facade::plan_for_meta(name, &args) {
+                Ok(planned) => {
+                    Box::pin(self.call_tool_by_name_as_caller(
+                        planned.tool,
+                        planned.args,
+                        session_id,
+                        managed_context_override,
+                        ToolCaller {
+                            trust: caller,
+                            actor,
+                        },
+                    ))
+                    .await
+                }
+                Err(message) => {
+                    // Parse failures still respect rewind-only pressure:
+                    // probed with the envelope name (a non-recovery tool),
+                    // so a malformed call under pressure gets the recovery
+                    // guidance instead of registry-shaped error output.
+                    if let Some(pressure) = self.state.read().await.rewind_only_gate_message_for(
+                        name,
+                        session_id,
+                        managed_context_override,
+                    ) {
+                        return Ok(text_tool_error(pressure));
+                    }
+                    Ok(text_tool_error(message))
+                }
+            },
+            "help" => Ok(text_tool_result(facade::render_help(&args))),
+            "docs" => Ok(text_tool_result(facade::render_docs(&args))),
             "get_status" => Ok(text_tool_result(
                 self.get_status_for_session(session_id, managed_context_override)
                     .await,
