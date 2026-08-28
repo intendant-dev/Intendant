@@ -451,6 +451,83 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         )],
         help: "Per-layer display/CU readiness diagnosis",
     },
+    // The managed-context recovery family: under rewind-only pressure the
+    // dispatcher's pressure gate admits only these (applied to the RESOLVED
+    // tool — facade meta names are exempt at the envelope so recovery stays
+    // reachable through the facade). On non-managed sessions the underlying
+    // tools answer with their own managed-context guidance.
+    CommandSpec {
+        path: &["context", "anchors"],
+        lane: RiskLane::Inspect,
+        tool: "list_rewind_anchors",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("session", "session_id", Str, "target session"),
+            flag!("limit", "limit", U64, "max anchors"),
+            flag!("offset", "offset", U64, "pagination offset"),
+            flag!("query", "query", Str, "filter anchors"),
+        ],
+        help: "List rewind anchors for a managed session",
+    },
+    CommandSpec {
+        path: &["context", "inspect"],
+        lane: RiskLane::Inspect,
+        tool: "inspect_rewind_anchor",
+        seed: "{}",
+        positionals: &[p_str("ITEM_ID", "item_id", true, false)],
+        flags: &[
+            flag!("session", "session_id", Str, "target session"),
+            flag!("radius", "radius", U64, "context radius around the anchor"),
+        ],
+        help: "Inspect one rewind anchor with surrounding context",
+    },
+    CommandSpec {
+        path: &["context", "rewind"],
+        lane: RiskLane::Authorize,
+        tool: "rewind_context",
+        seed: r#"{"anchor":{"position":"before"}}"#,
+        positionals: &[
+            p_str("ITEM_ID", "anchor.item_id", true, false),
+            p_str("REASON", "reason", true, false),
+            p_str("PRIMER", "primer", true, true),
+        ],
+        flags: &[
+            flag!("session", "session_id", Str, "target session"),
+            flag!(
+                "position",
+                "anchor.position",
+                Str,
+                "before (default) or after"
+            ),
+            flag!(
+                "preserve",
+                "preserve",
+                StrList,
+                "fact to carry across (repeatable)"
+            ),
+        ],
+        help: "Rewind a managed session's context to an anchor and resume",
+    },
+    CommandSpec {
+        path: &["context", "backout"],
+        lane: RiskLane::Authorize,
+        tool: "rewind_backout",
+        seed: "{}",
+        positionals: &[p_str("RECORD_ID", "record_id", true, false)],
+        flags: &[
+            flag!("session", "session_id", Str, "target session"),
+            flag!("mode", "mode", Str, "restore or fork"),
+            flag!("name", "name", Str, "label for the backout"),
+            flag!(
+                "allow-cache-reset",
+                "allow_cache_reset",
+                Bool,
+                "permit a cache reset"
+            ),
+        ],
+        help: "Back out of a rewind (restore or fork the saved thread)",
+    },
     CommandSpec {
         path: &["cu", "elements"],
         lane: RiskLane::Inspect,
@@ -540,6 +617,17 @@ fn insert_value(
     kind: ValueKind,
     raw: &str,
 ) -> Result<(), String> {
+    // A dotted json_key nests one level ("anchor.item_id" lands inside the
+    // "anchor" object) — enough for the wire shapes the registry maps.
+    if let Some((outer, inner)) = key.split_once('.') {
+        let nested = obj
+            .entry(outer.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let nested = nested
+            .as_object_mut()
+            .ok_or_else(|| format!("{outer}: not an object"))?;
+        return insert_value(nested, inner, kind, raw);
+    }
     let value = match kind {
         ValueKind::Str => serde_json::Value::String(raw.to_string()),
         ValueKind::U64 => serde_json::Value::from(
@@ -578,10 +666,19 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     let mut positional_index = 0usize;
     let mut greedy_parts: Vec<String> = Vec::new();
     let mut greedy_key: Option<&'static str> = None;
+    // The conventional end-of-options marker: after a literal "--", every
+    // remaining token is positional data, so free-text tails may contain
+    // flag-shaped words (["task","start","--","cargo","build","--release"]).
+    let mut options_ended = false;
     let mut i = 0usize;
     while i < rest.len() {
         let token = &rest[i];
-        if let Some(flag_name) = token.strip_prefix("--") {
+        if !options_ended && token == "--" {
+            options_ended = true;
+            i += 1;
+            continue;
+        }
+        if let Some(flag_name) = token.strip_prefix("--").filter(|_| !options_ended) {
             let (flag_name, inline_value) = match flag_name.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (flag_name, None),
@@ -639,8 +736,18 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             serde_json::Value::String(greedy_parts.join(" ")),
         );
     }
+    // Dot-aware presence walk, matching `insert_value`'s nesting.
+    fn key_present(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        match key.split_once('.') {
+            None => obj.contains_key(key),
+            Some((outer, inner)) => obj
+                .get(outer)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|nested| key_present(nested, inner)),
+        }
+    }
     for pos in spec.positionals {
-        if pos.required && !obj.contains_key(pos.json_key) {
+        if pos.required && !key_present(&obj, pos.json_key) {
             return Err(format!(
                 "missing required {} for `{}` — usage: {}",
                 pos.name,
@@ -935,6 +1042,56 @@ mod tests {
         assert!(plan_for_meta("inspect", &argv(&[])).is_err());
         assert!(plan_for_meta("inspect", &serde_json::json!({})).is_err());
         assert!(plan_for_meta("inspect", &argv(&["approval", "approve", "not-a-number"])).is_err());
+    }
+
+    /// The conventional `--` marker ends option parsing so free-text tails
+    /// may contain flag-shaped words (review round 2's P2).
+    #[test]
+    fn double_dash_ends_option_parsing() {
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["task", "start", "--", "run", "cargo", "build", "--release"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["task"], "run cargo build --release");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["notify", "--title", "hm", "--", "--help", "is", "confusing"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["text"], "--help is confusing");
+        assert_eq!(planned.args["title"], "hm");
+    }
+
+    /// The recovery family builds the nested rewind wire shape and rides
+    /// the authorize lane (review round 2's P1: recovery must stay
+    /// reachable through the facade under rewind-only pressure).
+    #[test]
+    fn context_rewind_builds_the_nested_anchor_shape() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "rewind",
+                "item-7",
+                "context pressure",
+                "resume",
+                "from",
+                "here",
+                "--preserve",
+                "the port number",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "rewind_context");
+        assert_eq!(planned.args["anchor"]["item_id"], "item-7");
+        assert_eq!(planned.args["anchor"]["position"], "before");
+        assert_eq!(planned.args["reason"], "context pressure");
+        assert_eq!(planned.args["primer"], "resume from here");
+        assert_eq!(
+            planned.args["preserve"],
+            serde_json::json!(["the port number"])
+        );
     }
 
     #[test]

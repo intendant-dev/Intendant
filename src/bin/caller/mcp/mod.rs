@@ -574,12 +574,19 @@ impl IntendantServer {
                 .map_err(|e| e.to_string())
         }
 
-        if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
-            name,
-            session_id,
-            managed_context_override,
-        ) {
-            return Ok(text_tool_error(message));
+        // The rewind-only pressure gate applies to the RESOLVED tool, never
+        // the facade envelope: a facade executor recurses with the resolved
+        // name and meets this same gate there, so recovery commands
+        // (`context rewind` et al.) stay reachable through the facade while
+        // everything else still gets the pressure guidance.
+        if !facade::is_facade_tool(name) {
+            if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
+                name,
+                session_id,
+                managed_context_override,
+            ) {
+                return Ok(text_tool_error(message));
+            }
         }
         if (managed_context_tool(name) || fission_tool(name))
             && !self
