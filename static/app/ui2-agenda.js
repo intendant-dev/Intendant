@@ -21,6 +21,13 @@ let agendaCounts = { open: 0, done: 0, retired: 0 };
 let agendaSkippedLines = 0;
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
+// Bounded in-place retry for a first load that failed with NOTHING on
+// screen (the daemon's cold session-join can outlive even the widened
+// client budget once; its server-side work continues past the abort and
+// warms the cache, so a short-delay retry lands in milliseconds). Data
+// on screen never triggers this — the heal lane owns staleness.
+let agendaRetryTimer = null;
+let agendaRetryAttempts = 0;
 // Track AS S3 — the resume cursor: the daemon's op-log line seq as of
 // the last full fetch, advanced by each `agenda_changed` (which carries
 // its producing op's seq) and by each heal. null until a response
@@ -163,8 +170,30 @@ const agendaQaSel = {};
 const agendaQaDrafts = {};
 const agendaQaNotes = {};
 
+function agendaCancelRetry() {
+  if (agendaRetryTimer) {
+    clearTimeout(agendaRetryTimer);
+    agendaRetryTimer = null;
+  }
+}
+
+// A dataless failed load retries itself twice (4s, then 12s) instead of
+// sitting on the error until the user clicks away and back — the cold
+// daemon keeps warming behind the failed request, so the retry is cheap.
+function agendaArmRetry() {
+  if (agendaItems !== null) return;
+  if (agendaRetryTimer || agendaRetryAttempts >= 2) return;
+  const delayMs = agendaRetryAttempts === 0 ? 4000 : 12000;
+  agendaRetryAttempts += 1;
+  agendaRetryTimer = setTimeout(() => {
+    agendaRetryTimer = null;
+    if (agendaItems === null && !agendaFetchInFlight) agendaRefresh();
+  }, delayMs);
+}
+
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
+  agendaCancelRetry();
   agendaFetchInFlight = (async () => {
     try {
       // Track AS S5: the list feed is SUMMARIES (titles, chips, edges,
@@ -182,13 +211,16 @@ async function agendaRefresh() {
         agendaSessionLookupsAttempted = new Set(
           agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
+        agendaRetryAttempts = 0;
         agendaLastFullPullAt = Date.now();
         agendaAnnounceParkedAsks();
       } else {
         agendaLoadError = (resp.body && resp.body.error) || `agenda unavailable (${resp.status})`;
+        agendaArmRetry();
       }
     } catch (e) {
       agendaLoadError = String(e && e.message || e);
+      agendaArmRetry();
     } finally {
       agendaFetchInFlight = null;
     }

@@ -48,7 +48,11 @@ pub(crate) async fn agenda_list_api_response(
     // in-process consumer stay whole (ruling R-AS5).
     let next_page = crate::agenda::apply_window(&mut served, window, page, crate::agenda::now_ms())
         .map(|(before, before_id)| serde_json::json!({ "before": before, "before_id": before_id }));
-    let sessions = agenda_sessions_join(&crate::platform::home_dir(), &served);
+    let sessions = agenda_sessions_join_blocking(
+        crate::platform::home_dir(),
+        agenda_referenced_session_ids(&served),
+    )
+    .await;
     // Tier-1 PR state for the anchors this snapshot serves — the same
     // sibling discipline as `sessions`: keyed by the anchors' url-ref
     // locators, memory-only (the scanner's poll fetched it, not this
@@ -130,10 +134,11 @@ pub(crate) async fn agenda_item_api_response(
     };
     match agenda.resolve_prefix(item_id) {
         crate::agenda::AgendaPrefixResolution::One(item) => {
-            let sessions = agenda_sessions_join(
-                &crate::platform::home_dir(),
-                std::slice::from_ref(item.as_ref()),
-            );
+            let sessions = agenda_sessions_join_blocking(
+                crate::platform::home_dir(),
+                agenda_referenced_session_ids(std::slice::from_ref(item.as_ref())),
+            )
+            .await;
             let pull_requests = crate::github_pr::join::tier1()
                 .for_locators(item.refs.iter().map(|r| r.locator.as_str()));
             let mut body = serde_json::json!({
@@ -259,22 +264,72 @@ pub(crate) async fn handle_agenda_pr_state(
 /// wrapper index to its backend conversation even when superseded; a
 /// dangling id (log dir gone, index pruned) simply has no entry, and every
 /// surface degrades to the raw id.
+/// The item-walk + resolve composition. Production lanes call the two
+/// halves separately (ids collected on the async path, resolution on a
+/// blocking thread via [`agenda_sessions_join_blocking`]); tests join
+/// in one hop.
+#[cfg(test)]
 fn agenda_sessions_join(
     home: &std::path::Path,
     items: &[crate::agenda::AgendaItem],
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut out = serde_json::Map::new();
+    agenda_sessions_join_ids(home, &agenda_referenced_session_ids(items))
+}
+
+/// The join's input grain: every distinct non-empty session id the
+/// items reference, in first-mention order — cheap to collect on the
+/// async path, so the file-IO half below can move to a blocking thread
+/// without borrowing the served set.
+fn agenda_referenced_session_ids(items: &[crate::agenda::AgendaItem]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
     for item in items {
         for recorded_id in item.referenced_session_ids() {
-            if recorded_id.is_empty() || out.contains_key(recorded_id) {
+            if recorded_id.is_empty() || !seen.insert(recorded_id.to_string()) {
                 continue;
             }
-            if let Some(entry) = agenda_session_join_entry(home, recorded_id) {
-                out.insert(recorded_id.to_string(), entry);
-            }
+            out.push(recorded_id.to_string());
         }
     }
     out
+}
+
+fn agenda_sessions_join_ids(
+    home: &std::path::Path,
+    ids: &[String],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for recorded_id in ids {
+        if out.contains_key(recorded_id) {
+            continue;
+        }
+        if let Some(entry) = agenda_session_join_entry(home, recorded_id) {
+            out.insert(recorded_id.to_string(), entry);
+        }
+    }
+    out
+}
+
+/// The sessions join on a blocking thread: per-id resolution pays real
+/// file IO (`session_meta.json` reads, wrapper-index lookups, logs-root
+/// scans on misses — 13s measured cold on a 350-open-item box), and the
+/// list/detail handlers run on tokio reactor threads. A failed join
+/// task degrades to "nothing resolved" — the join is a render
+/// convenience, never worth failing the request over.
+async fn agenda_sessions_join_blocking(
+    home: std::path::PathBuf,
+    ids: Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if ids.is_empty() {
+        return serde_json::Map::new();
+    }
+    match tokio::task::spawn_blocking(move || agenda_sessions_join_ids(&home, &ids)).await {
+        Ok(map) => map,
+        Err(e) => {
+            eprintln!("[agenda] sessions join task failed: {e}");
+            serde_json::Map::new()
+        }
+    }
 }
 
 /// The session-join resolution cache (Track AS S8, ruling Q10): the

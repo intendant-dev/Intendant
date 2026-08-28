@@ -1741,6 +1741,22 @@ function dashboardControlRequestTimeoutMs(method) {
     // budget as the peer round trips above.
     case 'api_credential_egress_probe':
       return 30000;
+    // Plane reads whose FIRST hit after a daemon restart folds or scans
+    // cold state: the agenda list's session join pays per-unresolved-id
+    // logs-root scans (13s measured live on a 350-open-item box before
+    // its cache warms — the generic 5s default rendered the pane's
+    // sticky "Fetch is aborted"), and the Memory/Access pane bootstraps
+    // share the cold-open class (owner-verified 2026-07-29). Warm reads
+    // answer in milliseconds, so the wide budget is only ever felt on
+    // the one cold hit.
+    case 'api_agenda_list':
+    case 'api_agenda_item':
+    case 'api_agenda_ops':
+    case 'api_agenda_occurrences':
+    case 'api_memory_search':
+    case 'api_memory_claim':
+    case 'api_access_overview':
+      return 30000;
     // The control-msg trio (transport F7): interrupts, session lifecycle,
     // and dashboard actions dispatched while a busy daemon is mid-turn.
     // The pre-facade call sites asked for 10-15 s and were silently

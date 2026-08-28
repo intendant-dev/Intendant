@@ -39429,7 +39429,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '6e5493ba984a654f';
+const INTENDANT_APP_BUILD = '04ddfd99177d54b9';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -96372,6 +96372,13 @@ let agendaCounts = { open: 0, done: 0, retired: 0 };
 let agendaSkippedLines = 0;
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
+// Bounded in-place retry for a first load that failed with NOTHING on
+// screen (the daemon's cold session-join can outlive even the widened
+// client budget once; its server-side work continues past the abort and
+// warms the cache, so a short-delay retry lands in milliseconds). Data
+// on screen never triggers this — the heal lane owns staleness.
+let agendaRetryTimer = null;
+let agendaRetryAttempts = 0;
 // Track AS S3 — the resume cursor: the daemon's op-log line seq as of
 // the last full fetch, advanced by each `agenda_changed` (which carries
 // its producing op's seq) and by each heal. null until a response
@@ -96514,8 +96521,30 @@ const agendaQaSel = {};
 const agendaQaDrafts = {};
 const agendaQaNotes = {};
 
+function agendaCancelRetry() {
+  if (agendaRetryTimer) {
+    clearTimeout(agendaRetryTimer);
+    agendaRetryTimer = null;
+  }
+}
+
+// A dataless failed load retries itself twice (4s, then 12s) instead of
+// sitting on the error until the user clicks away and back — the cold
+// daemon keeps warming behind the failed request, so the retry is cheap.
+function agendaArmRetry() {
+  if (agendaItems !== null) return;
+  if (agendaRetryTimer || agendaRetryAttempts >= 2) return;
+  const delayMs = agendaRetryAttempts === 0 ? 4000 : 12000;
+  agendaRetryAttempts += 1;
+  agendaRetryTimer = setTimeout(() => {
+    agendaRetryTimer = null;
+    if (agendaItems === null && !agendaFetchInFlight) agendaRefresh();
+  }, delayMs);
+}
+
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
+  agendaCancelRetry();
   agendaFetchInFlight = (async () => {
     try {
       // Track AS S5: the list feed is SUMMARIES (titles, chips, edges,
@@ -96533,13 +96562,16 @@ async function agendaRefresh() {
         agendaSessionLookupsAttempted = new Set(
           agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
+        agendaRetryAttempts = 0;
         agendaLastFullPullAt = Date.now();
         agendaAnnounceParkedAsks();
       } else {
         agendaLoadError = (resp.body && resp.body.error) || `agenda unavailable (${resp.status})`;
+        agendaArmRetry();
       }
     } catch (e) {
       agendaLoadError = String(e && e.message || e);
+      agendaArmRetry();
     } finally {
       agendaFetchInFlight = null;
     }
@@ -118512,6 +118544,22 @@ function dashboardControlRequestTimeoutMs(method) {
     // daemon -> the relaying browser -> the provider's API -> back. Same
     // budget as the peer round trips above.
     case 'api_credential_egress_probe':
+      return 30000;
+    // Plane reads whose FIRST hit after a daemon restart folds or scans
+    // cold state: the agenda list's session join pays per-unresolved-id
+    // logs-root scans (13s measured live on a 350-open-item box before
+    // its cache warms — the generic 5s default rendered the pane's
+    // sticky "Fetch is aborted"), and the Memory/Access pane bootstraps
+    // share the cold-open class (owner-verified 2026-07-29). Warm reads
+    // answer in milliseconds, so the wide budget is only ever felt on
+    // the one cold hit.
+    case 'api_agenda_list':
+    case 'api_agenda_item':
+    case 'api_agenda_ops':
+    case 'api_agenda_occurrences':
+    case 'api_memory_search':
+    case 'api_memory_claim':
+    case 'api_access_overview':
       return 30000;
     // The control-msg trio (transport F7): interrupts, session lifecycle,
     // and dashboard actions dispatched while a busy daemon is mid-turn.
