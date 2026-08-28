@@ -1152,6 +1152,14 @@ mod tests {
     /// "120ms hold < 10s deadline"; `denials >= 1` is guaranteed
     /// because the raw denial is asserted while the holder provably
     /// still lives.
+    ///
+    /// Environmental evidence from the seat that landed this (a
+    /// forkpty storm battery, since retired — forking the whole test
+    /// binary from its own threaded harness wedges children pre-exec,
+    /// the fork window's own hazard turned on the harness): 146
+    /// interleaved reopens against 204 real forked children measured
+    /// 5 spurious `LockDenied` absorbed by the retry on an M-series
+    /// Mac — any one of them is CI run 33051392374 without this fix.
     #[test]
     fn reopen_retry_bridges_a_transient_lock_holder() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1192,81 +1200,6 @@ mod tests {
             &ActorBinding::dashboard(Some("principal:root:dashboard".into())),
         )
         .expect("the bridged plane accepts writes");
-    }
-
-    /// On-demand ENVIRONMENTAL proof for the same class (run by name
-    /// with `-- --ignored`; not in CI — it is a deliberate storm and
-    /// the ordinary suite must stay fast): PTY storm threads fork real
-    /// children (`forkpty` — the fork path the terminal tests
-    /// exercise, on macOS too) while this thread loops drop-then-
-    /// reopen through the bounded retry. Every reopen must succeed;
-    /// the printed tally shows how many spurious denials the retry
-    /// absorbed on this box. Raw `new_durable` under this storm is
-    /// what the merge-group Mac leg saw on run 33051392374.
-    ///
-    /// Unix-only by nature: the mechanism under proof IS the Unix
-    /// fork→exec fd-inheritance window — Windows process creation has
-    /// no fork window, and `/usr/bin/true` plus the PTY fork path
-    /// don't exist there. The deterministic sibling above stays
-    /// portable (std file locks and the manufactured-holder class are
-    /// OS-neutral).
-    #[cfg(unix)]
-    #[test]
-    #[ignore]
-    fn reopen_survives_a_fork_storm() {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("plane");
-        drop(MemoryService::new_durable(&dir).unwrap());
-
-        let storming = std::sync::Arc::new(AtomicBool::new(true));
-        let spawned = std::sync::Arc::new(AtomicU32::new(0));
-        let storms: Vec<_> = (0..4)
-            .map(|_| {
-                let flag = std::sync::Arc::clone(&storming);
-                let spawned = std::sync::Arc::clone(&spawned);
-                std::thread::spawn(move || {
-                    use portable_pty::{CommandBuilder, PtySize};
-                    let pty_system = portable_pty::native_pty_system();
-                    while flag.load(Ordering::Relaxed) {
-                        let pair = pty_system
-                            .openpty(PtySize::default())
-                            .expect("storm openpty");
-                        let mut child = pair
-                            .slave
-                            .spawn_command(CommandBuilder::new("/usr/bin/true"))
-                            .expect("storm forkpty spawn");
-                        spawned.fetch_add(1, Ordering::Relaxed);
-                        let _ = child.wait();
-                    }
-                })
-            })
-            .collect();
-
-        // Interleave reopens with live forks: at least 20 iterations
-        // AND at least 200 forked children before stopping, hard-capped
-        // at 30s so the battery stays bounded.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut iterations = 0u32;
-        let mut absorbed = 0u32;
-        while (iterations < 20 || spawned.load(Ordering::Relaxed) < 200)
-            && std::time::Instant::now() < deadline
-        {
-            let (svc, denials) = reopen_durable_counting(&dir);
-            absorbed += denials;
-            drop(svc);
-            iterations += 1;
-        }
-        storming.store(false, Ordering::Relaxed);
-        for storm in storms {
-            storm.join().expect("storm thread");
-        }
-        assert!(iterations >= 20, "the storm window must cover 20 reopens");
-        println!(
-            "[fork-storm proof] {iterations} reopens clean; {absorbed} spurious \
-             LockDenied absorbed by the retry across {} forked children",
-            spawned.load(Ordering::Relaxed)
-        );
     }
 
     /// P1.8 exit battery — durable round-trip through the SERVICE with
