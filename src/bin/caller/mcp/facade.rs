@@ -576,6 +576,15 @@ pub(crate) fn is_facade_tool(name: &str) -> bool {
     FACADE_TOOLS.contains(&name)
 }
 
+/// The three risk-lane executors — the only facade tools that recurse into
+/// dispatch (and therefore into the rewind-only pressure gate) with their
+/// RESOLVED tool name. `help`/`docs` answer directly and stay behind the
+/// envelope-level gate: under pressure they would otherwise add exactly the
+/// context the gate exists to prevent.
+pub(crate) fn is_facade_executor(name: &str) -> bool {
+    matches!(name, "inspect" | "act" | "authorize")
+}
+
 /// One resolved, ready-to-dispatch call.
 #[derive(Debug)]
 pub(crate) struct PlannedCall {
@@ -1042,6 +1051,22 @@ mod tests {
         assert!(plan_for_meta("inspect", &argv(&[])).is_err());
         assert!(plan_for_meta("inspect", &serde_json::json!({})).is_err());
         assert!(plan_for_meta("inspect", &argv(&["approval", "approve", "not-a-number"])).is_err());
+    }
+
+    /// Only the executors are exempt from the envelope-level rewind-only
+    /// pressure gate (their recursion meets it on the resolved tool);
+    /// help/docs answer directly and stay gated (review round 3's P2).
+    #[test]
+    fn executor_split_pins_which_meta_tools_recurse() {
+        for name in ["inspect", "act", "authorize"] {
+            assert!(is_facade_executor(name), "{name} is an executor");
+            assert!(is_facade_tool(name));
+        }
+        for name in ["help", "docs"] {
+            assert!(!is_facade_executor(name), "{name} answers directly");
+            assert!(is_facade_tool(name));
+        }
+        assert!(!is_facade_executor("get_status"));
     }
 
     /// The conventional `--` marker ends option parsing so free-text tails
