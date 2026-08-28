@@ -467,6 +467,15 @@ impl IntendantServer {
             .read()
             .await
             .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
+        if let Some(profile) = tool_profile.map(str::trim).filter(|p| !p.is_empty()) {
+            if !known_tool_profile(profile) {
+                eprintln!(
+                    "[mcp] unknown tool_profile {profile:?} — advertising the core bootstrap \
+                     set (hidden tools stay callable; known profiles: {})",
+                    known_tool_profile_names()
+                );
+            }
+        }
         // Router tool definitions are static per process, but every call
         // used to re-serialize and ref-inline all ~50 schemas. Build the
         // unfiltered set once; per-request work is the name-keyed

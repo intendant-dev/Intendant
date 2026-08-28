@@ -71,8 +71,9 @@ browser-workspace and raw frame tools, which currently have no served
 `tools/list` definitions anywhere and are reachable only by direct call;
 `managed` (alias `managed-context`) advertises `get_status` plus the managed
 rewind/fission set; `full` — or omitting `tool_profile` — keeps the whole
-list, and unknown profile names fail open so a typoed URL does not silently
-hide tools. Profile filtering applies to `tools/list` only —
+list, and unknown profile names fall back to the `core` bootstrap set (the
+daemon logs the unknown name, and hidden tools stay callable, so a typoed
+URL stays diagnosable without the full-list context cost). Profile filtering applies to `tools/list` only —
 hidden HTTP tools remain callable (the lazy `ctl tools call` path).
 *Authorization* is separate: see the next section.
 

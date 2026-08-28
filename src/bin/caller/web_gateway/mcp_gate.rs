@@ -411,6 +411,31 @@ pub(crate) fn mcp_permission_denied_result(
     })
 }
 
+/// Protocol revisions the stateless HTTP `/mcp` endpoint fully implements,
+/// newest first. A revision is listed only when every MUST that applies to a
+/// stateless, tools-only POST server is actually implemented here: 2025-03-26
+/// is deliberately absent (it makes JSON-RPC batching mandatory, and this
+/// endpoint parses single-object bodies only), and newer revisions stay off
+/// until their mandatory surface (list cache metadata, `server/discover`,
+/// header routing) lands. The stdio transport negotiates separately via rmcp.
+pub(crate) const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2024-11-05"];
+
+/// Spec version negotiation for `initialize`: echo the client's requested
+/// revision when this endpoint implements it; otherwise answer with the
+/// newest implemented revision and let the client decide whether to proceed.
+/// A missing or malformed `protocolVersion` also gets the newest — tolerant
+/// reads beat guessing a caller's era wrong.
+pub(crate) fn negotiated_mcp_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|req| {
+            SUPPORTED_MCP_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == req)
+                .copied()
+        })
+        .unwrap_or(SUPPORTED_MCP_PROTOCOL_VERSIONS[0])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_http_request(
     body: &str,
@@ -452,8 +477,13 @@ pub(crate) async fn handle_mcp_http_request(
             if let Some(sid) = gate_session.as_deref() {
                 note_supervised_mcp_serve(bus, sid, McpServeMilestone::Initialize);
             }
+            let requested = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("protocolVersion"))
+                .and_then(serde_json::Value::as_str);
             Ok(serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated_mcp_protocol_version(requested),
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "intendant",
@@ -920,6 +950,97 @@ pub(crate) fn mcp_agent_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stateless `/mcp` endpoint negotiates `initialize` per spec: echo
+    /// a requested revision it implements, otherwise answer with the newest
+    /// it does. 2025-03-26 is deliberately not echoed (its mandatory
+    /// JSON-RPC batching is unimplemented here).
+    #[test]
+    fn initialize_negotiates_protocol_version() {
+        assert_eq!(
+            negotiated_mcp_protocol_version(Some("2025-06-18")),
+            "2025-06-18"
+        );
+        assert_eq!(
+            negotiated_mcp_protocol_version(Some("2024-11-05")),
+            "2024-11-05"
+        );
+        assert_eq!(
+            negotiated_mcp_protocol_version(Some("2025-03-26")),
+            "2025-06-18"
+        );
+        assert_eq!(
+            negotiated_mcp_protocol_version(Some("2026-07-28")),
+            "2025-06-18"
+        );
+        assert_eq!(negotiated_mcp_protocol_version(None), "2025-06-18");
+    }
+
+    /// End-to-end through `handle_mcp_http_request`: the wire response's
+    /// `protocolVersion` follows negotiation and capabilities stay
+    /// tools-only.
+    #[test]
+    fn initialize_response_negotiates_on_the_wire() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let loopback: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\nx-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            );
+            let access =
+                mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &request)
+                    .unwrap();
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            let bus = EventBus::new();
+            for (requested, expect) in [
+                ("2024-11-05", "2024-11-05"),
+                ("2025-06-18", "2025-06-18"),
+                ("2025-03-26", "2025-06-18"),
+                ("not-a-version", "2025-06-18"),
+            ] {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": requested,
+                        "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "0"},
+                    },
+                })
+                .to_string();
+                let outcome =
+                    handle_mcp_http_request(&body, &server, None, None, None, &access, None, &bus)
+                        .await;
+                let McpHttpOutcome::Response(resp) = outcome else {
+                    panic!("initialize must produce a response (requested {requested})");
+                };
+                let result = resp.result.expect("initialize result");
+                assert_eq!(
+                    result
+                        .get("protocolVersion")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expect),
+                    "requested {requested}"
+                );
+                assert!(
+                    result
+                        .get("capabilities")
+                        .and_then(|c| c.get("tools"))
+                        .is_some(),
+                    "capabilities must stay tools-only-shaped (requested {requested})"
+                );
+            }
+        });
+    }
 
     /// The mcp_token-less loopback tail of the /mcp ladder mints
     /// `local_process` — owner posture — so it now requires the per-boot

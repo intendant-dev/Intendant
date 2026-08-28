@@ -88,19 +88,24 @@ pub(crate) fn tool_allowed_for_profile(
     if !managed_context && (managed_context_tool(name) || fission_tool(name)) {
         return false;
     }
-    let Some(profile) = profile
-        .map(str::trim)
-        .filter(|profile| !profile.is_empty())
-        .map(|profile| profile.to_ascii_lowercase())
-    else {
+    let Some(profile) = profile.map(str::trim).filter(|profile| !profile.is_empty()) else {
         return true;
     };
-    match profile.as_str() {
-        "full" => true,
+    // Unknown profiles fall back to the `Core` family. This used to fail
+    // open to the full surface so a typoed third-party URL would not
+    // silently hide tools — but the full unfiltered list is itself the
+    // failure mode now (tens of KB of schemas swamping a session's context
+    // before any work starts), and profile shaping never gates calls:
+    // hidden tools stay callable, so the core set keeps a typo diagnosable
+    // (the listing edge logs unknown names via `known_tool_profile`)
+    // without the blowout. Intendant-generated URLs use known names.
+    let family = tool_profile_family(profile).unwrap_or(ToolProfileFamily::Core);
+    match family {
+        ToolProfileFamily::Full => true,
         // Codex should learn the broad Intendant surface lazily through
         // `intendant ctl --help` instead of receiving every MCP schema up front.
         // Keep the tiny always-useful status/collaboration set first-class.
-        "core" | "codex-core" | "cli" | "minimal" => {
+        ToolProfileFamily::Core => {
             matches!(
                 name,
                 "get_status"
@@ -177,7 +182,7 @@ pub(crate) fn tool_allowed_for_profile(
                 // normal turns should use them.
                 && (managed_context_tool(name) || fission_tool(name)))
         }
-        "screen" | "display" => {
+        ToolProfileFamily::Screen => {
             matches!(
                 name,
                 "get_status"
@@ -206,14 +211,61 @@ pub(crate) fn tool_allowed_for_profile(
                     | "hide_shared_view"
             ) || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
-        "managed" | "managed-context" => {
+        ToolProfileFamily::Managed => {
             matches!(name, "get_status")
                 || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
-        // Unknown profiles fail open so typoed third-party URLs do not silently
-        // hide tools. Intendant-generated URLs use known profile names.
-        _ => true,
     }
+}
+
+/// The advertisement-profile catalog: every recognized `tool_profile` name
+/// and the filter family it routes to. The single source behind filtering
+/// ([`tool_allowed_for_profile`] routes through [`tool_profile_family`]),
+/// recognition and the listing edge's unknown-name diagnostic
+/// ([`known_tool_profile`], [`known_tool_profile_names`]), and the profile
+/// tests — add a profile here and every consumer follows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToolProfileFamily {
+    Full,
+    Core,
+    Screen,
+    Managed,
+}
+
+pub(crate) const TOOL_PROFILE_CATALOG: &[(&str, ToolProfileFamily)] = &[
+    ("full", ToolProfileFamily::Full),
+    ("core", ToolProfileFamily::Core),
+    ("codex-core", ToolProfileFamily::Core),
+    ("cli", ToolProfileFamily::Core),
+    ("minimal", ToolProfileFamily::Core),
+    ("screen", ToolProfileFamily::Screen),
+    ("display", ToolProfileFamily::Screen),
+    ("managed", ToolProfileFamily::Managed),
+    ("managed-context", ToolProfileFamily::Managed),
+];
+
+/// Case-insensitive, whitespace-tolerant catalog lookup.
+fn tool_profile_family(profile: &str) -> Option<ToolProfileFamily> {
+    let normalized = profile.trim().to_ascii_lowercase();
+    TOOL_PROFILE_CATALOG
+        .iter()
+        .find(|(name, _)| *name == normalized)
+        .map(|(_, family)| *family)
+}
+
+/// Whether `profile` names a catalog profile (the listing edge logs
+/// unknown names before they fall back to the core family).
+pub(crate) fn known_tool_profile(profile: &str) -> bool {
+    tool_profile_family(profile).is_some()
+}
+
+/// The catalog's names, comma-joined for diagnostics.
+pub(crate) fn known_tool_profile_names() -> String {
+    TOOL_PROFILE_CATALOG
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The IAM permission gate a given MCP tool call must clear.
@@ -647,7 +699,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "create_virtual_display",
         manual_http_tool_definition!(
             "create_virtual_display",
-            "Create an agent-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer. Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
+            "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
             CreateVirtualDisplayParams
         ),
     );
@@ -761,6 +813,74 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unknown profiles used to fail open to the full surface; they now fall
+    /// back to the `core` bootstrap set (the full-list context blowout was
+    /// the real failure mode). Pin the fallback through the real serving
+    /// path in both managed-context states.
+    #[test]
+    fn unknown_profile_advertises_exactly_the_core_set() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            for managed_context in [false, true] {
+                let names = |served: &serde_json::Value| -> Vec<String> {
+                    served["tools"]
+                        .as_array()
+                        .expect("tools array")
+                        .iter()
+                        .map(|t| t["name"].as_str().expect("tool name").to_string())
+                        .collect()
+                };
+                let unknown = server
+                    .list_tools_json_for_session(
+                        None,
+                        Some(managed_context),
+                        Some("no-such-profile"),
+                    )
+                    .await;
+                let core = server
+                    .list_tools_json_for_session(None, Some(managed_context), Some("core"))
+                    .await;
+                assert_eq!(
+                    names(&unknown),
+                    names(&core),
+                    "unknown profile must advertise the core set \
+                     (managed_context={managed_context})"
+                );
+            }
+        });
+    }
+
+    /// Recognition, filtering, and the diagnostic name list all derive from
+    /// `TOOL_PROFILE_CATALOG` — pin the catalog's own invariants instead of
+    /// a second hand-written list.
+    #[test]
+    fn tool_profile_catalog_drives_recognition_and_diagnostics() {
+        for (name, _) in TOOL_PROFILE_CATALOG {
+            assert!(known_tool_profile(name), "{name:?} must be known");
+            assert!(
+                known_tool_profile_names().contains(name),
+                "{name:?} must appear in the diagnostic list"
+            );
+        }
+        // Lookup is trim + case-insensitive, like the filter itself.
+        assert!(known_tool_profile(" Core "));
+        // No duplicate names — a duplicate would shadow its family.
+        let mut names: Vec<&str> = TOOL_PROFILE_CATALOG.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), TOOL_PROFILE_CATALOG.len());
+        for profile in ["", "no-such-profile", "core2", "facade"] {
+            assert!(!known_tool_profile(profile), "{profile:?} must be unknown");
+        }
+    }
 
     #[test]
     fn codex_cloud_tools_are_full_profile_only_with_explicit_iam_classes() {
@@ -1470,8 +1590,8 @@ mod tests {
     /// lacks `"type": "object"` rejects the ENTIRE list and the session
     /// registers zero Intendant tools (the live 2026-07 `agenda_op`
     /// regression). Iterate every profile branch of
-    /// [`tool_allowed_for_profile`] (plus the no-profile and unknown-profile
-    /// fail-open surfaces) x managed-context through the real serving path
+    /// [`tool_allowed_for_profile`] (plus the no-profile default and the
+    /// unknown-profile core fallback) x managed-context through the real serving path
     /// and fail on any served schema that is not explicitly object-typed.
     #[test]
     fn every_profile_serves_only_object_typed_tool_schemas() {
@@ -1485,21 +1605,12 @@ mod tests {
         rt.block_on(async {
             let (_home, server) = test_server(test_state(), EventBus::new());
             // Every named arm of `tool_allowed_for_profile`, the profile-less
-            // default, and an unknown profile (which fails open to the full
-            // surface).
-            let profiles = [
-                None,
-                Some("full"),
-                Some("core"),
-                Some("codex-core"),
-                Some("cli"),
-                Some("minimal"),
-                Some("screen"),
-                Some("display"),
-                Some("managed"),
-                Some("managed-context"),
-                Some("unknown-profile-for-schema-pin"),
-            ];
+            // default, and an unknown profile (which falls back to the core
+            // set).
+            let profiles = TOOL_PROFILE_CATALOG
+                .iter()
+                .map(|(name, _)| Some(*name))
+                .chain([None, Some("unknown-profile-for-schema-pin")]);
             for profile in profiles {
                 for managed_context in [false, true] {
                     let served = server

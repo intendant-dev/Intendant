@@ -242,6 +242,12 @@ pub(crate) async fn serve_http_request(
             table_posture,
             Some(crate::gateway_routes::CorsPosture::FleetOrLoopback)
         );
+        // One list for every preflight branch. MCP-Protocol-Version rides
+        // here because Streamable HTTP clients at revision 2025-06-18 send
+        // it on every post-initialize request — the app-scheme origin is a
+        // real cross-origin /mcp caller, and a preflight that omits the
+        // header would block every request after the handshake.
+        const PREFLIGHT_ALLOW_HEADERS: &str = "Content-Type, Authorization, MCP-Protocol-Version";
         let response = if own_origin_scoped {
             // Own-origin APIs (and /mcp) are same-origin (or
             // app-scheme) only; a cross-origin preflight gets
@@ -255,10 +261,7 @@ pub(crate) async fn serve_http_request(
                 Some(origin) => HttpResponse::new("204 No Content")
                     .header("Access-Control-Allow-Origin", origin)
                     .header("Access-Control-Allow-Methods", methods)
-                    .header(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization",
-                    )
+                    .header("Access-Control-Allow-Headers", PREFLIGHT_ALLOW_HEADERS)
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
                     .header("Connection", "close"),
@@ -292,10 +295,7 @@ pub(crate) async fn serve_http_request(
                 Some(origin) => HttpResponse::new("204 No Content")
                     .header("Access-Control-Allow-Origin", origin)
                     .header("Access-Control-Allow-Methods", methods)
-                    .header(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization",
-                    )
+                    .header("Access-Control-Allow-Headers", PREFLIGHT_ALLOW_HEADERS)
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
                     .header("Connection", "close"),
@@ -310,10 +310,7 @@ pub(crate) async fn serve_http_request(
             HttpResponse::new("204 No Content")
                 .header("Access-Control-Allow-Origin", "*")
                 .header("Access-Control-Allow-Methods", methods)
-                .header(
-                    "Access-Control-Allow-Headers",
-                    "Content-Type, Authorization",
-                )
+                .header("Access-Control-Allow-Headers", PREFLIGHT_ALLOW_HEADERS)
                 .header("Access-Control-Max-Age", "86400")
                 .header("Connection", "close")
         };
