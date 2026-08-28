@@ -516,7 +516,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "docs",
         manual_http_tool_definition!(
             "docs",
-            "The embedded Intendant operating skills: no argument lists them; a skill name returns its full text (judgment and workflow guidance beyond command syntax).",
+            "The embedded Intendant operating skills: no argument lists them; a skill name returns its full text plus its support-file manifest; skill + file fetches one bundled support file (judgment and workflow guidance beyond command syntax).",
             crate::mcp::facade::FacadeDocsParams
         ),
     );

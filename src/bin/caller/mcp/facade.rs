@@ -564,12 +564,16 @@ pub struct FacadeHelpParams {
 }
 
 /// Params for the `docs` meta-tool.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct FacadeDocsParams {
     /// Omit to list the embedded operating skills; a skill name to fetch
-    /// its full text.
+    /// its full text (plus its support-file manifest, when it has one).
     #[serde(default)]
     pub skill: Option<String>,
+    /// A support-file path from the skill's manifest (e.g.
+    /// "references/query-recipes.md") to fetch that file instead.
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 pub(crate) fn is_facade_tool(name: &str) -> bool {
@@ -613,9 +617,21 @@ fn resolve_path(argv: &[String]) -> Result<&'static CommandSpec, String> {
         }
     }
     best.ok_or_else(|| {
+        // Reflected tokens are char-capped: an unknown command's argv can
+        // be arbitrarily large, and this message must stay small even when
+        // it is the only output a pressured session receives.
+        let shown = |token: &String| -> String {
+            if token.chars().count() > 48 {
+                let mut cut: String = token.chars().take(48).collect();
+                cut.push('…');
+                cut
+            } else {
+                token.clone()
+            }
+        };
         format!(
             "unknown command {:?} — call the help tool for the command map, or help {{\"topic\":\"<family>\"}}",
-            argv.iter().take(2).cloned().collect::<Vec<_>>().join(" ")
+            argv.iter().take(2).map(shown).collect::<Vec<_>>().join(" ")
         )
     })
 }
@@ -812,19 +828,21 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
 }
 
 /// The gate-side authorization resolver. `None`: not a facade tool (fall
-/// through to the fixed per-tool map). `Some(Err)`: fail-closed parse
-/// failure — return the error as a tool result, never dispatch.
-/// `Some(Ok(op))`: authorize this operation, then dispatch.
-pub(crate) fn facade_gate_operation(
-    name: &str,
-    args: &serde_json::Value,
-) -> Option<Result<PeerOperation, String>> {
+/// through to the fixed per-tool map). `Some(op)`: authorize this
+/// operation, then dispatch. An executor call whose argv fails to parse
+/// authorizes at the harmless read floor: nothing will execute — dispatch
+/// re-plans, applies the rewind-only pressure gate first, and returns the
+/// parse error as a tool result — and the error's content is registry
+/// shape, the same disclosure class as `help`.
+pub(crate) fn facade_gate_operation(name: &str, args: &serde_json::Value) -> Option<PeerOperation> {
     match name {
         // The read-only meta surface: the command map and the embedded
         // skills corpus disclose less than get_status already does.
-        "help" | "docs" => Some(Ok(PeerOperation::StatsRead)),
+        "help" | "docs" => Some(PeerOperation::StatsRead),
         "inspect" | "act" | "authorize" => Some(
-            plan_for_meta(name, args).map(|planned| crate::mcp::mcp_tool_operation(planned.tool)),
+            plan_for_meta(name, args)
+                .map(|planned| crate::mcp::mcp_tool_operation(planned.tool))
+                .unwrap_or(PeerOperation::StatsRead),
         ),
         _ => None,
     }
@@ -941,36 +959,66 @@ pub(crate) fn render_help(args: &serde_json::Value) -> String {
     }
 }
 
-/// `docs` tool: the embedded operate-skills corpus, listed or fetched.
+/// `docs` tool: the embedded operate-skills corpus — list, fetch a skill,
+/// or fetch one of its support files. The file vocabulary derives from
+/// `BuiltinSkill::support_files`, so a skill whose text references its
+/// bundled files is always a complete package through the facade.
 pub(crate) fn render_docs(args: &serde_json::Value) -> String {
-    let skill = serde_json::from_value::<FacadeDocsParams>(args.clone())
-        .ok()
-        .and_then(|params| params.skill)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let skill = skill.as_deref();
-    match skill {
+    let params = serde_json::from_value::<FacadeDocsParams>(args.clone()).unwrap_or_default();
+    let normalize = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let skill = normalize(params.skill);
+    let file = normalize(params.file);
+    let Some(name) = skill.as_deref() else {
+        if file.is_some() {
+            return "a file fetch needs its skill: docs {\"skill\":\"<name>\",\"file\":\"<path>\"}"
+                .to_string();
+        }
+        let mut out = String::from(
+            "Embedded operating skills (fetch one with docs {\"skill\":\"<name>\"}):\n",
+        );
+        for skill in crate::builtin_skills::BUILTIN_SKILLS {
+            let first_heading = skill
+                .skill_md
+                .lines()
+                .find(|l| !l.trim().is_empty() && !l.starts_with("---"))
+                .unwrap_or("")
+                .trim();
+            out.push_str(&format!("  {:<24} {}\n", skill.name, first_heading));
+        }
+        return out;
+    };
+    let Some(skill) = crate::builtin_skills::BUILTIN_SKILLS
+        .iter()
+        .find(|s| s.name == name)
+    else {
+        return format!("unknown skill {name:?} — call docs with no arguments for the list");
+    };
+    match file.as_deref() {
         None => {
-            let mut out = String::from(
-                "Embedded operating skills (fetch one with docs {\"skill\":\"<name>\"}):\n",
-            );
-            for skill in crate::builtin_skills::BUILTIN_SKILLS {
-                let first_heading = skill
-                    .skill_md
-                    .lines()
-                    .find(|l| !l.trim().is_empty() && !l.starts_with("---"))
-                    .unwrap_or("")
-                    .trim();
-                out.push_str(&format!("  {:<24} {}\n", skill.name, first_heading));
+            let mut out = skill.skill_md.to_string();
+            if !skill.support_files.is_empty() {
+                out.push_str("\n\n---\nSupport files (fetch with docs {\"skill\":\"");
+                out.push_str(skill.name);
+                out.push_str("\",\"file\":\"<path>\"}):\n");
+                for (path, bytes) in skill.support_files {
+                    out.push_str(&format!("  {path} ({} bytes)\n", bytes.len()));
+                }
             }
             out
         }
-        Some(name) => match crate::builtin_skills::BUILTIN_SKILLS
-            .iter()
-            .find(|s| s.name == name)
-        {
-            Some(skill) => skill.skill_md.to_string(),
-            None => format!("unknown skill {name:?} — call docs with no arguments for the list"),
+        Some(path) => match skill.support_files.iter().find(|(p, _)| *p == path) {
+            Some((_, bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            None => {
+                let available: Vec<&str> = skill.support_files.iter().map(|(p, _)| *p).collect();
+                format!(
+                    "unknown file {path:?} for skill {name:?} — available: {}",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )
+            }
         },
     }
 }
@@ -1130,23 +1178,24 @@ mod tests {
     #[test]
     fn gate_operation_resolves_per_command() {
         use crate::peer::access_policy::PeerOperation as Op;
-        let op = facade_gate_operation("authorize", &argv(&["approval", "approve", "7"]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(op, Op::Approval);
-        let op = facade_gate_operation("inspect", &argv(&["status"]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(op, Op::StatsRead);
-        assert!(facade_gate_operation("inspect", &argv(&["nope"]))
-            .unwrap()
-            .is_err());
+        assert_eq!(
+            facade_gate_operation("authorize", &argv(&["approval", "approve", "7"])),
+            Some(Op::Approval)
+        );
+        assert_eq!(
+            facade_gate_operation("inspect", &argv(&["status"])),
+            Some(Op::StatsRead)
+        );
+        // A parse failure authorizes at the read floor: nothing executes —
+        // dispatch re-plans, pressure-gates, and returns the parse error.
+        assert_eq!(
+            facade_gate_operation("inspect", &argv(&["nope"])),
+            Some(Op::StatsRead)
+        );
         assert!(facade_gate_operation("get_status", &serde_json::json!({})).is_none());
         assert_eq!(
-            facade_gate_operation("help", &serde_json::json!({}))
-                .unwrap()
-                .unwrap(),
-            Op::StatsRead
+            facade_gate_operation("help", &serde_json::json!({})),
+            Some(Op::StatsRead)
         );
     }
 
@@ -1229,5 +1278,28 @@ mod tests {
             one.len()
         );
         assert!(render_docs(&serde_json::json!({ "skill": "zzz" })).contains("unknown skill"));
+        // Support files derive from the BuiltinSkill manifest (review
+        // round 4's P2): a skill that references its bundled files is a
+        // complete package through the facade.
+        let with_files = render_docs(&serde_json::json!({ "skill": "intendant-log-search" }));
+        assert!(
+            with_files.contains("Support files"),
+            "manifest expected in skill fetch"
+        );
+        assert!(with_files.contains("references/query-recipes.md"));
+        let file = render_docs(&serde_json::json!({
+            "skill": "intendant-log-search",
+            "file": "references/query-recipes.md",
+        }));
+        assert!(file.len() > 1000, "support file body expected");
+        let unknown = render_docs(&serde_json::json!({
+            "skill": "intendant-log-search",
+            "file": "nope.md",
+        }));
+        assert!(unknown.contains("available:"), "{unknown}");
+        assert!(
+            render_docs(&serde_json::json!({ "file": "references/query-recipes.md" }))
+                .contains("needs its skill")
+        );
     }
 }

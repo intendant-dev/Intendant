@@ -626,7 +626,20 @@ impl IntendantServer {
                     ))
                     .await
                 }
-                Err(message) => Ok(text_tool_error(message)),
+                Err(message) => {
+                    // Parse failures still respect rewind-only pressure:
+                    // probed with the envelope name (a non-recovery tool),
+                    // so a malformed call under pressure gets the recovery
+                    // guidance instead of registry-shaped error output.
+                    if let Some(pressure) = self.state.read().await.rewind_only_gate_message_for(
+                        name,
+                        session_id,
+                        managed_context_override,
+                    ) {
+                        return Ok(text_tool_error(pressure));
+                    }
+                    Ok(text_tool_error(message))
+                }
             },
             "help" => Ok(text_tool_result(facade::render_help(&args))),
             "docs" => Ok(text_tool_result(facade::render_docs(&args))),

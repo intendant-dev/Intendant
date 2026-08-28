@@ -1242,20 +1242,11 @@ pub(crate) async fn api_mcp_tool_call_response(
     // tool must also clear its own IAM operation, so a principal scoped to
     // messaging cannot reach display input or runtime control through the
     // generic tool-call RPC. Facade meta-tools authorize as the RESOLVED
-    // command's operation (resolve-before-authorize); a parse failure is a
-    // 400 and never dispatches.
-    let operation = match crate::mcp::facade_gate_operation(&name, &arguments) {
-        Some(Ok(op)) => op,
-        Some(Err(message)) => {
-            return http_body_response(
-                id,
-                400,
-                mcp_error_body(mcp_id, -32602, &message),
-                "mcp tool call",
-            );
-        }
-        None => crate::mcp::mcp_tool_operation(&name),
-    };
+    // command's operation (resolve-before-authorize); a parse failure
+    // authorizes at the read floor and surfaces from dispatch, where the
+    // rewind-only pressure gate is applied first.
+    let operation = crate::mcp::facade_gate_operation(&name, &arguments)
+        .unwrap_or_else(|| crate::mcp::mcp_tool_operation(&name));
     let decision = runtime.grant.access_decision(operation);
     if !decision.allowed {
         return http_body_response(
