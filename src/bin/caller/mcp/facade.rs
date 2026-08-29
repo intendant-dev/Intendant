@@ -662,6 +662,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         ],
         flags: &[
             flag!("session", "session_id", Str, "target session"),
+            flag!("item-id", "anchor.item_id", Str, "ctl-spelling alias for ITEM_ID"),
+            flag!("reason", "reason", Str, "ctl-spelling alias for REASON"),
+            flag!("primer", "primer", Str, "ctl-spelling alias for PRIMER"),
             flag!(
                 "position",
                 "anchor.position",
@@ -739,6 +742,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: "{}",
         positionals: &[p_json("ACTIONS", "actions", true)],
         flags: &[
+            flag!("actions", "actions", Json, "ctl-spelling alias for ACTIONS"),
             flag!("target", "display_target", Str, "display target"),
             flag!(
                 "coordinate-space",
@@ -1608,6 +1612,13 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("GOAL", "north_star_goal", true, true),
         ],
         flags: &[
+            flag!(
+                "controller-id",
+                "controller_id",
+                Str,
+                "ctl-spelling alias for CONTROLLER_ID"
+            ),
+            flag!("goal", "north_star_goal", Str, "ctl-spelling alias for GOAL"),
             flag!("reason", "reason", Str, "why restart"),
             flag!("after", "restart_after", Str, "turn_end (default) or now"),
             flag!(
@@ -2569,6 +2580,56 @@ mod tests {
         let planned = plan_for_meta("act", &argv(&["ask", "ship it?", "--park"])).unwrap();
         assert_eq!(planned.args["question"], "ship it?");
         assert_eq!(planned.args["park"], serde_json::json!(true));
+    }
+
+    /// The ctl flag spellings for values the registry models as
+    /// positionals plan identically (review round 14): a caller copying
+    /// ctl help verbatim must not fail on argv shape.
+    #[test]
+    fn ctl_flag_spellings_alias_the_positionals() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "rewind",
+                "--item-id",
+                "item-1",
+                "--reason",
+                "noise",
+                "--primer",
+                "the primer",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["anchor"]["item_id"], "item-1");
+        assert_eq!(planned.args["reason"], "noise");
+        assert_eq!(planned.args["primer"], "the primer");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["cu", "actions", "--actions", "[{\"type\":\"screenshot\"}]"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["actions"][0]["type"], "screenshot");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "controller",
+                "schedule",
+                "--controller-id",
+                "ctl-1",
+                "--goal",
+                "keep shipping",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["controller_id"], "ctl-1");
+        assert_eq!(planned.args["north_star_goal"], "keep shipping");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["agenda", "approve", "item-1", "--digest", "abc123"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["digest"], "abc123");
     }
 
     /// The dispatcher replaces the identity sentinel with the caller's
