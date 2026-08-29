@@ -299,8 +299,14 @@ fn build_args(
                 greedy_kind = pos.kind;
                 greedy_parts.push(token.clone());
             } else {
-                insert_value(&mut obj, pos.json_key, pos.kind, token)?;
-                written.insert(outer(pos.json_key));
+                // ctl's precedence for dual spellings: an explicit flag
+                // beats its positional twin in either order, so a
+                // positional never overwrites a flag-written key (the
+                // slot is still consumed).
+                if !flag_written.contains(outer(pos.json_key)) {
+                    insert_value(&mut obj, pos.json_key, pos.kind, token)?;
+                    written.insert(outer(pos.json_key));
+                }
                 positional_index += 1;
             }
         } else if greedy_key.is_some() {
@@ -2320,6 +2326,32 @@ mod tests {
         );
         let err = substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap_err();
         assert!(err.contains("too far in the future"), "{err}");
+        // Round 36: the flag beats its positional twin in EITHER order
+        // (ctl reads the flag first), non-greedy included.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "browser",
+                "create",
+                "--url",
+                "https://flag.example",
+                "https://positional.example",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["url"], "https://flag.example");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "browser",
+                "create",
+                "https://positional.example",
+                "--url",
+                "https://flag.example",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["url"], "https://flag.example");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
