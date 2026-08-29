@@ -985,19 +985,22 @@ impl IntendantServer {
             "terminal_read" => {
                 let Parameters(params) = parse_params::<TerminalReadParams>(args)?;
                 Ok(text_tool_result(
-                    self.terminal_read_tool(params, caller, &actor).await,
+                    self.terminal_read_tool(params, caller, &actor, fs_scope)
+                        .await,
                 ))
             }
             "terminal_write" => {
                 let Parameters(params) = parse_params::<TerminalWriteParams>(args)?;
                 Ok(text_tool_result(
-                    self.terminal_write_tool(params, caller, &actor).await,
+                    self.terminal_write_tool(params, caller, &actor, fs_scope)
+                        .await,
                 ))
             }
             "terminal_resize" => {
                 let Parameters(params) = parse_params::<TerminalResizeParams>(args)?;
                 Ok(text_tool_result(
-                    self.terminal_resize_tool(params, caller, &actor).await,
+                    self.terminal_resize_tool(params, caller, &actor, fs_scope)
+                        .await,
                 ))
             }
             "terminal_close" => {

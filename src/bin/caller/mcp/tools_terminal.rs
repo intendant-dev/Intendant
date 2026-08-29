@@ -23,6 +23,7 @@
 //!   principal id degrades to a principal that owns nothing.
 
 use super::*;
+use crate::peer::access_policy::FilesystemAccessPolicy;
 use crate::terminal::{ShellSpawnPolicy, TerminalActor, TerminalKey};
 
 /// Cap on one cursor read. Big enough for a full scrollback replay in
@@ -175,6 +176,34 @@ fn no_visible(terminal_id: &str) -> String {
     .to_string()
 }
 
+/// Whether the caller's CURRENT filesystem scope still matches the one
+/// the session's shell was spawned under. The OS sandbox is fixed at
+/// spawn, so when an operator narrows (or reissues) the owning
+/// principal's scope, the old shell keeps enforcing the broader policy
+/// — the session is refused as stale rather than serving authority the
+/// grant no longer expresses (security review P1). Applies only to
+/// sessions the CALLING principal owns: a shared session another
+/// principal spawned runs under ITS owner's authority by design, and
+/// root surfaces are never scope-bound.
+fn scope_is_stale(
+    trust: ToolCallerTrust,
+    owned: bool,
+    spawn_scope: Option<&FilesystemAccessPolicy>,
+    current: Option<&FilesystemAccessPolicy>,
+) -> bool {
+    matches!(trust, ToolCallerTrust::Scoped) && owned && spawn_scope != current
+}
+
+fn stale_scope(terminal_id: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "your filesystem scope changed since terminal {terminal_id:?} was spawned and its sandbox still reflects the old scope — terminal_close it, then terminal_open a fresh shell under the current scope"
+        ),
+    })
+    .to_string()
+}
+
 impl IntendantServer {
     pub(crate) async fn terminal_list_tool(
         &self,
@@ -237,7 +266,7 @@ impl IntendantServer {
             // including one whose grant carries no filesystem scope)
             // gets a cleared, secret-free environment and can never read
             // the daemon's provider keys through `env`.
-            scope: fs_scope,
+            scope: fs_scope.clone(),
         };
         match registry
             .open_or_attach(
@@ -250,6 +279,21 @@ impl IntendantServer {
             .await
         {
             Ok((session, created)) => {
+                // Attaching back to your own live shell whose sandbox
+                // predates a scope change is refused up front — the
+                // handle would only meet the same staleness refusal on
+                // every read and write. (A fresh spawn is by definition
+                // under the current scope.)
+                if !created
+                    && scope_is_stale(
+                        trust,
+                        session.managed_by(&acting),
+                        session.spawn_scope(),
+                        fs_scope.as_ref(),
+                    )
+                {
+                    return stale_scope(&terminal_id);
+                }
                 // The current write high-water is the natural first
                 // cursor: a fresh open starts reading at "now".
                 let (_, cursor, _) = session.read_since(u64::MAX, 0);
@@ -274,17 +318,24 @@ impl IntendantServer {
         params: TerminalReadParams,
         trust: ToolCallerTrust,
         actor: &crate::access::actor::ActorBinding,
+        fs_scope: Option<FilesystemAccessPolicy>,
     ) -> String {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
         let key = TerminalKey::local(&params.terminal_id);
-        let Some(session) = registry
-            .get_visible(&key, &terminal_actor(trust, actor))
-            .await
-        else {
+        let acting = terminal_actor(trust, actor);
+        let Some(session) = registry.get_visible(&key, &acting).await else {
             return no_visible(&params.terminal_id);
         };
+        if scope_is_stale(
+            trust,
+            session.managed_by(&acting),
+            session.spawn_scope(),
+            fs_scope.as_ref(),
+        ) {
+            return stale_scope(&params.terminal_id);
+        }
         // Floor 4 (the longest UTF-8 sequence): with boundary-aligned
         // cursors and room for a whole sequence, the boundary trim below
         // can only hold back a tail the ring has not finished receiving.
@@ -318,17 +369,24 @@ impl IntendantServer {
         params: TerminalWriteParams,
         trust: ToolCallerTrust,
         actor: &crate::access::actor::ActorBinding,
+        fs_scope: Option<FilesystemAccessPolicy>,
     ) -> String {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
         let key = TerminalKey::local(&params.terminal_id);
-        let Some(session) = registry
-            .get_visible(&key, &terminal_actor(trust, actor))
-            .await
-        else {
+        let acting = terminal_actor(trust, actor);
+        let Some(session) = registry.get_visible(&key, &acting).await else {
             return no_visible(&params.terminal_id);
         };
+        if scope_is_stale(
+            trust,
+            session.managed_by(&acting),
+            session.spawn_scope(),
+            fs_scope.as_ref(),
+        ) {
+            return stale_scope(&params.terminal_id);
+        }
         if !session.is_alive() {
             return serde_json::json!({
                 "ok": false,
@@ -359,17 +417,24 @@ impl IntendantServer {
         params: TerminalResizeParams,
         trust: ToolCallerTrust,
         actor: &crate::access::actor::ActorBinding,
+        fs_scope: Option<FilesystemAccessPolicy>,
     ) -> String {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
         let key = TerminalKey::local(&params.terminal_id);
-        let Some(session) = registry
-            .get_visible(&key, &terminal_actor(trust, actor))
-            .await
-        else {
+        let acting = terminal_actor(trust, actor);
+        let Some(session) = registry.get_visible(&key, &acting).await else {
             return no_visible(&params.terminal_id);
         };
+        if scope_is_stale(
+            trust,
+            session.managed_by(&acting),
+            session.spawn_scope(),
+            fs_scope.as_ref(),
+        ) {
+            return stale_scope(&params.terminal_id);
+        }
         session.resize(params.cols, params.rows);
         serde_json::json!({ "ok": true, "cols": params.cols, "rows": params.rows }).to_string()
     }
@@ -436,6 +501,55 @@ mod tests {
             "incomplete prefix held, not consumed"
         );
         assert_eq!(utf8_page_len(b""), 0);
+    }
+
+    /// A caller-owned session spawned under an older filesystem scope
+    /// is refused once the grant's scope changes — the OS sandbox is
+    /// fixed at spawn and must not keep serving authority the grant no
+    /// longer expresses (security review P1). Shared sessions another
+    /// principal owns ride that owner's authority, and root surfaces
+    /// are never scope-bound.
+    #[test]
+    fn stale_scope_refuses_only_owned_scoped_mismatches() {
+        let a = FilesystemAccessPolicy {
+            read_roots: vec!["/srv/a".into()],
+            write_roots: Vec::new(),
+        };
+        let b = FilesystemAccessPolicy {
+            read_roots: vec!["/srv/b".into()],
+            write_roots: Vec::new(),
+        };
+        assert!(scope_is_stale(
+            ToolCallerTrust::Scoped,
+            true,
+            Some(&a),
+            Some(&b)
+        ));
+        assert!(
+            scope_is_stale(ToolCallerTrust::Scoped, true, None, Some(&a)),
+            "a grant gaining a scope stales the old unscoped shell"
+        );
+        assert!(scope_is_stale(
+            ToolCallerTrust::Scoped,
+            true,
+            Some(&a),
+            None
+        ));
+        assert!(!scope_is_stale(
+            ToolCallerTrust::Scoped,
+            true,
+            Some(&a),
+            Some(&a)
+        ));
+        assert!(!scope_is_stale(ToolCallerTrust::Scoped, true, None, None));
+        assert!(
+            !scope_is_stale(ToolCallerTrust::Scoped, false, Some(&a), Some(&b)),
+            "another owner's shared session rides its owner's authority"
+        );
+        assert!(
+            !scope_is_stale(ToolCallerTrust::OwnerSurface, true, Some(&a), None),
+            "root surfaces are never scope-bound"
+        );
     }
 
     /// Once the shell has exited nothing can ever complete a split

@@ -822,6 +822,12 @@ pub struct PtySession {
     /// Shared sessions are visible to (and, with terminal.write, usable
     /// by) principals other than the owner. Toggled by the owner or root.
     shared: std::sync::atomic::AtomicBool,
+    /// The filesystem scope this shell was spawned under (`None` =
+    /// unscoped). The OS sandbox is fixed at spawn and cannot be
+    /// retrofitted, so accessors compare this against the owning
+    /// principal's CURRENT scope to refuse sessions whose sandbox no
+    /// longer expresses the grant.
+    spawn_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
 }
 
 impl PtySession {
@@ -972,6 +978,7 @@ impl PtySession {
             scope_grants,
             owner,
             shared: std::sync::atomic::AtomicBool::new(shared),
+            spawn_scope: scope.cloned(),
         });
 
         // portable_pty's reader and child wait are both blocking. On Windows,
@@ -1261,6 +1268,15 @@ impl PtySession {
     #[allow(dead_code)]
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
+    }
+
+    /// The filesystem scope this shell was spawned under (`None` =
+    /// unscoped). The OS sandbox is fixed at spawn: when the owning
+    /// principal's grant scope has since changed, accessors refuse the
+    /// session as stale — close and reopen gets a shell under the
+    /// current scope.
+    pub fn spawn_scope(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+        self.spawn_scope.as_ref()
     }
 
     /// Whether `actor` may see (attach to / act on) this session: root
@@ -2536,6 +2552,10 @@ mod tests {
         drop(guard);
         let (session, created) = spawned.unwrap();
         assert!(created);
+        assert!(
+            session.spawn_scope().is_none(),
+            "an unscoped spawn records no scope"
+        );
 
         let mut rx = session.attach();
         expect_output(&mut rx, None, "shell startup").await;
@@ -2621,6 +2641,11 @@ mod tests {
             .await
             .unwrap();
         assert!(created);
+        assert_eq!(
+            session.spawn_scope().map(|s| s.write_roots.clone()),
+            Some(vec![root.clone()]),
+            "the spawn scope is recorded on the session"
+        );
 
         let mut rx = session.attach();
 
