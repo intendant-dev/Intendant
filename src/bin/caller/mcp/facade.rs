@@ -1000,6 +1000,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Clear the shared-view focus region",
     },
     CommandSpec {
+        // ctl's three-segment spelling of the same retraction; the
+        // resolver prefers the longest matching path, so this wins over
+        // `shared focus` whenever the third token is literally "clear".
+        path: &["shared", "focus", "clear"],
+        lane: RiskLane::Act,
+        tool: "clear_shared_view_focus",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!("reason", "reason", Str, "why focus cleared")],
+        help: "Clear the shared-view focus region (ctl spelling)",
+    },
+    CommandSpec {
         path: &["shared", "input"],
         lane: RiskLane::Authorize,
         tool: "request_shared_view_input",
@@ -1449,6 +1461,14 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("GOAL", "goal", true, true),
         ],
         flags: &[
+            flag!("goal", "goal", Str, "ctl-spelling alias for GOAL"),
+            flag!(
+                "at",
+                "fire_at_ms",
+                U64,
+                "fire instant in epoch ms (ctl's human --at vocabulary is converted client-side)"
+            ),
+            flag!("fire-at-ms", "fire_at_ms", U64, "fire instant, ms since epoch"),
             flag!("orchestrate", "orchestrate", Bool, "orchestrated session"),
             flag!("interactive", "interactive", Bool, "interactive session"),
             flag!("recurrence", "recurrence", Json, "{\"every_ms\":..}"),
@@ -1589,7 +1609,10 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("ID", "id", true, false),
             p_str("REPLACEMENT", "replacement", true, false),
         ],
-        flags: &[flag!("reason", "reason", Str, "rationale")],
+        flags: &[
+            flag!("with", "replacement", Str, "ctl-spelling alias for REPLACEMENT"),
+            flag!("reason", "reason", Str, "rationale"),
+        ],
         help: "Supersede a memory claim with a replacement (owner curation)",
     },
     CommandSpec {
@@ -2923,6 +2946,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["context"]["k"], 1);
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["shared", "focus", "clear", "--reason", "done"]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "clear_shared_view_focus");
+        assert_eq!(planned.args["reason"], "done");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "run the sweep",
+                "--at",
+                "1700000000000",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["goal"], "run the sweep");
+        assert_eq!(planned.args["fire_at_ms"], 1_700_000_000_000u64);
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["memory", "supersede", "abc123", "--with", "def456"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["replacement"], "def456");
         let planned = plan_for_meta(
             "act",
             &argv(&["display", "request", "--reason", "please share"]),
