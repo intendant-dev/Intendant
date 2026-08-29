@@ -767,6 +767,7 @@ async fn run_events(
     let filter = args.one("--filter").map(str::to_string);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
     let mut delivered_any = false;
+    let mut saw_gap = false;
     let mut last_quiet_envelope: Option<Value> = None;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -828,6 +829,7 @@ async fn run_events(
             }
         }
         if gap {
+            saw_gap = true;
             eprintln!(
                 "events: gap — events were missed; resync state via the read commands and continue from the cursor below"
             );
@@ -847,9 +849,11 @@ async fn run_events(
             break;
         }
     }
-    if !delivered_any {
+    if !delivered_any && !saw_gap {
         // The one meaningful record for a quiet one-shot --json run: the
-        // final timeout envelope (current cursor, empty batch).
+        // final timeout envelope (current cursor, empty batch). A gap
+        // exit is NOT a timeout — its envelope and warning already went
+        // out, and the budget was not exhausted.
         if let Some(envelope) = &last_quiet_envelope {
             println!(
                 "{}",
