@@ -656,7 +656,7 @@ impl IntendantServer {
                         .as_deref()
                         .or(actor.principal_id.as_deref())
                         .unwrap_or("facade");
-                    facade::substitute_caller_identity(&mut planned.args, identity);
+                    facade::substitute_dispatch_sentinels(&mut planned.args, identity);
                     Box::pin(self.call_tool_by_name_as_caller(
                         planned.tool,
                         planned.args,

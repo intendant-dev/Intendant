@@ -735,6 +735,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: "{}",
         positionals: &[p_str("RECORD_ID", "record_id", true, false)],
         flags: &[
+            flag!("record-id", "record_id", Str, "rewind record (ctl spelling)"),
             flag!("session", "session_id", Str, "target session"),
             flag!("mode", "mode", Str, "restore or fork"),
             flag!("name", "name", Str, "label for the backout"),
@@ -946,6 +947,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("HOLDER_ID", "holder_id", false, false),
         ],
         flags: &[
+            flag!("holder", "holder_id", Str, "holder taking the lease (ctl spelling)"),
+            flag!("holder-id", "holder_id", Str, "holder taking the lease"),
             flag!("holder-kind", "holder_kind", Str, "holder kind"),
             flag!("note", "note", Str, "lease note"),
             flag!("force", "force", Bool, "steal a live lease"),
@@ -975,6 +978,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("target", "display_target", Str, "display target"),
             flag!("display-id", "display_id", U64, "numeric display id"),
             flag!("reason", "reason", Str, "why the user should watch"),
+            flag!(
+                "focus",
+                "__focus_csv",
+                Str,
+                "x,y,width,height normalized 0-1 (ctl spelling)"
+            ),
             flag!(
                 "focus-region",
                 "focus_region",
@@ -2506,19 +2515,20 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         if obj.contains_key("region") {
             return Err("pass one region — either the REGION positional or --region".to_string());
         }
-        let text = csv.as_str().unwrap_or_default();
-        let parts: Vec<f64> = text
-            .split(',')
-            .map(|p| p.trim().parse::<f64>())
-            .collect::<Result<_, _>>()
-            .map_err(|_| format!("--region expects x,y,width,height (got {text:?})"))?;
-        let [x, y, width, height] = parts.as_slice() else {
-            return Err(format!("--region expects four values (got {text:?})"));
-        };
-        obj.insert(
-            "region".to_string(),
-            serde_json::json!({ "x": x, "y": y, "width": width, "height": height }),
-        );
+        let region = region_from_csv("region", &csv)?;
+        obj.insert("region".to_string(), region);
+    }
+    // ctl's `shared show --focus x,y,w,h` opens the view already
+    // focused — the same CSV vocabulary as `shared focus --region`,
+    // filling the tool's focus_region object.
+    if let Some(csv) = obj.remove("__focus_csv") {
+        if obj.contains_key("focus_region") {
+            return Err(
+                "pass one focus — either --focus x,y,w,h or --focus-region JSON".to_string(),
+            );
+        }
+        let region = region_from_csv("focus", &csv)?;
+        obj.insert("focus_region".to_string(), region);
     }
     // ctl's `audio spawn --args '{...}'` passes the tool object whole;
     // entries fill only keys the decomposed flags did not set.
@@ -2589,25 +2599,45 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     Ok(serde_json::Value::Object(obj))
 }
 
-/// Replace the `"__caller"` identity sentinel in a planned call's
-/// top-level string values with the dispatching caller's identity. The
-/// planner is pure and cannot know who is calling, but a CONSTANT
-/// default identity would make two different facade sessions collide as
-/// the "same" holder (the browser-lease registry rejects only a
-/// DIFFERENT holder id, so a constant silently hands one session's
-/// exclusive lease to another). The dispatcher substitutes after
-/// resolution; the gate's resolution ignores argument values, so
-/// authorization is unaffected.
-pub(crate) fn substitute_caller_identity(args: &mut serde_json::Value, identity: &str) {
+/// Parse ctl's compact region CSV ("x,y,width,height", normalized 0-1)
+/// into the region object the display tools take; `flag` names the
+/// spelling in refusals.
+fn region_from_csv(flag: &str, csv: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let text = csv.as_str().unwrap_or_default();
+    let parts: Vec<f64> = text
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("--{flag} expects x,y,width,height (got {text:?})"))?;
+    let [x, y, width, height] = parts.as_slice() else {
+        return Err(format!("--{flag} expects four values (got {text:?})"));
+    };
+    Ok(serde_json::json!({ "x": x, "y": y, "width": width, "height": height }))
+}
+
+/// Substitute the planner's dispatch-time sentinels. The planner is
+/// pure — it cannot know who is calling and reads no clock — so rows
+/// seed `"__caller"` under `holder_id` (a CONSTANT default identity
+/// would make two facade sessions collide as the "same" holder: the
+/// browser-lease registry rejects only a DIFFERENT holder id, so a
+/// constant silently hands one session's exclusive lease to another),
+/// and a triggered schedule's omitted arm floor fills `fire_at_ms`
+/// with `"__now"` (armed on approval). The dispatcher substitutes
+/// after gate resolution — the gate ignores argument values, so
+/// authorization is unaffected — and each sentinel is scoped to the
+/// key the planner seeds it under, never matched by value alone:
+/// caller text that happens to spell a sentinel (`notify __now`) must
+/// reach its string-typed tool untouched. Under `fire_at_ms` the
+/// string is unforgeable by callers (the key is U64-kind in every
+/// row, so planning parses caller input to a number or refuses);
+/// `holder_id`'s literal `__caller` is that key's documented
+/// "the caller" default.
+pub(crate) fn substitute_dispatch_sentinels(args: &mut serde_json::Value, identity: &str) {
     if let Some(obj) = args.as_object_mut() {
-        for value in obj.values_mut() {
-            if value.as_str() == Some("__caller") {
+        for (key, value) in obj.iter_mut() {
+            if key == "holder_id" && value.as_str() == Some("__caller") {
                 *value = serde_json::Value::String(identity.to_string());
-            } else if value.as_str() == Some("__now") {
-                // The dispatch clock, for planner-pure "now" defaults
-                // (a triggered schedule's omitted arm floor = armed on
-                // approval). Same discipline as the identity sentinel:
-                // substituted after gate resolution, values only.
+            } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
                 *value = serde_json::Value::from(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -3281,6 +3311,52 @@ mod tests {
             plan_for_meta("act", &argv(&["shared", "focus", "--region", "0.1,0.2"])).is_err(),
             "a region needs four values"
         );
+        // Round 21: the remaining ctl flag spellings — acquire's
+        // --holder, shared show's CSV --focus, backout's --record-id.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["browser", "acquire", "ws-1", "--holder", "sess-9"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["holder_id"], "sess-9");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["shared", "show", "--focus", "0.1,0.2,0.5,0.4"]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["focus_region"],
+            serde_json::json!({ "x": 0.1, "y": 0.2, "width": 0.5, "height": 0.4 })
+        );
+        assert!(
+            plan_for_meta(
+                "act",
+                &argv(&[
+                    "shared",
+                    "show",
+                    "--focus",
+                    "0.1,0.2,0.5,0.4",
+                    "--focus-region",
+                    "{\"x\":0.1,\"y\":0.2,\"width\":0.5,\"height\":0.4}",
+                ]),
+            )
+            .is_err(),
+            "one focus spelling at a time"
+        );
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "backout",
+                "--record-id",
+                "rec-1",
+                "--mode",
+                "fork",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["record_id"], "rec-1");
+        assert_eq!(planned.args["mode"], "fork");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
@@ -3527,7 +3603,7 @@ mod tests {
         assert_eq!(planned.args["agent_config"]["agent"], "codex");
         // The dispatch clock sentinel becomes a number.
         let mut args = serde_json::json!({ "fire_at_ms": "__now" });
-        substitute_caller_identity(&mut args, "sess-1");
+        substitute_dispatch_sentinels(&mut args, "sess-1");
         assert!(args["fire_at_ms"].is_u64());
         let planned = plan_for_meta(
             "act",
@@ -3549,15 +3625,28 @@ mod tests {
     /// The dispatcher replaces the identity sentinel with the caller's
     /// own identity, so two facade sessions never collide as the same
     /// lease holder (review round 10); explicit values pass untouched.
+    /// Sentinels are KEY-scoped (review round 21): caller text that
+    /// merely spells a sentinel under some other key reaches its
+    /// string-typed tool untouched.
     #[test]
-    fn caller_identity_sentinel_substitutes_at_dispatch() {
+    fn dispatch_sentinels_substitute_key_scoped() {
         let mut args = serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" });
-        substitute_caller_identity(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7");
         assert_eq!(args["holder_id"], "sess-7");
         assert_eq!(args["workspace_id"], "ws-1");
         let mut args = serde_json::json!({ "holder_id": "alice" });
-        substitute_caller_identity(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7");
         assert_eq!(args["holder_id"], "alice");
+        // Literal sentinel spellings under other keys are caller data,
+        // not sentinels — `notify __now` stays the text "__now".
+        let mut args = serde_json::json!({ "body": "__now", "reason": "__caller" });
+        substitute_dispatch_sentinels(&mut args, "sess-7");
+        assert_eq!(args["body"], "__now");
+        assert_eq!(args["reason"], "__caller");
+        // And the clock sentinel fills only its own key.
+        let mut args = serde_json::json!({ "fire_at_ms": "__now" });
+        substitute_dispatch_sentinels(&mut args, "sess-7");
+        assert!(args["fire_at_ms"].is_u64());
     }
 
     /// `agenda ask` mirrors ctl's own split (review round 10): plain
