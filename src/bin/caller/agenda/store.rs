@@ -2579,7 +2579,11 @@ impl AgendaStore {
     /// Rewrite every item-id field of an incoming command to its exact
     /// resolved id (see [`Self::resolve_write_id`]). Exhaustive over the
     /// command set so a new op must decide its id fields here explicitly.
-    fn resolve_command_ids(&self, cmd: &mut AgendaCommand) -> Result<(), AgendaError> {
+    /// `pub(crate)`: the handle calls it at the tenant edge too, for the
+    /// verbs it pre-validates before this store's own intake (attest's
+    /// journal binding, the start-now item lookup) — exact ids are
+    /// fixpoints, so the double resolution is idempotent.
+    pub(crate) fn resolve_command_ids(&self, cmd: &mut AgendaCommand) -> Result<(), AgendaError> {
         let resolve = |store: &Self, id: &mut String| -> Result<(), AgendaError> {
             *id = store.resolve_write_id(id)?;
             Ok(())

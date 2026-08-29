@@ -1637,6 +1637,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("outcome", "outcome", Str, "ctl-spelling alias for OUTCOME"),
             flag!("note", "note", Str, "attestation note"),
             flag!(
+                "ref",
+                "__attest_ref_client",
+                StrList,
+                "ctl-side only: ctl hashes the file into the pin — here pass --refs"
+            ),
+            flag!(
                 "refs",
                 "refs",
                 Json,

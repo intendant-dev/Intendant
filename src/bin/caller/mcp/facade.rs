@@ -527,6 +527,16 @@ fn build_args(
                 .to_string(),
         );
     }
+    // Attest's `--ref` is the same class: ctl hashes the file into the
+    // attestation pin — "the pin says what THIS side read".
+    if obj.remove("__attest_ref_client").is_some() {
+        return Err(
+            "--ref hashes the referenced file client-side into the attestation pin (a \
+             ctl behavior the facade excludes); compute each sha256 yourself and pass \
+             --refs '[{\"locator\":..,\"sha256\":..}]'"
+                .to_string(),
+        );
+    }
     // ctl's `agenda start --goal-run`: the autonomous shape sends
     // interactive:false; absent stays absent on the wire (the daemon
     // defaults interactive, and on a standing manifest absent means
@@ -2032,6 +2042,25 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("client-side"), "{err}");
         assert!(err.contains("--binding-refs"), "{err}");
+        // Round 28: attest's file-pinning --ref is the same named
+        // exclusion class.
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "attest",
+                "item-1",
+                "--occurrence",
+                "occ-1",
+                "--outcome",
+                "partial",
+                "--ref",
+                "file:handoff.md",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("client-side"), "{err}");
+        assert!(err.contains("--refs"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
