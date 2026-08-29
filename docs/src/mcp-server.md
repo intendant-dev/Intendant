@@ -410,7 +410,8 @@ grant's filesystem scope and — independently, even when the grant
 carries no scope — never inherits the daemon's process environment (the
 daemon env holds provider API keys; the child env is cleared and
 rebuilt secret-free, and the shell starts profile-less so rc files
-can't repopulate it). The sandbox is fixed at spawn, so a caller-owned
+can't repopulate it — a shell with no known profile-suppression mode is
+substituted by profile-less bash). The sandbox is fixed at spawn, so a caller-owned
 session whose grant scope has since changed is refused as stale by
 open-attach, reads, writes, and resizes — close it and reopen to get a
 shell under the current scope. None of these ride the scoped profiles; they appear on

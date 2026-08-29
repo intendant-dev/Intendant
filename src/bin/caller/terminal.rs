@@ -211,6 +211,12 @@ fn scoped_shell_cwd(
 /// repopulate the cleared environment the moment they execute (API keys
 /// exported in `~/.zshrc` are routine) — the profile skip is what makes
 /// the env clearing in [`PtySession::spawn`] stick.
+///
+/// The empty fallback for unrecognized shells is safe only under a
+/// filesystem sandbox (the rc files are unreadable there); an
+/// UNSANDBOXED principal spawn must never trust it — it goes through
+/// [`principal_shell_program`], which substitutes a shell with a known
+/// suppression mode instead.
 #[cfg(unix)]
 fn secret_free_shell_args(shell: &str) -> Vec<String> {
     let name = std::path::Path::new(shell)
@@ -241,6 +247,46 @@ fn secret_free_shell_args(shell: &str) -> Vec<String> {
         "powershell" | "pwsh" => vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
         "cmd" => vec!["/d".to_string()],
         _ => Vec::new(),
+    }
+}
+
+/// The (program, argv) actually spawned for an UNSANDBOXED
+/// principal-owned shell. Suppressing profile startup is what makes the
+/// cleared environment stick, so only shells with a KNOWN suppression
+/// mode run as themselves; anything else — tcsh reads `~/.tcshrc` on
+/// every start, and an unrecognized shell can't be audited here — is
+/// replaced by bash in `--noprofile --norc` mode. Fail closed on
+/// secrecy, not open on shell preference.
+#[cfg(unix)]
+fn principal_shell_program(shell: &str) -> (String, Vec<String>) {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell);
+    match name {
+        "zsh" | "bash" | "fish" => (shell.to_string(), secret_free_shell_args(shell)),
+        _ => (
+            "/bin/bash".to_string(),
+            vec!["--noprofile".to_string(), "--norc".to_string()],
+        ),
+    }
+}
+
+/// Windows twin of [`principal_shell_program`].
+/// [`crate::platform::interactive_pty_shell`] only ever supplies
+/// powershell or cmd here — both with known suppression — but an
+/// unexpected program still falls back to profile-less PowerShell
+/// rather than running with profiles enabled.
+#[cfg(windows)]
+fn principal_shell_program(shell: &str) -> (String, Vec<String>) {
+    let args = secret_free_shell_args(shell);
+    if args.is_empty() {
+        (
+            "powershell.exe".to_string(),
+            vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+        )
+    } else {
+        (shell.to_string(), args)
     }
 }
 
@@ -840,8 +886,10 @@ impl PtySession {
     /// provider API keys, so the child env is cleared and rebuilt
     /// secret-free and the shell starts profile-less (a login shell's rc
     /// files would repopulate the environment before the principal ever
-    /// types); only root-lane shells (the owner's own surfaces) inherit
-    /// and get the login-style startup.
+    /// types — and a shell with no known suppression mode is substituted
+    /// by profile-less bash, see [`principal_shell_program`]); only
+    /// root-lane shells (the owner's own surfaces) inherit and get the
+    /// login-style startup.
     fn spawn(
         cols: u16,
         rows: u16,
@@ -883,17 +931,20 @@ impl PtySession {
                 .map_err(|e| format!("spawn scoped shell: {e}"))?
         } else {
             let build_cmd = |program: &str, args: &[String]| {
-                let mut cmd = PtyCommandBuilder::new(program);
-                if owner.is_some() {
-                    // Profile-less startup, or the env clearing below is
-                    // theater: a login shell's rc files run before the
-                    // principal ever types and would repopulate the
-                    // cleared environment (API keys exported in dotfiles
-                    // are routine).
-                    cmd.args(secret_free_shell_args(program));
+                // For a principal-owned spawn the PROGRAM is part of the
+                // secrecy decision, not just the argv: profile-less
+                // startup is what makes the env clearing below stick (a
+                // login shell's rc files run before the principal ever
+                // types and would repopulate the environment), and a
+                // shell without a known suppression mode is substituted
+                // rather than trusted — see `principal_shell_program`.
+                let (program, args) = if owner.is_some() {
+                    principal_shell_program(program)
                 } else {
-                    cmd.args(args);
-                }
+                    (program.to_string(), args.to_vec())
+                };
+                let mut cmd = PtyCommandBuilder::new(&program);
+                cmd.args(&args);
                 if let Some(ref dir) = cwd {
                     cmd.cwd(dir);
                 }
@@ -912,7 +963,7 @@ impl PtySession {
                     #[cfg(unix)]
                     let curated = secret_free_shell_env(
                         std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
-                        program,
+                        &program,
                     );
                     #[cfg(windows)]
                     let curated = windows_secret_free_shell_env(
@@ -2460,6 +2511,37 @@ mod tests {
         assert!(secret_free_shell_args("/bin/sh").is_empty());
     }
 
+    /// A shell without a known profile-suppression mode must never run
+    /// an unsandboxed principal spawn (security review P1): tcsh reads
+    /// `~/.tcshrc` on every start, so an unrecognized `$SHELL` would
+    /// repopulate the cleared environment. It is substituted by
+    /// profile-less bash instead; known shells run as themselves.
+    #[cfg(unix)]
+    #[test]
+    fn principal_shell_program_substitutes_unknown_shells() {
+        assert_eq!(
+            principal_shell_program("/bin/zsh"),
+            ("/bin/zsh".to_string(), vec!["-f".to_string()])
+        );
+        assert_eq!(
+            principal_shell_program("/opt/homebrew/bin/fish"),
+            (
+                "/opt/homebrew/bin/fish".to_string(),
+                vec!["--no-config".to_string()]
+            )
+        );
+        for exotic in ["/bin/tcsh", "/bin/csh", "/usr/local/bin/nu", "/bin/sh"] {
+            assert_eq!(
+                principal_shell_program(exotic),
+                (
+                    "/bin/bash".to_string(),
+                    vec!["--noprofile".to_string(), "--norc".to_string()]
+                ),
+                "{exotic} must be replaced by profile-less bash"
+            );
+        }
+    }
+
     /// The Windows variant must disable profile/AutoRun startup for the
     /// interactive shells [`crate::platform::interactive_pty_shell`] can
     /// return — a profile script would repopulate the cleared environment
@@ -2476,6 +2558,16 @@ mod tests {
             vec!["-NoLogo", "-NoProfile"]
         );
         assert_eq!(secret_free_shell_args("cmd.exe"), vec!["/d"]);
+        // An unexpected program falls back to profile-less PowerShell
+        // rather than running with profiles enabled.
+        assert_eq!(
+            principal_shell_program("weird.exe"),
+            (
+                "powershell.exe".to_string(),
+                vec!["-NoLogo".to_string(), "-NoProfile".to_string()]
+            )
+        );
+        assert_eq!(principal_shell_program("cmd.exe").0, "cmd.exe");
     }
 
     #[cfg(unix)]
