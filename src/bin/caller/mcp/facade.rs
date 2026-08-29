@@ -303,6 +303,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Json,
                 "true forces orchestration, false forces a direct session; omit for automatic selection"
             ),
+            flag!(
+                "frame",
+                "reference_frame_ids",
+                StrList,
+                "reference frame id (repeatable; routes to the CU runner)"
+            ),
+            flag!(
+                "display-target",
+                "display_target",
+                Str,
+                "display target for a computer-use task"
+            ),
         ],
         help: "Start an agent task (or queue a follow-up into a session)",
     },
@@ -2261,6 +2273,28 @@ mod tests {
         assert_eq!(planned.args["orchestrate"], serde_json::json!(false));
         let planned = plan_for_meta("act", &argv(&["task", "start", "fix it"])).unwrap();
         assert!(planned.args.get("orchestrate").is_none());
+        // The computer-use context travels too (review round 3):
+        // repeatable frames and the display target reach the CU runner.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "task",
+                "start",
+                "click it",
+                "--frame",
+                "f1",
+                "--frame",
+                "f2",
+                "--display-target",
+                "display_99",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["reference_frame_ids"],
+            serde_json::json!(["f1", "f2"])
+        );
+        assert_eq!(planned.args["display_target"], "display_99");
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry

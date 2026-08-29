@@ -799,7 +799,13 @@ async fn run_events(
             .cloned()
             .unwrap_or_default();
         if config.json {
-            print_json(&envelope)?;
+            // One compact envelope per line — --follow emits a batch
+            // stream, and line-oriented consumers must never see a
+            // pretty-printed envelope split across lines.
+            println!(
+                "{}",
+                serde_json::to_string(&envelope).map_err(|e| format!("serialize envelope: {e}"))?
+            );
         } else {
             for event in &events {
                 println!(
