@@ -300,8 +300,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!(
                 "orchestrate",
                 "orchestrate",
-                Bool,
-                "force orchestration mode"
+                Json,
+                "true forces orchestration, false forces a direct session; omit for automatic selection"
             ),
         ],
         help: "Start an agent task (or queue a follow-up into a session)",
@@ -2250,6 +2250,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["require_clean"], serde_json::json!(false));
+        // The task-start mode override is tri-state: true forces
+        // orchestration, false forces direct (ctl's --direct), omitted
+        // keeps automatic selection (review round 2).
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["task", "start", "fix it", "--orchestrate", "false"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["orchestrate"], serde_json::json!(false));
+        let planned = plan_for_meta("act", &argv(&["task", "start", "fix it"])).unwrap();
+        assert!(planned.args.get("orchestrate").is_none());
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry
