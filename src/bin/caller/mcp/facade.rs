@@ -207,6 +207,58 @@ fn insert_value(
     Ok(())
 }
 
+/// `ancestor` covers `key` when they are equal or `ancestor` is a
+/// dotted prefix of `key` (`patch` covers `patch.title`; `patch` does
+/// not cover `patchwork`).
+fn path_covers(ancestor: &str, key: &str) -> bool {
+    key == ancestor
+        || (key.len() > ancestor.len()
+            && key.starts_with(ancestor)
+            && key.as_bytes()[ancestor.len()] == b'.')
+}
+
+/// Merge a freshly built positional value into the arguments while
+/// keeping every value at a flag-written dotted path — ctl's flag
+/// precedence field by field, so a positional parent object cannot
+/// clobber `--title` while its own other fields still land.
+fn merge_flag_precedent(
+    existing: &mut serde_json::Map<String, serde_json::Value>,
+    incoming: serde_json::Map<String, serde_json::Value>,
+    flag_paths: &std::collections::HashSet<&'static str>,
+    prefix: &str,
+) {
+    for (key, value) in incoming {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if flag_paths.contains(path.as_str()) {
+            // the explicit flag's value stands
+            continue;
+        }
+        if flag_paths
+            .iter()
+            .any(|flag_path| path_covers(&path, flag_path))
+        {
+            // flag paths live DEEPER under this key: recurse so they
+            // survive while the incoming object's other fields land (a
+            // non-object here cannot hold them, so it yields to the
+            // flag entirely).
+            if let serde_json::Value::Object(src) = value {
+                let dst = existing
+                    .entry(key)
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(dst) = dst.as_object_mut() {
+                    merge_flag_precedent(dst, src, flag_paths, &path);
+                }
+            }
+            continue;
+        }
+        existing.insert(key, value);
+    }
+}
+
 /// Pure argv → arguments builder for one command. No I/O, no environment,
 /// no expansion: values are literal strings. Returns the built
 /// object plus the top-level keys whose seed declared a caller-identity
@@ -231,9 +283,11 @@ fn build_args(
     // Top-level keys the ARGV wrote (flags, positionals, the greedy
     // tail) — the discriminator between a seed default and an explicit
     // caller value that happens to spell the same string. Flag-written
-    // keys are tracked separately: ctl gives an explicit flag
-    // precedence over the free-text tail (`--task` beats the
-    // positional), so the greedy insert must not overwrite one.
+    // paths are tracked separately and in FULL: ctl gives an explicit
+    // flag precedence over its positional twin, and the precedence
+    // decision must distinguish `patch.title` from the whole `patch`
+    // object — an outer-key check would drop a positional PATCH beside
+    // --title, or block `anchor.item_id` beside --position (round 37).
     let mut written: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     let mut flag_written: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
@@ -292,7 +346,7 @@ fn build_args(
             };
             insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
             written.insert(outer(flag.json_key));
-            flag_written.insert(outer(flag.json_key));
+            flag_written.insert(flag.json_key);
         } else if let Some(pos) = spec.positionals.get(positional_index) {
             if pos.greedy {
                 greedy_key = Some(pos.json_key);
@@ -300,11 +354,26 @@ fn build_args(
                 greedy_parts.push(token.clone());
             } else {
                 // ctl's precedence for dual spellings: an explicit flag
-                // beats its positional twin in either order, so a
-                // positional never overwrites a flag-written key (the
-                // slot is still consumed).
-                if !flag_written.contains(outer(pos.json_key)) {
-                    insert_value(&mut obj, pos.json_key, pos.kind, token)?;
+                // beats its positional twin in either order. A flag
+                // path covering this positional's path skips it (the
+                // slot is still consumed); flag paths NESTED UNDER it
+                // (--title beside the whole PATCH object) deep-merge
+                // instead — the positional's other fields land, the
+                // flag's values stand.
+                let covered = flag_written
+                    .iter()
+                    .any(|flag_path| path_covers(flag_path, pos.json_key));
+                if !covered {
+                    let nested_flags = flag_written
+                        .iter()
+                        .any(|flag_path| path_covers(pos.json_key, flag_path));
+                    if nested_flags {
+                        let mut scratch = serde_json::Map::new();
+                        insert_value(&mut scratch, pos.json_key, pos.kind, token)?;
+                        merge_flag_precedent(&mut obj, scratch, &flag_written, "");
+                    } else {
+                        insert_value(&mut obj, pos.json_key, pos.kind, token)?;
+                    }
                     written.insert(outer(pos.json_key));
                 }
                 positional_index += 1;
@@ -335,7 +404,10 @@ fn build_args(
         // (`--task` wins over the positional, which ctl silently
         // ignores beside it) — never the other way around, which would
         // dispatch a different value than the caller's explicit flag.
-        if !flag_written.contains(outer(key)) {
+        if !flag_written
+            .iter()
+            .any(|flag_path| path_covers(flag_path, key))
+        {
             obj.insert(key.to_string(), value);
             written.insert(outer(key));
         }
@@ -2352,6 +2424,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["url"], "https://flag.example");
+        // Round 37: precedence is PATH-exact — a nested flag deep-merges
+        // with a positional parent object (the flag's field stands, the
+        // object's other fields land), and a sibling nested flag never
+        // blocks a distinct positional path.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "patch",
+                "--title",
+                "renamed",
+                "item-1",
+                "{\"body\":\"kept\",\"title\":\"clobber\"}",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["patch"]["title"], "renamed");
+        assert_eq!(planned.args["patch"]["body"], "kept");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "rewind",
+                "--position",
+                "after",
+                "item-9",
+                "too deep",
+                "primer text",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["anchor"]["item_id"], "item-9");
+        assert_eq!(planned.args["anchor"]["position"], "after");
+        assert_eq!(planned.args["reason"], "too deep");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
