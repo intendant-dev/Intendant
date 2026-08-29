@@ -116,9 +116,13 @@ impl EventRing {
         let oldest_retained = inner.entries.front().map(|e| e.seq);
         // A gap exists when events newer than the cursor were evicted:
         // the oldest retained entry is more than one past the cursor,
-        // or everything is gone while the counter moved past it.
+        // or everything is gone while the counter moved past it. The
+        // arithmetic saturates so an out-of-range cursor (callers are
+        // expected to validate first) degrades to a wrong-but-harmless
+        // answer instead of a debug overflow panic that would poison
+        // the ring's mutex for the whole daemon.
         let gap = match oldest_retained {
-            Some(oldest) => since + 1 < oldest,
+            Some(oldest) => since.saturating_add(1) < oldest,
             None => since < inner.next_seq - 1,
         };
         let events = inner
@@ -277,6 +281,18 @@ mod tests {
             Some(3),
             "the newest entry always survives"
         );
+    }
+
+    /// An out-of-range cursor must never panic inside the lock — a
+    /// debug overflow there would poison the mutex and kill the event
+    /// stream for the whole daemon (review P2). Callers validate
+    /// cursors first; the ring is merely harmless on junk.
+    #[test]
+    fn out_of_range_cursor_is_harmless() {
+        let ring = EventRing::new();
+        ring.push("{\"event\":\"a\"}".into());
+        let (events, _) = ring.since(u64::MAX, 10);
+        assert!(events.is_empty());
     }
 
     #[test]

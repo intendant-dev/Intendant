@@ -106,6 +106,35 @@ fn events_error(message: &str) -> String {
     serde_json::json!({ "ok": false, "error": message }).to_string()
 }
 
+/// Decode and validate a caller cursor against the live ring: shape,
+/// boot epoch, principal binding, and position. The position check
+/// matters twice over — a forged future sequence would otherwise park
+/// the poll until the counter catches up, and it must never reach the
+/// ring's arithmetic at all (review P2).
+fn validate_cursor(cursor: &str, ring: &EventRing, expected_tag: u64) -> Result<u64, &'static str> {
+    let Some((epoch, seq, tag)) = decode_cursor(cursor) else {
+        return Err("invalid cursor — omit `since` to start at now and mint a fresh one");
+    };
+    if epoch != ring.epoch() {
+        return Err(
+            "cursor is from a previous daemon boot — the stream restarted; omit `since`, resync state via the read commands, and continue from the fresh cursor",
+        );
+    }
+    if tag != expected_tag {
+        // Principal-bound (design-review amendment): a cursor minted
+        // under another principal is refused.
+        return Err("cursor was minted for a different principal — omit `since` to mint your own");
+    }
+    if seq > ring.current_seq() {
+        // Real cursors are minted from the monotonic counter, so a
+        // position ahead of it was never minted by this ring.
+        return Err(
+            "cursor is ahead of the stream — it was not minted by this ring; omit `since` to start at now",
+        );
+    }
+    Ok(seq)
+}
+
 impl IntendantServer {
     pub(crate) async fn events_tool(
         &self,
@@ -127,26 +156,10 @@ impl IntendantServer {
             .filter(|s| !s.is_empty())
         {
             None => ring.current_seq(),
-            Some(cursor) => {
-                let Some((epoch, seq, cursor_tag)) = decode_cursor(cursor) else {
-                    return events_error(
-                        "invalid cursor — omit `since` to start at now and mint a fresh one",
-                    );
-                };
-                if epoch != ring.epoch() {
-                    return events_error(
-                        "cursor is from a previous daemon boot — the stream restarted; omit `since`, resync state via the read commands, and continue from the fresh cursor",
-                    );
-                }
-                if cursor_tag != tag {
-                    // Principal-bound (design-review amendment): a cursor
-                    // minted under another principal is refused.
-                    return events_error(
-                        "cursor was minted for a different principal — omit `since` to mint your own",
-                    );
-                }
-                seq
-            }
+            Some(cursor) => match validate_cursor(cursor, &ring, tag) {
+                Ok(seq) => seq,
+                Err(message) => return events_error(message),
+            },
         };
         let filter = params.filter.as_deref().map(|f| {
             f.split(',')
@@ -178,29 +191,31 @@ impl IntendantServer {
                     break;
                 }
             }
-            // Return on the first delivered batch (long-poll contract),
-            // on a gap (the caller must resync), or at the deadline.
-            if !delivered.is_empty() || gap || tokio::time::Instant::now() >= deadline {
+            // Return on the first delivered batch (long-poll contract)
+            // or on a gap (the caller must resync).
+            if !delivered.is_empty() || gap {
+                break;
+            }
+            // A filter can reject a whole raw page while a match sits
+            // further along the buffered window — and nothing already
+            // buffered will ever fire the notify. Drain to the ring's
+            // head before considering any wait (review P2); the window
+            // is bounded, so this is at most a few pages.
+            if scan_seq < ring.current_seq() {
+                continue;
+            }
+            if tokio::time::Instant::now() >= deadline {
                 break;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                // Lapse: fall through to one final read — an event
+                // Lapse: loop once more for a final read — an event
                 // recorded moments ago is delivered instead of being
                 // reported as a quiet timeout (the ask-tool ledger
-                // discipline).
-                let (entries, gap_now) = ring.since(scan_seq, max_events);
-                gap |= gap_now;
-                for entry in entries {
-                    scan_seq = entry.seq;
-                    if passes_filter(&entry.json, &filter) {
-                        delivered.push(entry.json);
-                    }
-                    if delivered.len() >= max_events {
-                        break;
-                    }
-                }
-                break;
+                // discipline); the deadline check above ends the loop
+                // right after it.
+                continue;
             }
+            // Woken: loop back and read from the advanced cursor.
         }
 
         let events_json = delivered.join(",");
@@ -240,6 +255,76 @@ mod tests {
         assert_eq!(
             root,
             cursor_principal_tag(ToolCallerTrust::OwnerSurface, &unattributed)
+        );
+    }
+
+    /// Every refusal branch of cursor validation, including the forged
+    /// future position (review P2 — it would park the poll and, worse,
+    /// must never reach the ring's arithmetic).
+    #[test]
+    fn cursor_validation_refuses_foreign_stale_and_future_cursors() {
+        let ring = EventRing::new();
+        ring.push("{\"event\":\"a\"}".into());
+        let tag = 0x77;
+        let ok = encode_cursor(ring.epoch(), 1, tag);
+        assert_eq!(validate_cursor(&ok, &ring, tag), Ok(1));
+        assert!(validate_cursor("garbage", &ring, tag).is_err());
+        let wrong_epoch = encode_cursor(ring.epoch().wrapping_add(1), 1, tag);
+        assert!(validate_cursor(&wrong_epoch, &ring, tag)
+            .unwrap_err()
+            .contains("previous daemon boot"));
+        let wrong_principal = encode_cursor(ring.epoch(), 1, tag + 1);
+        assert!(validate_cursor(&wrong_principal, &ring, tag)
+            .unwrap_err()
+            .contains("different principal"));
+        let future = encode_cursor(ring.epoch(), u64::MAX, tag);
+        assert!(validate_cursor(&future, &ring, tag)
+            .unwrap_err()
+            .contains("ahead of the stream"));
+    }
+
+    /// A filter that rejects whole raw pages must not park the poll
+    /// while a match already sits further along the buffered window
+    /// (review P2): with wait_s=0 the scan drains to the ring's head
+    /// and returns the buried match immediately.
+    #[tokio::test]
+    async fn filtered_polls_drain_the_buffered_window() {
+        let state = crate::mcp::tests::test_state();
+        let ring = Arc::new(EventRing::new());
+        for i in 0..250 {
+            ring.push(format!("{{\"event\":\"session_started\",\"n\":{i}}}"));
+        }
+        ring.push("{\"event\":\"approval_required\",\"id\":9}".into());
+        state.write().await.event_ring = Some(ring.clone());
+        let server = IntendantServer::new(state, crate::event::EventBus::new());
+
+        let unattributed = crate::access::actor::ActorBinding::unattributed();
+        let start = encode_cursor(
+            ring.epoch(),
+            0,
+            cursor_principal_tag(ToolCallerTrust::OwnerSurface, &unattributed),
+        );
+        let result = server
+            .events_tool(
+                EventsParams {
+                    since: Some(start),
+                    wait_s: Some(0),
+                    filter: Some("approval_required".into()),
+                    max_events: Some(10),
+                },
+                ToolCallerTrust::OwnerSurface,
+                &unattributed,
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["ok"], true, "{result}");
+        let events = parsed["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 1, "{result}");
+        assert_eq!(events[0]["event"], "approval_required");
+        assert_eq!(
+            parsed["current_seq"].as_u64(),
+            Some(251),
+            "cursor drained to the head"
         );
     }
 
