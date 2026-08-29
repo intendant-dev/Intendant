@@ -2091,6 +2091,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["refs"][0]["locator"], "/srv/notes.md");
+        // Round 30: the shared-focus positional speaks the same CSV as
+        // --region, and ctl's browser path aliases resolve.
+        let planned = plan_for_meta("act", &argv(&["shared", "focus", "0,0,1,1"])).unwrap();
+        assert_eq!(
+            planned.args["region"],
+            serde_json::json!({ "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0 })
+        );
+        let planned = plan_for_meta("inspect", &argv(&["browser", "ls"])).unwrap();
+        assert_eq!(planned.tool, "list_browser_workspaces");
+        let planned =
+            plan_for_meta("act", &argv(&["browser", "open", "https://example.com"])).unwrap();
+        assert_eq!(planned.tool, "create_browser_workspace");
+        assert_eq!(planned.args["url"], "https://example.com");
+        let planned = plan_for_meta("act", &argv(&["browser", "take", "ws-1"])).unwrap();
+        assert_eq!(planned.tool, "acquire_browser_workspace");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["browser", "exec", "[{\"action\":\"screenshot\"}]"]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "execute_cu_actions");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[

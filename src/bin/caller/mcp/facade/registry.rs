@@ -830,6 +830,51 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Execute a JSON array of computer-use actions",
     },
     CommandSpec {
+        // ctl routes `browser actions`/`browser exec` through the same
+        // CU-actions handler (pinned to mirror `cu actions`).
+        path: &["browser", "actions"],
+        lane: RiskLane::Act,
+        tool: "execute_cu_actions",
+        seed: "{}",
+        positionals: &[p_json("ACTIONS", "actions", true)],
+        flags: &[
+            flag!("actions", "actions", Json, "ctl-spelling alias for ACTIONS"),
+            flag!("target", "display_target", Str, "display target"),
+            flag!(
+                "coordinate-space",
+                "coordinate_space",
+                Str,
+                "pixel (default) or normalized_1000"
+            ),
+            flag!("observe", "observe", Str, "pixels|ax|auto|none"),
+            flag!("annotate", "annotate", Bool, "draw click crosshairs"),
+            flag!("settle", "settle", Json, "true/false or settle cap ms"),
+        ],
+        help: "Execute a JSON array of computer-use actions (ctl's browser alias)",
+    },
+    CommandSpec {
+        // ctl alias for `browser actions` (pinned to mirror `cu actions`).
+        path: &["browser", "exec"],
+        lane: RiskLane::Act,
+        tool: "execute_cu_actions",
+        seed: "{}",
+        positionals: &[p_json("ACTIONS", "actions", true)],
+        flags: &[
+            flag!("actions", "actions", Json, "ctl-spelling alias for ACTIONS"),
+            flag!("target", "display_target", Str, "display target"),
+            flag!(
+                "coordinate-space",
+                "coordinate_space",
+                Str,
+                "pixel (default) or normalized_1000"
+            ),
+            flag!("observe", "observe", Str, "pixels|ax|auto|none"),
+            flag!("annotate", "annotate", Bool, "draw click crosshairs"),
+            flag!("settle", "settle", Json, "true/false or settle cap ms"),
+        ],
+        help: "Execute a JSON array of computer-use actions (ctl's browser alias)",
+    },
+    CommandSpec {
         path: &["display", "create"],
         lane: RiskLane::Act,
         tool: "create_virtual_display",
@@ -965,6 +1010,17 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "List browser workspaces",
     },
     CommandSpec {
+        // ctl alias for `browser list` (`alias_rows_mirror_their_primaries`
+        // pins the pair).
+        path: &["browser", "ls"],
+        lane: RiskLane::Inspect,
+        tool: "list_browser_workspaces",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "List browser workspaces (ctl alias)",
+    },
+    CommandSpec {
         path: &["browser", "create"],
         lane: RiskLane::Act,
         tool: "create_browser_workspace",
@@ -985,6 +1041,29 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
         ],
         help: "Create a browser workspace",
+    },
+    CommandSpec {
+        // ctl alias for `browser create` (pinned to mirror it).
+        path: &["browser", "open"],
+        lane: RiskLane::Act,
+        tool: "create_browser_workspace",
+        seed: "{}",
+        positionals: &[p_str("URL", "url", false, false)],
+        flags: &[
+            flag!("url", "url", Str, "URL to open (omit = about:blank)"),
+            flag!("label", "label", Str, "dashboard label"),
+            flag!(
+                "provider",
+                "provider",
+                Str,
+                "auto|cdp|system_cdp|playwright|agent_browser|stream"
+            ),
+            flag!("peer", "peer_id", Str, "federation peer (ctl spelling)"),
+            flag!("session", "owner_session_id", Str, "owning session (ctl spelling)"),
+            flag!("owner-session", "owner_session_id", Str, "owning session"),
+            flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
+        ],
+        help: "Create a browser workspace (ctl alias)",
     },
     CommandSpec {
         path: &["browser", "close"],
@@ -1012,6 +1091,25 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("force", "force", Bool, "steal a live lease"),
         ],
         help: "Acquire a browser workspace lease",
+    },
+    CommandSpec {
+        // ctl alias for `browser acquire` (pinned to mirror it).
+        path: &["browser", "take"],
+        lane: RiskLane::Act,
+        tool: "acquire_browser_workspace",
+        seed: r#"{"holder_id":"__caller"}"#,
+        positionals: &[
+            p_str("WORKSPACE_ID", "workspace_id", true, false),
+            p_str("HOLDER_ID", "holder_id", false, false),
+        ],
+        flags: &[
+            flag!("holder", "holder_id", Str, "holder taking the lease (ctl spelling)"),
+            flag!("holder-id", "holder_id", Str, "holder taking the lease"),
+            flag!("holder-kind", "holder_kind", Str, "holder kind"),
+            flag!("note", "note", Str, "lease note"),
+            flag!("force", "force", Bool, "steal a live lease"),
+        ],
+        help: "Acquire a browser workspace lease (ctl alias)",
     },
     CommandSpec {
         path: &["browser", "release"],
@@ -1056,7 +1154,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Act,
         tool: "focus_shared_view",
         seed: "{}",
-        positionals: &[p_json("REGION", "region", false)],
+        // ctl parses the positional and --region through the same CSV
+        // grammar; both spell x,y,width,height.
+        positionals: &[p_str("REGION", "__region_csv", false, false)],
         flags: &[
             flag!(
                 "region",
@@ -1068,7 +1168,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("display-id", "display_id", U64, "numeric display id"),
             flag!("note", "note", Str, "short label"),
         ],
-        help: "Focus the shared view on a normalized region (REGION JSON or --region x,y,w,h)",
+        help: "Focus the shared view on a normalized region (REGION or --region, x,y,w,h)",
     },
     CommandSpec {
         path: &["shared", "focus-clear"],
@@ -2330,6 +2430,48 @@ mod tests {
             for b in &COMMANDS[i + 1..] {
                 assert_ne!(a.path, b.path, "duplicate command path");
             }
+        }
+    }
+
+    /// ctl's path aliases mirror their primary row exactly — tool,
+    /// lane, seed, and the whole argument vocabulary — so a flag added
+    /// to one side cannot silently drift from the other (the alias
+    /// rows are copies, and this pin is what makes copies safe).
+    #[test]
+    fn alias_rows_mirror_their_primaries() {
+        let find = |path: &[&str]| {
+            COMMANDS
+                .iter()
+                .find(|spec| spec.path == path)
+                .unwrap_or_else(|| panic!("missing row {path:?}"))
+        };
+        let vocab = |spec: &CommandSpec| {
+            (
+                spec.positionals
+                    .iter()
+                    .map(|p| (p.name, p.json_key, p.kind, p.required, p.greedy))
+                    .collect::<Vec<_>>(),
+                spec.flags
+                    .iter()
+                    .map(|f| (f.name, f.json_key, f.kind))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (alias, primary) in [
+            (&["browser", "ls"][..], &["browser", "list"][..]),
+            (&["browser", "open"][..], &["browser", "create"][..]),
+            (&["browser", "take"][..], &["browser", "acquire"][..]),
+            (&["browser", "actions"][..], &["cu", "actions"][..]),
+            (&["browser", "exec"][..], &["cu", "actions"][..]),
+            (&["display", "frame"][..], &["display", "read-frame"][..]),
+            (&["cu", "screenshot"][..], &["display", "screenshot"][..]),
+        ] {
+            let alias_spec = find(alias);
+            let primary_spec = find(primary);
+            assert_eq!(alias_spec.tool, primary_spec.tool, "{alias:?}");
+            assert_eq!(alias_spec.lane, primary_spec.lane, "{alias:?}");
+            assert_eq!(alias_spec.seed, primary_spec.seed, "{alias:?}");
+            assert_eq!(vocab(alias_spec), vocab(primary_spec), "{alias:?}");
         }
     }
 }
