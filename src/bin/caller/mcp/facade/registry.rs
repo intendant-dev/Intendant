@@ -254,7 +254,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "respond",
         seed: "{}",
         positionals: &[p_str("TEXT", "text", true, true)],
-        flags: &[],
+        flags: &[flag!("text", "text", Str, "the response text (ctl spelling)")],
         help: "Answer the pending askHuman question",
     },
     CommandSpec {
@@ -1759,6 +1759,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("trigger", "trigger", Json, "{\"kind\":\"on_item_match\",..} etc."),
             flag!("project", "project_root", Str, "project root (ctl spelling)"),
             flag!("project-root", "project_root", Str, "project root"),
+            flag!(
+                "binding-ref",
+                "__binding_ref_client",
+                StrList,
+                "ctl-side only: ctl reads and digests the file — here pass --binding-refs"
+            ),
             flag!(
                 "binding-refs",
                 "binding_refs",

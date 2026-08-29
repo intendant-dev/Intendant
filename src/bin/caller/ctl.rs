@@ -765,7 +765,11 @@ async fn run_events(
     };
     let mut since = args.one("--since").map(str::to_string);
     let filter = args.one("--filter").map(str::to_string);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
+    // checked: a huge --for must be a CLI error, not an Instant overflow
+    // panic.
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(total_s))
+        .ok_or_else(|| format!("--for {total_s}s is too large"))?;
     let mut delivered_any = false;
     let mut saw_gap = false;
     let mut last_quiet_envelope: Option<Value> = None;

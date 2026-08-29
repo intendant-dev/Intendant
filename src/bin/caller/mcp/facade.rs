@@ -513,6 +513,20 @@ fn build_args(
     } else if park_must_read || park_label.is_some() {
         return Err("--must-read/--label describe refs: pass --ref too".to_string());
     }
+    // ctl's repeatable `--binding-ref TYPE:PATH` reads and digests the
+    // referenced file CLIENT-side into the sealed manifest — a
+    // filesystem read the pure registry must never perform (and the
+    // digest must bind what the CALLER saw, not what the daemon can
+    // read). Registered so the refusal explains the working
+    // alternative instead of an unknown-flag error.
+    if obj.remove("__binding_ref_client").is_some() {
+        return Err(
+            "--binding-ref digests the referenced file client-side (a ctl behavior the \
+             facade excludes); compute each sha256 yourself and pass --binding-refs \
+             '[{\"locator\":..,\"sha256\":..}]'"
+                .to_string(),
+        );
+    }
     // ctl's `agenda start --goal-run`: the autonomous shape sends
     // interactive:false; absent stays absent on the wire (the daemon
     // defaults interactive, and on a standing manifest absent means
@@ -1997,6 +2011,27 @@ mod tests {
         let planned =
             plan_for_meta("inspect", &argv(&["agenda", "list", "--all", "--done"])).unwrap();
         assert!(planned.args.get("status").is_none());
+        // Round 27: input respond's --text spelling, and the sealed
+        // binding-ref workflow named as a ctl-side exclusion.
+        let planned = plan_for_meta("act", &argv(&["input", "respond", "--text", "yes"])).unwrap();
+        assert_eq!(planned.args["text"], "yes");
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--binding-ref",
+                "file:/srv/plan.md",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("client-side"), "{err}");
+        assert!(err.contains("--binding-refs"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
