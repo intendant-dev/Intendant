@@ -133,6 +133,19 @@ const fn p_json(name: &'static str, json_key: &'static str, required: bool) -> P
     }
 }
 
+/// Greedy TOKEN LIST: the remaining argv tokens land as a JSON string
+/// array, word boundaries preserved — the shape a command argv needs
+/// (a greedy Str joins with spaces and would destroy quoting).
+const fn p_rest(name: &'static str, json_key: &'static str) -> PositionalSpec {
+    PositionalSpec {
+        name,
+        json_key,
+        kind: ValueKind::StrList,
+        required: true,
+        greedy: true,
+    }
+}
+
 macro_rules! flag {
     ($name:literal, $key:literal, $kind:ident, $help:literal) => {
         FlagSpec {
@@ -645,6 +658,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: "{}",
         positionals: &[p_str("ITEM_ID", "item_id", true, false)],
         flags: &[
+            flag!("item-id", "item_id", Str, "ctl-spelling alias for ITEM_ID"),
             flag!("session", "session_id", Str, "target session"),
             flag!("radius", "radius", U64, "context radius around the anchor"),
         ],
@@ -845,6 +859,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: "{}",
         positionals: &[p_str("REASON", "reason", true, true)],
         flags: &[
+            flag!("reason", "reason", Str, "ctl-spelling alias for REASON"),
             flag!(
                 "access",
                 "access",
@@ -879,7 +894,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Act,
         tool: "create_browser_workspace",
         seed: "{}",
-        positionals: &[],
+        positionals: &[p_str("URL", "url", false, false)],
         flags: &[
             flag!("url", "url", Str, "URL to open (omit = about:blank)"),
             flag!("label", "label", Str, "dashboard label"),
@@ -889,6 +904,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Str,
                 "auto|cdp|system_cdp|playwright|agent_browser|stream"
             ),
+            flag!("peer", "peer_id", Str, "federation peer (ctl spelling)"),
+            flag!("session", "owner_session_id", Str, "owning session (ctl spelling)"),
             flag!("owner-session", "owner_session_id", Str, "owning session"),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
         ],
@@ -1030,17 +1047,23 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Authorize,
         tool: "remote_command",
         seed: r#"{"op":"start"}"#,
-        positionals: &[p_json("ARGV", "argv", true)],
+        positionals: &[p_rest("COMMAND", "argv")],
         flags: &[
             flag!("host", "host", Str, "remote host selector"),
             flag!("branch", "branch", Str, "branch to run on"),
             flag!("cwd", "cwd", Str, "working directory"),
-            flag!("env", "env", Json, "environment object {\"K\":\"V\"}"),
+            flag!("env", "__env_kv", StrList, "KEY=VALUE (repeatable, ctl spelling)"),
             flag!(
                 "source",
                 "source",
                 Str,
                 "git_revision (default) or working_tree"
+            ),
+            flag!(
+                "revision",
+                "expected_revision",
+                Str,
+                "revision guard (ctl spelling)"
             ),
             flag!(
                 "expected-revision",
@@ -1049,15 +1072,22 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "revision guard"
             ),
             flag!("cache", "cache", Str, "none (default) or durable_sccache"),
+            flag!("timeout", "timeout_s", U64, "1-3600 seconds (ctl spelling)"),
             flag!("timeout-s", "timeout_s", U64, "1-3600 (default 900)"),
+            flag!(
+                "allow-dirty",
+                "__allow_dirty",
+                Bool,
+                "allow a dirty working tree (ctl spelling)"
+            ),
             flag!(
                 "require-clean",
                 "require_clean",
                 Json,
-                "true (default) or false — false allows a dirty working tree"
+                "true (default) or false"
             ),
         ],
-        help: "Start a remote command (ARGV is a JSON array of strings)",
+        help: "Start a remote command: remote start [flags] -- CMD ARGS… (word boundaries preserved)",
     },
     CommandSpec {
         path: &["remote", "status"],
@@ -1657,7 +1687,20 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("TOKEN", "turn_complete_token", true, false),
         ],
         flags: &[
+            flag!(
+                "restart-id",
+                "restart_id",
+                Str,
+                "ctl-spelling alias for RESTART_ID"
+            ),
+            flag!(
+                "token",
+                "turn_complete_token",
+                Str,
+                "ctl-spelling alias for TOKEN"
+            ),
             flag!("status", "status", Str, "completion status"),
+            flag!("summary", "handoff_summary", Str, "handoff summary (ctl spelling)"),
             flag!("handoff-summary", "handoff_summary", Str, "handoff summary"),
         ],
         help: "Report a controller turn complete",
@@ -1668,10 +1711,16 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "spawn_live_audio",
         seed: "{}",
         positionals: &[
-            p_str("ID", "id", true, false),
-            p_str("PROVIDER", "provider", true, false),
+            p_str("ID", "id", false, false),
+            p_str("PROVIDER", "provider", false, false),
         ],
         flags: &[
+            flag!(
+                "args",
+                "__audio_args",
+                Json,
+                "the whole tool object, ctl's form: {id, provider, playbook, response_schema, …}"
+            ),
             flag!(
                 "playbook",
                 "playbook",
@@ -1901,6 +1950,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     let mut positional_index = 0usize;
     let mut greedy_parts: Vec<String> = Vec::new();
     let mut greedy_key: Option<&'static str> = None;
+    let mut greedy_kind = ValueKind::Str;
     // The conventional end-of-options marker: after a literal "--", every
     // remaining token is positional data, so free-text tails may contain
     // flag-shaped words (["task","start","--","cargo","build","--release"]).
@@ -1950,6 +2000,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         } else if let Some(pos) = spec.positionals.get(positional_index) {
             if pos.greedy {
                 greedy_key = Some(pos.json_key);
+                greedy_kind = pos.kind;
                 greedy_parts.push(token.clone());
             } else {
                 insert_value(&mut obj, pos.json_key, pos.kind, token)?;
@@ -1966,10 +2017,18 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         i += 1;
     }
     if let Some(key) = greedy_key {
-        obj.insert(
-            key.to_string(),
-            serde_json::Value::String(greedy_parts.join(" ")),
-        );
+        let value = match greedy_kind {
+            // A rest-list keeps word boundaries — the shape a command
+            // argv needs; a greedy Str stays the joined free-text tail.
+            ValueKind::StrList => serde_json::Value::Array(
+                greedy_parts
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+            _ => serde_json::Value::String(greedy_parts.join(" ")),
+        };
+        obj.insert(key.to_string(), value);
     }
     // Dot-aware presence walk, matching `insert_value`'s nesting.
     fn key_present(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
@@ -2009,6 +2068,36 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
                     .collect(),
             ),
         );
+    }
+    // ctl's repeatable `--env KEY=VALUE` becomes the tool's env object.
+    if let Some(pairs) = obj.remove("__env_kv") {
+        let mut env = serde_json::Map::new();
+        for pair in pairs.as_array().cloned().unwrap_or_default() {
+            let Some((key, value)) = pair.as_str().and_then(|p| p.split_once('=')) else {
+                return Err("--env expects KEY=VALUE".to_string());
+            };
+            env.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+        obj.insert("env".to_string(), serde_json::Value::Object(env));
+    }
+    // ctl's `--allow-dirty` is the negative of the tool's require_clean.
+    if obj.remove("__allow_dirty").is_some() {
+        obj.insert("require_clean".to_string(), serde_json::Value::Bool(false));
+    }
+    // ctl's `audio spawn --args '{...}'` passes the tool object whole;
+    // entries fill only keys the decomposed flags did not set.
+    if let Some(args_obj) = obj.remove("__audio_args") {
+        let Some(map) = args_obj.as_object() else {
+            return Err("--args expects a JSON object".to_string());
+        };
+        for (key, value) in map {
+            if !obj.contains_key(key) {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
     }
     // The `agenda list --all` shape: lift the seeded open-status default
     // so the whole ledger (every status) comes back.
@@ -2630,6 +2719,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["digest"], "abc123");
+    }
+
+    /// ctl's primary invocation grammars plan verbatim (review round
+    /// 15): remote start's trailing argv keeps word boundaries and its
+    /// KEY=VALUE env pairs fold into the object, --allow-dirty flips
+    /// require_clean, browser create takes the URL positionally with
+    /// the ctl peer/session spellings, controller complete takes its
+    /// required flags, and audio spawn accepts the whole tool object.
+    #[test]
+    fn ctl_primary_grammars_plan_verbatim() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "remote",
+                "start",
+                "--revision",
+                "abc123",
+                "--env",
+                "RUST_LOG=debug",
+                "--env",
+                "CI=1",
+                "--allow-dirty",
+                "--timeout",
+                "600",
+                "--",
+                "cargo",
+                "check",
+                "--all",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["argv"],
+            serde_json::json!(["cargo", "check", "--all"]),
+            "word boundaries preserved, flag-shaped words included"
+        );
+        assert_eq!(planned.args["expected_revision"], "abc123");
+        assert_eq!(
+            planned.args["env"],
+            serde_json::json!({ "RUST_LOG": "debug", "CI": "1" })
+        );
+        assert_eq!(planned.args["require_clean"], serde_json::json!(false));
+        assert_eq!(planned.args["timeout_s"], 600);
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "browser",
+                "create",
+                "https://example.com",
+                "--session",
+                "sess-2",
+                "--peer",
+                "peer-a",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["url"], "https://example.com");
+        assert_eq!(planned.args["owner_session_id"], "sess-2");
+        assert_eq!(planned.args["peer_id"], "peer-a");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "controller",
+                "complete",
+                "--restart-id",
+                "r-1",
+                "--token",
+                "tok",
+                "--summary",
+                "done",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["restart_id"], "r-1");
+        assert_eq!(planned.args["turn_complete_token"], "tok");
+        assert_eq!(planned.args["handoff_summary"], "done");
+        let planned = plan_for_meta(
+            "inspect",
+            &argv(&["context", "inspect", "--item-id", "item-9"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["item_id"], "item-9");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["display", "request", "--reason", "please share"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["reason"], "please share");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "audio",
+                "spawn",
+                "--args",
+                "{\"id\":\"a1\",\"provider\":\"openai\",\"playbook\":\"greet\"}",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["id"], "a1");
+        assert_eq!(planned.args["provider"], "openai");
+        assert_eq!(planned.args["playbook"], "greet");
     }
 
     /// The dispatcher replaces the identity sentinel with the caller's
