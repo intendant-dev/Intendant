@@ -291,6 +291,13 @@ fn build_args(
     let mut written: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     let mut flag_written: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
+    // Which flag NAME wrote each scalar key: two synonymous spellings
+    // for one field (--session/--session-id) refuse together instead of
+    // last-wins — ctl's or_else picks a fixed winner regardless of argv
+    // order, and silently dispatching the other spelling's value would
+    // diverge from it. Repeatable list flags append and stay exempt.
+    let mut flag_name_by_key: std::collections::HashMap<&'static str, &'static str> =
+        std::collections::HashMap::new();
     fn outer(key: &'static str) -> &'static str {
         key.split('.').next().unwrap_or(key)
     }
@@ -344,6 +351,17 @@ fn build_args(
                     .cloned()
                     .ok_or_else(|| format!("--{flag_name} needs a value"))?
             };
+            if flag.kind != ValueKind::StrList {
+                if let Some(prev) = flag_name_by_key.get(flag.json_key) {
+                    if *prev != flag.name {
+                        return Err(format!(
+                            "pass --{prev} or --{}, not both — they set the same field",
+                            flag.name
+                        ));
+                    }
+                }
+                flag_name_by_key.insert(flag.json_key, flag.name);
+            }
             insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
             written.insert(outer(flag.json_key));
             flag_written.insert(flag.json_key);
@@ -2458,6 +2476,40 @@ mod tests {
         assert_eq!(planned.args["anchor"]["item_id"], "item-9");
         assert_eq!(planned.args["anchor"]["position"], "after");
         assert_eq!(planned.args["reason"], "too deep");
+        // Round 38: two synonymous scalar spellings refuse together
+        // (ctl's or_else picks a fixed winner; last-wins could dispatch
+        // the other value). Repeatable list twins still append.
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "task",
+                "start",
+                "work",
+                "--session",
+                "sess-a",
+                "--session-id",
+                "sess-b",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "stamp",
+                "fix-task",
+                "--note",
+                "first",
+                "--annotation",
+                "second",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["annotations"],
+            serde_json::json!(["first", "second"])
+        );
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
