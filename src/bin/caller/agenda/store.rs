@@ -2535,43 +2535,54 @@ impl AgendaStore {
         }
     }
 
-    /// Resolve a REMOVAL command's target against the edge ids an item
-    /// actually stores: the fold tolerates dangling targets (partial or
-    /// foreign logs), and a dangling edge must stay removable, so the
-    /// item map cannot be the refusal authority here. An exact stored
-    /// target — live or dangling — stays; a unique prefix of a stored
-    /// target expands; an ambiguous one refuses; anything else falls
-    /// back to the item map when it resolves there (a live item that
-    /// simply is not an edge target) and otherwise stays verbatim so
-    /// the validation arm answers in its own words.
+    /// Resolve a REMOVAL command's target: the fold tolerates dangling
+    /// targets (partial or foreign logs), and a dangling edge must stay
+    /// removable, so the item map cannot be the sole refusal authority
+    /// — but a prefix must still be unique across the stored edges AND
+    /// the live ledger together, or a globally ambiguous spelling would
+    /// silently pick the edge. An exact id (stored edge or live item)
+    /// stays; a globally unique prefix expands; an ambiguous one
+    /// refuses; no match stays verbatim so the validation arm answers
+    /// in its own words.
     fn resolve_removal_target<'a>(
         &self,
         needle: &mut String,
         stored: impl Iterator<Item = &'a str>,
     ) -> Result<(), AgendaError> {
         let stored: Vec<&str> = stored.collect();
-        if stored.contains(&needle.as_str()) {
+        // Exact ids always win, stored edge or live item alike — the
+        // caller named the thing precisely.
+        if stored.contains(&needle.as_str()) || self.items.contains_key(needle.as_str()) {
             return Ok(());
         }
         if !needle.is_empty() {
-            let mut matches = stored
+            // A prefix resolves against the stored edges AND the live
+            // ledger together: a prefix matching one dangling edge but
+            // also prefixing an unrelated live item is globally
+            // ambiguous and refuses (round 40) — an edge-local
+            // expansion would silently pick the edge.
+            let mut matches: std::collections::BTreeSet<&str> = stored
                 .iter()
-                .filter(|target| target.starts_with(needle.as_str()));
-            match (matches.next(), matches.next()) {
-                (Some(only), None) => {
-                    *needle = (*only).to_string();
-                    return Ok(());
+                .copied()
+                .filter(|target| target.starts_with(needle.as_str()))
+                .collect();
+            matches.extend(
+                self.items
+                    .keys()
+                    .filter(|key| key.starts_with(needle.as_str()))
+                    .map(String::as_str),
+            );
+            match matches.len() {
+                0 => {}
+                1 => {
+                    *needle = matches.into_iter().next().expect("one match").to_string();
                 }
-                (Some(_), Some(_)) => {
+                _ => {
                     return Err(AgendaError::Invalid(format!(
                         "target prefix {needle:?} is ambiguous — use more characters"
                     )))
                 }
-                _ => {}
             }
-        }
-        if let Ok(resolved) = self.resolve_write_id(needle) {
-            *needle = resolved;
         }
         Ok(())
     }
@@ -3699,13 +3710,32 @@ mod tests {
         let mut store = AgendaStore::open(dir2.path()).unwrap();
         assert!(store.get(&b.id).is_none(), "b's add was filtered out");
         // A stored-edge PREFIX resolves even though the item map has no
-        // such item (and even though it also prefixes `a` there — the
-        // edge set is consulted first).
+        // such item — but only a GLOBALLY unique one: the shared ULID
+        // time prefix also matches live `a`, so it refuses as ambiguous
+        // (round 40), while the divergence-unique prefix expands.
+        let unique_len =
+            a.id.chars()
+                .zip(b.id.chars())
+                .take_while(|(x, y)| x == y)
+                .count()
+                + 1;
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::RemoveReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id[..unique_len - 1].to_string(),
+                    source: None,
+                },
+                owner(),
+                5500,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
         store
             .apply_command(
                 AgendaCommand::RemoveReliesOn {
                     id: a.id.clone(),
-                    target_id: b.id[..6].to_string(),
+                    target_id: b.id[..unique_len].to_string(),
                     source: None,
                 },
                 owner(),

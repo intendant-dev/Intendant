@@ -589,12 +589,21 @@ fn build_args(
         }
         obj.insert("env".to_string(), serde_json::Value::Object(env));
     }
-    // ctl's `--allow-dirty` is the negative of the tool's require_clean.
+    // ctl's `--allow-dirty` is the negative of the tool's require_clean
+    // — contradicting an explicit --require-clean refuses instead of
+    // silently allowing a dirty tree (round 40).
     if obj.remove("__allow_dirty").is_some() {
+        if flag_written.contains("require_clean") {
+            return Err("pass --allow-dirty or --require-clean, not both".to_string());
+        }
         obj.insert("require_clean".to_string(), serde_json::Value::Bool(false));
     }
-    // ctl's `--one-shot` is the negative of the halt's persistent field.
+    // ctl's `--one-shot` is the negative of the halt's persistent field
+    // — same contradiction guard.
     if obj.remove("__one_shot").is_some() {
+        if flag_written.contains("persistent") {
+            return Err("pass --one-shot or --persistent, not both".to_string());
+        }
         obj.insert("persistent".to_string(), serde_json::Value::Bool(false));
     }
     // ctl's task-start mode pair: bare --orchestrate / --direct set the
@@ -2523,6 +2532,27 @@ mod tests {
             planned.args["annotations"],
             serde_json::json!(["first", "second"])
         );
+        // Round 40: a transformed boolean alias contradicting its
+        // explicit twin refuses instead of silently overwriting.
+        let err = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "remote",
+                "start",
+                "job",
+                "--allow-dirty",
+                "--require-clean",
+                "true",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        let err = plan_for_meta(
+            "authorize",
+            &argv(&["controller", "halt", "--one-shot", "--persistent", "true"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
         // Round 39: a full-object flag beside its nested flags is
         // order-independent — the specific spelling wins, the object
         // fills the rest (both orders pinned).
