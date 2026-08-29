@@ -1466,8 +1466,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("ID", "id", true, false),
             p_str("DIGEST", "digest", true, false),
         ],
-        flags: &[],
-        help: "Bind owner approval to a scheduled effect's manifest digest",
+        flags: &[flag!("digest", "digest", Str, "ctl-spelling alias for DIGEST")],
+        help: "Bind owner approval to a scheduled effect's manifest digest. Review first: agenda show ID surfaces effects[].manifest and its digest (ctl's digestless review is that read, client-rendered) — approving echoes the digest so what you approve is what you read",
     },
     CommandSpec {
         path: &["agenda", "revoke-schedule"],

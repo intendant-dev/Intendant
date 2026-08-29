@@ -767,6 +767,7 @@ async fn run_events(
     let filter = args.one("--filter").map(str::to_string);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
     let mut delivered_any = false;
+    let mut last_quiet_envelope: Option<Value> = None;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -798,14 +799,26 @@ async fn run_events(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let gap = envelope.get("gap").and_then(Value::as_bool) == Some(true);
+        // One-shot mode produces exactly one meaningful stdout record:
+        // empty non-gap chunks are internal polling, and printing them
+        // would make line-oriented callers treat the first empty
+        // envelope as completion while the process keeps waiting.
+        // --follow is the batch stream and prints every chunk.
+        let print_this = follow || !events.is_empty() || gap;
         if config.json {
-            // One compact envelope per line — --follow emits a batch
-            // stream, and line-oriented consumers must never see a
-            // pretty-printed envelope split across lines.
-            println!(
-                "{}",
-                serde_json::to_string(&envelope).map_err(|e| format!("serialize envelope: {e}"))?
-            );
+            if print_this {
+                // One compact envelope per line — line-oriented
+                // consumers must never see a pretty-printed envelope
+                // split across lines.
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope)
+                        .map_err(|e| format!("serialize envelope: {e}"))?
+                );
+            } else {
+                last_quiet_envelope = Some(envelope.clone());
+            }
         } else {
             for event in &events {
                 println!(
@@ -814,7 +827,7 @@ async fn run_events(
                 );
             }
         }
-        if envelope.get("gap").and_then(Value::as_bool) == Some(true) {
+        if gap {
             eprintln!(
                 "events: gap — events were missed; resync state via the read commands and continue from the cursor below"
             );
@@ -823,7 +836,9 @@ async fn run_events(
             since = Some(cursor.to_string());
         }
         delivered_any |= !events.is_empty();
-        let gap = envelope.get("gap").and_then(Value::as_bool) == Some(true);
+        if print_this {
+            last_quiet_envelope = None;
+        }
         // A gap is a terminal answer for the one-shot form: the server
         // said "resync now", and burning the rest of the budget on
         // another long poll after printing the warning helps nobody.
@@ -833,6 +848,14 @@ async fn run_events(
         }
     }
     if !delivered_any {
+        // The one meaningful record for a quiet one-shot --json run: the
+        // final timeout envelope (current cursor, empty batch).
+        if let Some(envelope) = &last_quiet_envelope {
+            println!(
+                "{}",
+                serde_json::to_string(envelope).map_err(|e| format!("serialize envelope: {e}"))?
+            );
+        }
         eprintln!("events: nothing arrived within {total_s}s");
     }
     if let Some(cursor) = &since {

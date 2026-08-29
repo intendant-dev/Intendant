@@ -112,13 +112,14 @@ write/effect family), memory (reads, proposals, and owner curation),
 displays, browser workspaces, computer use, shared view, settings,
 remote compute, controller, audio, peers, terminal, and context — with
 nested/structured parameters passed as literal JSON values (parsed at
-plan time; a parse failure never dispatches). Three ctl surfaces are
+plan time; a parse failure never dispatches). Four ctl surfaces are
 deliberately NOT registry commands: `dashboard-url` (a local file
 read), `tools call` (the variable-operation escape hatch — raw `/mcp`
-exists for typed callers), and the `agenda ops`/`agenda occurrences`
-audit reads, which ride the loopback-token `/api` lane and refuse the
-peer and supervised-session lanes by design — a trust boundary the
-facade must not tunnel through. ctl's derived agenda views
+exists for typed callers), `takeover` (the daemon-drain act on the
+same loopback lane — owner/local trust class), and the `agenda
+ops`/`agenda occurrences` audit reads, which ride the loopback-token
+`/api` lane and refuse the peer and supervised-session lanes by design
+— a trust boundary the facade must not tunnel through. ctl's derived agenda views
 (`--blocked`, `--frontier`, `--under`, and the bare-list
 answered-union) are client-side renders over the same `agenda list`
 read, not registry vocabulary: fetch and derive. The serialized facade
