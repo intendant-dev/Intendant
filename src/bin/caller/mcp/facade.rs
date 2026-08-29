@@ -63,6 +63,9 @@ enum ValueKind {
     /// dispatch. The argv value is the JSON text itself; the CLI-side
     /// `@file`/stdin expansions stay client-side as ever.
     Json,
+    /// JSON when the value parses as JSON, otherwise the literal string
+    /// — ctl's `JSON|TEXT` contract (peer task context).
+    JsonOrText,
 }
 
 struct PositionalSpec {
@@ -943,6 +946,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: "{}",
         positionals: &[p_str("WORKSPACE_ID", "workspace_id", true, false)],
         flags: &[
+            flag!("holder", "holder_id", Str, "holder releasing (ctl spelling)"),
             flag!("holder-id", "holder_id", Str, "holder releasing"),
             flag!("note", "note", Str, "release note"),
         ],
@@ -972,13 +976,19 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Act,
         tool: "focus_shared_view",
         seed: "{}",
-        positionals: &[p_json("REGION", "region", true)],
+        positionals: &[p_json("REGION", "region", false)],
         flags: &[
+            flag!(
+                "region",
+                "__region_csv",
+                Str,
+                "x,y,width,height normalized 0-1 (ctl spelling)"
+            ),
             flag!("target", "display_target", Str, "display target"),
             flag!("display-id", "display_id", U64, "numeric display id"),
             flag!("note", "note", Str, "short label"),
         ],
-        help: "Focus the shared view on a normalized region",
+        help: "Focus the shared view on a normalized region (REGION JSON or --region x,y,w,h)",
     },
     CommandSpec {
         path: &["shared", "focus-clear"],
@@ -1783,7 +1793,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("PEER_ID", "peer_id", true, false),
             p_str("INSTRUCTIONS", "instructions", true, true),
         ],
-        flags: &[flag!("context", "context", Json, "free-form JSON context")],
+        flags: &[flag!(
+            "context",
+            "context",
+            JsonOrText,
+            "JSON when it parses, else the literal text (ctl's JSON|TEXT contract)"
+        )],
         help: "Delegate an autonomous task to a peer daemon",
     },
     CommandSpec {
@@ -1932,27 +1947,29 @@ fn insert_value(
             .ok_or_else(|| format!("{outer}: not an object"))?;
         return insert_value(nested, inner, kind, raw);
     }
-    let value = match kind {
-        ValueKind::Str => serde_json::Value::String(raw.to_string()),
-        ValueKind::U64 => serde_json::Value::from(
-            raw.parse::<u64>()
-                .map_err(|_| format!("{key}: expected an unsigned integer, got {raw:?}"))?,
-        ),
-        ValueKind::Bool => serde_json::Value::Bool(true),
-        ValueKind::StrList => {
-            let entry = obj
-                .entry(key.to_string())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            entry
-                .as_array_mut()
-                .ok_or_else(|| format!("{key}: not an array"))?
-                .push(serde_json::Value::String(raw.to_string()));
-            return Ok(());
-        }
-        ValueKind::Json => {
-            serde_json::from_str(raw).map_err(|e| format!("{key}: expected literal JSON ({e})"))?
-        }
-    };
+    let value =
+        match kind {
+            ValueKind::Str => serde_json::Value::String(raw.to_string()),
+            ValueKind::U64 => serde_json::Value::from(
+                raw.parse::<u64>()
+                    .map_err(|_| format!("{key}: expected an unsigned integer, got {raw:?}"))?,
+            ),
+            ValueKind::Bool => serde_json::Value::Bool(true),
+            ValueKind::StrList => {
+                let entry = obj
+                    .entry(key.to_string())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                entry
+                    .as_array_mut()
+                    .ok_or_else(|| format!("{key}: not an array"))?
+                    .push(serde_json::Value::String(raw.to_string()));
+                return Ok(());
+            }
+            ValueKind::Json => serde_json::from_str(raw)
+                .map_err(|e| format!("{key}: expected literal JSON ({e})"))?,
+            ValueKind::JsonOrText => serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        };
     obj.insert(key.to_string(), value);
     Ok(())
 }
@@ -2113,6 +2130,26 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     // ctl's `--one-shot` is the negative of the halt's persistent field.
     if obj.remove("__one_shot").is_some() {
         obj.insert("persistent".to_string(), serde_json::Value::Bool(false));
+    }
+    // ctl's `--region x,y,width,height` (normalized 0-1 floats) becomes
+    // the tool's region object.
+    if let Some(csv) = obj.remove("__region_csv") {
+        if obj.contains_key("region") {
+            return Err("pass one region — either the REGION positional or --region".to_string());
+        }
+        let text = csv.as_str().unwrap_or_default();
+        let parts: Vec<f64> = text
+            .split(',')
+            .map(|p| p.trim().parse::<f64>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| format!("--region expects x,y,width,height (got {text:?})"))?;
+        let [x, y, width, height] = parts.as_slice() else {
+            return Err(format!("--region expects four values (got {text:?})"));
+        };
+        obj.insert(
+            "region".to_string(),
+            serde_json::json!({ "x": x, "y": y, "width": width, "height": height }),
+        );
     }
     // ctl's `audio spawn --args '{...}'` passes the tool object whole;
     // entries fill only keys the decomposed flags did not set.
@@ -2848,6 +2885,44 @@ mod tests {
         let planned =
             plan_for_meta("authorize", &argv(&["controller", "halt", "--one-shot"])).unwrap();
         assert_eq!(planned.args["persistent"], serde_json::json!(false));
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["browser", "release", "ws-1", "--holder", "sess-2"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["holder_id"], "sess-2");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["shared", "focus", "--region", "0.1,0.2,0.5,0.4"]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["region"],
+            serde_json::json!({ "x": 0.1, "y": 0.2, "width": 0.5, "height": 0.4 })
+        );
+        assert!(
+            plan_for_meta("act", &argv(&["shared", "focus", "--region", "0.1,0.2"])).is_err(),
+            "a region needs four values"
+        );
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "peer",
+                "task",
+                "peer-a",
+                "do the thing",
+                "--context",
+                "plain words",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["context"], "plain words");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["peer", "task", "peer-a", "go", "--context", "{\"k\":1}"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["context"]["k"], 1);
         let planned = plan_for_meta(
             "act",
             &argv(&["display", "request", "--reason", "please share"]),
