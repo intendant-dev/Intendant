@@ -479,6 +479,12 @@ impl AgendaStore {
     ) -> Result<AgendaItem, AgendaError> {
         // Validate against the freshest state another instance may have left.
         self.refresh_if_stale()?;
+        // Resolve unique id prefixes to exact ids BEFORE anything is
+        // appended: the durable op must carry the exact id (folds replay
+        // exact lookups), and surfaces without ctl's client-side
+        // pre-resolution (the MCP facade) send prefixes the read path
+        // already serves.
+        self.resolve_command_ids(&mut cmd)?;
         let source = validate_source(cmd.take_source())?;
         // Rich-ask park: blob commits interleave with the id mint and need
         // rollback on any later failure, so it has its own arm.
@@ -2495,6 +2501,82 @@ impl AgendaStore {
             .ok_or_else(|| AgendaError::NotFound(id.to_string()))
     }
 
+    /// Resolve a full id or unique prefix to the exact item id, for the
+    /// WRITE intake: exact ids always win, a unique prefix resolves, an
+    /// ambiguous one refuses by name, and the empty string resolves
+    /// nothing. Mirrors the read path (`AgendaHandle::resolve_prefix`)
+    /// and the ClearBlocker precedent — and like ClearBlocker, callers
+    /// rewrite the COMMAND with the result before an op is appended, so
+    /// the durable op (and every fold that replays it) carries the
+    /// exact id.
+    fn resolve_write_id(&self, needle: &str) -> Result<String, AgendaError> {
+        if self.items.contains_key(needle) {
+            return Ok(needle.to_string());
+        }
+        if needle.is_empty() {
+            return Err(AgendaError::NotFound(needle.to_string()));
+        }
+        let mut matches = self.items.keys().filter(|key| key.starts_with(needle));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Ok(only.clone()),
+            (Some(_), Some(_)) => Err(AgendaError::Invalid(format!(
+                "id prefix {needle:?} is ambiguous — use more characters"
+            ))),
+            _ => Err(AgendaError::NotFound(needle.to_string())),
+        }
+    }
+
+    /// Rewrite every item-id field of an incoming command to its exact
+    /// resolved id (see [`Self::resolve_write_id`]). Exhaustive over the
+    /// command set so a new op must decide its id fields here explicitly.
+    fn resolve_command_ids(&self, cmd: &mut AgendaCommand) -> Result<(), AgendaError> {
+        let resolve = |store: &Self, id: &mut String| -> Result<(), AgendaError> {
+            *id = store.resolve_write_id(id)?;
+            Ok(())
+        };
+        match cmd {
+            AgendaCommand::Add { .. } | AgendaCommand::Ask { .. } | AgendaCommand::Stamp { .. } => {
+            }
+            AgendaCommand::Patch { id, .. }
+            | AgendaCommand::Complete { id, .. }
+            | AgendaCommand::Reopen { id, .. }
+            | AgendaCommand::Retire { id, .. }
+            | AgendaCommand::Answer { id, .. }
+            | AgendaCommand::AcknowledgeAnswer { id, .. }
+            | AgendaCommand::ProposeEffect { id, .. }
+            | AgendaCommand::RequestOccurrence { id }
+            | AgendaCommand::Annotate { id, .. }
+            | AgendaCommand::PickUp { id, .. }
+            | AgendaCommand::Attest { id, .. }
+            | AgendaCommand::SetBlocker { id, .. }
+            | AgendaCommand::ClearBlocker { id, .. }
+            | AgendaCommand::ApproveEffect { id, .. }
+            | AgendaCommand::RevokeEffect { id }
+            | AgendaCommand::WithdrawEffect { id, .. }
+            | AgendaCommand::StartNow { id, .. } => resolve(self, id)?,
+            AgendaCommand::AddReliesOn { id, target_id, .. }
+            | AgendaCommand::RemoveReliesOn { id, target_id, .. }
+            | AgendaCommand::AddRelatesTo { id, target_id, .. }
+            | AgendaCommand::RemoveRelatesTo { id, target_id, .. } => {
+                resolve(self, id)?;
+                resolve(self, target_id)?;
+            }
+            AgendaCommand::AddPartOf { id, parent_id, .. }
+            | AgendaCommand::RemovePartOf { id, parent_id, .. } => {
+                resolve(self, id)?;
+                resolve(self, parent_id)?;
+            }
+            AgendaCommand::Place { id, under, .. } => {
+                resolve(self, id)?;
+                resolve(self, under)?;
+            }
+            AgendaCommand::AddRef { id, .. } | AgendaCommand::RemoveRef { id, .. } => {
+                resolve(self, id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Mint the next item id: a fresh ULID, floored against the largest id
     /// ever seen so mint order equals id order even when the clock has not
     /// advanced past the previous mint (same-millisecond restarts, refolds
@@ -3471,6 +3553,88 @@ mod tests {
         ctx.default_project_root = Some(project.path().to_path_buf());
         store.set_spawn_context(ctx);
         project
+    }
+
+    /// Write intake resolves unique id prefixes like the read path does
+    /// (the MCP facade forwards ids verbatim, with no ctl-side
+    /// pre-resolution): a unique prefix works, an ambiguous one refuses
+    /// by name, and an unknown one stays NotFound.
+    #[test]
+    fn writes_resolve_unique_id_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let a = store
+            .apply_command(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "first".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner(),
+                1000,
+            )
+            .unwrap();
+        let b = store
+            .apply_command(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "second".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner(),
+                2000,
+            )
+            .unwrap();
+        // ULIDs minted in one store share a long timestamp prefix — find
+        // the shortest prefix unique to `a`.
+        let unique_len =
+            a.id.chars()
+                .zip(b.id.chars())
+                .take_while(|(x, y)| x == y)
+                .count()
+                + 1;
+        let unique = &a.id[..unique_len];
+        let ambiguous = &a.id[..unique_len - 1];
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: unique.to_string(),
+                    source: None,
+                },
+                owner(),
+                3000,
+            )
+            .expect("a unique prefix resolves at write intake");
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Complete {
+                    id: ambiguous.to_string(),
+                    source: None,
+                },
+                owner(),
+                4000,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Complete {
+                    id: "ZZZZZZ".to_string(),
+                    source: None,
+                },
+                owner(),
+                5000,
+            ),
+            Err(AgendaError::NotFound(_))
+        ));
     }
 
     #[test]

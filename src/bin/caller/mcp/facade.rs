@@ -354,12 +354,15 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Str,
                 "target session (follow-up turn)"
             ),
+            flag!("task", "task", Str, "ctl-spelling alias for TASK"),
+            flag!("session-id", "session_id", Str, "ctl-spelling alias for --session"),
             flag!(
                 "orchestrate",
-                "orchestrate",
-                Json,
-                "true forces orchestration, false forces a direct session; omit for automatic selection"
+                "__orchestrate",
+                Bool,
+                "force orchestration mode (omit both mode flags for automatic selection)"
             ),
+            flag!("direct", "__direct", Bool, "force a direct session"),
             flag!(
                 "frame",
                 "reference_frame_ids",
@@ -1145,15 +1148,28 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: r#"{"op":"patch"}"#,
         positionals: &[
             p_str("ID", "id", true, false),
-            p_json("PATCH", "patch", true),
+            p_json("PATCH", "patch", false),
         ],
-        flags: &[flag!(
-            "source",
-            "source",
-            Str,
-            "self-described caller label"
-        )],
-        help: "Merge-patch an item (absent = keep, null = clear)",
+        flags: &[
+            flag!("title", "patch.title", Str, "new title (ctl spelling)"),
+            flag!("body", "patch.body", Str, "new body (ctl spelling)"),
+            flag!(
+                "tag",
+                "patch.tags",
+                StrList,
+                "replacement tag (repeatable, ctl spelling)"
+            ),
+            flag!(
+                "due-ms",
+                "patch.due_ms",
+                U64,
+                "new due instant in epoch ms (ctl's human --due converts client-side)"
+            ),
+            flag!("clear-tags", "__clear_tags", Bool, "empty the tag list"),
+            flag!("clear-due", "__clear_due", Bool, "clear the due instant"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Merge-patch an item: PATCH JSON, or the ctl flags (absent = keep, clears explicit)",
     },
     CommandSpec {
         path: &["agenda", "reopen"],
@@ -1272,6 +1288,61 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Clear a blocker",
     },
     CommandSpec {
+        // ctl's spelling: one verb, --remove flips the edge off.
+        path: &["agenda", "relies-on"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_relies_on"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[
+            flag!("remove", "__remove_relies", Bool, "remove the edge instead"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Add (or with --remove, drop) a relies-on edge — ctl's spelling",
+    },
+    CommandSpec {
+        path: &["agenda", "relates"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_relates_to"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[
+            flag!("kind", "link_kind", Str, "closed relates-to vocabulary (add only)"),
+            flag!("remove", "__remove_relates", Bool, "remove the link instead"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Add (or with --remove, drop) a relates-to link — ctl's spelling",
+    },
+    CommandSpec {
+        path: &["agenda", "ref"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_ref"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("LOCATOR", "locator", true, false),
+        ],
+        flags: &[
+            flag!(
+                "type",
+                "ref_type",
+                Str,
+                "file|dir|memory|session|url (ctl infers it from the locator client-side)"
+            ),
+            flag!("must-read", "must_read", Bool, "mark the ref must-read"),
+            flag!("label", "label", Str, "ref label"),
+            flag!("remove", "__remove_ref", Bool, "detach the ref instead"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Attach (or with --remove, detach) a ref — ctl's spelling; pass --type explicitly",
+    },
+    CommandSpec {
         path: &["agenda", "relies-add"],
         lane: RiskLane::Act,
         tool: "agenda_op",
@@ -1348,13 +1419,11 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("ID", "id", true, false),
             p_str("UNDER", "under", true, false),
         ],
-        flags: &[flag!(
-            "source",
-            "source",
-            Str,
-            "self-described caller label"
-        )],
-        help: "Re-parent an item under a hub",
+        flags: &[
+            flag!("under", "under", Str, "ctl-spelling alias for UNDER"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Re-parent an item under a hub (ctl's place --remove resolves the parent client-side — use part-remove ID PARENT here)",
     },
     CommandSpec {
         path: &["agenda", "relates-add"],
@@ -1439,6 +1508,13 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("OUTCOME", "outcome", true, false),
         ],
         flags: &[
+            flag!(
+                "occurrence",
+                "occurrence",
+                Str,
+                "ctl-spelling alias for OCCURRENCE"
+            ),
+            flag!("outcome", "outcome", Str, "ctl-spelling alias for OUTCOME"),
             flag!("note", "note", Str, "attestation note"),
             flag!(
                 "refs",
@@ -1471,9 +1547,67 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("fire-at-ms", "fire_at_ms", U64, "fire instant, ms since epoch"),
             flag!("orchestrate", "orchestrate", Bool, "orchestrated session"),
             flag!("interactive", "interactive", Bool, "interactive session"),
+            flag!(
+                "every",
+                "recurrence.every_ms",
+                U64,
+                "recurrence period in ms (ctl's human durations convert client-side)"
+            ),
+            flag!("until", "recurrence.until_ms", U64, "recurrence end, epoch ms"),
+            flag!(
+                "max-occurrences",
+                "recurrence.max_occurrences",
+                U64,
+                "occurrence cap"
+            ),
+            flag!(
+                "suspend-after",
+                "recurrence.suspend_after_failures",
+                U64,
+                "suspend after N failures"
+            ),
+            flag!(
+                "on-unblock",
+                "__on_unblock",
+                Bool,
+                "fire when the item's prerequisites clear"
+            ),
             flag!("recurrence", "recurrence", Json, "{\"every_ms\":..}"),
-            flag!("agent-config", "agent_config", Json, "agent launch pins"),
-            flag!("trigger", "trigger", Json, "{\"kind\":\"on_unblock\"} etc."),
+            flag!("agent", "agent_config.agent", Str, "launch pin: backend"),
+            flag!(
+                "claude-model",
+                "agent_config.claude_model",
+                Str,
+                "launch pin"
+            ),
+            flag!(
+                "claude-effort",
+                "agent_config.claude_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("codex-model", "agent_config.codex_model", Str, "launch pin"),
+            flag!(
+                "codex-reasoning-effort",
+                "agent_config.codex_reasoning_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("kimi-model", "agent_config.kimi_model", Str, "launch pin"),
+            flag!(
+                "kimi-thinking",
+                "agent_config.kimi_thinking",
+                Str,
+                "launch pin"
+            ),
+            flag!(
+                "agent-config",
+                "agent_config",
+                Json,
+                "the full launch-pin object (the flags above cover the common pins)"
+            ),
+            flag!("trigger", "trigger", Json, "{\"kind\":\"on_item_match\",..} etc."),
+            flag!("project", "project_root", Str, "project root (ctl spelling)"),
             flag!("project-root", "project_root", Str, "project root"),
             flag!(
                 "binding-refs",
@@ -1492,8 +1626,21 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: r#"{"op":"stamp"}"#,
         positionals: &[p_str("DEFINITION", "definition", true, false)],
         flags: &[
+            flag!("project", "project_root", Str, "project root (ctl spelling)"),
             flag!("project-root", "project_root", Str, "project root"),
+            flag!(
+                "at",
+                "fire_at_ms",
+                U64,
+                "first fire instant, epoch ms (ctl's human vocabulary converts client-side)"
+            ),
             flag!("fire-at-ms", "fire_at_ms", U64, "first fire instant"),
+            flag!(
+                "every",
+                "every_ms",
+                U64,
+                "recurrence period in ms (ctl spelling)"
+            ),
             flag!("every-ms", "every_ms", U64, "recurrence period"),
             flag!(
                 "suspend-after",
@@ -1501,6 +1648,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 U64,
                 "suspend after N failures"
             ),
+            flag!("note", "annotations", StrList, "annotation (ctl spelling)"),
             flag!("agent-config", "agent_config", Json, "agent launch pins"),
             flag!(
                 "annotation",
@@ -2154,6 +2302,78 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     if obj.remove("__one_shot").is_some() {
         obj.insert("persistent".to_string(), serde_json::Value::Bool(false));
     }
+    // ctl's task-start mode pair: bare --orchestrate / --direct set the
+    // tri-state orchestrate field; both together is a contradiction.
+    let wants_orchestrate = obj.remove("__orchestrate").is_some();
+    let wants_direct = obj.remove("__direct").is_some();
+    match (wants_orchestrate, wants_direct) {
+        (true, true) => return Err("pass --orchestrate or --direct, not both".to_string()),
+        (true, false) => {
+            obj.insert("orchestrate".to_string(), serde_json::Value::Bool(true));
+        }
+        (false, true) => {
+            obj.insert("orchestrate".to_string(), serde_json::Value::Bool(false));
+        }
+        (false, false) => {}
+    }
+    // ctl's patch clears: --clear-tags empties the tag list, --clear-due
+    // nulls the due instant (the merge-patch's explicit-clear forms).
+    let clear_tags = obj.remove("__clear_tags").is_some();
+    let clear_due = obj.remove("__clear_due").is_some();
+    if clear_tags || clear_due {
+        let patch = obj
+            .entry("patch".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let patch = patch
+            .as_object_mut()
+            .ok_or_else(|| "patch: not an object".to_string())?;
+        if clear_tags {
+            patch.insert("tags".to_string(), serde_json::Value::Array(Vec::new()));
+        }
+        if clear_due {
+            patch.insert("due_ms".to_string(), serde_json::Value::Null);
+        }
+    }
+    // ctl's `--remove` edge forms flip the seeded add op to its remove
+    // twin. The relates remove drops/refuses --kind (it types the link
+    // being ADDED — ctl's own refusal), and the ref remove drops the
+    // add-only fields (the remove op's strict shape rejects them).
+    if obj.remove("__remove_relies").is_some() {
+        obj.insert(
+            "op".to_string(),
+            serde_json::Value::String("remove_relies_on".to_string()),
+        );
+    }
+    if obj.remove("__remove_relates").is_some() {
+        if obj.contains_key("link_kind") {
+            return Err(
+                "agenda relates --kind types the link being added; drop it with --remove"
+                    .to_string(),
+            );
+        }
+        obj.insert(
+            "op".to_string(),
+            serde_json::Value::String("remove_relates_to".to_string()),
+        );
+    }
+    if obj.remove("__remove_ref").is_some() {
+        obj.insert(
+            "op".to_string(),
+            serde_json::Value::String("remove_ref".to_string()),
+        );
+        obj.remove("must_read");
+        obj.remove("label");
+    }
+    // ctl's `--on-unblock` is the dependency-gated trigger shape.
+    if obj.remove("__on_unblock").is_some() {
+        if obj.contains_key("trigger") {
+            return Err("pass --on-unblock or --trigger, not both".to_string());
+        }
+        obj.insert(
+            "trigger".to_string(),
+            serde_json::json!({ "kind": "on_unblock" }),
+        );
+    }
     // ctl's `--region x,y,width,height` (normalized 0-1 floats) becomes
     // the tool's region object.
     if let Some(csv) = obj.remove("__region_csv") {
@@ -2612,14 +2832,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["require_clean"], serde_json::json!(false));
-        // The task-start mode override is tri-state: true forces
-        // orchestration, false forces direct (ctl's --direct), omitted
-        // keeps automatic selection (review round 2).
-        let planned = plan_for_meta(
-            "act",
-            &argv(&["task", "start", "fix it", "--orchestrate", "false"]),
-        )
-        .unwrap();
+        // The task-start mode override is tri-state via ctl's bare flag
+        // pair (rounds 2 and 19): --direct forces direct, --orchestrate
+        // forces orchestration, omitted keeps automatic selection.
+        let planned =
+            plan_for_meta("act", &argv(&["task", "start", "fix it", "--direct"])).unwrap();
         assert_eq!(planned.args["orchestrate"], serde_json::json!(false));
         let planned = plan_for_meta("act", &argv(&["task", "start", "fix it"])).unwrap();
         assert!(planned.args.get("orchestrate").is_none());
@@ -2993,6 +3210,124 @@ mod tests {
         assert_eq!(planned.args["id"], "a1");
         assert_eq!(planned.args["provider"], "openai");
         assert_eq!(planned.args["playbook"], "greet");
+    }
+
+    /// ctl's agenda write vocabulary and the task-start mode pair plan
+    /// verbatim (review round 19): the bare mode flags, the patch
+    /// flags with explicit clears, the single-verb edge commands with
+    /// --remove, the recurrence/trigger/launch-pin schedule flags, and
+    /// the attest flags.
+    #[test]
+    fn ctl_agenda_vocabulary_plans_verbatim() {
+        let planned =
+            plan_for_meta("act", &argv(&["task", "start", "fix it", "--direct"])).unwrap();
+        assert_eq!(planned.args["orchestrate"], serde_json::json!(false));
+        let planned =
+            plan_for_meta("act", &argv(&["task", "start", "fix it", "--orchestrate"])).unwrap();
+        assert_eq!(planned.args["orchestrate"], serde_json::json!(true));
+        assert!(plan_for_meta(
+            "act",
+            &argv(&["task", "start", "x", "--orchestrate", "--direct"])
+        )
+        .is_err());
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "patch",
+                "item-1",
+                "--title",
+                "new title",
+                "--clear-due",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["patch"]["title"], "new title");
+        assert_eq!(planned.args["patch"]["due_ms"], serde_json::Value::Null);
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "patch", "item-1", "--clear-tags"])).unwrap();
+        assert_eq!(planned.args["patch"]["tags"], serde_json::json!([]));
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "relies-on", "item-1", "item-2", "--remove"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["op"], "remove_relies_on");
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "relies-on", "item-1", "item-2"])).unwrap();
+        assert_eq!(planned.args["op"], "add_relies_on");
+        assert!(
+            plan_for_meta(
+                "act",
+                &argv(&[
+                    "agenda",
+                    "relates",
+                    "item-1",
+                    "item-2",
+                    "--kind",
+                    "duplicates",
+                    "--remove"
+                ])
+            )
+            .is_err(),
+            "kind types the link being added"
+        );
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "ref",
+                "item-1",
+                "/srv/notes.md",
+                "--type",
+                "file",
+                "--must-read",
+                "--remove",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["op"], "remove_ref");
+        assert!(
+            planned.args.get("must_read").is_none(),
+            "the remove op's strict shape drops add-only fields"
+        );
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "1700000000000",
+                "run the sweep",
+                "--every",
+                "86400000",
+                "--on-unblock",
+                "--agent",
+                "codex",
+                "--project",
+                "/srv/proj",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["recurrence"]["every_ms"], 86_400_000u64);
+        assert_eq!(planned.args["trigger"]["kind"], "on_unblock");
+        assert_eq!(planned.args["agent_config"]["agent"], "codex");
+        assert_eq!(planned.args["project_root"], "/srv/proj");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "attest",
+                "item-1",
+                "--occurrence",
+                "occ-1",
+                "--outcome",
+                "achieved",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["occurrence"], "occ-1");
+        assert_eq!(planned.args["outcome"], "achieved");
     }
 
     /// The dispatcher replaces the identity sentinel with the caller's
