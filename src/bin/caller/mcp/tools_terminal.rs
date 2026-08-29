@@ -60,7 +60,8 @@ pub struct TerminalReadParams {
     /// retained output).
     #[serde(default)]
     pub cursor: Option<u64>,
-    /// Max bytes to return (default 16384, cap 65536).
+    /// Max bytes to return (default 16384, cap 65536, floor 4 — a page
+    /// never consumes a split UTF-8 sequence).
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
@@ -110,18 +111,22 @@ fn terminal_actor(
 }
 
 /// How much of `bytes` to deliver so the page ends on a UTF-8 boundary:
-/// the whole page when it is valid or ends mid-page-invalid (binary —
-/// lossy is honest), trimmed when the tail is an INCOMPLETE multibyte
-/// sequence a later page completes. A page smaller than one sequence is
-/// delivered whole so progress is always made.
+/// the whole page when it is valid or contains a genuinely INVALID
+/// sequence (binary output — lossy is honest), trimmed to the last
+/// boundary when the tail is an INCOMPLETE sequence a later page
+/// completes. An incomplete prefix is NEVER consumed — even when that
+/// means an empty page with a parked cursor — because delivering it
+/// lossily advances past bytes the caller can then never reconstruct.
+/// Progress is guaranteed by the read floor (`max_bytes` ≥ 4, the
+/// longest UTF-8 sequence): a page that starts on a boundary and has
+/// room for a whole sequence only ever trims a tail the ring has not
+/// finished receiving yet.
 fn utf8_page_len(bytes: &[u8]) -> usize {
     match std::str::from_utf8(bytes) {
         Ok(_) => bytes.len(),
         Err(err) => {
             if err.error_len().is_some() {
                 // Invalid sequence inside the page — not a boundary split.
-                bytes.len()
-            } else if err.valid_up_to() == 0 && !bytes.is_empty() {
                 bytes.len()
             } else {
                 err.valid_up_to()
@@ -254,18 +259,19 @@ impl IntendantServer {
         else {
             return no_visible(&params.terminal_id);
         };
+        // Floor 4 (the longest UTF-8 sequence): with boundary-aligned
+        // cursors and room for a whole sequence, the boundary trim below
+        // can only hold back a tail the ring has not finished receiving.
         let max_bytes = params
             .max_bytes
             .unwrap_or(TERMINAL_READ_DEFAULT_BYTES)
-            .min(TERMINAL_READ_MAX_BYTES);
+            .clamp(4, TERMINAL_READ_MAX_BYTES);
         let (bytes, next_cursor, gap) = session.read_since(params.cursor.unwrap_or(0), max_bytes);
         // A multibyte UTF-8 sequence split at the page boundary must not
         // decay into replacement characters on both pages: hold the
         // incomplete tail back (rewinding the cursor to the boundary) so
         // the next read re-delivers it whole. Genuinely invalid bytes
-        // mid-page (binary output) stay lossy — that is honest — and a
-        // page smaller than one sequence is delivered as-is so a tiny
-        // max_bytes still makes progress.
+        // mid-page (binary output) stay lossy — that is honest.
         let kept = utf8_page_len(&bytes);
         let next_cursor = next_cursor - (bytes.len() - kept) as u64;
         serde_json::json!({
@@ -371,10 +377,13 @@ mod tests {
             2,
             "invalid mid-page stays lossy"
         );
+        // An incomplete PREFIX is never consumed — the cursor parks, and
+        // the read floor (max_bytes ≥ 4) guarantees the next page has
+        // room for the whole sequence.
         assert_eq!(
             utf8_page_len(&s[2..3]),
-            1,
-            "sub-sequence page still progresses"
+            0,
+            "incomplete prefix held, not consumed"
         );
         assert_eq!(utf8_page_len(b""), 0);
     }
