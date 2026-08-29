@@ -574,22 +574,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Screenshot a display (returns an image content block)",
     },
     CommandSpec {
-        // ctl routes `cu screenshot` through the display handler — the
-        // same tool by another documented name.
-        path: &["cu", "screenshot"],
-        lane: RiskLane::Inspect,
-        tool: "take_screenshot",
-        seed: "{}",
-        positionals: &[],
-        flags: &[flag!(
-            "target",
-            "display_target",
-            Str,
-            "user_session, display_99, …"
-        )],
-        help: "Screenshot a display (ctl's cu alias; ctl's --output is a client-side file write)",
-    },
-    CommandSpec {
         path: &["display", "status"],
         lane: RiskLane::Inspect,
         tool: "display_readiness",
@@ -830,51 +814,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Execute a JSON array of computer-use actions",
     },
     CommandSpec {
-        // ctl routes `browser actions`/`browser exec` through the same
-        // CU-actions handler (pinned to mirror `cu actions`).
-        path: &["browser", "actions"],
-        lane: RiskLane::Act,
-        tool: "execute_cu_actions",
-        seed: "{}",
-        positionals: &[p_json("ACTIONS", "actions", true)],
-        flags: &[
-            flag!("actions", "actions", Json, "ctl-spelling alias for ACTIONS"),
-            flag!("target", "display_target", Str, "display target"),
-            flag!(
-                "coordinate-space",
-                "coordinate_space",
-                Str,
-                "pixel (default) or normalized_1000"
-            ),
-            flag!("observe", "observe", Str, "pixels|ax|auto|none"),
-            flag!("annotate", "annotate", Bool, "draw click crosshairs"),
-            flag!("settle", "settle", Json, "true/false or settle cap ms"),
-        ],
-        help: "Execute a JSON array of computer-use actions (ctl's browser alias)",
-    },
-    CommandSpec {
-        // ctl alias for `browser actions` (pinned to mirror `cu actions`).
-        path: &["browser", "exec"],
-        lane: RiskLane::Act,
-        tool: "execute_cu_actions",
-        seed: "{}",
-        positionals: &[p_json("ACTIONS", "actions", true)],
-        flags: &[
-            flag!("actions", "actions", Json, "ctl-spelling alias for ACTIONS"),
-            flag!("target", "display_target", Str, "display target"),
-            flag!(
-                "coordinate-space",
-                "coordinate_space",
-                Str,
-                "pixel (default) or normalized_1000"
-            ),
-            flag!("observe", "observe", Str, "pixels|ax|auto|none"),
-            flag!("annotate", "annotate", Bool, "draw click crosshairs"),
-            flag!("settle", "settle", Json, "true/false or settle cap ms"),
-        ],
-        help: "Execute a JSON array of computer-use actions (ctl's browser alias)",
-    },
-    CommandSpec {
         path: &["display", "create"],
         lane: RiskLane::Act,
         tool: "create_virtual_display",
@@ -911,22 +850,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "stream filter when FRAME_ID is \"latest\""
         )],
         help: "Read one captured frame (\"latest\" works)",
-    },
-    CommandSpec {
-        // ctl routes `display frame` and `display read-frame` to the
-        // same tool.
-        path: &["display", "frame"],
-        lane: RiskLane::Inspect,
-        tool: "read_frame",
-        seed: r#"{"frame_id":"latest"}"#,
-        positionals: &[p_str("FRAME_ID", "frame_id", false, false)],
-        flags: &[flag!(
-            "stream",
-            "stream",
-            Str,
-            "stream filter when FRAME_ID is \"latest\""
-        )],
-        help: "Read one captured frame (ctl alias for read-frame)",
     },
     CommandSpec {
         path: &["display", "take"],
@@ -1010,17 +933,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "List browser workspaces",
     },
     CommandSpec {
-        // ctl alias for `browser list` (`alias_rows_mirror_their_primaries`
-        // pins the pair).
-        path: &["browser", "ls"],
-        lane: RiskLane::Inspect,
-        tool: "list_browser_workspaces",
-        seed: "{}",
-        positionals: &[],
-        flags: &[],
-        help: "List browser workspaces (ctl alias)",
-    },
-    CommandSpec {
         path: &["browser", "create"],
         lane: RiskLane::Act,
         tool: "create_browser_workspace",
@@ -1041,29 +953,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
         ],
         help: "Create a browser workspace",
-    },
-    CommandSpec {
-        // ctl alias for `browser create` (pinned to mirror it).
-        path: &["browser", "open"],
-        lane: RiskLane::Act,
-        tool: "create_browser_workspace",
-        seed: "{}",
-        positionals: &[p_str("URL", "url", false, false)],
-        flags: &[
-            flag!("url", "url", Str, "URL to open (omit = about:blank)"),
-            flag!("label", "label", Str, "dashboard label"),
-            flag!(
-                "provider",
-                "provider",
-                Str,
-                "auto|cdp|system_cdp|playwright|agent_browser|stream"
-            ),
-            flag!("peer", "peer_id", Str, "federation peer (ctl spelling)"),
-            flag!("session", "owner_session_id", Str, "owning session (ctl spelling)"),
-            flag!("owner-session", "owner_session_id", Str, "owning session"),
-            flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
-        ],
-        help: "Create a browser workspace (ctl alias)",
     },
     CommandSpec {
         path: &["browser", "close"],
@@ -1091,25 +980,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("force", "force", Bool, "steal a live lease"),
         ],
         help: "Acquire a browser workspace lease",
-    },
-    CommandSpec {
-        // ctl alias for `browser acquire` (pinned to mirror it).
-        path: &["browser", "take"],
-        lane: RiskLane::Act,
-        tool: "acquire_browser_workspace",
-        seed: r#"{"holder_id":"__caller"}"#,
-        positionals: &[
-            p_str("WORKSPACE_ID", "workspace_id", true, false),
-            p_str("HOLDER_ID", "holder_id", false, false),
-        ],
-        flags: &[
-            flag!("holder", "holder_id", Str, "holder taking the lease (ctl spelling)"),
-            flag!("holder-id", "holder_id", Str, "holder taking the lease"),
-            flag!("holder-kind", "holder_kind", Str, "holder kind"),
-            flag!("note", "note", Str, "lease note"),
-            flag!("force", "force", Bool, "steal a live lease"),
-        ],
-        help: "Acquire a browser workspace lease (ctl alias)",
     },
     CommandSpec {
         path: &["browser", "release"],
@@ -2383,9 +2253,110 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
+/// ctl's family spellings (`ctl.rs::run`'s multi-pattern arms), applied
+/// to the first argv token before path resolution. One table instead of
+/// duplicated rows: an alias resolves to the canonical family's own
+/// rows, so its vocabulary cannot drift ("derive, don't mirror").
+pub(crate) const FAMILY_ALIASES: &[(&str, &str)] = &[
+    ("browsers", "browser"),
+    ("shared-view", "shared"),
+    ("approvals", "approval"),
+    ("sessions", "session"),
+    ("peers", "peer"),
+    ("set", "settings"),
+];
+
+/// ctl's command-path aliases (the family dispatchers' multi-pattern
+/// arms), rewritten whole-path to the canonical row before resolution —
+/// the same no-copies rule as [`FAMILY_ALIASES`]. `cu screenshot` is
+/// the one cross-family entry: ctl routes it through the display
+/// screenshot handler by that name.
+pub(crate) const COMMAND_ALIASES: &[(&[&str], &[&str])] = &[
+    (&["browser", "ls"], &["browser", "list"]),
+    (&["browser", "open"], &["browser", "create"]),
+    (&["browser", "take"], &["browser", "acquire"]),
+    (&["cu", "exec"], &["cu", "actions"]),
+    (&["cu", "read-screen"], &["cu", "elements"]),
+    (&["cu", "screenshot"], &["display", "screenshot"]),
+    (&["display", "frame"], &["display", "read-frame"]),
+    (&["display", "ready"], &["display", "status"]),
+    (&["display", "readiness"], &["display", "status"]),
+    (&["display", "grant_user"], &["display", "grant-user"]),
+    (
+        &["display", "grant-user-display"],
+        &["display", "grant-user"],
+    ),
+    (
+        &["display", "grant_user_display"],
+        &["display", "grant-user"],
+    ),
+    (&["display", "revoke_user"], &["display", "revoke-user"]),
+    (
+        &["display", "revoke-user-display"],
+        &["display", "revoke-user"],
+    ),
+    (
+        &["display", "revoke_user_display"],
+        &["display", "revoke-user"],
+    ),
+    (&["display", "request-user"], &["display", "request"]),
+    (&["display", "request_user"], &["display", "request"]),
+    (
+        &["display", "request_user_display"],
+        &["display", "request"],
+    ),
+    (&["shared", "request-input"], &["shared", "input"]),
+    (&["agenda", "ls"], &["agenda", "list"]),
+    (&["agenda", "done"], &["agenda", "complete"]),
+    (&["agenda", "pick-up"], &["agenda", "pickup"]),
+    (&["agenda", "ack"], &["agenda", "acknowledge"]),
+    (&["agenda", "needs"], &["agenda", "relies-on"]),
+    (&["agenda", "relates-to"], &["agenda", "relates"]),
+    (&["agenda", "edit"], &["agenda", "patch"]),
+    (&["context", "inspect-anchor"], &["context", "inspect"]),
+    (&["memory", "list"], &["memory", "search"]),
+    (&["memory", "ls"], &["memory", "search"]),
+    (&["memory", "show"], &["memory", "read"]),
+    (&["memory", "add"], &["memory", "propose"]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The alias tables stay coherent with the registry: every command
+    /// alias rewrites onto a REGISTERED canonical path, no alias source
+    /// shadows a real row (an alias must never change what a registered
+    /// spelling means), sources are unique, and every family alias
+    /// points at a family that actually has rows.
+    #[test]
+    fn alias_tables_target_registered_rows_and_shadow_nothing() {
+        for (alias, canonical) in COMMAND_ALIASES {
+            assert!(
+                COMMANDS.iter().any(|spec| spec.path == *canonical),
+                "alias {alias:?} rewrites to unregistered {canonical:?}"
+            );
+            assert!(
+                !COMMANDS.iter().any(|spec| spec.path == *alias),
+                "alias {alias:?} shadows a registered row"
+            );
+        }
+        for (i, (a, _)) in COMMAND_ALIASES.iter().enumerate() {
+            for (b, _) in &COMMAND_ALIASES[i + 1..] {
+                assert_ne!(a, b, "duplicate command alias source");
+            }
+        }
+        for (alias, family) in FAMILY_ALIASES {
+            assert!(
+                COMMANDS.iter().any(|spec| spec.path[0] == *family),
+                "family alias {alias:?} points at rowless family {family:?}"
+            );
+            assert!(
+                !COMMANDS.iter().any(|spec| spec.path[0] == *alias),
+                "family alias {alias:?} shadows a registered family"
+            );
+        }
+    }
 
     /// Every registry row's operation derives from its underlying tool and
     /// stays consistent with its risk lane: inspect rows carry read-class
@@ -2430,48 +2401,6 @@ mod tests {
             for b in &COMMANDS[i + 1..] {
                 assert_ne!(a.path, b.path, "duplicate command path");
             }
-        }
-    }
-
-    /// ctl's path aliases mirror their primary row exactly — tool,
-    /// lane, seed, and the whole argument vocabulary — so a flag added
-    /// to one side cannot silently drift from the other (the alias
-    /// rows are copies, and this pin is what makes copies safe).
-    #[test]
-    fn alias_rows_mirror_their_primaries() {
-        let find = |path: &[&str]| {
-            COMMANDS
-                .iter()
-                .find(|spec| spec.path == path)
-                .unwrap_or_else(|| panic!("missing row {path:?}"))
-        };
-        let vocab = |spec: &CommandSpec| {
-            (
-                spec.positionals
-                    .iter()
-                    .map(|p| (p.name, p.json_key, p.kind, p.required, p.greedy))
-                    .collect::<Vec<_>>(),
-                spec.flags
-                    .iter()
-                    .map(|f| (f.name, f.json_key, f.kind))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        for (alias, primary) in [
-            (&["browser", "ls"][..], &["browser", "list"][..]),
-            (&["browser", "open"][..], &["browser", "create"][..]),
-            (&["browser", "take"][..], &["browser", "acquire"][..]),
-            (&["browser", "actions"][..], &["cu", "actions"][..]),
-            (&["browser", "exec"][..], &["cu", "actions"][..]),
-            (&["display", "frame"][..], &["display", "read-frame"][..]),
-            (&["cu", "screenshot"][..], &["display", "screenshot"][..]),
-        ] {
-            let alias_spec = find(alias);
-            let primary_spec = find(primary);
-            assert_eq!(alias_spec.tool, primary_spec.tool, "{alias:?}");
-            assert_eq!(alias_spec.lane, primary_spec.lane, "{alias:?}");
-            assert_eq!(alias_spec.seed, primary_spec.seed, "{alias:?}");
-            assert_eq!(vocab(alias_spec), vocab(primary_spec), "{alias:?}");
         }
     }
 }

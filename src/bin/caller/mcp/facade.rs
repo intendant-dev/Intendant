@@ -101,6 +101,30 @@ fn argv_from_args(args: &serde_json::Value) -> Result<Vec<String>, String> {
         .map_err(|_| "missing argv: pass the command as an array of strings".to_string())
 }
 
+/// Rewrite ctl's alias spellings onto their canonical paths before
+/// resolution: the family token first ([`FAMILY_ALIASES`]), then one
+/// whole-path rewrite ([`COMMAND_ALIASES`]) — so `browsers ls` becomes
+/// `browser list` and resolves to the canonical row's own vocabulary.
+/// Exact-match and fail-closed like the resolver itself; the registry
+/// pin holds that no alias shadows a registered spelling.
+fn normalize_aliases(mut argv: Vec<String>) -> Vec<String> {
+    let Some(first) = argv.first() else {
+        return argv;
+    };
+    if let Some((_, canonical)) = FAMILY_ALIASES.iter().find(|(alias, _)| alias == first) {
+        argv[0] = (*canonical).to_string();
+    }
+    for (alias, canonical) in COMMAND_ALIASES {
+        if argv.len() >= alias.len() && argv[..alias.len()].iter().eq(alias.iter()) {
+            let mut rewritten: Vec<String> =
+                canonical.iter().map(|seg| (*seg).to_string()).collect();
+            rewritten.extend(argv.drain(alias.len()..));
+            return rewritten;
+        }
+    }
+    argv
+}
+
 /// Longest exact path match: `["agenda","list"]` beats a hypothetical
 /// one-segment `["agenda"]`; a bare family name resolves to nothing (no
 /// prefix dispatch — the parser is fail-closed).
@@ -1069,6 +1093,7 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
     if argv.is_empty() {
         return Err("empty argv — call the help tool for the command map".to_string());
     }
+    let argv = normalize_aliases(argv);
     let spec = resolve_path(&argv)?;
     if spec.lane.tool_name() != meta {
         return Err(format!(
@@ -2106,12 +2131,39 @@ mod tests {
         assert_eq!(planned.args["url"], "https://example.com");
         let planned = plan_for_meta("act", &argv(&["browser", "take", "ws-1"])).unwrap();
         assert_eq!(planned.tool, "acquire_browser_workspace");
+        // Round 31: the alias TABLES — family spellings and ctl's
+        // command aliases rewrite onto canonical rows (one sample per
+        // class; the registry pin holds the tables coherent).
         let planned = plan_for_meta(
             "act",
-            &argv(&["browser", "exec", "[{\"action\":\"screenshot\"}]"]),
+            &argv(&["cu", "exec", "[{\"action\":\"screenshot\"}]"]),
         )
         .unwrap();
         assert_eq!(planned.tool, "execute_cu_actions");
+        let planned = plan_for_meta("inspect", &argv(&["browsers", "ls"])).unwrap();
+        assert_eq!(planned.tool, "list_browser_workspaces");
+        let planned = plan_for_meta("inspect", &argv(&["approvals", "pending"])).unwrap();
+        assert_eq!(planned.tool, "get_pending_approval");
+        let planned = plan_for_meta("inspect", &argv(&["peers", "list"])).unwrap();
+        assert_eq!(planned.tool, "list_peers");
+        let planned =
+            plan_for_meta("act", &argv(&["sessions", "note", "remember the port"])).unwrap();
+        assert_eq!(planned.tool, "post_session_note");
+        let planned = plan_for_meta("authorize", &argv(&["set", "autonomy", "high"])).unwrap();
+        assert_eq!(planned.tool, "set_autonomy");
+        let planned = plan_for_meta("act", &argv(&["shared-view", "show"])).unwrap();
+        assert_eq!(planned.tool, "show_shared_view");
+        let planned = plan_for_meta("act", &argv(&["agenda", "done", "item-1"])).unwrap();
+        assert_eq!(planned.tool, "agenda_op");
+        assert_eq!(planned.args["op"], "complete");
+        let planned = plan_for_meta("inspect", &argv(&["memory", "show", "claim-1"])).unwrap();
+        assert_eq!(planned.tool, "memory_read");
+        let planned = plan_for_meta("inspect", &argv(&["display", "ready"])).unwrap();
+        assert_eq!(planned.tool, "display_readiness");
+        let planned = plan_for_meta("inspect", &argv(&["cu", "screenshot"])).unwrap();
+        assert_eq!(planned.tool, "take_screenshot");
+        let planned = plan_for_meta("authorize", &argv(&["shared", "request-input"])).unwrap();
+        assert_eq!(planned.tool, "request_shared_view_input");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
