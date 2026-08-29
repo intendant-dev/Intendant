@@ -316,6 +316,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("source", "source", Str, "short source label"),
             flag!("session", "session_id", Str, "post into another session"),
+            flag!(
+                "images",
+                "images",
+                Json,
+                "JSON array of {media_type, data (base64), name?} attachments"
+            ),
         ],
         help: "Post a display-only note into the session transcript",
     },
@@ -891,7 +897,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["browser", "acquire"],
         lane: RiskLane::Act,
         tool: "acquire_browser_workspace",
-        seed: r#"{"holder_id":"facade"}"#,
+        seed: r#"{"holder_id":"__caller"}"#,
         positionals: &[
             p_str("WORKSPACE_ID", "workspace_id", true, false),
             p_str("HOLDER_ID", "holder_id", false, false),
@@ -1147,15 +1153,21 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["agenda", "ask"],
         lane: RiskLane::Act,
         tool: "agenda_op",
-        seed: r#"{"op":"ask"}"#,
-        positionals: &[p_json("QUESTIONS", "questions", true)],
+        seed: r#"{"op":"add","kind":"question"}"#,
+        positionals: &[p_str("TEXT", "title", false, true)],
         flags: &[
             flag!("body", "body", Str, "markdown body"),
             flag!("tag", "tags", StrList, "tag (repeatable)"),
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
+            flag!(
+                "questions",
+                "__ask_questions",
+                Json,
+                "structured option-bearing form: JSON array of question objects (omit TEXT)"
+            ),
         ],
-        help: "Park a durable question (QUESTIONS is a JSON array)",
+        help: "Park a durable question (plain TEXT, or --questions for the structured form — ctl's own split)",
     },
     CommandSpec {
         path: &["agenda", "block"],
@@ -1980,6 +1992,31 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     if obj.remove("__all_statuses").is_some() {
         obj.remove("status");
     }
+    // The `agenda ask` split, mirroring ctl: plain TEXT parks an
+    // ordinary question item (op add, kind question); --questions is
+    // the structured option-bearing form (op ask), which carries no
+    // kind or title.
+    if let Some(questions) = obj.remove("__ask_questions") {
+        if obj.contains_key("title") {
+            return Err(
+                "use either plain TEXT or --questions, not both — the structured form carries its questions inside the array".to_string(),
+            );
+        }
+        obj.insert(
+            "op".to_string(),
+            serde_json::Value::String("ask".to_string()),
+        );
+        obj.remove("kind");
+        obj.insert("questions".to_string(), questions);
+    } else if obj.get("op").and_then(serde_json::Value::as_str) == Some("add")
+        && obj.get("kind").and_then(serde_json::Value::as_str) == Some("question")
+        && !obj.contains_key("title")
+    {
+        return Err(
+            "agenda ask needs the question TEXT (or --questions for the structured form)"
+                .to_string(),
+        );
+    }
     // The multi-question ask carries its decision fields INSIDE each
     // question object — the daemon ignores the flat twins when
     // `questions` is present, so accepting the combination would
@@ -2005,6 +2042,25 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         }
     }
     Ok(serde_json::Value::Object(obj))
+}
+
+/// Replace the `"__caller"` identity sentinel in a planned call's
+/// top-level string values with the dispatching caller's identity. The
+/// planner is pure and cannot know who is calling, but a CONSTANT
+/// default identity would make two different facade sessions collide as
+/// the "same" holder (the browser-lease registry rejects only a
+/// DIFFERENT holder id, so a constant silently hands one session's
+/// exclusive lease to another). The dispatcher substitutes after
+/// resolution; the gate's resolution ignores argument values, so
+/// authorization is unaffected.
+pub(crate) fn substitute_caller_identity(args: &mut serde_json::Value, identity: &str) {
+    if let Some(obj) = args.as_object_mut() {
+        for value in obj.values_mut() {
+            if value.as_str() == Some("__caller") {
+                *value = serde_json::Value::String(identity.to_string());
+            }
+        }
+    }
 }
 
 /// Resolve one executor call (`inspect`/`act`/`authorize`) into the command
@@ -2503,6 +2559,73 @@ mod tests {
         assert_eq!(planned.args["park"], serde_json::json!(true));
     }
 
+    /// The dispatcher replaces the identity sentinel with the caller's
+    /// own identity, so two facade sessions never collide as the same
+    /// lease holder (review round 10); explicit values pass untouched.
+    #[test]
+    fn caller_identity_sentinel_substitutes_at_dispatch() {
+        let mut args = serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" });
+        substitute_caller_identity(&mut args, "sess-7");
+        assert_eq!(args["holder_id"], "sess-7");
+        assert_eq!(args["workspace_id"], "ws-1");
+        let mut args = serde_json::json!({ "holder_id": "alice" });
+        substitute_caller_identity(&mut args, "sess-7");
+        assert_eq!(args["holder_id"], "alice");
+    }
+
+    /// `agenda ask` mirrors ctl's own split (review round 10): plain
+    /// TEXT parks an ordinary question item; --questions is the
+    /// structured op:ask form; mixing or omitting both is a plan error.
+    #[test]
+    fn agenda_ask_splits_plain_and_structured_forms() {
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "ask", "When should this run?"])).unwrap();
+        assert_eq!(planned.args["op"], "add");
+        assert_eq!(planned.args["kind"], "question");
+        assert_eq!(planned.args["title"], "When should this run?");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "ask",
+                "--questions",
+                "[{\"question\":\"which?\",\"options\":[{\"label\":\"a\"}]}]",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["op"], "ask");
+        assert!(planned.args.get("kind").is_none());
+        assert!(planned.args.get("title").is_none());
+        assert_eq!(planned.args["questions"][0]["question"], "which?");
+        let err = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ask", "text", "--questions", "[]"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        let err = plan_for_meta("act", &argv(&["agenda", "ask"])).unwrap_err();
+        assert!(err.contains("needs the question TEXT"), "{err}");
+    }
+
+    /// Session-note image attachments travel as literal JSON (review
+    /// round 10) — the daemon reads no caller paths; base64 goes in the
+    /// objects.
+    #[test]
+    fn session_note_carries_image_attachments() {
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "session",
+                "note",
+                "see this",
+                "--images",
+                "[{\"media_type\":\"image/png\",\"data\":\"aGk=\"}]",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["images"][0]["media_type"], "image/png");
+    }
+
     /// Bare `agenda list` serves the useful default (open work) instead
     /// of the whole ledger, `--all` lifts the seed, and an explicit
     /// status overrides it (review round 9); the residual divergence
@@ -2532,7 +2655,10 @@ mod tests {
             plan_for_meta("inspect", &argv(&["display", "read-frame", "frame-7"])).unwrap();
         assert_eq!(planned.args["frame_id"], "frame-7");
         let planned = plan_for_meta("act", &argv(&["browser", "acquire", "ws-1"])).unwrap();
-        assert_eq!(planned.args["holder_id"], "facade");
+        assert_eq!(
+            planned.args["holder_id"], "__caller",
+            "the identity sentinel travels to dispatch, which substitutes the caller"
+        );
         let planned =
             plan_for_meta("act", &argv(&["browser", "acquire", "ws-1", "sess-4"])).unwrap();
         assert_eq!(planned.args["holder_id"], "sess-4");

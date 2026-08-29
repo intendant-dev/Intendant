@@ -112,7 +112,13 @@ write/effect family), memory (reads, proposals, and owner curation),
 displays, browser workspaces, computer use, shared view, settings,
 remote compute, controller, audio, peers, terminal, and context — with
 nested/structured parameters passed as literal JSON values (parsed at
-plan time; a parse failure never dispatches). The serialized facade
+plan time; a parse failure never dispatches). Three ctl surfaces are
+deliberately NOT registry commands: `dashboard-url` (a local file
+read), `tools call` (the variable-operation escape hatch — raw `/mcp`
+exists for typed callers), and the `agenda ops`/`agenda occurrences`
+audit reads, which ride the loopback-token `/api` lane and refuse the
+peer and supervised-session lanes by design — a trust boundary the
+facade must not tunnel through. The serialized facade
 listing is budget-pinned in tests so the whole advertised surface stays
 a few kilobytes regardless of registry size; `intendant ctl events` is
 the CLI leg of the `events` verb (client-side ≤60s chunking over a

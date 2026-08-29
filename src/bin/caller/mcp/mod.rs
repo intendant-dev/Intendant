@@ -646,7 +646,17 @@ impl IntendantServer {
             // not a privilege: a parse failure is a tool error, never a
             // dispatch.
             "inspect" | "act" | "authorize" => match facade::plan_for_meta(name, &args) {
-                Ok(planned) => {
+                Ok(mut planned) => {
+                    // Seeded "__caller" identity defaults become THIS
+                    // caller's identity: the gate-bound session when one
+                    // exists, else the principal, else the facade label —
+                    // so two facade sessions never collide as one holder.
+                    let identity = actor
+                        .session_id
+                        .as_deref()
+                        .or(actor.principal_id.as_deref())
+                        .unwrap_or("facade");
+                    facade::substitute_caller_identity(&mut planned.args, identity);
                     Box::pin(self.call_tool_by_name_as_caller(
                         planned.tool,
                         planned.args,
