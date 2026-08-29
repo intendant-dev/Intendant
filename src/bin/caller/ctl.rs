@@ -823,7 +823,12 @@ async fn run_events(
             since = Some(cursor.to_string());
         }
         delivered_any |= !events.is_empty();
-        if delivered_any && !follow {
+        let gap = envelope.get("gap").and_then(Value::as_bool) == Some(true);
+        // A gap is a terminal answer for the one-shot form: the server
+        // said "resync now", and burning the rest of the budget on
+        // another long poll after printing the warning helps nobody.
+        // --follow keeps streaming from the advanced cursor.
+        if (delivered_any || gap) && !follow {
             break;
         }
     }

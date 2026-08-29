@@ -357,13 +357,19 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["agenda", "list"],
         lane: RiskLane::Inspect,
         tool: "agenda_list",
-        seed: "{}",
+        seed: r#"{"status":"open"}"#,
         positionals: &[],
         flags: &[
-            flag!("status", "status", Str, "open|done|retired"),
+            flag!(
+                "status",
+                "status",
+                Str,
+                "open (default) | done | retired"
+            ),
+            flag!("all", "__all_statuses", Bool, "the whole ledger, every status"),
             flag!("q", "q", Str, "server-side search"),
         ],
-        help: "List agenda items (oldest first, with counts)",
+        help: "List agenda items (default: open work; ctl's bare list additionally folds in unconsumed answers client-side)",
     },
     CommandSpec {
         path: &["agenda", "show"],
@@ -1969,6 +1975,11 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             ),
         );
     }
+    // The `agenda list --all` shape: lift the seeded open-status default
+    // so the whole ledger (every status) comes back.
+    if obj.remove("__all_statuses").is_some() {
+        obj.remove("status");
+    }
     // The multi-question ask carries its decision fields INSIDE each
     // question object — the daemon ignores the flat twins when
     // `questions` is present, so accepting the combination would
@@ -2490,6 +2501,22 @@ mod tests {
         let planned = plan_for_meta("act", &argv(&["ask", "ship it?", "--park"])).unwrap();
         assert_eq!(planned.args["question"], "ship it?");
         assert_eq!(planned.args["park"], serde_json::json!(true));
+    }
+
+    /// Bare `agenda list` serves the useful default (open work) instead
+    /// of the whole ledger, `--all` lifts the seed, and an explicit
+    /// status overrides it (review round 9); the residual divergence
+    /// from ctl's client-side answered-union is named in the row help.
+    #[test]
+    fn agenda_list_defaults_to_open_and_all_lifts_it() {
+        let planned = plan_for_meta("inspect", &argv(&["agenda", "list"])).unwrap();
+        assert_eq!(planned.args["status"], "open");
+        let planned = plan_for_meta("inspect", &argv(&["agenda", "list", "--all"])).unwrap();
+        assert!(planned.args.get("status").is_none());
+        assert!(planned.args.get("__all_statuses").is_none());
+        let planned =
+            plan_for_meta("inspect", &argv(&["agenda", "list", "--status", "done"])).unwrap();
+        assert_eq!(planned.args["status"], "done");
     }
 
     /// ctl's default forms plan identically through the facade (review
