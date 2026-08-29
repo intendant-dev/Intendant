@@ -2179,8 +2179,15 @@ impl AgendaStore {
                 let parent_id = parent_id.trim().to_string();
                 let item = self.require(&id)?;
                 match &item.part_of {
-                    Some(placement) if placement.parent_id == parent_id => {
-                        Ok(AgendaOp::RemovePartOf { id, parent_id })
+                    // An empty parent removes the CURRENT placement (the
+                    // ClearBlocker sole-resolve idiom, for surfaces that
+                    // can't read the ledger first); the durable op still
+                    // carries the exact parent id.
+                    Some(placement) if parent_id.is_empty() || placement.parent_id == parent_id => {
+                        Ok(AgendaOp::RemovePartOf {
+                            id,
+                            parent_id: placement.parent_id.clone(),
+                        })
                     }
                     Some(placement) => Err(AgendaError::NotFound(format!(
                         "{id} is placed under {}, not {parent_id}",
@@ -2561,10 +2568,17 @@ impl AgendaStore {
                 resolve(self, id)?;
                 resolve(self, target_id)?;
             }
-            AgendaCommand::AddPartOf { id, parent_id, .. }
-            | AgendaCommand::RemovePartOf { id, parent_id, .. } => {
+            AgendaCommand::AddPartOf { id, parent_id, .. } => {
                 resolve(self, id)?;
                 resolve(self, parent_id)?;
+            }
+            AgendaCommand::RemovePartOf { id, parent_id, .. } => {
+                resolve(self, id)?;
+                // Empty parent = remove the current placement (resolved
+                // in the validation arm) — not a prefix to expand.
+                if !parent_id.is_empty() {
+                    resolve(self, parent_id)?;
+                }
             }
             AgendaCommand::Place { id, under, .. } => {
                 resolve(self, id)?;

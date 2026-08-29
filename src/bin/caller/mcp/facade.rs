@@ -126,6 +126,16 @@ const fn p_u64(name: &'static str, json_key: &'static str) -> PositionalSpec {
     }
 }
 
+const fn p_u64_opt(name: &'static str, json_key: &'static str) -> PositionalSpec {
+    PositionalSpec {
+        name,
+        json_key,
+        kind: ValueKind::U64,
+        required: false,
+        greedy: false,
+    }
+}
+
 const fn p_json(name: &'static str, json_key: &'static str, required: bool) -> PositionalSpec {
     PositionalSpec {
         name,
@@ -1417,13 +1427,19 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: r#"{"op":"place"}"#,
         positionals: &[
             p_str("ID", "id", true, false),
-            p_str("UNDER", "under", true, false),
+            p_str("UNDER", "under", false, false),
         ],
         flags: &[
             flag!("under", "under", Str, "ctl-spelling alias for UNDER"),
+            flag!(
+                "remove",
+                "__unplace",
+                Bool,
+                "remove the CURRENT placement (the daemon resolves the parent)"
+            ),
             flag!("source", "source", Str, "self-described caller label"),
         ],
-        help: "Re-parent an item under a hub (ctl's place --remove resolves the parent client-side — use part-remove ID PARENT here)",
+        help: "Re-parent an item under a hub, or --remove its current placement",
     },
     CommandSpec {
         path: &["agenda", "relates-add"],
@@ -1533,11 +1549,17 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: r#"{"op":"propose_effect"}"#,
         positionals: &[
             p_str("ID", "id", true, false),
-            p_u64("FIRE_AT_MS", "fire_at_ms"),
-            p_str("GOAL", "goal", true, true),
+            p_u64_opt("FIRE_AT_MS", "fire_at_ms"),
+            p_str("GOAL", "goal", false, true),
         ],
         flags: &[
             flag!("goal", "goal", Str, "ctl-spelling alias for GOAL"),
+            flag!(
+                "on-item-match",
+                "__on_item_match",
+                Str,
+                "fire when a matching item parks: KIND:TAG[,TAG...] (e.g. question:gate)"
+            ),
             flag!(
                 "at",
                 "fire_at_ms",
@@ -1649,6 +1671,33 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "suspend after N failures"
             ),
             flag!("note", "annotations", StrList, "annotation (ctl spelling)"),
+            flag!("agent", "agent_config.agent", Str, "launch pin: backend"),
+            flag!(
+                "claude-model",
+                "agent_config.claude_model",
+                Str,
+                "launch pin"
+            ),
+            flag!(
+                "claude-effort",
+                "agent_config.claude_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("codex-model", "agent_config.codex_model", Str, "launch pin"),
+            flag!(
+                "codex-reasoning-effort",
+                "agent_config.codex_reasoning_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("kimi-model", "agent_config.kimi_model", Str, "launch pin"),
+            flag!(
+                "kimi-thinking",
+                "agent_config.kimi_thinking",
+                Str,
+                "launch pin"
+            ),
             flag!("agent-config", "agent_config", Json, "agent launch pins"),
             flag!(
                 "annotation",
@@ -2364,14 +2413,91 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         obj.remove("must_read");
         obj.remove("label");
     }
-    // ctl's `--on-unblock` is the dependency-gated trigger shape.
-    if obj.remove("__on_unblock").is_some() {
+    // ctl's trigger pair: `--on-unblock` is the dependency-gated shape,
+    // `--on-item-match KIND:TAG[,TAG…]` the item-match shape; one
+    // trigger only, and a triggered manifest is trigger OR cadence.
+    let on_unblock = obj.remove("__on_unblock").is_some();
+    let on_item_match = obj.remove("__on_item_match");
+    if on_unblock || on_item_match.is_some() {
         if obj.contains_key("trigger") {
-            return Err("pass --on-unblock or --trigger, not both".to_string());
+            return Err(
+                "pass one trigger form — --on-unblock, --on-item-match, or --trigger".to_string(),
+            );
+        }
+        if on_unblock && on_item_match.is_some() {
+            return Err("pass --on-unblock OR --on-item-match, not both".to_string());
+        }
+        let trigger = if on_unblock {
+            serde_json::json!({ "kind": "on_unblock" })
+        } else {
+            let spec = on_item_match
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let Some((kind, tags)) = spec.split_once(':') else {
+                return Err(
+                    "--on-item-match takes KIND:TAG[,TAG...] (e.g. question:gate)".to_string(),
+                );
+            };
+            let tags: Vec<serde_json::Value> = tags
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| serde_json::Value::String(tag.to_string()))
+                .collect();
+            serde_json::json!({
+                "kind": "on_item_match",
+                "item_kind": kind.trim(),
+                "tags": tags,
+            })
+        };
+        obj.insert("trigger".to_string(), trigger);
+    }
+    // A schedule is cadenced OR triggered (ctl's own refusal), and a
+    // triggered manifest's omitted fire instant is the ARM FLOOR —
+    // "armed on approval", filled with the dispatch clock via the
+    // `__now` sentinel (the planner is pure and reads no clock).
+    if spec.tool == "agenda_op"
+        && obj.get("op").and_then(serde_json::Value::as_str) == Some("propose_effect")
+    {
+        if !obj.contains_key("goal") {
+            return Err("agenda schedule requires --goal TEXT".to_string());
+        }
+        if obj.contains_key("trigger") && obj.contains_key("recurrence") {
+            return Err(
+                "a manifest is cadenced OR triggered: pass --every or a trigger flag, not both"
+                    .to_string(),
+            );
+        }
+        if !obj.contains_key("fire_at_ms") {
+            if obj.contains_key("trigger") {
+                obj.insert(
+                    "fire_at_ms".to_string(),
+                    serde_json::Value::String("__now".to_string()),
+                );
+            } else {
+                return Err(
+                    "agenda schedule requires FIRE_AT_MS (epoch ms) — or a trigger flag, whose omitted instant means armed on approval"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    // ctl's `agenda place ID --remove` removes the CURRENT placement:
+    // the empty parent id tells the daemon to resolve it (the
+    // sole-blocker idiom).
+    if obj.remove("__unplace").is_some() {
+        if obj.contains_key("under") {
+            return Err("pass UNDER to re-parent or --remove to unplace, not both".to_string());
         }
         obj.insert(
-            "trigger".to_string(),
-            serde_json::json!({ "kind": "on_unblock" }),
+            "op".to_string(),
+            serde_json::Value::String("remove_part_of".to_string()),
+        );
+        obj.remove("under");
+        obj.insert(
+            "parent_id".to_string(),
+            serde_json::Value::String(String::new()),
         );
     }
     // ctl's `--region x,y,width,height` (normalized 0-1 floats) becomes
@@ -2477,6 +2603,17 @@ pub(crate) fn substitute_caller_identity(args: &mut serde_json::Value, identity:
         for value in obj.values_mut() {
             if value.as_str() == Some("__caller") {
                 *value = serde_json::Value::String(identity.to_string());
+            } else if value.as_str() == Some("__now") {
+                // The dispatch clock, for planner-pure "now" defaults
+                // (a triggered schedule's omitted arm floor = armed on
+                // approval). Same discipline as the identity sentinel:
+                // substituted after gate resolution, values only.
+                *value = serde_json::Value::from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                );
             }
         }
     }
@@ -3301,7 +3438,6 @@ mod tests {
                 "run the sweep",
                 "--every",
                 "86400000",
-                "--on-unblock",
                 "--agent",
                 "codex",
                 "--project",
@@ -3310,9 +3446,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["recurrence"]["every_ms"], 86_400_000u64);
-        assert_eq!(planned.args["trigger"]["kind"], "on_unblock");
         assert_eq!(planned.args["agent_config"]["agent"], "codex");
         assert_eq!(planned.args["project_root"], "/srv/proj");
+        // Triggered schedules: --on-unblock with no instant arms on
+        // approval (the __now sentinel fills at dispatch);
+        // --on-item-match parses ctl's compact spec; cadence+trigger
+        // and dual triggers refuse in ctl's own words (round 20).
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "gate the question",
+                "--on-unblock",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["trigger"]["kind"], "on_unblock");
+        assert_eq!(planned.args["fire_at_ms"], "__now");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "gate",
+                "--on-item-match",
+                "question:gate,urgent",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["trigger"]["kind"], "on_item_match");
+        assert_eq!(planned.args["trigger"]["item_kind"], "question");
+        assert_eq!(
+            planned.args["trigger"]["tags"],
+            serde_json::json!(["gate", "urgent"])
+        );
+        assert!(plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--every",
+                "1000",
+                "--on-unblock"
+            ])
+        )
+        .is_err());
+        assert!(
+            plan_for_meta(
+                "act",
+                &argv(&["agenda", "schedule", "item-1", "--on-unblock"])
+            )
+            .is_err(),
+            "goal is required"
+        );
+        // The one-command unplace: --remove sends the empty parent the
+        // daemon resolves to the current placement (round 20).
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "place", "item-1", "--remove"])).unwrap();
+        assert_eq!(planned.args["op"], "remove_part_of");
+        assert_eq!(planned.args["parent_id"], "");
+        assert!(plan_for_meta(
+            "act",
+            &argv(&["agenda", "place", "item-1", "hub-1", "--remove"])
+        )
+        .is_err());
+        // Stamp carries the same launch pins (round 20).
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "stamp", "fix-task", "--agent", "codex"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["agent_config"]["agent"], "codex");
+        // The dispatch clock sentinel becomes a number.
+        let mut args = serde_json::json!({ "fire_at_ms": "__now" });
+        substitute_caller_identity(&mut args, "sess-1");
+        assert!(args["fire_at_ms"].is_u64());
         let planned = plan_for_meta(
             "act",
             &argv(&[
