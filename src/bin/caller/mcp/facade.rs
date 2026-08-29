@@ -438,6 +438,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("kind", "kind", Str, "claim kind (default observation)"),
             flag!("sensitivity", "sensitivity", Str, "sensitivity label"),
             flag!("label", "labels", StrList, "label (repeatable)"),
+            flag!("project", "project", Str, "project provenance"),
         ],
         help: "Propose a candidate memory claim (curation stays owner-side)",
     },
@@ -620,6 +621,24 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 StrList,
                 "fact to carry across (repeatable)"
             ),
+            flag!(
+                "discard",
+                "discard",
+                StrList,
+                "dead end to record as discarded (repeatable)"
+            ),
+            flag!(
+                "artifact",
+                "artifacts",
+                StrList,
+                "produced artifact to carry across (repeatable)"
+            ),
+            flag!(
+                "next-step",
+                "next_steps",
+                StrList,
+                "recommended continuation step (repeatable)"
+            ),
         ],
         help: "Rewind a managed session's context to an anchor and resume",
     },
@@ -651,6 +670,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("target", "display_target", Str, "display target"),
             flag!("format", "format", Str, "text (default) or json"),
+            flag!(
+                "full-values",
+                "full_values",
+                Bool,
+                "uncapped element values/titles (long URLs, document text)"
+            ),
         ],
         help: "Read the accessibility element tree",
     },
@@ -2295,6 +2320,47 @@ mod tests {
             serde_json::json!(["f1", "f2"])
         );
         assert_eq!(planned.args["display_target"], "display_99");
+    }
+
+    /// The remaining ctl option-vocabulary parity pins (review round 4):
+    /// the rewind handoff lists, the uncapped accessibility read, and
+    /// memory project provenance all travel through the facade.
+    #[test]
+    fn parity_options_cover_rewind_lists_full_values_and_project() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "rewind",
+                "item-1",
+                "noise",
+                "the primer",
+                "--preserve",
+                "fact",
+                "--discard",
+                "dead end",
+                "--artifact",
+                "out.txt",
+                "--next-step",
+                "rerun tests",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["discard"], serde_json::json!(["dead end"]));
+        assert_eq!(planned.args["artifacts"], serde_json::json!(["out.txt"]));
+        assert_eq!(
+            planned.args["next_steps"],
+            serde_json::json!(["rerun tests"])
+        );
+        let planned =
+            plan_for_meta("inspect", &argv(&["cu", "elements", "--full-values"])).unwrap();
+        assert_eq!(planned.args["full_values"], serde_json::json!(true));
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["memory", "propose", "a fact", "--project", "intendant"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["project"], "intendant");
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry
