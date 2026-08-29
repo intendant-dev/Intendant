@@ -1,0 +1,333 @@
+//! The terminal tool family: request/response shell access for MCP
+//! callers, sharing the dashboard's PTY pool (a shell opened over MCP is
+//! attachable from a dashboard terminal tile and vice versa).
+//!
+//! Deliberate shape decisions (docs/design-mcp-control-lane.md, the
+//! owner's terminal ruling):
+//!
+//! - **Per-tool operations stay honest.** The streaming tunnel's
+//!   `terminal_open` frame does a stateful "attach = terminal.view,
+//!   create = shell.spawn" split inside the handler; here the split is
+//!   structural — `terminal_open` always demands `shell.spawn` (it
+//!   creates when absent), while reads ride `terminal.view` and
+//!   input/resize/close ride `terminal.write` — so the gate-level
+//!   operation IS the tool's whole authority.
+//! - **Polling, not streaming.** Output is read with a monotonic cursor
+//!   over the scrollback ring ([`crate::terminal::Scrollback`]'s
+//!   total-bytes-written space); a cursor that fell off the 256 KiB
+//!   window reports `gap: true` — the polling analogue of the push
+//!   lane's dropped-output marker.
+//! - **Visibility is the registry's own model**: root-surface callers act
+//!   as [`TerminalActor::Root`]; every scoped caller acts as its bound
+//!   IAM principal and sees only its own and shared sessions. A missing
+//!   principal id degrades to a principal that owns nothing.
+
+use super::*;
+use crate::terminal::{ShellSpawnPolicy, TerminalActor, TerminalKey};
+
+/// Cap on one cursor read. Big enough for a full scrollback replay in
+/// four calls, small enough to keep a tool result model-sized.
+const TERMINAL_READ_MAX_BYTES: usize = 64 * 1024;
+const TERMINAL_READ_DEFAULT_BYTES: usize = 16 * 1024;
+
+/// Params for `terminal_list` (none).
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalListParams {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalOpenParams {
+    /// Terminal id to open or attach (creates the shell when absent).
+    /// Omit to mint a fresh id.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    /// Initial columns (default 120).
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Initial rows (default 32).
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Create the shell as shared (visible to other principals). Default
+    /// false.
+    #[serde(default)]
+    pub shared: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalReadParams {
+    /// The terminal id.
+    pub terminal_id: String,
+    /// Cursor from a previous read's `next_cursor` (0 = from the oldest
+    /// retained output).
+    #[serde(default)]
+    pub cursor: Option<u64>,
+    /// Max bytes to return (default 16384, cap 65536).
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalWriteParams {
+    /// The terminal id.
+    pub terminal_id: String,
+    /// Bytes to write to the shell's stdin, verbatim.
+    pub input: String,
+    /// Append a newline (submit the input as a command line). Default
+    /// true — pass false for raw keystrokes.
+    #[serde(default)]
+    pub enter: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalResizeParams {
+    /// The terminal id.
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TerminalCloseParams {
+    /// The terminal id.
+    pub terminal_id: String,
+}
+
+/// Root-surface callers act as root; every scoped caller acts as its
+/// bound principal (a missing id owns nothing — fail closed, never
+/// root).
+fn terminal_actor(
+    trust: ToolCallerTrust,
+    actor: &crate::access::actor::ActorBinding,
+) -> TerminalActor {
+    match trust {
+        ToolCallerTrust::OwnerSurface => TerminalActor::Root,
+        ToolCallerTrust::Scoped => TerminalActor::Principal(
+            actor
+                .principal_id
+                .clone()
+                .unwrap_or_else(|| "principal:unattributed".to_string()),
+        ),
+    }
+}
+
+fn no_registry() -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": "terminal registry unavailable on this server shape (bare stdio --mcp has no gateway PTY pool)",
+    })
+    .to_string()
+}
+
+fn no_visible(terminal_id: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "no visible terminal {terminal_id:?} — terminal_list enumerates yours, terminal_open creates one"
+        ),
+    })
+    .to_string()
+}
+
+impl IntendantServer {
+    pub(crate) async fn terminal_list_tool(
+        &self,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let rows: Vec<serde_json::Value> = registry
+            .list_visible(&terminal_actor(trust, actor))
+            .await
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "terminal_id": s.key.terminal_id,
+                    "host_id": s.key.host_id,
+                    "alive": s.alive,
+                    "shared": s.shared,
+                    "can_manage": s.can_manage,
+                    "exit_status": s.exit_status,
+                    "cols": s.size.map(|(c, _)| c),
+                    "rows": s.size.map(|(_, r)| r),
+                })
+            })
+            .collect();
+        serde_json::json!({ "terminals": rows }).to_string()
+    }
+
+    pub(crate) async fn terminal_open_tool(
+        &self,
+        params: TerminalOpenParams,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let terminal_id = params
+            .terminal_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| format!("mcp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        let key = TerminalKey::local(&terminal_id);
+        let acting = terminal_actor(trust, actor);
+        let policy = ShellSpawnPolicy {
+            // The gate already charged this call as shell.spawn — that is
+            // the tool's whole operation, so creation is always permitted
+            // here (attach-only callers use terminal_read/terminal_list,
+            // which never spawn).
+            may_spawn: true,
+            shared: params.shared.unwrap_or(false),
+            scope: None,
+        };
+        match registry
+            .open_or_attach(
+                key,
+                params.cols.unwrap_or(120),
+                params.rows.unwrap_or(32),
+                &acting,
+                policy,
+            )
+            .await
+        {
+            Ok((session, created)) => {
+                // The current write high-water is the natural first
+                // cursor: a fresh open starts reading at "now".
+                let (_, cursor, _) = session.read_since(u64::MAX, 0);
+                serde_json::json!({
+                    "ok": true,
+                    "terminal_id": terminal_id,
+                    "created": created,
+                    "alive": session.is_alive(),
+                    "shared": session.shared(),
+                    "cols": session.size().map(|(c, _)| c),
+                    "rows": session.size().map(|(_, r)| r),
+                    "read_cursor": cursor,
+                })
+                .to_string()
+            }
+            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+        }
+    }
+
+    pub(crate) async fn terminal_read_tool(
+        &self,
+        params: TerminalReadParams,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let key = TerminalKey::local(&params.terminal_id);
+        let Some(session) = registry
+            .get_visible(&key, &terminal_actor(trust, actor))
+            .await
+        else {
+            return no_visible(&params.terminal_id);
+        };
+        let max_bytes = params
+            .max_bytes
+            .unwrap_or(TERMINAL_READ_DEFAULT_BYTES)
+            .min(TERMINAL_READ_MAX_BYTES);
+        let (bytes, next_cursor, gap) = session.read_since(params.cursor.unwrap_or(0), max_bytes);
+        serde_json::json!({
+            "ok": true,
+            "output": String::from_utf8_lossy(&bytes),
+            "next_cursor": next_cursor,
+            "gap": gap,
+            "alive": session.is_alive(),
+            "exit_status": session.exit_status(),
+        })
+        .to_string()
+    }
+
+    pub(crate) async fn terminal_write_tool(
+        &self,
+        params: TerminalWriteParams,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let key = TerminalKey::local(&params.terminal_id);
+        let Some(session) = registry
+            .get_visible(&key, &terminal_actor(trust, actor))
+            .await
+        else {
+            return no_visible(&params.terminal_id);
+        };
+        if !session.is_alive() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "shell already exited",
+                "exit_status": session.exit_status(),
+            })
+            .to_string();
+        }
+        let mut input = params.input.into_bytes();
+        if params.enter.unwrap_or(true) {
+            input.push(b'\n');
+        }
+        session.write_input(&input);
+        serde_json::json!({
+            "ok": true,
+            "wrote_bytes": input.len(),
+            "hint": "poll terminal_read with your cursor for the shell's response",
+        })
+        .to_string()
+    }
+
+    pub(crate) async fn terminal_resize_tool(
+        &self,
+        params: TerminalResizeParams,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let key = TerminalKey::local(&params.terminal_id);
+        let Some(session) = registry
+            .get_visible(&key, &terminal_actor(trust, actor))
+            .await
+        else {
+            return no_visible(&params.terminal_id);
+        };
+        session.resize(params.cols, params.rows);
+        serde_json::json!({ "ok": true, "cols": params.cols, "rows": params.rows }).to_string()
+    }
+
+    pub(crate) async fn terminal_close_tool(
+        &self,
+        params: TerminalCloseParams,
+        trust: ToolCallerTrust,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> String {
+        let Some(registry) = self.terminal_registry().await else {
+            return no_registry();
+        };
+        let key = TerminalKey::local(&params.terminal_id);
+        let closed = registry
+            .close_visible(&key, &terminal_actor(trust, actor))
+            .await;
+        serde_json::json!({ "ok": closed, "closed": closed }).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_actor_without_principal_owns_nothing() {
+        let unattributed = crate::access::actor::ActorBinding::unattributed();
+        let actor = terminal_actor(ToolCallerTrust::Scoped, &unattributed);
+        match actor {
+            TerminalActor::Principal(id) => assert_eq!(id, "principal:unattributed"),
+            TerminalActor::Root => panic!("scoped caller must never derive Root"),
+        }
+    }
+}

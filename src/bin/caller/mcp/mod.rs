@@ -74,6 +74,11 @@ pub(crate) use tools_ask::{
 pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_codex_cloud;
 mod tools_display;
+mod tools_terminal;
+pub(crate) use tools_terminal::{
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams,
+};
 mod tools_managed;
 mod tools_notes;
 mod tools_remote_compute;
@@ -170,6 +175,32 @@ impl IntendantServer {
         &self,
     ) -> Option<std::sync::Arc<crate::handover::HandoverRuntime>> {
         self.state.read().await.handover.clone()
+    }
+
+    /// The gateway's shell PTY registry, when this server shape carries
+    /// one (`None` on bare stdio servers — terminal tools answer
+    /// "unavailable").
+    pub(crate) async fn terminal_registry(
+        &self,
+    ) -> Option<std::sync::Arc<crate::terminal::TerminalRegistry>> {
+        self.state.read().await.terminal.clone()
+    }
+
+    /// Sync best-effort boot wiring for the terminal registry (the
+    /// gateway's setup path is not async — same pattern as
+    /// [`Self::handover_runtime_now`]). Returns whether the handle landed;
+    /// at boot the state lock is uncontended, so a `false` is loud news.
+    pub(crate) fn set_terminal_registry_now(
+        &self,
+        registry: std::sync::Arc<crate::terminal::TerminalRegistry>,
+    ) -> bool {
+        match self.state.try_write() {
+            Ok(mut state) => {
+                state.terminal = Some(registry);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Sync best-effort read for boot-time wiring in non-async spawn
@@ -937,6 +968,39 @@ impl IntendantServer {
                 let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
                     self.release_browser_workspace(params).await,
+                ))
+            }
+            "terminal_list" => Ok(text_tool_result(
+                self.terminal_list_tool(caller, &actor).await,
+            )),
+            "terminal_open" => {
+                let Parameters(params) = parse_params::<TerminalOpenParams>(args)?;
+                Ok(text_tool_result(
+                    self.terminal_open_tool(params, caller, &actor).await,
+                ))
+            }
+            "terminal_read" => {
+                let Parameters(params) = parse_params::<TerminalReadParams>(args)?;
+                Ok(text_tool_result(
+                    self.terminal_read_tool(params, caller, &actor).await,
+                ))
+            }
+            "terminal_write" => {
+                let Parameters(params) = parse_params::<TerminalWriteParams>(args)?;
+                Ok(text_tool_result(
+                    self.terminal_write_tool(params, caller, &actor).await,
+                ))
+            }
+            "terminal_resize" => {
+                let Parameters(params) = parse_params::<TerminalResizeParams>(args)?;
+                Ok(text_tool_result(
+                    self.terminal_resize_tool(params, caller, &actor).await,
+                ))
+            }
+            "terminal_close" => {
+                let Parameters(params) = parse_params::<TerminalCloseParams>(args)?;
+                Ok(text_tool_result(
+                    self.terminal_close_tool(params, caller, &actor).await,
                 ))
             }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),

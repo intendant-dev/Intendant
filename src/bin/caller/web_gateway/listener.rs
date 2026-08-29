@@ -1078,6 +1078,16 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         })),
     );
+    // The MCP terminal tool family shares the same pool: a shell opened
+    // over MCP is attachable from the dashboard and vice versa.
+    if let Some(server) = mcp_server.as_ref() {
+        if !server.set_terminal_registry_now(terminal_registry.clone()) {
+            eprintln!(
+                "[web_gateway] terminal registry not wired into MCP state (lock contended at \
+                 boot) — terminal tools will answer unavailable"
+            );
+        }
+    }
 
     let dashboard_presence = {
         let connect_active_presence = active_presence.clone();

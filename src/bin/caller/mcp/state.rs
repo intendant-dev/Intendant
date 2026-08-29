@@ -144,6 +144,10 @@ pub struct McpAppState {
     /// scheduler-lease view, for the `scheduler_lease` status block.
     /// `None` outside the gateway/daemon shapes.
     pub handover: Option<std::sync::Arc<crate::handover::HandoverRuntime>>,
+    /// The gateway's shell PTY registry, for the terminal tool family.
+    /// `None` outside the gateway/daemon shapes (bare stdio servers) —
+    /// terminal surfaces then answer "unavailable".
+    pub terminal: Option<std::sync::Arc<crate::terminal::TerminalRegistry>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -332,6 +336,7 @@ impl McpAppState {
             agenda: None,
             memory: None,
             handover: None,
+            terminal: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

@@ -298,6 +298,15 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // it falls to the restrictive default rather than anything
         // broader, and never authorizes the envelope as a whole.
         "inspect" | "act" | "authorize" | "help" | "docs" => PeerOperation::RuntimeControl,
+        // The terminal family (owner-ruled 2026-08-28: controlling agents
+        // get terminal access, R2 tentatively at Operate). Reads ride
+        // terminal.view; input/resize/close ride terminal.write; open is
+        // the create-capable verb and carries shell.spawn structurally —
+        // this is the deliberate lift of the historical "no MCP tool
+        // reaches Terminal*" pin, per docs/design-mcp-control-lane.md.
+        "terminal_list" | "terminal_read" => PeerOperation::TerminalView,
+        "terminal_write" | "terminal_resize" | "terminal_close" => PeerOperation::TerminalWrite,
+        "terminal_open" => PeerOperation::ShellSpawn,
         // Daemon/agent status summaries. whoami rides here: it discloses
         // only the caller's own gate-resolved identity — strictly less than
         // get_status already reveals.
@@ -474,6 +483,60 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         );
         tools.push(definition);
     };
+
+    // The terminal family: request/response shell access sharing the
+    // dashboard's PTY pool. Advertised on full/unprofiled listings and
+    // reached through the facade's `terminal` commands; deliberately kept
+    // out of core/screen/managed (context rent + the remote_command
+    // precedent).
+    push(
+        "terminal_list",
+        manual_http_tool_definition!(
+            "terminal_list",
+            "List the shell sessions visible to the caller: id, liveness, sharing, geometry, retained exit status. Root surfaces see every session; scoped principals see their own and shared ones.",
+            crate::mcp::tools_terminal::TerminalListParams
+        ),
+    );
+    push(
+        "terminal_open",
+        manual_http_tool_definition!(
+            "terminal_open",
+            "Open (attach) or create a shell PTY session on this daemon. Creation is why this tool is gated as shell.spawn; attach-only workflows use terminal_list/terminal_read. Returns the id, whether it was created, geometry, and the read cursor to start polling from.",
+            crate::mcp::tools_terminal::TerminalOpenParams
+        ),
+    );
+    push(
+        "terminal_read",
+        manual_http_tool_definition!(
+            "terminal_read",
+            "Cursor-paged read of a visible shell session's output (0 = oldest retained). Returns the text, the next cursor, whether a gap fell off the 256 KiB scrollback ring, liveness, and the retained exit status. Poll after terminal_write.",
+            crate::mcp::tools_terminal::TerminalReadParams
+        ),
+    );
+    push(
+        "terminal_write",
+        manual_http_tool_definition!(
+            "terminal_write",
+            "Write input to a visible live shell session's stdin (appends a newline by default; pass enter=false for raw keystrokes). Refuses with the exit status when the shell has died.",
+            crate::mcp::tools_terminal::TerminalWriteParams
+        ),
+    );
+    push(
+        "terminal_resize",
+        manual_http_tool_definition!(
+            "terminal_resize",
+            "Resize a visible shell session's PTY.",
+            crate::mcp::tools_terminal::TerminalResizeParams
+        ),
+    );
+    push(
+        "terminal_close",
+        manual_http_tool_definition!(
+            "terminal_close",
+            "Close a visible shell session (sends end-of-input and removes it from the pool).",
+            crate::mcp::tools_terminal::TerminalCloseParams
+        ),
+    );
 
     // The facade meta-tools (`tool_profile=facade`): a CLI-shaped,
     // context-efficient control surface — three risk-lane argv executors

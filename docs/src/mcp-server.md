@@ -391,6 +391,34 @@ active holder.
 | `release_browser_workspace`   | Release a workspace lease. | `workspace_id`, `holder_id?`, `note?` |
 | `close_browser_workspace`     | Close a workspace and terminate its local browser process when owned here. | `workspace_id`, `reason?` |
 
+### Terminal
+
+Request/response shell access sharing the dashboard's PTY pool — a shell
+opened over MCP is attachable from a dashboard terminal tile and vice
+versa. Reads ride `terminal.view`; input, resize, and close ride
+`terminal.write`; `terminal_open` creates the shell when absent and is
+therefore gated as `shell.spawn` structurally (the attach-vs-create split
+the dashboard tunnel frame decides statefully is simply two different
+authorities here). Output is polled with a monotonic cursor over the
+256 KiB scrollback ring; a cursor that has fallen off the window reports
+`gap: true` — the polling analogue of the push lane's dropped-output
+marker — and the exit status is retained so a poller that missed the
+death still learns it. Visibility is the registry's own model: root
+surfaces see every session, scoped principals see their own and shared
+ones. None of these ride the scoped profiles; they appear on
+full/unprofiled listings and through the facade's `terminal` commands
+(`open` and `write` on the `authorize` lane — writing into a live shell
+is running commands).
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `terminal_list` | Visible sessions: id, liveness, sharing, geometry, retained exit status. | — |
+| `terminal_open` | Open or create a shell PTY (shell-spawn class); returns the id, whether it was created, geometry, and the starting read cursor. | `terminal_id?`, `cols?`, `rows?`, `shared?` |
+| `terminal_read` | Cursor-paged output read with gap reporting, liveness, and exit status. | `terminal_id`, `cursor?`, `max_bytes?` |
+| `terminal_write` | Write to a live shell's stdin (appends a newline by default; `enter: false` for raw keystrokes). | `terminal_id`, `input`, `enter?` |
+| `terminal_resize` | Resize the PTY. | `terminal_id`, `cols`, `rows` |
+| `terminal_close` | Close the session. | `terminal_id` |
+
 ### Remote compute & Codex Cloud workers
 
 `remote_command` offloads heavy platform-neutral compilation and testing to

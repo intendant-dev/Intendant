@@ -463,6 +463,10 @@ fn seatbelt_profile(
 struct Scrollback {
     buf: VecDeque<u8>,
     capacity: usize,
+    /// Total bytes ever pushed — the monotonic cursor space for
+    /// [`Scrollback::read_since`]. The oldest retained byte sits at
+    /// `written - buf.len()`.
+    written: u64,
 }
 
 impl Scrollback {
@@ -470,15 +474,33 @@ impl Scrollback {
         Self {
             buf: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
+            written: 0,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
         self.buf.extend(data.iter().copied());
+        self.written += data.len() as u64;
         if self.buf.len() > self.capacity {
             let drop = self.buf.len() - self.capacity;
             self.buf.drain(..drop);
         }
+    }
+
+    /// Cursor-paged read for request/response consumers (the MCP terminal
+    /// verbs): `cursor` is an offset in total-bytes-written space (`0` =
+    /// from the oldest retained byte). Returns the bytes from the cursor —
+    /// or from the ring start when the cursor has fallen off the 256 KiB
+    /// window — the next cursor, and whether a gap was skipped (the
+    /// polling analogue of [`OUTPUT_DROPPED_MARKER`]).
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        let oldest = self.written - self.buf.len() as u64;
+        let gap = cursor < oldest && cursor != 0;
+        let start = cursor.clamp(oldest, self.written);
+        let skip = (start - oldest) as usize;
+        let take = self.buf.len().saturating_sub(skip).min(max_bytes);
+        let bytes: Vec<u8> = self.buf.iter().skip(skip).take(take).copied().collect();
+        (bytes, start + take as u64, gap)
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -706,6 +728,13 @@ impl OutputHub {
         }
     }
 
+    /// Cursor-paged passthrough for polling readers — same lock as
+    /// `attach`, so a read is atomic with respect to the reader thread's
+    /// push+fan-out.
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        self.scrollback.read_since(cursor, max_bytes)
+    }
+
     fn attach(&mut self, max_queued_bytes: usize) -> TerminalListener {
         let shared = Arc::new(ListenerShared::new(max_queued_bytes));
         let snapshot = self.scrollback.snapshot();
@@ -733,6 +762,10 @@ pub struct PtySession {
     child_killer: StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     output: StdMutex<OutputHub>,
     alive: StdMutex<bool>,
+    /// The exit status, retained after death so polling readers (which
+    /// were not attached when the `Exited` event fanned out) can still
+    /// learn why the shell died.
+    exit_status: StdMutex<Option<i32>>,
     /// Windows: the refcounted RESTRICTED ACE grants for this session's
     /// scope roots. Held for the session's lifetime so overlapping scoped
     /// shells never lose a shared grant early; dropped (and the ACEs
@@ -848,6 +881,7 @@ impl PtySession {
             child_killer: StdMutex::new(child_killer),
             output: StdMutex::new(OutputHub::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
+            exit_status: StdMutex::new(None),
             #[cfg(windows)]
             scope_grants,
             owner,
@@ -1101,9 +1135,35 @@ impl PtySession {
             false
         };
         if transitioned {
+            if let Ok(mut retained) = self.exit_status.lock() {
+                *retained = Some(status);
+            }
             let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
             hub.fan_out_exit(status);
         }
+    }
+
+    /// The retained exit status (`None` while alive or if never observed).
+    pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Cursor-paged scrollback read for request/response consumers; see
+    /// [`Scrollback::read_since`] for cursor semantics. Shares `attach`'s
+    /// critical section, so it can neither lose nor duplicate a chunk
+    /// racing in from the reader thread.
+    pub fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        let hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        hub.read_since(cursor, max_bytes)
+    }
+
+    /// Current PTY geometry, when the master can report it.
+    pub fn size(&self) -> Option<(u16, u16)> {
+        self.master
+            .lock()
+            .ok()
+            .and_then(|master| master.get_size().ok())
+            .map(|size| (size.cols, size.rows))
     }
 
     pub fn shared(&self) -> bool {
@@ -1216,6 +1276,18 @@ impl Drop for UnpublishedPtyGuard {
 /// replaced it while the opener was unlocked).
 fn slot_is_current(entry: Option<&SessionSlot>, slot: &Arc<OpeningSlot>) -> bool {
     matches!(entry, Some(SessionSlot::Opening(current)) if Arc::ptr_eq(current, slot))
+}
+
+/// One row of [`TerminalRegistry::list_visible`] — the fields a polling
+/// consumer needs to pick a session and start a cursor read.
+#[derive(Debug, Clone)]
+pub struct TerminalSummary {
+    pub key: TerminalKey,
+    pub alive: bool,
+    pub shared: bool,
+    pub can_manage: bool,
+    pub exit_status: Option<i32>,
+    pub size: Option<(u16, u16)>,
 }
 
 /// Process-wide registry of live shell sessions, keyed by
@@ -1463,6 +1535,31 @@ impl TerminalRegistry {
             Some(SessionSlot::Live(session)) if session.visible_to(actor) => Some(session.clone()),
             _ => None,
         }
+    }
+
+    /// Enumerate the sessions `actor` may see, for request/response
+    /// consumers (the MCP terminal verbs — the push lanes never needed
+    /// enumeration). Reservations in flight are skipped, matching every
+    /// other read's ordering: a spawn that has not published does not
+    /// exist yet.
+    pub async fn list_visible(&self, actor: &TerminalActor) -> Vec<TerminalSummary> {
+        let sessions = self.sessions.read().await;
+        let mut out: Vec<TerminalSummary> = sessions
+            .iter()
+            .filter_map(|(key, slot)| match slot {
+                SessionSlot::Live(session) if session.visible_to(actor) => Some(TerminalSummary {
+                    key: key.clone(),
+                    alive: session.is_alive(),
+                    shared: session.shared(),
+                    can_manage: session.managed_by(actor),
+                    exit_status: session.exit_status(),
+                    size: session.size(),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.terminal_id.cmp(&b.key.terminal_id));
+        out
     }
 
     /// Close `key` if `actor` may see it. Returns whether a session was
