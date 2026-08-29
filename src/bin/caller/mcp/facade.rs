@@ -303,6 +303,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("title", "title", Str, "short title"),
             flag!("urgency", "urgency", Str, "info|attention|urgent"),
+            flag!("session", "session_id", Str, "notify as another session"),
         ],
         help: "Fire-and-forget notification to the user",
     },
@@ -312,7 +313,10 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "post_session_note",
         seed: "{}",
         positionals: &[p_str("TEXT", "text", true, true)],
-        flags: &[flag!("source", "source", Str, "short source label")],
+        flags: &[
+            flag!("source", "source", Str, "short source label"),
+            flag!("session", "session_id", Str, "post into another session"),
+        ],
         help: "Post a display-only note into the session transcript",
     },
     CommandSpec {
@@ -1965,6 +1969,30 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             ),
         );
     }
+    // The multi-question ask carries its decision fields INSIDE each
+    // question object — the daemon ignores the flat twins when
+    // `questions` is present, so accepting the combination would
+    // silently drop the caller's constraints (review round 6). Reject
+    // it at plan time instead.
+    if obj.get("questions").is_some() {
+        for (flat, inside) in [
+            ("question", "the QUESTION positional"),
+            ("options", "options"),
+            ("previews", "previews"),
+            ("pick_min", "pick_min"),
+            ("pick_max", "pick_max"),
+            ("multi_select", "pick bounds"),
+            ("free_text", "free_text"),
+            ("consequence", "consequence"),
+            ("header", "header"),
+        ] {
+            if obj.contains_key(flat) {
+                return Err(format!(
+                    "--questions carries per-question fields inside each object — move {inside} into the question entries instead of the flat form"
+                ));
+            }
+        }
+    }
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -2394,17 +2422,22 @@ mod tests {
         assert_eq!(planned.args["project"], "intendant");
     }
 
-    /// The blocking-ask decision contract travels whole (review round
-    /// 5): the multi-question form, pick bounds, free-text opt-out,
-    /// consequence, wait override, expiry, and park.
+    /// The blocking-ask decision contract travels whole (review rounds
+    /// 5-6): flat-form flags on a single question; the multi-question
+    /// form carries per-question fields INSIDE each object, and mixing
+    /// the flat twins with --questions is a plan error (the daemon
+    /// would silently ignore them).
     #[test]
     fn ask_row_carries_the_full_decision_contract() {
         let planned = plan_for_meta(
             "act",
             &argv(&[
                 "ask",
-                "--questions",
-                "[{\"question\":\"which?\",\"options\":[{\"label\":\"a\"},{\"label\":\"b\"}]}]",
+                "which one?",
+                "--option",
+                "a",
+                "--option",
+                "b",
                 "--pick-max",
                 "2",
                 "--free-text",
@@ -2419,16 +2452,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.tool, "ask_user");
-        assert_eq!(planned.args["questions"][0]["question"], "which?");
-        assert!(planned.args.get("question").is_none(), "positional omitted");
+        assert_eq!(planned.args["question"], "which one?");
         assert_eq!(planned.args["pick_max"], 2);
         assert_eq!(planned.args["free_text"], serde_json::json!(false));
         assert_eq!(planned.args["consequence"], "I proceed with a");
         assert_eq!(planned.args["wait_seconds"], 600);
         assert_eq!(planned.args["expiry"], "2h");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "ask",
+                "--questions",
+                "[{\"question\":\"which?\",\"pick_max\":2,\"free_text\":false}]",
+                "--wait",
+                "600",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["questions"][0]["pick_max"], 2);
+        assert!(planned.args.get("question").is_none(), "positional omitted");
+        assert_eq!(
+            planned.args["wait_seconds"], 600,
+            "call-level fields stay flat"
+        );
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "ask",
+                "--questions",
+                "[{\"question\":\"which?\"}]",
+                "--pick-max",
+                "2",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("per-question fields"), "{err}");
         let planned = plan_for_meta("act", &argv(&["ask", "ship it?", "--park"])).unwrap();
         assert_eq!(planned.args["question"], "ship it?");
         assert_eq!(planned.args["park"], serde_json::json!(true));
+    }
+
+    /// Target-session routing travels on notify and session note
+    /// (review round 6).
+    #[test]
+    fn notify_and_note_carry_target_session_routing() {
+        let planned =
+            plan_for_meta("act", &argv(&["notify", "done", "--session", "sess-9"])).unwrap();
+        assert_eq!(planned.args["session_id"], "sess-9");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["session", "note", "hello", "--session", "sess-9"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["session_id"], "sess-9");
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry
