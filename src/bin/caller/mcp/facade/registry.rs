@@ -272,6 +272,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "choice label (repeatable, max 4)"
             ),
             flag!(
+                "schema",
+                "__schema_client",
+                Str,
+                "ctl-side only: ctl reads the schema file/stdin — here pass --questions"
+            ),
+            flag!(
                 "questions",
                 "questions",
                 Json,

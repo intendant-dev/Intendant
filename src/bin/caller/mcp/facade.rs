@@ -230,8 +230,13 @@ fn build_args(
     let mut obj = seed.clone();
     // Top-level keys the ARGV wrote (flags, positionals, the greedy
     // tail) — the discriminator between a seed default and an explicit
-    // caller value that happens to spell the same string.
+    // caller value that happens to spell the same string. Flag-written
+    // keys are tracked separately: ctl gives an explicit flag
+    // precedence over the free-text tail (`--task` beats the
+    // positional), so the greedy insert must not overwrite one.
     let mut written: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut flag_written: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
     fn outer(key: &'static str) -> &'static str {
         key.split('.').next().unwrap_or(key)
     }
@@ -287,6 +292,7 @@ fn build_args(
             };
             insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
             written.insert(outer(flag.json_key));
+            flag_written.insert(outer(flag.json_key));
         } else if let Some(pos) = spec.positionals.get(positional_index) {
             if pos.greedy {
                 greedy_key = Some(pos.json_key);
@@ -319,8 +325,14 @@ fn build_args(
             ),
             _ => serde_json::Value::String(greedy_parts.join(" ")),
         };
-        obj.insert(key.to_string(), value);
-        written.insert(outer(key));
+        // ctl's precedence: an explicit flag beats the free-text tail
+        // (`--task` wins over the positional, which ctl silently
+        // ignores beside it) — never the other way around, which would
+        // dispatch a different value than the caller's explicit flag.
+        if !flag_written.contains(outer(key)) {
+            obj.insert(key.to_string(), value);
+            written.insert(outer(key));
+        }
     }
     // Seed-declared caller-identity defaults the argv left alone: strip
     // them and hand the key names back for the dispatcher's out-of-band
@@ -366,6 +378,16 @@ fn build_args(
         obj.insert(
             "options".to_string(),
             serde_json::Value::Array(option_entries(&raw_options)),
+        );
+    }
+    // ctl's `--schema FILE|-` reads the multi-question JSON from the
+    // caller's file or stdin — client I/O the pure registry excludes;
+    // the refusal names the inline form.
+    if obj.remove("__schema_client").is_some() {
+        return Err(
+            "--schema reads the question file (or stdin) client-side (a ctl behavior the \
+             facade excludes); pass the questions inline with --questions '[...]'"
+                .to_string(),
         );
     }
     // ctl's file-backed preview forms read files CLIENT-side (the
@@ -2231,6 +2253,24 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("client-side"), "{err}");
         assert!(err.contains("--previews"), "{err}");
+        // Round 33: an explicit flag beats the free-text tail (ctl's
+        // precedence — the positional is silently ignored beside it),
+        // and --schema is a named client-side exclusion.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["task", "start", "positional", "task", "--task", "flag task"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["task"], "flag task");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["input", "respond", "positional", "--text", "flag text"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["text"], "flag text");
+        let err = plan_for_meta("act", &argv(&["ask", "--schema", "/srv/q.json"])).unwrap_err();
+        assert!(err.contains("client-side"), "{err}");
+        assert!(err.contains("--questions"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
