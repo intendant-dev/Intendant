@@ -378,12 +378,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["agenda", "add"],
         lane: RiskLane::Act,
         tool: "agenda_op",
-        seed: r#"{"op":"add","kind":"note"}"#,
+        seed: r#"{"op":"add","kind":"task"}"#,
         positionals: &[p_str("TITLE", "title", true, true)],
         flags: &[
             flag!("body", "body", Str, "markdown body"),
             flag!("tag", "tags", StrList, "tag (repeatable)"),
-            flag!("kind", "kind", Str, "note|task|question"),
+            flag!("kind", "kind", Str, "note|task|question (default task, matching ctl)"),
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
         ],
@@ -2293,7 +2293,7 @@ mod tests {
         .unwrap();
         assert_eq!(planned.tool, "agenda_op");
         assert_eq!(planned.args["op"], "add");
-        assert_eq!(planned.args["kind"], "note");
+        assert_eq!(planned.args["kind"], "task");
         assert_eq!(planned.args["title"], "fix the roof");
         assert_eq!(planned.args["tags"], serde_json::json!(["house", "urgent"]));
     }
