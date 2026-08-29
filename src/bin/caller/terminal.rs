@@ -418,17 +418,23 @@ fn windows_scoped_shell_env(
 
 /// Read-only system baseline a scoped shell needs to be a usable shell
 /// (binaries, libraries, config) without exposing user data. `/home`,
-/// `/root`, `/Users`, and `/proc` are deliberately absent — and so is
-/// bare `/dev`: scoped shells run as the daemon's Unix account, so a
-/// whole-`/dev` grant would let them open OTHER same-account sessions'
-/// PTYs under `/dev/pts` (reading one steals that session's
-/// keystrokes). Only ownerless device nodes are listed; the shell's own
-/// terminal rides its inherited descriptors plus `/dev/tty`, which the
-/// kernel resolves to the caller's controlling terminal and can never
-/// reach another session. (Landlock rules are additive-only — there is
-/// no way to allow `/dev` minus the PTYs, so the safe nodes are
-/// enumerated. Nested PTY allocation inside a scoped shell is
-/// deliberately unavailable.)
+/// `/root`, `/Users`, and `/proc` are deliberately absent — and so are
+/// the same-account trees a whole-directory grant would expose:
+///
+/// - bare `/dev` would let the shell open OTHER same-account sessions'
+///   PTYs under `/dev/pts` (reading one steals that session's
+///   keystrokes), so only ownerless device nodes are listed; the
+///   shell's own terminal rides its inherited descriptors plus
+///   `/dev/tty`, which the kernel resolves to the caller's controlling
+///   terminal and can never reach another session;
+/// - bare `/run` would expose `/run/secrets` mounts and plain files
+///   under `/run/user/<uid>`, so only the resolver backends
+///   `/etc/resolv.conf` can point at are listed (the Landlock applier
+///   skips paths that don't exist on this distro).
+///
+/// Landlock rules are additive-only — there is no way to allow a tree
+/// minus a subtree, so the safe entries are enumerated. Nested PTY
+/// allocation inside a scoped shell is deliberately unavailable.
 #[cfg(target_os = "linux")]
 fn scoped_shell_read_baseline() -> Vec<std::path::PathBuf> {
     [
@@ -442,7 +448,9 @@ fn scoped_shell_read_baseline() -> Vec<std::path::PathBuf> {
         "/etc",
         "/opt",
         "/nix",
-        "/run",
+        "/run/systemd/resolve",
+        "/run/resolvconf",
+        "/run/NetworkManager",
         "/dev/null",
         "/dev/zero",
         "/dev/full",
@@ -510,12 +518,9 @@ fn seatbelt_profile(
         )?);
     }
     let mut exec_paths = read_paths.clone();
-    let mut write_paths: Vec<String> = Vec::new();
-    for path in ["/dev"] {
-        write_paths.push(crate::sandbox::seatbelt_path_literal(
-            std::path::Path::new(path),
-        )?);
-    }
+    let mut write_paths: Vec<String> = vec![crate::sandbox::seatbelt_path_literal(
+        std::path::Path::new("/dev"),
+    )?];
     let scratch_canonical =
         std::fs::canonicalize(scratch).unwrap_or_else(|_| scratch.to_path_buf());
     let scratch_literal = crate::sandbox::seatbelt_path_literal(&scratch_canonical)?;
@@ -1133,11 +1138,14 @@ impl PtySession {
     ///   [`SCOPED_SHELL_POLICY_ENV`] (fail-closed when the kernel lacks
     ///   Landlock) and then execs the shell.
     /// - **macOS**: `sandbox-exec -p <generated Seatbelt profile>`.
-    /// - **Windows**: refused — no OS sandbox seam wired up yet.
-    /// Build the sandboxed shell command for a scoped spawn. The second
-    /// element is the session-private scratch directory (the shell's
-    /// whole temp world on Unix — see the baselines above); the caller
-    /// owns its lifetime and removes it when the session drops.
+    /// - **Windows**: re-exec as `--scoped-shell-exec` under a fully
+    ///   restricted token, with scope-root ACEs stamped daemon-side
+    ///   (win_sandbox.rs).
+    ///
+    /// The returned tuple's second element is the session-private
+    /// scratch directory (the shell's whole temp world on Unix — see
+    /// the baselines above); the caller owns its lifetime and removes
+    /// it when the session drops.
     fn scoped_shell_command(
         scope: &crate::peer::access_policy::FilesystemAccessPolicy,
         project_root: Option<&std::path::Path>,
@@ -2798,17 +2806,19 @@ mod tests {
     }
 
     /// The Landlock baselines must never grant the shared same-account
-    /// trees (security review P1): `/dev/pts` opens other sessions'
+    /// trees (security review P1s): `/dev/pts` opens other sessions'
     /// PTYs, `/dev/shm` and the `/tmp` trees expose other processes'
-    /// shared memory and temp files, and bare `/dev` read covers the
-    /// pts side too. The shell's own terminal lane and the ownerless
-    /// entropy devices stay.
+    /// shared memory and temp files, bare `/dev` read covers the pts
+    /// side too, and bare `/run` exposes `/run/secrets` mounts and
+    /// `/run/user/<uid>` files. The shell's own terminal lane, the
+    /// ownerless entropy devices, and the enumerated resolver backends
+    /// stay.
     #[cfg(target_os = "linux")]
     #[test]
     fn scoped_shell_baselines_exclude_shared_account_trees() {
         let read = scoped_shell_read_baseline();
         let write = scoped_shell_write_baseline();
-        for shared in ["/dev", "/dev/pts", "/dev/shm", "/tmp", "/var/tmp"] {
+        for shared in ["/dev", "/dev/pts", "/dev/shm", "/tmp", "/var/tmp", "/run"] {
             let shared = std::path::PathBuf::from(shared);
             assert!(!read.contains(&shared), "{shared:?} must not be readable");
             assert!(!write.contains(&shared), "{shared:?} must not be writable");
@@ -2819,6 +2829,10 @@ mod tests {
             assert!(write.contains(&kept), "{kept:?} is the shell's own lane");
         }
         assert!(read.contains(&std::path::PathBuf::from("/dev/urandom")));
+        assert!(
+            read.contains(&std::path::PathBuf::from("/run/systemd/resolve")),
+            "the resolv.conf backend stays enumerated"
+        );
     }
 
     /// Real end-to-end sandbox check (macOS): a scoped PTY shell can read
