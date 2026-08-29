@@ -296,7 +296,13 @@ impl AgendaHandle {
             cmd,
             AgendaCommand::StartNow { .. } | AgendaCommand::Attest { .. }
         ) {
-            self.lock().resolve_command_ids(&mut cmd)?;
+            let mut store = self.lock();
+            // Refreshed first: a prefix must resolve against the fold's
+            // CURRENT items — on stale state a prefix another instance
+            // has since made ambiguous would silently expand to the
+            // older item instead of refusing (review round 29).
+            store.refresh_if_stale()?;
+            store.resolve_command_ids(&mut cmd)?;
         }
         let cmd = cmd;
         // Attest binds HERE, at the tenant edge (Track AO): the handle

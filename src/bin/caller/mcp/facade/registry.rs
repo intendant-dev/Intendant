@@ -868,6 +868,22 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Read one captured frame (\"latest\" works)",
     },
     CommandSpec {
+        // ctl routes `display frame` and `display read-frame` to the
+        // same tool.
+        path: &["display", "frame"],
+        lane: RiskLane::Inspect,
+        tool: "read_frame",
+        seed: r#"{"frame_id":"latest"}"#,
+        positionals: &[p_str("FRAME_ID", "frame_id", false, false)],
+        flags: &[flag!(
+            "stream",
+            "stream",
+            Str,
+            "stream filter when FRAME_ID is \"latest\""
+        )],
+        help: "Read one captured frame (ctl alias for read-frame)",
+    },
+    CommandSpec {
         path: &["display", "take"],
         lane: RiskLane::Act,
         tool: "take_display",

@@ -946,6 +946,16 @@ fn ref_type_and_locator(raw: &str, explicit: Option<&str>) -> Result<(String, St
         },
     };
     let locator = if prefixed.is_some() { rest } else { raw };
+    // ctl canonicalizes relative file/dir locators against ITS working
+    // directory — a filesystem the facade cannot see — and the store
+    // rejects non-absolute paths, so a relative path must refuse at
+    // plan time with the reason, not after dispatch.
+    if (ref_type == "file" || ref_type == "dir") && !std::path::Path::new(locator).is_absolute() {
+        return Err(format!(
+            "file/dir refs need an absolute path here (got {locator:?}) — ctl resolves \
+             relative paths against its own working directory, which the facade cannot see"
+        ));
+    }
     Ok((ref_type, locator.to_string()))
 }
 
@@ -2061,6 +2071,26 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("client-side"), "{err}");
         assert!(err.contains("--refs"), "{err}");
+        // Round 29: the display frame alias, and relative file refs
+        // refusing at plan time (ctl canonicalizes against ITS cwd).
+        let planned = plan_for_meta("inspect", &argv(&["display", "frame", "latest"])).unwrap();
+        assert_eq!(planned.tool, "read_frame");
+        assert_eq!(planned.args["frame_id"], "latest");
+        let err = plan_for_meta(
+            "act",
+            &argv(&["agenda", "add", "x", "--ref", "file:notes.md"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute path"), "{err}");
+        let err =
+            plan_for_meta("act", &argv(&["agenda", "ref", "item-1", "file:notes.md"])).unwrap_err();
+        assert!(err.contains("absolute path"), "{err}");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "add", "x", "--ref", "file:/srv/notes.md"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["refs"][0]["locator"], "/srv/notes.md");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
