@@ -321,8 +321,10 @@ fn secret_free_shell_env(home: String, shell: &str) -> Vec<(String, String)> {
     }
     #[cfg(target_os = "macos")]
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        // The daemon's per-user temp dir is allowed read-write in the
-        // Seatbelt profile below.
+        // Unsandboxed principal shells keep the daemon's per-user temp
+        // dir; a SCOPED shell's TMPDIR is overridden to its private
+        // scratch in `scoped_shell_env` (the profile no longer allows
+        // the shared temp trees).
         env.push(("TMPDIR".to_string(), tmpdir));
     }
     env
@@ -330,11 +332,14 @@ fn secret_free_shell_env(home: String, shell: &str) -> Vec<(String, String)> {
 
 /// [`secret_free_shell_env`] for a scoped shell: `HOME` points at the
 /// first writable root so shell history, tool caches, and dotfile writes
-/// land inside the scope instead of erroring.
+/// land inside the scope instead of erroring, and `TMPDIR` points at the
+/// session-private `scratch` — the shell's whole temp world, since the
+/// shared same-account `/tmp` trees are no longer granted.
 #[cfg(unix)]
 fn scoped_shell_env(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
     shell: &str,
+    scratch: &std::path::Path,
 ) -> Vec<(String, String)> {
     let home = scope
         .write_roots
@@ -342,7 +347,10 @@ fn scoped_shell_env(
         .or_else(|| scope.read_roots.first())
         .map(|root| root.display().to_string())
         .unwrap_or_else(|| "/tmp".to_string());
-    secret_free_shell_env(home, shell)
+    let mut env = secret_free_shell_env(home, shell);
+    env.retain(|(key, _)| key != "TMPDIR");
+    env.push(("TMPDIR".to_string(), scratch.display().to_string()));
+    env
 }
 
 /// Windows twin of [`secret_free_shell_env`]: minimal, secret-free
@@ -410,45 +418,78 @@ fn windows_scoped_shell_env(
 
 /// Read-only system baseline a scoped shell needs to be a usable shell
 /// (binaries, libraries, config) without exposing user data. `/home`,
-/// `/root`, `/Users`, and `/proc` are deliberately absent.
+/// `/root`, `/Users`, and `/proc` are deliberately absent — and so is
+/// bare `/dev`: scoped shells run as the daemon's Unix account, so a
+/// whole-`/dev` grant would let them open OTHER same-account sessions'
+/// PTYs under `/dev/pts` (reading one steals that session's
+/// keystrokes). Only ownerless device nodes are listed; the shell's own
+/// terminal rides its inherited descriptors plus `/dev/tty`, which the
+/// kernel resolves to the caller's controlling terminal and can never
+/// reach another session. (Landlock rules are additive-only — there is
+/// no way to allow `/dev` minus the PTYs, so the safe nodes are
+/// enumerated. Nested PTY allocation inside a scoped shell is
+/// deliberately unavailable.)
 #[cfg(target_os = "linux")]
 fn scoped_shell_read_baseline() -> Vec<std::path::PathBuf> {
     [
-        "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix",
-        "/run", "/dev",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/etc",
+        "/opt",
+        "/nix",
+        "/run",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
     ]
     .iter()
     .map(std::path::PathBuf::from)
     .collect()
 }
 
-/// Writable (read-write) baseline for a scoped shell: terminal devices and
-/// the shared scratch locations every Unix tool assumes.
+/// Writable (read-write) baseline for a scoped shell: the shell's own
+/// terminal lane only. The shared same-account trees that used to be
+/// here — `/dev/pts` (open other sessions' PTYs: inject output, consume
+/// keystrokes), `/dev/shm` and `/tmp`/`/var/tmp` (read other
+/// same-account processes' shared memory and temp files, the daemon's
+/// own included) — are deliberately absent; temp space is a
+/// session-private scratch directory the spawn creates and points
+/// `TMPDIR` at (see [`PtySession::scoped_shell_command`]).
 #[cfg(target_os = "linux")]
 fn scoped_shell_write_baseline() -> Vec<std::path::PathBuf> {
-    [
-        "/dev/null",
-        "/dev/tty",
-        "/dev/pts",
-        "/dev/shm",
-        "/tmp",
-        "/var/tmp",
-    ]
-    .iter()
-    .map(std::path::PathBuf::from)
-    .collect()
+    ["/dev/null", "/dev/tty"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
 }
 
 /// Generate the Seatbelt (sandbox-exec) profile for a scoped shell on
 /// macOS: deny-default, Apple's own dyld bootstrap rules, read-only system
 /// paths, read access on the scope's roots, write access on the write
-/// roots and scratch space. Network is allowed — the scope is a
-/// *filesystem* boundary, matching Landlock semantics on Linux. Mach
-/// lookups stay open too (uid-guarded; shells need libc services); the
-/// boundary this profile enforces is file access.
+/// roots and the session-private `scratch` directory (which replaces the
+/// shared `/tmp` trees and the daemon's `TMPDIR` — same-account temp
+/// files, the daemon's own included, are not the scope's to read).
+/// Network is allowed — the scope is a *filesystem* boundary, matching
+/// Landlock semantics on Linux. Mach lookups stay open too (uid-guarded;
+/// shells need libc services); the boundary this profile enforces is
+/// file access. `/dev` stays broadly allowed for process bootstrap, but
+/// PTY devices are denied last-match-wins: scoped shells run as the
+/// daemon's Unix account, and an open on another session's
+/// `/dev/ttysNNN` injects into or steals from that terminal — the
+/// shell's own terminal rides its inherited descriptors plus
+/// `/dev/tty`, which resolves to the controlling terminal only.
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+    scratch: &std::path::Path,
 ) -> Result<String, String> {
     let mut read_paths: Vec<String> = Vec::new();
     for path in [
@@ -470,16 +511,16 @@ fn seatbelt_profile(
     }
     let mut exec_paths = read_paths.clone();
     let mut write_paths: Vec<String> = Vec::new();
-    for path in ["/dev", "/private/tmp", "/private/var/tmp"] {
+    for path in ["/dev"] {
         write_paths.push(crate::sandbox::seatbelt_path_literal(
             std::path::Path::new(path),
         )?);
     }
-    if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        let canonical =
-            std::fs::canonicalize(&tmpdir).unwrap_or_else(|_| std::path::PathBuf::from(&tmpdir));
-        write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical)?);
-    }
+    let scratch_canonical =
+        std::fs::canonicalize(scratch).unwrap_or_else(|_| scratch.to_path_buf());
+    let scratch_literal = crate::sandbox::seatbelt_path_literal(&scratch_canonical)?;
+    read_paths.push(scratch_literal.clone());
+    write_paths.push(scratch_literal);
     // Seatbelt matches the REAL path of a file: a rule on a symlinked root
     // (`/tmp/...`, `/var/...`, `/etc/...` on macOS) would never match, so
     // roots are canonicalized first. A root that doesn't resolve is kept
@@ -533,6 +574,7 @@ fn seatbelt_profile(
          (allow file-map-executable {exec})\n\
          (allow file-read* {read})\n\
          (allow file-write* {write})\n\
+         (deny file-read* file-write* (regex #\"^/dev/ttys\"))\n\
          {sensitive}{credential}",
         exec = subpaths(&exec_paths),
         read = subpaths(&read_paths),
@@ -874,6 +916,10 @@ pub struct PtySession {
     /// principal's CURRENT scope to refuse sessions whose sandbox no
     /// longer expresses the grant.
     spawn_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
+    /// Session-private temp directory of a scoped Unix shell (its
+    /// `TMPDIR`, replacing the shared same-account `/tmp` trees).
+    /// Removed on Drop.
+    scoped_scratch: Option<std::path::PathBuf>,
 }
 
 impl PtySession {
@@ -924,11 +970,24 @@ impl PtySession {
             ),
             None => None,
         };
+        let mut scoped_scratch: Option<std::path::PathBuf> = None;
+        // Any failure between scratch creation and session construction
+        // must remove the scratch dir — after construction, Drop owns it.
+        let cleanup_scratch = |scratch: &Option<std::path::PathBuf>| {
+            if let Some(scratch) = scratch {
+                let _ = std::fs::remove_dir_all(scratch);
+            }
+        };
         let child = if let Some(scope) = scope {
-            let cmd = Self::scoped_shell_command(scope, cwd.as_deref())?;
-            pair.slave
-                .spawn_command(cmd)
-                .map_err(|e| format!("spawn scoped shell: {e}"))?
+            let (cmd, scratch) = Self::scoped_shell_command(scope, cwd.as_deref())?;
+            scoped_scratch = scratch;
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => child,
+                Err(e) => {
+                    cleanup_scratch(&scoped_scratch);
+                    return Err(format!("spawn scoped shell: {e}"));
+                }
+            }
         } else {
             let build_cmd = |program: &str, args: &[String]| {
                 // For a principal-owned spawn the PROGRAM is part of the
@@ -1009,14 +1068,14 @@ impl PtySession {
         };
 
         let child_killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("clone reader: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("take writer: {e}"))?;
+        let reader = pair.master.try_clone_reader().map_err(|e| {
+            cleanup_scratch(&scoped_scratch);
+            format!("clone reader: {e}")
+        })?;
+        let writer = pair.master.take_writer().map_err(|e| {
+            cleanup_scratch(&scoped_scratch);
+            format!("take writer: {e}")
+        })?;
 
         let session = Arc::new(Self {
             master: StdMutex::new(pair.master),
@@ -1030,6 +1089,7 @@ impl PtySession {
             owner,
             shared: std::sync::atomic::AtomicBool::new(shared),
             spawn_scope: scope.cloned(),
+            scoped_scratch,
         });
 
         // portable_pty's reader and child wait are both blocking. On Windows,
@@ -1074,10 +1134,14 @@ impl PtySession {
     ///   Landlock) and then execs the shell.
     /// - **macOS**: `sandbox-exec -p <generated Seatbelt profile>`.
     /// - **Windows**: refused — no OS sandbox seam wired up yet.
+    /// Build the sandboxed shell command for a scoped spawn. The second
+    /// element is the session-private scratch directory (the shell's
+    /// whole temp world on Unix — see the baselines above); the caller
+    /// owns its lifetime and removes it when the session drops.
     fn scoped_shell_command(
         scope: &crate::peer::access_policy::FilesystemAccessPolicy,
         project_root: Option<&std::path::Path>,
-    ) -> Result<PtyCommandBuilder, String> {
+    ) -> Result<(PtyCommandBuilder, Option<std::path::PathBuf>), String> {
         #[cfg(windows)]
         {
             // Windows twin of the Linux wrapper: re-exec this binary as
@@ -1113,7 +1177,9 @@ impl PtySession {
                 cmd.env(key, value);
             }
             cmd.cwd(cwd);
-            return Ok(cmd);
+            // Windows temp already lands inside the scope (the profile
+            // family points there) — no shared-tree scratch to manage.
+            return Ok((cmd, None));
         }
         #[cfg(unix)]
         {
@@ -1124,9 +1190,32 @@ impl PtySession {
                 project_root.unwrap_or_else(|| std::path::Path::new("/")),
             );
 
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let scratch = {
+                // Session-private temp: the shared `/tmp` trees hold
+                // same-account files (other sessions', the daemon's own)
+                // that are not the scope's to read, so each scoped shell
+                // gets a fresh 0700 directory as its whole temp world —
+                // granted below, pointed at by `TMPDIR`, and removed when
+                // the session drops.
+                let scratch = std::env::temp_dir().join(format!(
+                    "intendant-scoped-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                std::fs::create_dir_all(&scratch)
+                    .map_err(|e| format!("create scoped scratch dir: {e}"))?;
+                let mut perms = std::fs::metadata(&scratch)
+                    .map_err(|e| format!("stat scoped scratch dir: {e}"))?
+                    .permissions();
+                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+                std::fs::set_permissions(&scratch, perms)
+                    .map_err(|e| format!("restrict scoped scratch dir: {e}"))?;
+                scratch
+            };
+
             #[cfg(target_os = "macos")]
             let (program, args, policy_env) = {
-                let profile = seatbelt_profile(scope)?;
+                let profile = seatbelt_profile(scope, &scratch)?;
                 let mut args = vec!["-p".to_string(), profile, shell.clone()];
                 args.extend(shell_args);
                 ("/usr/bin/sandbox-exec".to_string(), args, None::<String>)
@@ -1139,8 +1228,10 @@ impl PtySession {
                 let mut read = scoped_shell_read_baseline();
                 read.extend(scope.read_roots.iter().cloned());
                 read.extend(scope.write_roots.iter().cloned());
+                read.push(scratch.clone());
                 let mut write = scoped_shell_write_baseline();
                 write.extend(scope.write_roots.iter().cloned());
+                write.push(scratch.clone());
                 let policy = serde_json::to_string(&ScopedShellPolicy { read, write })
                     .map_err(|e| format!("encode scoped shell policy: {e}"))?;
                 let mut args = vec!["--scoped-shell-exec".to_string(), shell.clone()];
@@ -1161,14 +1252,14 @@ impl PtySession {
                 let mut cmd = PtyCommandBuilder::new(program);
                 cmd.args(&args);
                 cmd.env_clear();
-                for (key, value) in scoped_shell_env(scope, &shell) {
+                for (key, value) in scoped_shell_env(scope, &shell, &scratch) {
                     cmd.env(key, value);
                 }
                 if let Some(policy) = policy_env {
                     cmd.env(SCOPED_SHELL_POLICY_ENV, policy);
                 }
                 cmd.cwd(cwd);
-                Ok(cmd)
+                Ok((cmd, Some(scratch)))
             }
         }
     }
@@ -1364,6 +1455,11 @@ impl Drop for PtySession {
         // channels signalled.
         if let Ok(hub) = self.output.lock() {
             hub.detach_all();
+        }
+        // The scoped shell's session-private temp world dies with the
+        // session (best-effort — a leftover is inert 0700 scratch).
+        if let Some(scratch) = self.scoped_scratch.take() {
+            let _ = std::fs::remove_dir_all(scratch);
         }
     }
 }
@@ -2578,12 +2674,16 @@ mod tests {
             read_roots: vec![std::path::PathBuf::from("/srv/data")],
             write_roots: vec![std::path::PathBuf::from("/srv/work")],
         };
-        let env = scoped_shell_env(&scope, "/bin/zsh");
+        let scratch = std::path::Path::new("/tmp/intendant-scoped-test");
+        let env = scoped_shell_env(&scope, "/bin/zsh", scratch);
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("HOME"), Some("/srv/work"));
         assert_eq!(get("SHELL"), Some("/bin/zsh"));
         assert!(get("TERM").is_some());
         assert!(get("PATH").is_some());
+        // The whole temp world is the session-private scratch — never
+        // the daemon's TMPDIR or the shared /tmp trees.
+        assert_eq!(get("TMPDIR"), Some("/tmp/intendant-scoped-test"));
         // Nothing beyond the fixed allowlist leaks in.
         for (key, _) in &env {
             assert!(
@@ -2669,7 +2769,8 @@ mod tests {
             read_roots: vec![std::path::PathBuf::from("/srv/spa ced/read")],
             write_roots: vec![std::path::PathBuf::from("/srv/quo\"te")],
         };
-        let profile = seatbelt_profile(&scope).unwrap();
+        let scratch = std::path::Path::new("/srv/scratch-le55");
+        let profile = seatbelt_profile(&scope, scratch).unwrap();
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(subpath \"/srv/spa ced/read\")"));
         assert!(profile.contains("(subpath \"/srv/quo\\\"te\")"));
@@ -2679,12 +2780,45 @@ mod tests {
             .find(|line| line.starts_with("(allow file-read* "))
             .unwrap();
         assert!(read_section.contains("/srv/quo"));
+        // The session-private scratch replaces the shared temp trees
+        // (same-account files are not the scope's to read), and PTY
+        // devices are denied last-match-wins — an open on another
+        // session's /dev/ttysNNN would inject into or steal from that
+        // terminal (security review P1).
+        assert!(profile.contains("(subpath \"/srv/scratch-le55\")"));
+        assert!(!profile.contains("(subpath \"/private/tmp\")"));
+        assert!(!profile.contains("(subpath \"/private/var/tmp\")"));
+        assert!(profile.contains("(deny file-read* file-write* (regex #\"^/dev/ttys\"))"));
         // Control characters are refused outright.
         let bad = FilesystemAccessPolicy {
             read_roots: vec![std::path::PathBuf::from("/srv/evil\nprofile")],
             write_roots: Vec::new(),
         };
-        assert!(seatbelt_profile(&bad).is_err());
+        assert!(seatbelt_profile(&bad, scratch).is_err());
+    }
+
+    /// The Landlock baselines must never grant the shared same-account
+    /// trees (security review P1): `/dev/pts` opens other sessions'
+    /// PTYs, `/dev/shm` and the `/tmp` trees expose other processes'
+    /// shared memory and temp files, and bare `/dev` read covers the
+    /// pts side too. The shell's own terminal lane and the ownerless
+    /// entropy devices stay.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_shell_baselines_exclude_shared_account_trees() {
+        let read = scoped_shell_read_baseline();
+        let write = scoped_shell_write_baseline();
+        for shared in ["/dev", "/dev/pts", "/dev/shm", "/tmp", "/var/tmp"] {
+            let shared = std::path::PathBuf::from(shared);
+            assert!(!read.contains(&shared), "{shared:?} must not be readable");
+            assert!(!write.contains(&shared), "{shared:?} must not be writable");
+        }
+        for kept in ["/dev/null", "/dev/tty"] {
+            let kept = std::path::PathBuf::from(kept);
+            assert!(read.contains(&kept) || write.contains(&kept));
+            assert!(write.contains(&kept), "{kept:?} is the shell's own lane");
+        }
+        assert!(read.contains(&std::path::PathBuf::from("/dev/urandom")));
     }
 
     /// Real end-to-end sandbox check (macOS): a scoped PTY shell can read
@@ -2738,6 +2872,13 @@ mod tests {
             Some(vec![root.clone()]),
             "the spawn scope is recorded on the session"
         );
+        // The session-private temp world was created for the shell
+        // (its TMPDIR; removed when the session drops).
+        let scratch = session
+            .scoped_scratch
+            .clone()
+            .expect("a scoped spawn creates its scratch dir");
+        assert!(scratch.is_dir(), "scratch {scratch:?} must exist");
 
         let mut rx = session.attach();
 
