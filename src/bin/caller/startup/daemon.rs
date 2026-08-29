@@ -60,7 +60,7 @@ pub(crate) async fn run_daemon(
     // runs — the daemon's `/mcp` gateway surface observes state through
     // `spawn_http_observation_listener`, which ignores Tick. A 1 Hz tick
     // would only wake every bus subscriber for nothing.
-    let _session_listeners = startup::wiring::spawn_session_listeners(
+    let session_listeners = startup::wiring::spawn_session_listeners(
         &bus,
         &recording_registry,
         &session_registry,
@@ -118,6 +118,7 @@ pub(crate) async fn run_daemon(
         outbound_tx.clone(),
         None, // query_ctx: the daemon serves supervised sessions, not one live agent
         None, // active_session_log: supervised children register their own logs
+        Some(session_listeners.event_ring.clone()),
     )?;
     let shared_session = gateway.shared_session.clone();
     eprintln!("{}", gateway.log_line);

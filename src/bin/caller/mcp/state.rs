@@ -148,6 +148,10 @@ pub struct McpAppState {
     /// `None` outside the gateway/daemon shapes (bare stdio servers) —
     /// terminal surfaces then answer "unavailable".
     pub terminal: Option<std::sync::Arc<crate::terminal::TerminalRegistry>>,
+    /// The daemon-wide event ring, for the `events` long-poll verb.
+    /// `None` outside the gateway/daemon shapes (bare stdio servers) —
+    /// the verb then answers "unavailable".
+    pub event_ring: Option<std::sync::Arc<crate::event_ring::EventRing>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -337,6 +341,7 @@ impl McpAppState {
             memory: None,
             handover: None,
             terminal: None,
+            event_ring: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

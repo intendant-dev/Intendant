@@ -74,6 +74,7 @@ pub(crate) use tools_ask::{
 pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_codex_cloud;
 mod tools_display;
+mod tools_events;
 mod tools_terminal;
 pub(crate) use tools_terminal::{
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
@@ -676,6 +677,12 @@ impl IntendantServer {
             },
             "help" => Ok(text_tool_result(facade::render_help(&args))),
             "docs" => Ok(text_tool_result(facade::render_docs(&args))),
+            "events" => {
+                let Parameters(params) = parse_params::<tools_events::EventsParams>(args)?;
+                Ok(text_tool_result(
+                    self.events_tool(params, caller, &actor).await,
+                ))
+            }
             "get_status" => Ok(text_tool_result(
                 self.get_status_for_session(session_id, managed_context_override)
                     .await,

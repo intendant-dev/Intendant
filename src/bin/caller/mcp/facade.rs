@@ -630,7 +630,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
 ];
 
 /// The meta-tool names the facade serves.
-pub(crate) const FACADE_TOOLS: [&str; 5] = ["inspect", "act", "authorize", "help", "docs"];
+pub(crate) const FACADE_TOOLS: [&str; 6] =
+    ["inspect", "act", "authorize", "help", "docs", "events"];
 
 /// Params for the three executor meta-tools (`inspect`/`act`/`authorize`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -932,6 +933,10 @@ pub(crate) fn facade_gate_operation(name: &str, args: &serde_json::Value) -> Opt
         // The read-only meta surface: the command map and the embedded
         // skills corpus disclose less than get_status already does.
         "help" | "docs" => Some(PeerOperation::StatsRead),
+        // The event stream carries only session/approval/task lifecycle
+        // (the ring's ingest allowlist), i.e. what the session.inspect
+        // read tools already serve — push semantics, not new authority.
+        "events" => Some(PeerOperation::SessionInspect),
         "inspect" | "act" | "authorize" => Some(
             plan_for_meta(name, args)
                 .map(|planned| crate::mcp::mcp_tool_operation(planned.tool))
@@ -953,6 +958,7 @@ pub(crate) fn facade_tool_advertised(
 ) -> Option<bool> {
     match name {
         "help" | "docs" => Some(allowed(PeerOperation::StatsRead)),
+        "events" => Some(allowed(PeerOperation::SessionInspect)),
         "inspect" | "act" | "authorize" => Some(
             COMMANDS
                 .iter()
@@ -1332,6 +1338,7 @@ mod tests {
         };
         assert_eq!(facade_tool_advertised("help", read_only), Some(true));
         assert_eq!(facade_tool_advertised("docs", read_only), Some(true));
+        assert_eq!(facade_tool_advertised("events", read_only), Some(true));
         assert_eq!(facade_tool_advertised("inspect", read_only), Some(true));
         assert_eq!(facade_tool_advertised("act", read_only), Some(false));
         assert_eq!(facade_tool_advertised("authorize", read_only), Some(false));
@@ -1344,8 +1351,14 @@ mod tests {
             facade_tool_advertised("inspect", approvals_only),
             Some(false)
         );
+        assert_eq!(
+            facade_tool_advertised("events", approvals_only),
+            Some(false),
+            "events rides session.inspect, not the approval operation"
+        );
         let nothing = |_: Op| false;
         assert_eq!(facade_tool_advertised("help", nothing), Some(false));
+        assert_eq!(facade_tool_advertised("events", nothing), Some(false));
         assert_eq!(facade_tool_advertised("get_status", read_only), None);
     }
 

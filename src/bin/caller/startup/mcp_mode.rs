@@ -42,7 +42,7 @@ pub(crate) async fn run_mcp_mode(
     let _human_monitor =
         event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
     let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
-    let _session_listeners = startup::wiring::spawn_session_listeners(
+    let session_listeners = startup::wiring::spawn_session_listeners(
         &bus,
         &recording_registry,
         &session_registry,
@@ -119,6 +119,7 @@ pub(crate) async fn run_mcp_mode(
             outbound_tx.clone(),
             None, // query_ctx: MCP mode has no dashboard agent-state queries
             Some(session_log.clone()),
+            Some(session_listeners.event_ring.clone()),
         )?;
         slog(&session_log, |l| l.info(&gateway.log_line));
         eprintln!("{}", gateway.log_line);
