@@ -118,7 +118,10 @@ read), `tools call` (the variable-operation escape hatch — raw `/mcp`
 exists for typed callers), and the `agenda ops`/`agenda occurrences`
 audit reads, which ride the loopback-token `/api` lane and refuse the
 peer and supervised-session lanes by design — a trust boundary the
-facade must not tunnel through. The serialized facade
+facade must not tunnel through. ctl's derived agenda views
+(`--blocked`, `--frontier`, `--under`, and the bare-list
+answered-union) are client-side renders over the same `agenda list`
+read, not registry vocabulary: fetch and derive. The serialized facade
 listing is budget-pinned in tests so the whole advertised surface stays
 a few kilobytes regardless of registry size; `intendant ctl events` is
 the CLI leg of the `events` verb (client-side ≤60s chunking over a

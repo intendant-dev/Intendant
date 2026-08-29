@@ -375,7 +375,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("all", "__all_statuses", Bool, "the whole ledger, every status"),
             flag!("q", "q", Str, "server-side search"),
         ],
-        help: "List agenda items (default: open work; ctl's bare list additionally folds in unconsumed answers client-side)",
+        help: "List agenda items (default: open work). ctl's --blocked/--frontier/--under and its bare-list answered-union are client-side renders over this read — fetch and derive",
     },
     CommandSpec {
         path: &["agenda", "show"],
@@ -398,6 +398,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("kind", "kind", Str, "note|task|question (default task, matching ctl)"),
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
+            flag!(
+                "refs",
+                "refs",
+                Json,
+                "source pointers, atomically with the park: [{ref_type, locator, must_read?, label?}]"
+            ),
         ],
         help: "Park a durable item on the agenda",
     },
@@ -1165,6 +1171,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "__ask_questions",
                 Json,
                 "structured option-bearing form: JSON array of question objects (omit TEXT)"
+            ),
+            flag!(
+                "refs",
+                "refs",
+                Json,
+                "source pointers, atomically with the park: [{ref_type, locator, must_read?, label?}]"
             ),
         ],
         help: "Park a durable question (plain TEXT, or --questions for the structured form — ctl's own split)",
@@ -2628,8 +2640,12 @@ mod tests {
 
     /// Bare `agenda list` serves the useful default (open work) instead
     /// of the whole ledger, `--all` lifts the seed, and an explicit
-    /// status overrides it (review round 9); the residual divergence
-    /// from ctl's client-side answered-union is named in the row help.
+    /// status overrides it (review round 9); the client-side ctl
+    /// renders — the answered-union, --blocked/--frontier/--under — are
+    /// deliberately NOT registry vocabulary (review round 11): a pure
+    /// single-call planner cannot derive them, the row help says so,
+    /// and this pin cements the exclusion as intent rather than
+    /// omission.
     #[test]
     fn agenda_list_defaults_to_open_and_all_lifts_it() {
         let planned = plan_for_meta("inspect", &argv(&["agenda", "list"])).unwrap();
@@ -2640,6 +2656,44 @@ mod tests {
         let planned =
             plan_for_meta("inspect", &argv(&["agenda", "list", "--status", "done"])).unwrap();
         assert_eq!(planned.args["status"], "done");
+        for render_only in ["--blocked", "--frontier", "--under"] {
+            assert!(
+                plan_for_meta("inspect", &argv(&["agenda", "list", render_only])).is_err(),
+                "{render_only} is a ctl client-side render, not registry vocabulary"
+            );
+        }
+    }
+
+    /// Park-time refs land atomically with the item (review round 11):
+    /// add and ask both carry literal ref objects, so no observer ever
+    /// sees a context-free item and no later failure strands one.
+    #[test]
+    fn agenda_parks_carry_refs_atomically() {
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "add",
+                "fix the roof",
+                "--refs",
+                "[{\"ref_type\":\"file\",\"locator\":\"/srv/roof.md\",\"must_read\":true}]",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["refs"][0]["ref_type"], "file");
+        assert_eq!(planned.args["refs"][0]["must_read"], true);
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "ask",
+                "when?",
+                "--refs",
+                "[{\"ref_type\":\"url\",\"locator\":\"https://example.com\"}]",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["refs"][0]["ref_type"], "url");
     }
 
     /// ctl's default forms plan identically through the facade (review
