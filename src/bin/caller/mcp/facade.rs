@@ -462,6 +462,19 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
             flag!(
+                "ref",
+                "__park_refs",
+                StrList,
+                "[TYPE:]LOCATOR source pointer (repeatable, ctl spelling)"
+            ),
+            flag!(
+                "must-read",
+                "__park_must_read",
+                Bool,
+                "mark every --ref of this park must-read"
+            ),
+            flag!("label", "__park_label", Str, "label every --ref of this park"),
+            flag!(
                 "refs",
                 "refs",
                 Json,
@@ -882,7 +895,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Authorize,
         tool: "grant_user_display",
         seed: "{}",
-        positionals: &[],
+        positionals: &[p_u64_opt("DISPLAY_ID", "display_id")],
         flags: &[flag!(
             "display-id",
             "display_id",
@@ -896,7 +909,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Authorize,
         tool: "revoke_user_display",
         seed: "{}",
-        positionals: &[],
+        positionals: &[p_u64_opt("DISPLAY_ID", "display_id")],
         flags: &[
             flag!("display-id", "display_id", U64, "omit = primary"),
             flag!("note", "note", Str, "why revoked"),
@@ -1299,10 +1312,48 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
             flag!(
+                "option",
+                "__agenda_options",
+                StrList,
+                "decision-card choice \"Label[:description]\" (repeatable; makes the structured form)"
+            ),
+            flag!(
+                "pick",
+                "__agenda_pick",
+                Str,
+                "selection bounds MIN[-MAX] (replaces --multi)"
+            ),
+            flag!(
+                "multi",
+                "__agenda_multi",
+                Bool,
+                "any subset of the options may be picked"
+            ),
+            flag!("header", "__agenda_header", Str, "short topic chip"),
+            flag!(
+                "consequence",
+                "__agenda_consequence",
+                Str,
+                "what happens if the question lapses unanswered"
+            ),
+            flag!(
+                "ref",
+                "__park_refs",
+                StrList,
+                "[TYPE:]LOCATOR source pointer (repeatable, ctl spelling)"
+            ),
+            flag!(
+                "must-read",
+                "__park_must_read",
+                Bool,
+                "mark every --ref of this park must-read"
+            ),
+            flag!("label", "__park_label", Str, "label every --ref of this park"),
+            flag!(
                 "questions",
                 "__ask_questions",
                 Json,
-                "structured option-bearing form: JSON array of question objects (omit TEXT)"
+                "structured multi-question form: JSON array of question objects (omit TEXT)"
             ),
             flag!(
                 "refs",
@@ -1311,7 +1362,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "source pointers, atomically with the park: [{ref_type, locator, must_read?, label?}]"
             ),
         ],
-        help: "Park a durable question (plain TEXT, or --questions for the structured form — ctl's own split)",
+        help: "Park a durable question (plain TEXT; --option flags make ctl's decision card; --questions is the raw form)",
     },
     CommandSpec {
         path: &["agenda", "block"],
@@ -2476,30 +2527,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         let raw_options = options.as_array().cloned().unwrap_or_default();
         obj.insert(
             "options".to_string(),
-            serde_json::Value::Array(
-                raw_options
-                    .into_iter()
-                    .map(|value| {
-                        let raw = value.as_str().unwrap_or_default();
-                        let (label, description) = match raw.split_once(':') {
-                            Some((label, description)) => (label.trim(), Some(description.trim())),
-                            None => (raw.trim(), None),
-                        };
-                        let mut entry = serde_json::Map::new();
-                        entry.insert(
-                            "label".to_string(),
-                            serde_json::Value::String(label.to_string()),
-                        );
-                        if let Some(description) = description.filter(|d| !d.is_empty()) {
-                            entry.insert(
-                                "description".to_string(),
-                                serde_json::Value::String(description.to_string()),
-                            );
-                        }
-                        serde_json::Value::Object(entry)
-                    })
-                    .collect(),
-            ),
+            serde_json::Value::Array(option_entries(&raw_options)),
         );
     }
     // ctl's `--pick MIN[-MAX]` becomes the explicit pick bounds — the
@@ -2586,35 +2614,46 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     // client filesystem — meaningless here — so they refuse in ctl's
     // own words instead.
     if let Some(raw) = obj.remove("__ref_locator") {
-        let raw = raw.as_str().unwrap_or_default().to_string();
-        const REF_TYPES: [&str; 5] = ["file", "dir", "memory", "session", "url"];
-        let (prefixed, rest) = match raw.split_once(':') {
-            Some((t, rest)) if REF_TYPES.contains(&t) => (Some(t.to_string()), rest.to_string()),
-            _ => (None, raw.clone()),
-        };
-        if let Some(explicit) = obj.get("ref_type").and_then(serde_json::Value::as_str) {
-            let t = explicit.trim().to_ascii_lowercase();
-            if !REF_TYPES.contains(&t.as_str()) {
-                return Err(format!(
-                    "unknown ref type '{explicit}' (file, dir, memory, session, or url)"
-                ));
-            }
-            obj.insert("ref_type".to_string(), serde_json::Value::String(t));
-        } else if let Some(t) = &prefixed {
-            obj.insert("ref_type".to_string(), serde_json::Value::String(t.clone()));
-        } else if raw.starts_with("http://") || raw.starts_with("https://") {
-            obj.insert(
-                "ref_type".to_string(),
-                serde_json::Value::String("url".to_string()),
-            );
-        } else {
-            return Err(format!(
-                "cannot infer the ref type of {raw:?} — prefix it \
-                 (file:…, dir:…, memory:…, session:…, url:https://…) or pass --type"
-            ));
-        }
-        let locator = if prefixed.is_some() { rest } else { raw };
+        let raw = raw.as_str().unwrap_or_default();
+        let explicit = obj
+            .get("ref_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let (ref_type, locator) = ref_type_and_locator(raw, explicit.as_deref())?;
+        obj.insert("ref_type".to_string(), serde_json::Value::String(ref_type));
         obj.insert("locator".to_string(), serde_json::Value::String(locator));
+    }
+    // ctl's park-time ref gesture on `agenda add`/`agenda ask`:
+    // repeatable `--ref [TYPE:]LOCATOR`, with `--must-read`/`--label`
+    // applying to every ref of this park, built into the same atomic
+    // refs array the --refs JSON form carries.
+    let park_must_read = obj.remove("__park_must_read").is_some();
+    let park_label = obj.remove("__park_label");
+    if let Some(specs) = obj.remove("__park_refs") {
+        if obj.contains_key("refs") {
+            return Err("pass --ref specs or the --refs JSON array, not both".to_string());
+        }
+        let mut refs = Vec::new();
+        for spec_value in specs.as_array().cloned().unwrap_or_default() {
+            let raw = spec_value.as_str().unwrap_or_default();
+            let (ref_type, locator) = ref_type_and_locator(raw, None)?;
+            let mut entry = serde_json::Map::new();
+            entry.insert("ref_type".to_string(), serde_json::Value::String(ref_type));
+            entry.insert("locator".to_string(), serde_json::Value::String(locator));
+            if park_must_read {
+                entry.insert("must_read".to_string(), serde_json::Value::Bool(true));
+            }
+            if let Some(label) = park_label.as_ref().and_then(serde_json::Value::as_str) {
+                entry.insert(
+                    "label".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+            }
+            refs.push(serde_json::Value::Object(entry));
+        }
+        obj.insert("refs".to_string(), serde_json::Value::Array(refs));
+    } else if park_must_read || park_label.is_some() {
+        return Err("--must-read/--label describe refs: pass --ref too".to_string());
     }
     // ctl's `agenda start --goal-run`: the autonomous shape sends
     // interactive:false; absent stays absent on the wire (the daemon
@@ -2820,6 +2859,78 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     if obj.remove("__all_statuses").is_some() {
         obj.remove("status");
     }
+    // ctl's structured `agenda ask` flags: any of --option/--multi/
+    // --pick/--header makes the decision-card form (ctl's own
+    // detector), building the one-question op:ask park with the same
+    // vocabulary and refusals as `ctl::agenda_ask_args`.
+    let agenda_options = obj.remove("__agenda_options");
+    let agenda_pick = obj.remove("__agenda_pick");
+    let agenda_multi = obj.remove("__agenda_multi").is_some();
+    let agenda_header = obj.remove("__agenda_header");
+    let agenda_consequence = obj.remove("__agenda_consequence");
+    if agenda_options.is_some() || agenda_pick.is_some() || agenda_multi || agenda_header.is_some()
+    {
+        if obj.contains_key("__ask_questions") {
+            return Err("use either the --option flags or --questions, not both".to_string());
+        }
+        let options = agenda_options
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if options.is_empty() {
+            return Err("--multi/--pick/--header describe options: pass --option too".to_string());
+        }
+        if options.len() > crate::mcp::ASK_USER_MAX_OPTIONS {
+            return Err(format!(
+                "too many options: {} (max {}; omit --option for free-text only)",
+                options.len(),
+                crate::mcp::ASK_USER_MAX_OPTIONS
+            ));
+        }
+        let Some(text) = obj.remove("title") else {
+            return Err("agenda ask requires question text".to_string());
+        };
+        let mut question = serde_json::Map::new();
+        question.insert("question".to_string(), text);
+        if let Some(header) = agenda_header {
+            question.insert("header".to_string(), header);
+        }
+        question.insert(
+            "options".to_string(),
+            serde_json::Value::Array(option_entries(&options)),
+        );
+        // The park wire speaks precise pick bounds only (ctl's rule):
+        // --pick verbatim; --multi = any subset of the options.
+        if let Some(pick) = agenda_pick {
+            if agenda_multi {
+                return Err("--pick replaces --multi — provide one or the other".to_string());
+            }
+            let (min, max) = crate::ctl::parse_pick_spec(pick.as_str().unwrap_or_default())?;
+            question.insert("pick_min".to_string(), serde_json::Value::from(min));
+            question.insert("pick_max".to_string(), serde_json::Value::from(max));
+        } else if agenda_multi {
+            question.insert("pick_min".to_string(), serde_json::Value::from(1));
+            question.insert(
+                "pick_max".to_string(),
+                serde_json::Value::from(options.len()),
+            );
+        }
+        if let Some(consequence) = agenda_consequence {
+            question.insert("consequence".to_string(), consequence);
+        }
+        obj.insert(
+            "op".to_string(),
+            serde_json::Value::String("ask".to_string()),
+        );
+        obj.remove("kind");
+        obj.insert(
+            "questions".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(question)]),
+        );
+    } else if agenda_consequence.is_some() {
+        return Err("--consequence rides the structured form: pass --option too".to_string());
+    }
     // The `agenda ask` split, mirroring ctl: plain TEXT parks an
     // ordinary question item (op add, kind question); --questions is
     // the structured option-bearing form (op ask), which carries no
@@ -2870,6 +2981,71 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         }
     }
     Ok(serde_json::Value::Object(obj))
+}
+
+/// Split ctl's "Label[:description]" option values into option objects
+/// (`ctl::ask_option_entries`'s split): the label is what the person
+/// picks; a non-empty description becomes the card's explainer.
+fn option_entries(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|value| {
+            let raw = value.as_str().unwrap_or_default();
+            let (label, description) = match raw.split_once(':') {
+                Some((label, description)) => (label.trim(), Some(description.trim())),
+                None => (raw.trim(), None),
+            };
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "label".to_string(),
+                serde_json::Value::String(label.to_string()),
+            );
+            if let Some(description) = description.filter(|d| !d.is_empty()) {
+                entry.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.to_string()),
+                );
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect()
+}
+
+/// Decode ctl's `[TYPE:]LOCATOR` ref grammar (`ctl::agenda_ref_spec`
+/// minus its client-filesystem inferences, which are meaningless
+/// daemon-side): a recognized prefix is stripped, an explicit type
+/// overrides the prefix (validated against the closed vocabulary,
+/// lowercased), http(s) infers url, and anything else refuses in ctl's
+/// own cannot-infer words.
+fn ref_type_and_locator(raw: &str, explicit: Option<&str>) -> Result<(String, String), String> {
+    const REF_TYPES: [&str; 5] = ["file", "dir", "memory", "session", "url"];
+    let (prefixed, rest) = match raw.split_once(':') {
+        Some((t, rest)) if REF_TYPES.contains(&t) => (Some(t), rest),
+        _ => (None, raw),
+    };
+    let ref_type = match explicit {
+        Some(explicit) => {
+            let t = explicit.trim().to_ascii_lowercase();
+            if !REF_TYPES.contains(&t.as_str()) {
+                return Err(format!(
+                    "unknown ref type '{explicit}' (file, dir, memory, session, or url)"
+                ));
+            }
+            t
+        }
+        None => match prefixed {
+            Some(t) => t.to_string(),
+            None if raw.starts_with("http://") || raw.starts_with("https://") => "url".to_string(),
+            None => {
+                return Err(format!(
+                    "cannot infer the ref type of {raw:?} — prefix it \
+                     (file:…, dir:…, memory:…, session:…, url:https://…) or pass --type"
+                ))
+            }
+        },
+    };
+    let locator = if prefixed.is_some() { rest } else { raw };
+    Ok((ref_type, locator.to_string()))
 }
 
 /// Parse ctl's compact region CSV ("x,y,width,height", normalized 0-1)
@@ -3838,6 +4014,100 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("CATEGORY=RULE"), "{err}");
+        // Round 24: display grant/revoke positional ids, the park-time
+        // --ref gesture, and ctl's structured agenda ask flags.
+        let planned = plan_for_meta("authorize", &argv(&["display", "grant-user", "2"])).unwrap();
+        assert_eq!(planned.args["display_id"], 2);
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["display", "revoke-user", "3", "--note", "done"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["display_id"], 3);
+        assert_eq!(planned.args["note"], "done");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "add",
+                "fix it",
+                "--ref",
+                "url:https://e.com/a",
+                "--ref",
+                "memory:notes",
+                "--must-read",
+                "--label",
+                "ctx",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["refs"],
+            serde_json::json!([
+                { "ref_type": "url", "locator": "https://e.com/a", "must_read": true, "label": "ctx" },
+                { "ref_type": "memory", "locator": "notes", "must_read": true, "label": "ctx" },
+            ])
+        );
+        let err = plan_for_meta("act", &argv(&["agenda", "add", "fix it", "--label", "ctx"]))
+            .unwrap_err();
+        assert!(err.contains("pass --ref too"), "{err}");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "ask",
+                "Choose",
+                "--option",
+                "A:First",
+                "--option",
+                "B",
+                "--pick",
+                "1",
+                "--header",
+                "Pick",
+                "--consequence",
+                "I pick A",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["op"], "ask");
+        assert!(planned.args.get("kind").is_none());
+        assert!(planned.args.get("title").is_none());
+        assert_eq!(
+            planned.args["questions"],
+            serde_json::json!([{
+                "question": "Choose",
+                "header": "Pick",
+                "options": [
+                    { "label": "A", "description": "First" },
+                    { "label": "B" },
+                ],
+                "pick_min": 1,
+                "pick_max": 1,
+                "consequence": "I pick A",
+            }])
+        );
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda", "ask", "Which?", "--option", "A", "--option", "B", "--multi",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["questions"][0]["pick_min"], 1);
+        assert_eq!(planned.args["questions"][0]["pick_max"], 2);
+        let err = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ask", "Which?", "--header", "Pick"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("pass --option too"), "{err}");
+        let err = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ask", "Which?", "--consequence", "stalls"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("pass --option too"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
