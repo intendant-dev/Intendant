@@ -479,6 +479,12 @@ impl AgendaStore {
     ) -> Result<AgendaItem, AgendaError> {
         // Validate against the freshest state another instance may have left.
         self.refresh_if_stale()?;
+        // Resolve unique id prefixes to exact ids BEFORE anything is
+        // appended: the durable op must carry the exact id (folds replay
+        // exact lookups), and surfaces without ctl's client-side
+        // pre-resolution (the MCP facade) send prefixes the read path
+        // already serves.
+        self.resolve_command_ids(&mut cmd)?;
         let source = validate_source(cmd.take_source())?;
         // Rich-ask park: blob commits interleave with the id mint and need
         // rollback on any later failure, so it has its own arm.
@@ -2173,8 +2179,15 @@ impl AgendaStore {
                 let parent_id = parent_id.trim().to_string();
                 let item = self.require(&id)?;
                 match &item.part_of {
-                    Some(placement) if placement.parent_id == parent_id => {
-                        Ok(AgendaOp::RemovePartOf { id, parent_id })
+                    // An empty parent removes the CURRENT placement (the
+                    // ClearBlocker sole-resolve idiom, for surfaces that
+                    // can't read the ledger first); the durable op still
+                    // carries the exact parent id.
+                    Some(placement) if parent_id.is_empty() || placement.parent_id == parent_id => {
+                        Ok(AgendaOp::RemovePartOf {
+                            id,
+                            parent_id: placement.parent_id.clone(),
+                        })
                     }
                     Some(placement) => Err(AgendaError::NotFound(format!(
                         "{id} is placed under {}, not {parent_id}",
@@ -2240,13 +2253,15 @@ impl AgendaStore {
                 let item = self.require(&id)?;
                 // Resolve which side stores the link — callers name the
                 // pair in either order; the op names the storing item.
+                // The reverse probe reads the item map without requiring
+                // it: a dangling target (partial/foreign logs) answers
+                // "not related", never a spurious not-found.
                 if item.relates_to.iter().any(|e| e.target_id == target_id) {
                     Ok(AgendaOp::RemoveRelatesTo { id, target_id })
                 } else if self
-                    .require(&target_id)?
-                    .relates_to
-                    .iter()
-                    .any(|e| e.target_id == id)
+                    .items
+                    .get(&target_id)
+                    .is_some_and(|t| t.relates_to.iter().any(|e| e.target_id == id))
                 {
                     Ok(AgendaOp::RemoveRelatesTo {
                         id: target_id,
@@ -2493,6 +2508,163 @@ impl AgendaStore {
         self.items
             .get(id)
             .ok_or_else(|| AgendaError::NotFound(id.to_string()))
+    }
+
+    /// Resolve a full id or unique prefix to the exact item id, for the
+    /// WRITE intake: exact ids always win, a unique prefix resolves, an
+    /// ambiguous one refuses by name, and the empty string resolves
+    /// nothing. Mirrors the read path (`AgendaHandle::resolve_prefix`)
+    /// and the ClearBlocker precedent — and like ClearBlocker, callers
+    /// rewrite the COMMAND with the result before an op is appended, so
+    /// the durable op (and every fold that replays it) carries the
+    /// exact id.
+    fn resolve_write_id(&self, needle: &str) -> Result<String, AgendaError> {
+        if self.items.contains_key(needle) {
+            return Ok(needle.to_string());
+        }
+        if needle.is_empty() {
+            return Err(AgendaError::NotFound(needle.to_string()));
+        }
+        let mut matches = self.items.keys().filter(|key| key.starts_with(needle));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Ok(only.clone()),
+            (Some(_), Some(_)) => Err(AgendaError::Invalid(format!(
+                "id prefix {needle:?} is ambiguous — use more characters"
+            ))),
+            _ => Err(AgendaError::NotFound(needle.to_string())),
+        }
+    }
+
+    /// Resolve a REMOVAL command's target: the fold tolerates dangling
+    /// targets (partial or foreign logs), and a dangling edge must stay
+    /// removable, so the item map cannot be the sole refusal authority
+    /// — but a prefix must still be unique across the stored edges AND
+    /// the live ledger together, or a globally ambiguous spelling would
+    /// silently pick the edge. An exact id (stored edge or live item)
+    /// stays; a globally unique prefix expands; an ambiguous one
+    /// refuses; no match stays verbatim so the validation arm answers
+    /// in its own words.
+    fn resolve_removal_target<'a>(
+        &self,
+        needle: &mut String,
+        stored: impl Iterator<Item = &'a str>,
+    ) -> Result<(), AgendaError> {
+        let stored: Vec<&str> = stored.collect();
+        // Exact ids always win, stored edge or live item alike — the
+        // caller named the thing precisely.
+        if stored.contains(&needle.as_str()) || self.items.contains_key(needle.as_str()) {
+            return Ok(());
+        }
+        if !needle.is_empty() {
+            // A prefix resolves against the stored edges AND the live
+            // ledger together: a prefix matching one dangling edge but
+            // also prefixing an unrelated live item is globally
+            // ambiguous and refuses (round 40) — an edge-local
+            // expansion would silently pick the edge.
+            let mut matches: std::collections::BTreeSet<&str> = stored
+                .iter()
+                .copied()
+                .filter(|target| target.starts_with(needle.as_str()))
+                .collect();
+            matches.extend(
+                self.items
+                    .keys()
+                    .filter(|key| key.starts_with(needle.as_str()))
+                    .map(String::as_str),
+            );
+            match matches.len() {
+                0 => {}
+                1 => {
+                    *needle = matches.into_iter().next().expect("one match").to_string();
+                }
+                _ => {
+                    return Err(AgendaError::Invalid(format!(
+                        "target prefix {needle:?} is ambiguous — use more characters"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite every item-id field of an incoming command to its exact
+    /// resolved id (see [`Self::resolve_write_id`]). Exhaustive over the
+    /// command set so a new op must decide its id fields here explicitly.
+    /// `pub(crate)`: the handle calls it at the tenant edge too, for the
+    /// verbs it pre-validates before this store's own intake (attest's
+    /// journal binding, the start-now item lookup) — exact ids are
+    /// fixpoints, so the double resolution is idempotent.
+    pub(crate) fn resolve_command_ids(&self, cmd: &mut AgendaCommand) -> Result<(), AgendaError> {
+        let resolve = |store: &Self, id: &mut String| -> Result<(), AgendaError> {
+            *id = store.resolve_write_id(id)?;
+            Ok(())
+        };
+        match cmd {
+            AgendaCommand::Add { .. } | AgendaCommand::Ask { .. } | AgendaCommand::Stamp { .. } => {
+            }
+            AgendaCommand::Patch { id, .. }
+            | AgendaCommand::Complete { id, .. }
+            | AgendaCommand::Reopen { id, .. }
+            | AgendaCommand::Retire { id, .. }
+            | AgendaCommand::Answer { id, .. }
+            | AgendaCommand::AcknowledgeAnswer { id, .. }
+            | AgendaCommand::ProposeEffect { id, .. }
+            | AgendaCommand::RequestOccurrence { id }
+            | AgendaCommand::Annotate { id, .. }
+            | AgendaCommand::PickUp { id, .. }
+            | AgendaCommand::Attest { id, .. }
+            | AgendaCommand::SetBlocker { id, .. }
+            | AgendaCommand::ClearBlocker { id, .. }
+            | AgendaCommand::ApproveEffect { id, .. }
+            | AgendaCommand::RevokeEffect { id }
+            | AgendaCommand::WithdrawEffect { id, .. }
+            | AgendaCommand::StartNow { id, .. } => resolve(self, id)?,
+            AgendaCommand::AddReliesOn { id, target_id, .. }
+            | AgendaCommand::AddRelatesTo { id, target_id, .. } => {
+                resolve(self, id)?;
+                resolve(self, target_id)?;
+            }
+            AgendaCommand::RemoveReliesOn { id, target_id, .. } => {
+                resolve(self, id)?;
+                let stored = self.require(id)?;
+                self.resolve_removal_target(
+                    target_id,
+                    stored.relies_on.iter().map(|e| e.target_id.as_str()),
+                )?;
+            }
+            AgendaCommand::RemoveRelatesTo { id, target_id, .. } => {
+                resolve(self, id)?;
+                let stored = self.require(id)?;
+                self.resolve_removal_target(
+                    target_id,
+                    stored.relates_to.iter().map(|e| e.target_id.as_str()),
+                )?;
+            }
+            AgendaCommand::AddPartOf { id, parent_id, .. } => {
+                resolve(self, id)?;
+                resolve(self, parent_id)?;
+            }
+            AgendaCommand::RemovePartOf { id, parent_id, .. } => {
+                resolve(self, id)?;
+                // Empty parent = remove the current placement (resolved
+                // in the validation arm) — not a prefix to expand.
+                if !parent_id.is_empty() {
+                    let stored = self.require(id)?;
+                    self.resolve_removal_target(
+                        parent_id,
+                        stored.part_of.iter().map(|p| p.parent_id.as_str()),
+                    )?;
+                }
+            }
+            AgendaCommand::Place { id, under, .. } => {
+                resolve(self, id)?;
+                resolve(self, under)?;
+            }
+            AgendaCommand::AddRef { id, .. } | AgendaCommand::RemoveRef { id, .. } => {
+                resolve(self, id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Mint the next item id: a fresh ULID, floored against the largest id
@@ -3471,6 +3643,213 @@ mod tests {
         ctx.default_project_root = Some(project.path().to_path_buf());
         store.set_spawn_context(ctx);
         project
+    }
+
+    /// Removal commands stay valid against DANGLING edges — targets the
+    /// fold tolerates from partial or foreign logs but the item map no
+    /// longer holds (review round 23). Removal targets resolve against
+    /// the item's own stored edges first (prefixes included); the item
+    /// map is only a fallback, never the refusal authority.
+    #[test]
+    fn removal_commands_resolve_dangling_edge_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seed = AgendaStore::open(dir.path()).unwrap();
+        let add = |title: &str| AgendaCommand::Add {
+            refs: Vec::new(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let a = seed.apply_command(add("kept"), owner(), 1000).unwrap();
+        let b = seed.apply_command(add("vanishes"), owner(), 2000).unwrap();
+        seed.apply_command(
+            AgendaCommand::AddReliesOn {
+                id: a.id.clone(),
+                target_id: b.id.clone(),
+                source: None,
+            },
+            owner(),
+            3000,
+        )
+        .unwrap();
+        seed.apply_command(
+            AgendaCommand::AddRelatesTo {
+                id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_kind: None,
+                source: None,
+            },
+            owner(),
+            4000,
+        )
+        .unwrap();
+        seed.apply_command(
+            AgendaCommand::AddPartOf {
+                id: a.id.clone(),
+                parent_id: b.id.clone(),
+                source: None,
+            },
+            owner(),
+            5000,
+        )
+        .unwrap();
+        drop(seed);
+        // A partial log: `b`'s own add dropped (the only line naming b
+        // without a), every edge naming it as a target kept.
+        let log = std::fs::read_to_string(dir.path().join("agenda.jsonl")).unwrap();
+        let partial: String = log
+            .lines()
+            .filter(|line| !(line.contains(b.id.as_str()) && !line.contains(a.id.as_str())))
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("agenda.jsonl"), partial).unwrap();
+        let mut store = AgendaStore::open(dir2.path()).unwrap();
+        assert!(store.get(&b.id).is_none(), "b's add was filtered out");
+        // A stored-edge PREFIX resolves even though the item map has no
+        // such item — but only a GLOBALLY unique one: the shared ULID
+        // time prefix also matches live `a`, so it refuses as ambiguous
+        // (round 40), while the divergence-unique prefix expands.
+        let unique_len =
+            a.id.chars()
+                .zip(b.id.chars())
+                .take_while(|(x, y)| x == y)
+                .count()
+                + 1;
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::RemoveReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id[..unique_len - 1].to_string(),
+                    source: None,
+                },
+                owner(),
+                5500,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        store
+            .apply_command(
+                AgendaCommand::RemoveReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id[..unique_len].to_string(),
+                    source: None,
+                },
+                owner(),
+                6000,
+            )
+            .expect("a dangling dependency is removable by stored-edge prefix");
+        store
+            .apply_command(
+                AgendaCommand::RemoveRelatesTo {
+                    id: a.id.clone(),
+                    target_id: b.id.clone(),
+                    source: None,
+                },
+                owner(),
+                7000,
+            )
+            .expect("a dangling relates-to link is removable");
+        store
+            .apply_command(
+                AgendaCommand::RemovePartOf {
+                    id: a.id.clone(),
+                    parent_id: b.id.clone(),
+                    source: None,
+                },
+                owner(),
+                8000,
+            )
+            .expect("a dangling placement is removable");
+        let a_after = store.get(&a.id).unwrap();
+        assert!(a_after.relies_on.is_empty());
+        assert!(a_after.relates_to.is_empty());
+        assert!(a_after.part_of.is_none());
+    }
+
+    /// Write intake resolves unique id prefixes like the read path does
+    /// (the MCP facade forwards ids verbatim, with no ctl-side
+    /// pre-resolution): a unique prefix works, an ambiguous one refuses
+    /// by name, and an unknown one stays NotFound.
+    #[test]
+    fn writes_resolve_unique_id_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let a = store
+            .apply_command(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "first".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner(),
+                1000,
+            )
+            .unwrap();
+        let b = store
+            .apply_command(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "second".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner(),
+                2000,
+            )
+            .unwrap();
+        // ULIDs minted in one store share a long timestamp prefix — find
+        // the shortest prefix unique to `a`.
+        let unique_len =
+            a.id.chars()
+                .zip(b.id.chars())
+                .take_while(|(x, y)| x == y)
+                .count()
+                + 1;
+        let unique = &a.id[..unique_len];
+        let ambiguous = &a.id[..unique_len - 1];
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: unique.to_string(),
+                    source: None,
+                },
+                owner(),
+                3000,
+            )
+            .expect("a unique prefix resolves at write intake");
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Complete {
+                    id: ambiguous.to_string(),
+                    source: None,
+                },
+                owner(),
+                4000,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Complete {
+                    id: "ZZZZZZ".to_string(),
+                    source: None,
+                },
+                owner(),
+                5000,
+            ),
+            Err(AgendaError::NotFound(_))
+        ));
     }
 
     #[test]

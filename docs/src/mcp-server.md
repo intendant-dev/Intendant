@@ -106,10 +106,27 @@ effect — a parse failure never dispatches, and a command invoked through the
 wrong lane is redirected to the right tool by name. Argv values are literal
 strings: no shell, no `@file`/stdin expansion, no local output paths (those
 are `intendant ctl` frontend behaviors and stay client-side). The command
-registry (`mcp/facade.rs`) starts with the operate core — status, approvals,
-input, ask/notify/notes, task start, agenda, memory, display reads — and
-grows family-by-family; the serialized facade listing is budget-pinned in
-tests so the whole advertised surface stays a few kilobytes.
+registry (`mcp/facade.rs`) covers the full `ctl` grammar — status,
+approvals, input, ask/notify/notes, tasks, agenda (reads and the whole
+write/effect family), memory (reads, proposals, and owner curation),
+displays, browser workspaces, computer use, shared view, settings,
+remote compute, controller, audio, peers, terminal, and context — with
+nested/structured parameters passed as literal JSON values (parsed at
+plan time; a parse failure never dispatches). Four ctl surfaces are
+deliberately NOT registry commands: `dashboard-url` (a local file
+read), `tools call` (the variable-operation escape hatch — raw `/mcp`
+exists for typed callers), `takeover` (the daemon-drain act on the
+same loopback lane — owner/local trust class), and the `agenda
+ops`/`agenda occurrences` audit reads, which ride the loopback-token
+`/api` lane and refuse the peer and supervised-session lanes by design
+— a trust boundary the facade must not tunnel through. ctl's derived agenda views
+(`--blocked`, `--frontier`, `--under`, and the bare-list
+answered-union) are client-side renders over the same `agenda list`
+read, not registry vocabulary: fetch and derive. The serialized facade
+listing is budget-pinned in tests so the whole advertised surface stays
+a few kilobytes regardless of registry size; `intendant ctl events` is
+the CLI leg of the `events` verb (client-side ≤60s chunking over a
+`--for` budget, NDJSON on stdout, cursor on stderr).
 
 The tables below describe the full daemon HTTP MCP surface. Bare `--mcp`
 stdio mode serves only the thirteen `#[tool]`-router tools — `get_status`,

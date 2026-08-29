@@ -83,7 +83,11 @@ pub(super) async fn run_remote(
             if total_s == 0 {
                 return Err("--for must be at least 1 second".to_string());
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
+            // checked: a huge --for must be a CLI error, not an Instant
+            // overflow panic.
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(total_s))
+                .ok_or_else(|| format!("--for {total_s}s is too large"))?;
             let mut last_progress = String::new();
             loop {
                 let remaining_s = deadline

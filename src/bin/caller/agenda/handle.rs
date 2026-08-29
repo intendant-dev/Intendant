@@ -281,6 +281,30 @@ impl AgendaHandle {
                 }));
             }
         }
+        // Unique-prefix ids resolve at the tenant edge for the verbs
+        // this handle pre-validates: the attest journal binding and the
+        // start-now item lookup below read the id BEFORE the store's
+        // write-intake resolver would run, so a documented prefix form
+        // must already be exact here. Scoped to those two verbs — their
+        // checks already read this same (possibly unrefreshed) state,
+        // so resolving here adds no new staleness, while every other
+        // command keeps resolving after the store's refresh. Exact ids
+        // are fixpoints, so the store's re-resolution is idempotent
+        // (review round 28).
+        let mut cmd = cmd;
+        if matches!(
+            cmd,
+            AgendaCommand::StartNow { .. } | AgendaCommand::Attest { .. }
+        ) {
+            let mut store = self.lock();
+            // Refreshed first: a prefix must resolve against the fold's
+            // CURRENT items — on stale state a prefix another instance
+            // has since made ambiguous would silently expand to the
+            // older item instead of refusing (review round 29).
+            store.refresh_if_stale()?;
+            store.resolve_command_ids(&mut cmd)?;
+        }
+        let cmd = cmd;
         // Attest binds HERE, at the tenant edge (Track AO): the handle
         // holds the occurrence journal, so the journal-side intake
         // checks — occurrence-belongs-to-item, actor in the started
@@ -3075,9 +3099,14 @@ mod tests {
 
         // Start-now on an already-scheduled item revises the same lineage
         // (standing re-propose semantics) rather than growing a second
-        // effect.
+        // effect — addressed by a unique id PREFIX, which resolves at
+        // the tenant edge (the handle pre-validates start-now before
+        // the store's own resolver runs; review round 28).
         let again = handle
-            .apply(bare_start_now(&item.id), actor("local_process", None))
+            .apply(
+                bare_start_now(&item.id[..item.id.len() - 4]),
+                actor("local_process", None),
+            )
             .unwrap();
         assert_eq!(again.effects.len(), 1);
         assert_eq!(again.effects[0].effect_id, effect.effect_id);
