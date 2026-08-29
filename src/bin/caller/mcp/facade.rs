@@ -762,8 +762,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["display", "read-frame"],
         lane: RiskLane::Inspect,
         tool: "read_frame",
-        seed: "{}",
-        positionals: &[p_str("FRAME_ID", "frame_id", true, false)],
+        seed: r#"{"frame_id":"latest"}"#,
+        positionals: &[p_str("FRAME_ID", "frame_id", false, false)],
         flags: &[flag!(
             "stream",
             "stream",
@@ -885,10 +885,10 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["browser", "acquire"],
         lane: RiskLane::Act,
         tool: "acquire_browser_workspace",
-        seed: "{}",
+        seed: r#"{"holder_id":"facade"}"#,
         positionals: &[
             p_str("WORKSPACE_ID", "workspace_id", true, false),
-            p_str("HOLDER_ID", "holder_id", true, false),
+            p_str("HOLDER_ID", "holder_id", false, false),
         ],
         flags: &[
             flag!("holder-kind", "holder_kind", Str, "holder kind"),
@@ -1172,10 +1172,10 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         path: &["agenda", "unblock"],
         lane: RiskLane::Act,
         tool: "agenda_op",
-        seed: r#"{"op":"clear_blocker"}"#,
+        seed: r#"{"op":"clear_blocker","blocker_id":""}"#,
         positionals: &[
             p_str("ID", "id", true, false),
-            p_str("BLOCKER_ID", "blocker_id", true, false),
+            p_str("BLOCKER_ID", "blocker_id", false, false),
         ],
         flags: &[flag!(
             "source",
@@ -2490,6 +2490,30 @@ mod tests {
         let planned = plan_for_meta("act", &argv(&["ask", "ship it?", "--park"])).unwrap();
         assert_eq!(planned.args["question"], "ship it?");
         assert_eq!(planned.args["park"], serde_json::json!(true));
+    }
+
+    /// ctl's default forms plan identically through the facade (review
+    /// round 8): an omitted frame id reads the latest frame, an omitted
+    /// holder gets facade provenance (overridable), and an omitted
+    /// blocker id clears the sole live blocker (empty prefix — the
+    /// daemon resolves it uniquely).
+    #[test]
+    fn optional_positionals_keep_ctl_default_forms() {
+        let planned = plan_for_meta("inspect", &argv(&["display", "read-frame"])).unwrap();
+        assert_eq!(planned.args["frame_id"], "latest");
+        let planned =
+            plan_for_meta("inspect", &argv(&["display", "read-frame", "frame-7"])).unwrap();
+        assert_eq!(planned.args["frame_id"], "frame-7");
+        let planned = plan_for_meta("act", &argv(&["browser", "acquire", "ws-1"])).unwrap();
+        assert_eq!(planned.args["holder_id"], "facade");
+        let planned =
+            plan_for_meta("act", &argv(&["browser", "acquire", "ws-1", "sess-4"])).unwrap();
+        assert_eq!(planned.args["holder_id"], "sess-4");
+        let planned = plan_for_meta("act", &argv(&["agenda", "unblock", "item-1"])).unwrap();
+        assert_eq!(planned.args["blocker_id"], "");
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "unblock", "item-1", "blk-2"])).unwrap();
+        assert_eq!(planned.args["blocker_id"], "blk-2");
     }
 
     /// Target-session routing travels on notify and session note
