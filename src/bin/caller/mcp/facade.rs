@@ -2296,6 +2296,30 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("client-side"), "{err}");
         assert!(err.contains("--images"), "{err}");
+        // Round 35: overflowing time arithmetic refuses instead of
+        // wrapping (checked mul/add in ctl's shared parsers).
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--every",
+                "30500568905w",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let mut planned = planned_with(
+            &["agenda", "add"],
+            serde_json::json!({ "due_ms": "__when:+30500568904w" }),
+        );
+        let err = substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap_err();
+        assert!(err.contains("too far in the future"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[

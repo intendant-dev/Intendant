@@ -4763,7 +4763,12 @@ pub(crate) fn parse_due_ms(raw: &str) -> Result<u64, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        return Ok(now + amount * ms_per);
+        // checked: a huge relative offset must be an error, not a
+        // wrapped instant in the past (which would fire immediately).
+        return amount
+            .checked_mul(ms_per)
+            .and_then(|offset| now.checked_add(offset))
+            .ok_or_else(|| format!("relative due '{raw}' is too far in the future"));
     }
     if raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty() {
         let value: u64 = raw.parse().map_err(|_| format!("invalid due '{raw}'"))?;
@@ -4811,7 +4816,11 @@ pub(crate) fn parse_duration_ms(raw: &str) -> Result<u64, String> {
                 ))
             }
         };
-        return Ok(amount * ms_per);
+        // checked: a huge cadence must be an error, not a wrapped
+        // (and far more frequent) interval.
+        return amount
+            .checked_mul(ms_per)
+            .ok_or_else(|| format!("interval '{raw}' is too large"));
     }
     body.parse()
         .map_err(|_| format!("invalid interval '{raw}' (try 45m, 2h, 7d, 1w, or ms)"))
