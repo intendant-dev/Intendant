@@ -96,7 +96,11 @@ pub(crate) struct PlannedCall {
 }
 
 fn argv_from_args(args: &serde_json::Value) -> Result<Vec<String>, String> {
-    serde_json::from_value::<FacadeRunParams>(args.clone())
+    // Deserialized from a reference: cloning the whole params Value
+    // first would double a near-cap request's allocation during the
+    // gate's PRE-auth resolution (security review).
+    use serde::Deserialize as _;
+    FacadeRunParams::deserialize(args)
         .map(|params| params.argv)
         .map_err(|_| "missing argv: pass the command as an array of strings".to_string())
 }
@@ -1313,11 +1317,18 @@ pub(crate) fn substitute_dispatch_sentinels(
     Ok(())
 }
 
-/// Resolve one executor call (`inspect`/`act`/`authorize`) into the command
-/// it names. Pure and side-effect-free; both the ingress gates (for the
-/// authorization target) and the dispatcher (for execution) call this, and
-/// determinism over (meta, args) makes the two resolutions identical.
-pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<PlannedCall, String> {
+/// Resolve one executor call's argv to its command WITHOUT building
+/// arguments: extraction, alias normalization, path resolution, and the
+/// lane check only. This is all the gate's authorization target needs —
+/// argument values never affect authorization — and it is what keeps
+/// value parsing (caller JSON included) strictly AFTER the resolved
+/// operation's `access.decision` (security review: a denied caller
+/// could otherwise allocate ~100 MB from a 16 MiB array before being
+/// refused).
+fn resolve_meta_argv(
+    meta: &str,
+    args: &serde_json::Value,
+) -> Result<(Vec<String>, &'static CommandSpec), String> {
     let argv = argv_from_args(args)?;
     if argv.is_empty() {
         return Err("empty argv — call the help tool for the command map".to_string());
@@ -1336,6 +1347,17 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
             spec.lane.tool_name()
         ));
     }
+    Ok((argv, spec))
+}
+
+/// Resolve one executor call (`inspect`/`act`/`authorize`) into the command
+/// it names and build its arguments. Pure and side-effect-free; the
+/// dispatcher calls this AFTER the gate authorized the resolved
+/// operation (the gate itself resolves via [`resolve_meta_argv`] only),
+/// and determinism over (meta, args) makes the two resolutions name the
+/// same command.
+pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<PlannedCall, String> {
+    let (argv, spec) = resolve_meta_argv(meta, args)?;
     let rest = &argv[spec.path.len()..];
     let (built, caller_defaults) = build_args(spec, rest)?;
     Ok(PlannedCall {
@@ -1348,11 +1370,15 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
 
 /// The gate-side authorization resolver. `None`: not a facade tool (fall
 /// through to the fixed per-tool map). `Some(op)`: authorize this
-/// operation, then dispatch. An executor call whose argv fails to parse
-/// authorizes at the harmless read floor: nothing will execute — dispatch
-/// re-plans, applies the rewind-only pressure gate first, and returns the
-/// parse error as a tool result — and the error's content is registry
-/// shape, the same disclosure class as `help`.
+/// operation, then dispatch. Resolution here NEVER builds arguments
+/// ([`resolve_meta_argv`]) — the gate ignores argument values, so caller
+/// JSON is parsed only after `access.decision` passes. An executor call
+/// whose PATH fails to resolve authorizes at the harmless read floor:
+/// nothing will execute — dispatch re-plans, applies the rewind-only
+/// pressure gate first, and returns the parse error as a tool result —
+/// and the error's content is registry shape, the same disclosure class
+/// as `help`. A call with a malformed VALUE authorizes at its resolved
+/// command's operation and fails at dispatch planning the same way.
 pub(crate) fn facade_gate_operation(name: &str, args: &serde_json::Value) -> Option<PeerOperation> {
     match name {
         // The read-only meta surface: the command map and the embedded
@@ -1363,8 +1389,8 @@ pub(crate) fn facade_gate_operation(name: &str, args: &serde_json::Value) -> Opt
         // read tools already serve — push semantics, not new authority.
         "events" => Some(PeerOperation::SessionInspect),
         "inspect" | "act" | "authorize" => Some(
-            plan_for_meta(name, args)
-                .map(|planned| crate::mcp::mcp_tool_operation(planned.tool))
+            resolve_meta_argv(name, args)
+                .map(|(_, spec)| crate::mcp::mcp_tool_operation(spec.tool))
                 .unwrap_or(PeerOperation::StatsRead),
         ),
         _ => None,
@@ -3320,12 +3346,21 @@ mod tests {
             facade_gate_operation("inspect", &argv(&["status"])),
             Some(Op::StatsRead)
         );
-        // A parse failure authorizes at the read floor: nothing executes —
+        // A PATH failure authorizes at the read floor: nothing executes —
         // dispatch re-plans, pressure-gates, and returns the parse error.
         assert_eq!(
             facade_gate_operation("inspect", &argv(&["nope"])),
             Some(Op::StatsRead)
         );
+        // The gate never parses VALUES (security review: caller JSON is
+        // parsed only after access.decision): a malformed value still
+        // authorizes at the resolved command's operation, and dispatch
+        // planning is where it fails.
+        assert_eq!(
+            facade_gate_operation("act", &argv(&["cu", "actions", "not json at all"])),
+            Some(crate::mcp::mcp_tool_operation("execute_cu_actions"))
+        );
+        assert!(plan_for_meta("act", &argv(&["cu", "actions", "not json at all"])).is_err());
         assert!(facade_gate_operation("get_status", &serde_json::json!({})).is_none());
         assert_eq!(
             facade_gate_operation("help", &serde_json::json!({})),
