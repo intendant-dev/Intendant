@@ -659,7 +659,7 @@ impl IntendantServer {
                         .as_deref()
                         .or(actor.principal_id.as_deref())
                         .unwrap_or("facade");
-                    facade::substitute_dispatch_sentinels(&mut planned.args, identity)?;
+                    facade::substitute_dispatch_sentinels(&mut planned, identity)?;
                     Ok(planned)
                 }) {
                     Ok(planned) => {

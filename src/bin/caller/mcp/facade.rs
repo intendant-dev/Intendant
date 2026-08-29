@@ -81,6 +81,7 @@ enum ValueKind {
     Interval,
 }
 
+#[derive(Debug)]
 struct PositionalSpec {
     name: &'static str,
     json_key: &'static str,
@@ -91,6 +92,7 @@ struct PositionalSpec {
     greedy: bool,
 }
 
+#[derive(Debug)]
 struct FlagSpec {
     /// Flag name without the leading dashes.
     name: &'static str,
@@ -99,6 +101,7 @@ struct FlagSpec {
     help: &'static str,
 }
 
+#[derive(Debug)]
 pub(crate) struct CommandSpec {
     /// Command path segments, e.g. `["approval", "approve"]`.
     pub(crate) path: &'static [&'static str],
@@ -306,14 +309,26 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "multi-question form: JSON array of question objects (omit QUESTION)"
             ),
             flag!("previews", "previews", Json, "preview cards (JSON array)"),
+            flag!(
+                "pick",
+                "__pick",
+                Str,
+                "selection bounds MIN[-MAX] (ctl spelling; replaces --multi)"
+            ),
             flag!("pick-min", "pick_min", U64, "minimum selections (0 = optional)"),
             flag!("pick-max", "pick_max", U64, "maximum selections (default 1)"),
             flag!("multi", "multi_select", Bool, "allow multiple selections"),
             flag!(
                 "free-text",
                 "free_text",
-                Json,
-                "true (default) or false — false requires an option pick"
+                Bool,
+                "document that a typed answer is welcome (the rail always accepts one)"
+            ),
+            flag!(
+                "no-free-text",
+                "__no_free_text",
+                Bool,
+                "require an option pick (free_text: false)"
             ),
             flag!(
                 "consequence",
@@ -1663,6 +1678,25 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "launch pin"
             ),
             flag!(
+                "dial-autonomy",
+                "agent_config.dial.autonomy",
+                Str,
+                "session dial"
+            ),
+            flag!("dial-ask", "agent_config.dial.ask", Str, "session dial"),
+            flag!(
+                "dial-notify",
+                "agent_config.dial.notify",
+                Str,
+                "session dial"
+            ),
+            flag!(
+                "dial-approve",
+                "__dial_approve",
+                StrList,
+                "CATEGORY=RULE (repeatable, e.g. network=deny)"
+            ),
+            flag!(
                 "agent-config",
                 "agent_config",
                 Json,
@@ -1738,6 +1772,25 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Str,
                 "launch pin"
             ),
+            flag!(
+                "dial-autonomy",
+                "agent_config.dial.autonomy",
+                Str,
+                "session dial"
+            ),
+            flag!("dial-ask", "agent_config.dial.ask", Str, "session dial"),
+            flag!(
+                "dial-notify",
+                "agent_config.dial.notify",
+                Str,
+                "session dial"
+            ),
+            flag!(
+                "dial-approve",
+                "__dial_approve",
+                StrList,
+                "CATEGORY=RULE (repeatable, e.g. network=deny)"
+            ),
             flag!("agent-config", "agent_config", Json, "agent launch pins"),
             flag!(
                 "annotation",
@@ -1799,14 +1852,67 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         positionals: &[p_str("ID", "id", true, false)],
         flags: &[
             flag!("goal", "goal", Str, "goal override"),
+            flag!("project", "project_root", Str, "project root (ctl spelling)"),
             flag!("project-root", "project_root", Str, "project root"),
-            flag!("agent-config", "agent_config", Json, "agent launch pins"),
+            flag!(
+                "goal-run",
+                "__goal_run",
+                Bool,
+                "autonomous shape (ctl spelling; default is interactive)"
+            ),
             flag!(
                 "interactive",
                 "interactive",
                 Json,
                 "true (default) or false — false is the autonomous goal-run"
             ),
+            flag!("agent", "agent_config.agent", Str, "launch pin: backend"),
+            flag!(
+                "claude-model",
+                "agent_config.claude_model",
+                Str,
+                "launch pin"
+            ),
+            flag!(
+                "claude-effort",
+                "agent_config.claude_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("codex-model", "agent_config.codex_model", Str, "launch pin"),
+            flag!(
+                "codex-reasoning-effort",
+                "agent_config.codex_reasoning_effort",
+                Str,
+                "launch pin"
+            ),
+            flag!("kimi-model", "agent_config.kimi_model", Str, "launch pin"),
+            flag!(
+                "kimi-thinking",
+                "agent_config.kimi_thinking",
+                Str,
+                "launch pin"
+            ),
+            flag!(
+                "dial-autonomy",
+                "agent_config.dial.autonomy",
+                Str,
+                "session dial"
+            ),
+            flag!("dial-ask", "agent_config.dial.ask", Str, "session dial"),
+            flag!(
+                "dial-notify",
+                "agent_config.dial.notify",
+                Str,
+                "session dial"
+            ),
+            flag!(
+                "dial-approve",
+                "__dial_approve",
+                StrList,
+                "CATEGORY=RULE (repeatable, e.g. network=deny)"
+            ),
+            flag!("agent-config", "agent_config", Json, "agent launch pins"),
         ],
         help: "Mint, approve, and fire an item's session in one act (owner surface)",
     },
@@ -2143,11 +2249,14 @@ pub(crate) fn is_facade_executor(name: &str) -> bool {
     matches!(name, "inspect" | "act" | "authorize")
 }
 
-/// One resolved, ready-to-dispatch call.
+/// One resolved, ready-to-dispatch call. `spec` rides along so the
+/// dispatcher can substitute sentinels at the exact argument paths the
+/// registry declares — never inside caller-owned opaque JSON.
 #[derive(Debug)]
 pub(crate) struct PlannedCall {
     pub(crate) tool: &'static str,
     pub(crate) args: serde_json::Value,
+    pub(crate) spec: &'static CommandSpec,
 }
 
 fn argv_from_args(args: &serde_json::Value) -> Result<Vec<String>, String> {
@@ -2393,6 +2502,29 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             ),
         );
     }
+    // ctl's `--pick MIN[-MAX]` becomes the explicit pick bounds — the
+    // same split and refusals as ctl's own parse.
+    if let Some(pick) = obj.remove("__pick") {
+        if obj.contains_key("multi_select") {
+            return Err("--pick replaces --multi — provide one or the other".to_string());
+        }
+        if obj.contains_key("pick_min") || obj.contains_key("pick_max") {
+            return Err(
+                "pass --pick MIN[-MAX] or the --pick-min/--pick-max pair, not both".to_string(),
+            );
+        }
+        let (min, max) = crate::ctl::parse_pick_spec(pick.as_str().unwrap_or_default())?;
+        obj.insert("pick_min".to_string(), serde_json::Value::from(min));
+        obj.insert("pick_max".to_string(), serde_json::Value::from(max));
+    }
+    // `--no-free-text` is the explicit option-only form (free_text:
+    // false); bare `--free-text` documents intent, exactly like ctl.
+    if obj.remove("__no_free_text").is_some() {
+        if obj.contains_key("free_text") {
+            return Err("pass --free-text or --no-free-text, not both".to_string());
+        }
+        obj.insert("free_text".to_string(), serde_json::Value::Bool(false));
+    }
     // ctl's repeatable `--env KEY=VALUE` becomes the tool's env object.
     if let Some(pairs) = obj.remove("__env_kv") {
         let mut env = serde_json::Map::new();
@@ -2483,6 +2615,55 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         }
         let locator = if prefixed.is_some() { rest } else { raw };
         obj.insert("locator".to_string(), serde_json::Value::String(locator));
+    }
+    // ctl's `agenda start --goal-run`: the autonomous shape sends
+    // interactive:false; absent stays absent on the wire (the daemon
+    // defaults interactive, and on a standing manifest absent means
+    // "fire as approved").
+    if obj.remove("__goal_run").is_some() {
+        if obj.contains_key("interactive") {
+            return Err("--goal-run is the autonomous shape — drop --interactive".to_string());
+        }
+        obj.insert("interactive".to_string(), serde_json::Value::Bool(false));
+    }
+    // ctl's repeatable `--dial-approve CATEGORY=RULE` builds the
+    // launch dial's approvals object (ctl's own split and wording).
+    if let Some(specs) = obj.remove("__dial_approve") {
+        let mut approvals = serde_json::Map::new();
+        for spec_value in specs.as_array().cloned().unwrap_or_default() {
+            let spec_text = spec_value.as_str().unwrap_or_default();
+            let split = spec_text
+                .split_once('=')
+                .map(|(category, rule)| (category.trim(), rule.trim()));
+            let Some((category, rule)) = split.filter(|(c, r)| !c.is_empty() && !r.is_empty())
+            else {
+                return Err(format!(
+                    "--dial-approve wants CATEGORY=RULE (e.g. network=deny), got '{spec_text}'"
+                ));
+            };
+            approvals.insert(
+                category.to_string(),
+                serde_json::Value::String(rule.to_string()),
+            );
+        }
+        if !approvals.is_empty() {
+            let agent_config = obj
+                .entry("agent_config".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let agent_config = agent_config
+                .as_object_mut()
+                .ok_or_else(|| "agent_config: not an object".to_string())?;
+            let dial = agent_config
+                .entry("dial".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let dial = dial
+                .as_object_mut()
+                .ok_or_else(|| "dial: not an object".to_string())?;
+            dial.insert(
+                "approvals".to_string(),
+                serde_json::Value::Object(approvals),
+            );
+        }
     }
     // ctl's `--remove` edge forms flip the seeded add op to its remove
     // twin. The relates remove drops/refuses --kind (it types the link
@@ -2707,30 +2888,6 @@ fn region_from_csv(flag: &str, csv: &serde_json::Value) -> Result<serde_json::Va
     Ok(serde_json::json!({ "x": x, "y": y, "width": width, "height": height }))
 }
 
-/// The leaf argument keys the registry declares as `When`-kind — the
-/// only keys where a `"__when:"` sentinel is honored at dispatch.
-/// Derived from the registry so a new When flag extends substitution
-/// without a mirror to forget ("derive, don't mirror").
-static WHEN_KEYS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
-    std::sync::LazyLock::new(|| {
-        COMMANDS
-            .iter()
-            .flat_map(|spec| {
-                spec.flags
-                    .iter()
-                    .filter(|flag| flag.kind == ValueKind::When)
-                    .map(|flag| flag.json_key)
-                    .chain(
-                        spec.positionals
-                            .iter()
-                            .filter(|pos| pos.kind == ValueKind::When)
-                            .map(|pos| pos.json_key),
-                    )
-            })
-            .map(|key| key.rsplit('.').next().unwrap_or(key))
-            .collect()
-    });
-
 fn dispatch_now_ms() -> serde_json::Value {
     serde_json::Value::from(
         std::time::SystemTime::now()
@@ -2738,6 +2895,18 @@ fn dispatch_now_ms() -> serde_json::Value {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     )
+}
+
+/// Follow one registry-declared dotted path (the nesting `insert_value`
+/// builds) to its value, if present.
+fn value_at_path<'a>(
+    args: &'a mut serde_json::Value,
+    path: &str,
+) -> Option<&'a mut serde_json::Value> {
+    match path.split_once('.') {
+        None => args.as_object_mut()?.get_mut(path),
+        Some((outer, inner)) => value_at_path(args.as_object_mut()?.get_mut(outer)?, inner),
+    }
 }
 
 /// Substitute the planner's dispatch-time sentinels. The planner is
@@ -2753,43 +2922,47 @@ fn dispatch_now_ms() -> serde_json::Value {
 /// on, so it is also the right one to parse `+2h` and calendar forms
 /// against. The dispatcher substitutes after gate resolution — the
 /// gate ignores argument values, so authorization is unaffected — and
-/// every sentinel is scoped to its key (`__when:` to the
-/// registry-derived [`WHEN_KEYS`]), never matched by value alone:
-/// caller text that happens to spell a sentinel (`notify __now`) must
-/// reach its string-typed tool untouched. Under `fire_at_ms` the bare
-/// `"__now"` is unforgeable by callers (the key is U64- or When-kind
-/// in every row, so planning yields a number or a `"__when:"` form);
-/// `holder_id`'s literal `__caller` is that key's documented "the
-/// caller" default. The walk recurses so a When key nested in a built
-/// object (`recurrence.until_ms`) resolves too.
+/// every sentinel is scoped to the exact place the planner put it,
+/// never matched by value or key name alone: `__caller`/`__now` at
+/// their top-level seeded keys, and `__when:` only at the dotted paths
+/// the resolved row declares as When-kind. Caller-owned opaque JSON
+/// (a peer task's `--context`, a raw `--recurrence` object) is never
+/// walked, so caller data that happens to spell a sentinel — even
+/// under a same-named key — reaches its tool untouched.
 pub(crate) fn substitute_dispatch_sentinels(
-    args: &mut serde_json::Value,
+    planned: &mut PlannedCall,
     identity: &str,
 ) -> Result<(), String> {
-    match args {
-        serde_json::Value::Object(obj) => {
-            for (key, value) in obj.iter_mut() {
-                if key == "holder_id" && value.as_str() == Some("__caller") {
-                    *value = serde_json::Value::String(identity.to_string());
-                } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
-                    *value = dispatch_now_ms();
-                } else if let Some(text) = value
-                    .as_str()
-                    .filter(|_| WHEN_KEYS.contains(key.as_str()))
-                    .and_then(|s| s.strip_prefix("__when:"))
-                {
-                    *value = serde_json::Value::from(crate::ctl::parse_due_ms(text)?);
-                } else {
-                    substitute_dispatch_sentinels(value, identity)?;
-                }
+    if let Some(obj) = planned.args.as_object_mut() {
+        for (key, value) in obj.iter_mut() {
+            if key == "holder_id" && value.as_str() == Some("__caller") {
+                *value = serde_json::Value::String(identity.to_string());
+            } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
+                *value = dispatch_now_ms();
             }
         }
-        serde_json::Value::Array(items) => {
-            for item in items.iter_mut() {
-                substitute_dispatch_sentinels(item, identity)?;
-            }
+    }
+    let when_paths = planned
+        .spec
+        .flags
+        .iter()
+        .filter(|flag| flag.kind == ValueKind::When)
+        .map(|flag| flag.json_key)
+        .chain(
+            planned
+                .spec
+                .positionals
+                .iter()
+                .filter(|pos| pos.kind == ValueKind::When)
+                .map(|pos| pos.json_key),
+        );
+    for path in when_paths {
+        let Some(value) = value_at_path(&mut planned.args, path) else {
+            continue;
+        };
+        if let Some(text) = value.as_str().and_then(|s| s.strip_prefix("__when:")) {
+            *value = serde_json::Value::from(crate::ctl::parse_due_ms(text)?);
         }
-        _ => {}
     }
     Ok(())
 }
@@ -2821,6 +2994,7 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
     Ok(PlannedCall {
         tool: spec.tool,
         args: built,
+        spec,
     })
 }
 
@@ -3235,8 +3409,7 @@ mod tests {
                 "b",
                 "--pick-max",
                 "2",
-                "--free-text",
-                "false",
+                "--no-free-text",
                 "--consequence",
                 "I proceed with a",
                 "--wait",
@@ -3608,6 +3781,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("unknown ref type"), "{err}");
+        // Round 23: ctl's --pick MIN[-MAX] / --no-free-text ask
+        // grammar, and agenda start's full launch vocabulary.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["ask", "Choose", "--pick", "0-2", "--no-free-text"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["pick_min"], 0);
+        assert_eq!(planned.args["pick_max"], 2);
+        assert_eq!(planned.args["free_text"], serde_json::json!(false));
+        let err =
+            plan_for_meta("act", &argv(&["ask", "Choose", "--pick", "2", "--multi"])).unwrap_err();
+        assert!(err.contains("--pick replaces --multi"), "{err}");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "agenda",
+                "start",
+                "item-1",
+                "--project",
+                "/srv/proj",
+                "--goal-run",
+                "--agent",
+                "codex",
+                "--dial-autonomy",
+                "high",
+                "--dial-approve",
+                "network=deny",
+                "--dial-approve",
+                "shell=allow",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["project_root"], "/srv/proj");
+        assert_eq!(planned.args["interactive"], serde_json::json!(false));
+        assert_eq!(planned.args["agent_config"]["agent"], "codex");
+        assert_eq!(planned.args["agent_config"]["dial"]["autonomy"], "high");
+        assert_eq!(
+            planned.args["agent_config"]["dial"]["approvals"],
+            serde_json::json!({ "network": "deny", "shell": "allow" })
+        );
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--dial-approve",
+                "network",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("CATEGORY=RULE"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
@@ -3651,9 +3881,9 @@ mod tests {
         // --at is When-kind (round 22): the raw text rides to dispatch
         // and resolves through ctl's parse_due_ms there.
         assert_eq!(planned.args["fire_at_ms"], "__when:1700000000000");
-        let mut args = planned.args.clone();
-        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
-        assert_eq!(args["fire_at_ms"], 1_700_000_000_000u64);
+        let mut planned = planned;
+        substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap();
+        assert_eq!(planned.args["fire_at_ms"], 1_700_000_000_000u64);
         let planned = plan_for_meta(
             "authorize",
             &argv(&["memory", "supersede", "abc123", "--with", "def456"]),
@@ -3858,9 +4088,12 @@ mod tests {
         .unwrap();
         assert_eq!(planned.args["agent_config"]["agent"], "codex");
         // The dispatch clock sentinel becomes a number.
-        let mut args = serde_json::json!({ "fire_at_ms": "__now" });
-        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
-        assert!(args["fire_at_ms"].is_u64());
+        let mut planned = planned_with(
+            &["agenda", "schedule"],
+            serde_json::json!({ "fire_at_ms": "__now" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap();
+        assert!(planned.args["fire_at_ms"].is_u64());
         let planned = plan_for_meta(
             "act",
             &argv(&[
@@ -3878,6 +4111,21 @@ mod tests {
         assert_eq!(planned.args["outcome"], "achieved");
     }
 
+    /// Wrap raw args in a [`PlannedCall`] for a named registry row —
+    /// the substitution tests exercise dispatch behavior for specific
+    /// specs without re-deriving argv forms.
+    fn planned_with(path: &[&str], args: serde_json::Value) -> PlannedCall {
+        let spec = COMMANDS
+            .iter()
+            .find(|spec| spec.path == path)
+            .expect("registry row");
+        PlannedCall {
+            tool: spec.tool,
+            args,
+            spec,
+        }
+    }
+
     /// The dispatcher replaces the identity sentinel with the caller's
     /// own identity, so two facade sessions never collide as the same
     /// lease holder (review round 10); explicit values pass untouched.
@@ -3886,57 +4134,85 @@ mod tests {
     /// string-typed tool untouched.
     #[test]
     fn dispatch_sentinels_substitute_key_scoped() {
-        let mut args = serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" });
-        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
-        assert_eq!(args["holder_id"], "sess-7");
-        assert_eq!(args["workspace_id"], "ws-1");
-        let mut args = serde_json::json!({ "holder_id": "alice" });
-        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
-        assert_eq!(args["holder_id"], "alice");
+        let mut planned = planned_with(
+            &["browser", "acquire"],
+            serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
+        assert_eq!(planned.args["holder_id"], "sess-7");
+        assert_eq!(planned.args["workspace_id"], "ws-1");
+        let mut planned = planned_with(
+            &["browser", "acquire"],
+            serde_json::json!({ "holder_id": "alice" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
+        assert_eq!(planned.args["holder_id"], "alice");
         // Literal sentinel spellings under other keys are caller data,
         // not sentinels — `notify __now` stays the text "__now".
-        let mut args = serde_json::json!({ "body": "__now", "reason": "__caller" });
-        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
-        assert_eq!(args["body"], "__now");
-        assert_eq!(args["reason"], "__caller");
+        let mut planned = planned_with(
+            &["browser", "acquire"],
+            serde_json::json!({ "body": "__now", "reason": "__caller" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
+        assert_eq!(planned.args["body"], "__now");
+        assert_eq!(planned.args["reason"], "__caller");
         // And the clock sentinel fills only its own key.
-        let mut args = serde_json::json!({ "fire_at_ms": "__now" });
-        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
-        assert!(args["fire_at_ms"].is_u64());
+        let mut planned = planned_with(
+            &["agenda", "schedule"],
+            serde_json::json!({ "fire_at_ms": "__now" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
+        assert!(planned.args["fire_at_ms"].is_u64());
     }
 
     /// When-kind values ride to dispatch as `"__when:"` strings and
-    /// resolve there through ctl's own `parse_due_ms` — including
-    /// nested keys (`recurrence.until_ms`) and ctl's 10-digit
-    /// epoch-seconds heuristic; a bad form fails with ctl's wording,
-    /// and the sentinel is honored only under registry-declared When
-    /// keys (review round 22).
+    /// resolve there through ctl's own `parse_due_ms` — only at the
+    /// exact dotted paths the resolved row declares (review rounds
+    /// 22-23), including nested ones (`recurrence.until_ms`) and ctl's
+    /// 10-digit epoch-seconds heuristic; a bad form fails with ctl's
+    /// wording; caller-owned opaque JSON is never walked, even when a
+    /// key inside it shares a When name.
     #[test]
     fn when_sentinels_resolve_with_ctl_vocabulary_at_dispatch() {
-        assert!(WHEN_KEYS.contains("fire_at_ms"));
-        assert!(WHEN_KEYS.contains("until_ms"));
-        assert!(WHEN_KEYS.contains("due_ms"));
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let mut args = serde_json::json!({
-            "fire_at_ms": "__when:+2h",
-            "recurrence": { "until_ms": "__when:1756400000" },
-        });
-        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
-        let fire = args["fire_at_ms"].as_u64().unwrap();
+        let mut planned = planned_with(
+            &["agenda", "schedule"],
+            serde_json::json!({
+                "fire_at_ms": "__when:+2h",
+                "recurrence": { "until_ms": "__when:1756400000" },
+            }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap();
+        let fire = planned.args["fire_at_ms"].as_u64().unwrap();
         assert!(fire >= before + 2 * 3_600_000);
         assert!(fire <= before + 2 * 3_600_000 + 60_000);
         // ctl's heuristic: 10-digit values are epoch seconds.
-        assert_eq!(args["recurrence"]["until_ms"], 1_756_400_000_000u64);
-        let mut args = serde_json::json!({ "due_ms": "__when:bogus" });
-        let err = substitute_dispatch_sentinels(&mut args, "sess-1").unwrap_err();
+        assert_eq!(planned.args["recurrence"]["until_ms"], 1_756_400_000_000u64);
+        let mut planned = planned_with(
+            &["agenda", "patch"],
+            serde_json::json!({ "patch": { "due_ms": "__when:bogus" } }),
+        );
+        let err = substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap_err();
         assert!(err.contains("could not parse due"), "{err}");
-        // A "__when:" spelling under a non-When key is caller data.
-        let mut args = serde_json::json!({ "body": "__when:+2h" });
-        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
-        assert_eq!(args["body"], "__when:+2h");
+        // A "__when:" spelling outside the row's declared paths is
+        // caller data — even under a same-named key inside opaque
+        // JSON (`peer task --context '{"due_ms":"__when:+2h"}'`).
+        let mut planned = planned_with(
+            &["agenda", "schedule"],
+            serde_json::json!({ "body": "__when:+2h" }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap();
+        assert_eq!(planned.args["body"], "__when:+2h");
+        let mut planned = planned_with(
+            &["peer", "task"],
+            serde_json::json!({ "context": { "due_ms": "__when:+2h", "note": "__when:bogus" } }),
+        );
+        substitute_dispatch_sentinels(&mut planned, "sess-1").unwrap();
+        assert_eq!(planned.args["context"]["due_ms"], "__when:+2h");
+        assert_eq!(planned.args["context"]["note"], "__when:bogus");
     }
 
     /// `agenda ask` mirrors ctl's own split (review round 10): plain

@@ -2178,7 +2178,7 @@ fn ask_park_command(mut map: Map<String, Value>) -> Value {
 
 /// Parse `--pick MIN[-MAX]` (e.g. "1", "0-3", "2-2" — MIN alone means
 /// exactly MIN).
-fn parse_pick_spec(spec: &str) -> Result<(u8, u8), String> {
+pub(crate) fn parse_pick_spec(spec: &str) -> Result<(u8, u8), String> {
     let (min_s, max_s) = match spec.split_once('-') {
         Some((min, max)) => (min.trim(), max.trim()),
         None => (spec.trim(), spec.trim()),
