@@ -72,8 +72,9 @@ pub struct TerminalWriteParams {
     pub terminal_id: String,
     /// Bytes to write to the shell's stdin, verbatim.
     pub input: String,
-    /// Append a newline (submit the input as a command line). Default
-    /// true — pass false for raw keystrokes.
+    /// Append Enter (a carriage return — the key a terminal sends to
+    /// submit a command line). Default true — pass false for raw
+    /// keystrokes.
     #[serde(default)]
     pub enter: Option<bool>,
 }
@@ -110,27 +111,32 @@ fn terminal_actor(
     }
 }
 
-/// How much of `bytes` to deliver so the page ends on a UTF-8 boundary:
-/// the whole page when it is valid or contains a genuinely INVALID
-/// sequence (binary output — lossy is honest), trimmed to the last
-/// boundary when the tail is an INCOMPLETE sequence a later page
-/// completes. An incomplete prefix is NEVER consumed — even when that
+/// How much of `bytes` to deliver so the page never ends inside an
+/// INCOMPLETE UTF-8 sequence: the whole page when everything after the
+/// last genuinely INVALID sequence (binary output — lossy is honest) is
+/// valid, trimmed to the last boundary when the tail is an incomplete
+/// sequence a later page completes — invalid bytes earlier in the page
+/// don't forfeit that trim (a binary page can still end in a split
+/// character). An incomplete prefix is NEVER consumed — even when that
 /// means an empty page with a parked cursor — because delivering it
 /// lossily advances past bytes the caller can then never reconstruct.
 /// Progress is guaranteed by the read floor (`max_bytes` ≥ 4, the
-/// longest UTF-8 sequence): a page that starts on a boundary and has
-/// room for a whole sequence only ever trims a tail the ring has not
-/// finished receiving yet.
+/// longest UTF-8 sequence) plus invalid sequences always being consumed:
+/// the scan only ever holds back a tail the ring has not finished
+/// receiving yet.
 fn utf8_page_len(bytes: &[u8]) -> usize {
-    match std::str::from_utf8(bytes) {
-        Ok(_) => bytes.len(),
-        Err(err) => {
-            if err.error_len().is_some() {
-                // Invalid sequence inside the page — not a boundary split.
-                bytes.len()
-            } else {
-                err.valid_up_to()
-            }
+    // Walk the page the way the lossy decoder will: valid runs and
+    // invalid sequences are delivered; only a trailing incomplete
+    // sequence (`error_len() == None`) is held back. Each iteration
+    // resumes past the previous error, so the page is scanned once.
+    let mut offset = 0;
+    loop {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(err) => match err.error_len() {
+                Some(skip) => offset += err.valid_up_to() + skip,
+                None => return offset + err.valid_up_to(),
+            },
         }
     }
 }
@@ -208,9 +214,13 @@ impl IntendantServer {
             shared: params.shared.unwrap_or(false),
             // The caller's grant-resolved filesystem scope, stated by the
             // ingress gate (dashboard-tunnel parity): a scoped grant's
-            // shell is OS-sandboxed to its roots with a cleared
-            // environment, and an ungated caller's default is the empty
-            // scope — never an unrestricted, key-bearing shell.
+            // shell is OS-sandboxed to its roots, and an ungated caller's
+            // default is the empty scope. Environment secrecy does NOT
+            // ride this scope — the registry derives it from the ACTOR,
+            // so every principal-owned spawn (every Scoped caller,
+            // including one whose grant carries no filesystem scope)
+            // gets a cleared, secret-free environment and can never read
+            // the daemon's provider keys through `env`.
             scope: fs_scope,
         };
         match registry
@@ -311,7 +321,11 @@ impl IntendantServer {
         }
         let mut input = params.input.into_bytes();
         if params.enter.unwrap_or(true) {
-            input.push(b'\n');
+            // CR, not LF: the byte the Enter key actually sends. ConPTY
+            // only submits a command line on CR (terminal.rs's PTY tests
+            // pin this), and Unix line discipline maps CR to NL on input
+            // (ICRNL), so CR is the correct submit byte everywhere.
+            input.push(b'\r');
         }
         session.write_input(&input);
         serde_json::json!({
@@ -376,6 +390,24 @@ mod tests {
             utf8_page_len(&[0xff, 0x61]),
             2,
             "invalid mid-page stays lossy"
+        );
+        // Invalid bytes EARLIER in the page must not forfeit the tail
+        // trim: the scan resumes past them and still holds back a
+        // trailing incomplete sequence (review P2, round 3).
+        assert_eq!(
+            utf8_page_len(&[0xff, b'a', b'b', 0xc3]),
+            3,
+            "split tail held back even after an invalid byte"
+        );
+        assert_eq!(
+            utf8_page_len(&[0xff, 0xc3, 0xa9]),
+            3,
+            "complete char after an invalid byte delivered whole"
+        );
+        assert_eq!(
+            utf8_page_len(&[0xff]),
+            1,
+            "a lone invalid byte still makes progress"
         );
         // An incomplete PREFIX is never consumed — the cursor parks, and
         // the read floor (max_bytes ≥ 4) guarantees the next page has

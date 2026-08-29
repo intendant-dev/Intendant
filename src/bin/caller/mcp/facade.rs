@@ -512,7 +512,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "no-enter",
             "__no_enter",
             Bool,
-            "raw keystrokes, no newline"
+            "raw keystrokes, no Enter"
         )],
         help: "Write a command line (or raw input) into a live shell",
     },

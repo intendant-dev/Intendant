@@ -517,7 +517,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "terminal_write",
         manual_http_tool_definition!(
             "terminal_write",
-            "Write input to a visible live shell session's stdin (appends a newline by default; pass enter=false for raw keystrokes). Refuses with the exit status when the shell has died.",
+            "Write input to a visible live shell session's stdin (appends Enter — a carriage return — by default; pass enter=false for raw keystrokes). Refuses with the exit status when the shell has died.",
             crate::mcp::tools_terminal::TerminalWriteParams
         ),
     );

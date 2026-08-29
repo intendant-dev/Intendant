@@ -127,7 +127,10 @@ impl TerminalActor {
 /// a sandboxed one — the PTY child is confined to the scope's roots (plus
 /// read-only system paths) at the OS level: Landlock on Linux, a Seatbelt
 /// profile on macOS, a restricted token + temporary RESTRICTED ACEs on
-/// Windows (see win_sandbox.rs). `None` scope = today's full shell.
+/// Windows (see win_sandbox.rs). `None` scope = a filesystem-unrestricted
+/// shell; environment secrecy is a separate axis the spawn derives from
+/// the ACTOR, not from the scope — every principal-owned shell gets a
+/// cleared, secret-free environment (see [`PtySession::spawn`]).
 #[derive(Debug, Clone, Default)]
 pub struct ShellSpawnPolicy {
     pub may_spawn: bool,
@@ -218,22 +221,15 @@ fn scoped_shell_args(shell: &str) -> Vec<String> {
     }
 }
 
-/// Minimal, secret-free environment for a scoped shell. The daemon process
-/// env holds API keys and infrastructure detail; a scoped principal must
-/// not see any of it, so the child env is cleared and rebuilt. `HOME`
-/// points at the first writable root (shell history, tool caches, and
-/// dotfile writes land inside the scope instead of erroring).
+/// Minimal, secret-free environment for a shell whose spawning actor
+/// must not see the daemon's process env (API keys, infrastructure
+/// detail): the child env is cleared and rebuilt from this allowlist.
+/// `home` is where shell history, tool caches, and dotfile writes land —
+/// a sandboxed shell passes its first writable scope root (the real
+/// `$HOME` is outside the sandbox), an unsandboxed principal shell
+/// passes the real home.
 #[cfg(unix)]
-fn scoped_shell_env(
-    scope: &crate::peer::access_policy::FilesystemAccessPolicy,
-    shell: &str,
-) -> Vec<(String, String)> {
-    let home = scope
-        .write_roots
-        .first()
-        .or_else(|| scope.read_roots.first())
-        .map(|root| root.display().to_string())
-        .unwrap_or_else(|| "/tmp".to_string());
+fn secret_free_shell_env(home: String, shell: &str) -> Vec<(String, String)> {
     let path = if cfg!(target_os = "macos") {
         "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     } else {
@@ -263,23 +259,31 @@ fn scoped_shell_env(
     env
 }
 
-/// Windows twin of [`scoped_shell_env`]: minimal, secret-free environment
-/// for a scoped shell. `SystemRoot` and `PATHEXT` are load-bearing (process
-/// startup and DLL/command resolution break without them); the profile
-/// family (`USERPROFILE`, `APPDATA`, …) and temp point into the first
-/// writable root so PSReadLine history, tool caches, and temp files land
-/// inside the scope instead of erroring — the real profile is invisible to
-/// the restricted token anyway.
-#[cfg(windows)]
-fn windows_scoped_shell_env(
+/// [`secret_free_shell_env`] for a scoped shell: `HOME` points at the
+/// first writable root so shell history, tool caches, and dotfile writes
+/// land inside the scope instead of erroring.
+#[cfg(unix)]
+fn scoped_shell_env(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+    shell: &str,
 ) -> Vec<(String, String)> {
-    let profile = scope
+    let home = scope
         .write_roots
         .first()
         .or_else(|| scope.read_roots.first())
         .map(|root| root.display().to_string())
-        .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+        .unwrap_or_else(|| "/tmp".to_string());
+    secret_free_shell_env(home, shell)
+}
+
+/// Windows twin of [`secret_free_shell_env`]: minimal, secret-free
+/// environment for a shell whose spawning actor must not see the daemon's
+/// process env. `SystemRoot` and `PATHEXT` are load-bearing (process
+/// startup and DLL/command resolution break without them); the profile
+/// family (`USERPROFILE`, `APPDATA`, …) and temp point into `profile` so
+/// PSReadLine history, tool caches, and temp files have somewhere to land.
+#[cfg(windows)]
+fn windows_secret_free_shell_env(profile: String) -> Vec<(String, String)> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let mut env = vec![
         ("SystemRoot".to_string(), system_root.clone()),
@@ -317,6 +321,22 @@ fn windows_scoped_shell_env(
         }
     }
     env
+}
+
+/// [`windows_secret_free_shell_env`] for a scoped shell: the profile
+/// family points into the first writable root so writes land inside the
+/// scope — the real profile is invisible to the restricted token anyway.
+#[cfg(windows)]
+fn windows_scoped_shell_env(
+    scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+) -> Vec<(String, String)> {
+    let profile = scope
+        .write_roots
+        .first()
+        .or_else(|| scope.read_roots.first())
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+    windows_secret_free_shell_env(profile)
 }
 
 /// Read-only system baseline a scoped shell needs to be a usable shell
@@ -785,7 +805,12 @@ impl PtySession {
     /// Spawn a new shell under a fresh PTY. The shell defaults to
     /// `$SHELL`, falling back to `/bin/bash`. When `scope` is set the
     /// child is wrapped in an OS sandbox confined to the scope's roots —
-    /// see [`ShellSpawnPolicy`].
+    /// see [`ShellSpawnPolicy`]. Independently of the scope, a
+    /// principal-owned spawn (`owner` set — every non-root actor) never
+    /// inherits the daemon's process environment: the daemon env holds
+    /// provider API keys, so the child env is cleared and rebuilt
+    /// secret-free; only root-lane shells (the owner's own surfaces)
+    /// inherit.
     fn spawn(
         cols: u16,
         rows: u16,
@@ -832,8 +857,35 @@ impl PtySession {
                 if let Some(ref dir) = cwd {
                     cmd.cwd(dir);
                 }
-                // Seed TERM so xterm.js gets colors and cursor sequences.
-                cmd.env("TERM", "xterm-256color");
+                if owner.is_some() {
+                    // A principal-owned shell never inherits the daemon's
+                    // process environment, even without a filesystem
+                    // scope (scope-less grants, supervised sessions): the
+                    // daemon env holds provider API keys, and a scoped
+                    // principal reading them through `env` would cross
+                    // the runtime/controller key boundary. Secrecy and
+                    // filesystem confinement are separate axes — this
+                    // shell keeps the real home, it is only secret-free.
+                    // Root-lane shells (the owner's own terminal tabs)
+                    // inherit as before.
+                    cmd.env_clear();
+                    #[cfg(unix)]
+                    let curated = secret_free_shell_env(
+                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+                        program,
+                    );
+                    #[cfg(windows)]
+                    let curated = windows_secret_free_shell_env(
+                        std::env::var("USERPROFILE")
+                            .unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
+                    );
+                    for (key, value) in curated {
+                        cmd.env(key, value);
+                    }
+                } else {
+                    // Seed TERM so xterm.js gets colors and cursor sequences.
+                    cmd.env("TERM", "xterm-256color");
+                }
                 // Unit-test builds point the spawned shell's HOME at a
                 // per-process scratch: interactive shells write history
                 // (~/.zsh_history, ~/.bash_history) on exit, and terminal
@@ -2380,6 +2432,56 @@ mod tests {
                 "unexpected env var {key} in scoped shell env"
             );
         }
+    }
+
+    /// A principal-owned shell with NO filesystem scope still gets a
+    /// cleared, secret-free environment: the daemon process env holds
+    /// provider API keys, and environment secrecy must not depend on a
+    /// grant happening to carry a filesystem scope (review P1). Root-lane
+    /// shells keep inheriting — every other PTY test in this module
+    /// spawns as [`TerminalActor::Root`] and exercises that side.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_shell_without_scope_gets_secret_free_env() {
+        // The canary must be present in THIS process's environment while
+        // the shell spawns to prove the child cleared it; mutate and
+        // restore under the crate-wide env lock.
+        let guard = crate::test_support::TEST_ENV_LOCK.lock().await;
+        std::env::set_var("INTENDANT_TEST_ENV_CANARY", "leak_9418");
+
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let key = TerminalKey::local("principal-env-e2e");
+        let actor = TerminalActor::Principal("principal:client-key:envtest".to_string());
+        let spawned = registry
+            .open_or_attach(
+                key,
+                100,
+                30,
+                &actor,
+                ShellSpawnPolicy {
+                    may_spawn: true,
+                    shared: false,
+                    scope: None,
+                },
+            )
+            .await;
+        // The spawn ran synchronously inside open_or_attach, so the
+        // mutation window ends here regardless of the result.
+        std::env::remove_var("INTENDANT_TEST_ENV_CANARY");
+        drop(guard);
+        let (session, created) = spawned.unwrap();
+        assert!(created);
+
+        let mut rx = session.attach();
+        expect_output(&mut rx, None, "shell startup").await;
+        // `printenv` exits non-zero when the var is absent, so the echo
+        // fallback is the deterministic pass signal. The sentinel is
+        // quote-split in the typed command so the terminal's echo of the
+        // command line can never satisfy the check; a leaked canary
+        // prints its value, short-circuits the `||`, and the sentinel
+        // never appears (the assertion times out with the transcript).
+        session.write_input(b"printenv INTENDANT_TEST_ENV_CANARY || echo CANARY_ABSENT'_OK'\r");
+        expect_output(&mut rx, Some("CANARY_ABSENT_OK"), "daemon env cleared").await;
     }
 
     #[cfg(target_os = "macos")]

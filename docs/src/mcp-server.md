@@ -405,7 +405,11 @@ authorities here). Output is polled with a monotonic cursor over the
 marker — and the exit status is retained so a poller that missed the
 death still learns it. Visibility is the registry's own model: root
 surfaces see every session, scoped principals see their own and shared
-ones. None of these ride the scoped profiles; they appear on
+ones. A shell spawned for a scoped principal is OS-sandboxed to the
+grant's filesystem scope and — independently, even when the grant
+carries no scope — never inherits the daemon's process environment (the
+daemon env holds provider API keys; the child env is cleared and
+rebuilt secret-free). None of these ride the scoped profiles; they appear on
 full/unprofiled listings and through the facade's `terminal` commands
 (`open` and `write` on the `authorize` lane — writing into a live shell
 is running commands).
@@ -415,7 +419,7 @@ is running commands).
 | `terminal_list` | Visible sessions: id, liveness, sharing, geometry, retained exit status. | — |
 | `terminal_open` | Open or create a shell PTY (shell-spawn class); returns the id, whether it was created, geometry, and the starting read cursor. | `terminal_id?`, `cols?`, `rows?`, `shared?` |
 | `terminal_read` | Cursor-paged output read with gap reporting, liveness, and exit status. | `terminal_id`, `cursor?`, `max_bytes?` |
-| `terminal_write` | Write to a live shell's stdin (appends a newline by default; `enter: false` for raw keystrokes). | `terminal_id`, `input`, `enter?` |
+| `terminal_write` | Write to a live shell's stdin (appends Enter — a carriage return — by default; `enter: false` for raw keystrokes). | `terminal_id`, `input`, `enter?` |
 | `terminal_resize` | Resize the PTY. | `terminal_id`, `cols`, `rows` |
 | `terminal_close` | Close the session. | `terminal_id` |
 
