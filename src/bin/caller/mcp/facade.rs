@@ -362,7 +362,20 @@ fn build_args(
                 }
                 flag_name_by_key.insert(flag.json_key, flag.name);
             }
-            insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
+            // A full-object flag beside its own nested flags fills only
+            // what they did not set — in EITHER argv order (the audio
+            // --args precedent): the specific spelling wins, so
+            // `--agent codex --agent-config '{"dial":..}'` keeps both.
+            let nested_flags = flag_written.iter().any(|flag_path| {
+                path_covers(flag.json_key, flag_path) && *flag_path != flag.json_key
+            });
+            if nested_flags {
+                let mut scratch = serde_json::Map::new();
+                insert_value(&mut scratch, flag.json_key, flag.kind, &raw)?;
+                merge_flag_precedent(&mut obj, scratch, &flag_written, "");
+            } else {
+                insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
+            }
             written.insert(outer(flag.json_key));
             flag_written.insert(flag.json_key);
         } else if let Some(pos) = spec.positionals.get(positional_index) {
@@ -2510,6 +2523,41 @@ mod tests {
             planned.args["annotations"],
             serde_json::json!(["first", "second"])
         );
+        // Round 39: a full-object flag beside its nested flags is
+        // order-independent — the specific spelling wins, the object
+        // fills the rest (both orders pinned).
+        for argv_case in [
+            [
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--agent",
+                "codex",
+                "--agent-config",
+                "{\"agent\":\"claude\",\"dial\":{\"autonomy\":\"high\"}}",
+            ],
+            [
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--agent-config",
+                "{\"agent\":\"claude\",\"dial\":{\"autonomy\":\"high\"}}",
+                "--agent",
+                "codex",
+            ],
+        ] {
+            let planned = plan_for_meta("act", &argv(&argv_case)).unwrap();
+            assert_eq!(planned.args["agent_config"]["agent"], "codex");
+            assert_eq!(planned.args["agent_config"]["dial"]["autonomy"], "high");
+        }
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
