@@ -1454,6 +1454,7 @@ mod tests {
             iam_state: Some(std::sync::Arc::new(
                 crate::access::iam::LocalIamState::default(),
             )),
+            peer_filesystem: None,
         };
         let root = RequestAuthority {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
@@ -1461,6 +1462,7 @@ mod tests {
                 "http",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
 
         let mut revoked_state = crate::access::iam::LocalIamState::default();
@@ -1485,6 +1487,7 @@ mod tests {
         let revoked = RequestAuthority {
             principal: revoked_principal,
             iam_state: Some(std::sync::Arc::new(revoked_state)),
+            peer_filesystem: None,
         };
 
         for (path, operation) in [

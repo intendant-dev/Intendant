@@ -845,6 +845,7 @@ pub(crate) fn mcp_http_access_context(
                 return Ok(HttpAccessContext {
                     principal: crate::access::iam::AccessPrincipal::mcp_token_holder(transport),
                     iam_state: None,
+                    peer_filesystem: None,
                 });
             };
             mcp_agent_session_context(cert_dir, &session_id, transport, false)
@@ -889,6 +890,7 @@ pub(crate) fn mcp_http_access_context(
                     return Ok(HttpAccessContext {
                         principal,
                         iam_state: Some(state),
+                        peer_filesystem: None,
                     });
                 }
                 // A lapsed local_process grant binds and is denied by the
@@ -899,6 +901,7 @@ pub(crate) fn mcp_http_access_context(
                     return Ok(HttpAccessContext {
                         principal,
                         iam_state: Some(state),
+                        peer_filesystem: None,
                     });
                 }
                 if crate::access::iam::agent_session_scoping_present(&state) {
@@ -917,6 +920,7 @@ pub(crate) fn mcp_http_access_context(
                     transport,
                 ),
                 iam_state: None,
+                peer_filesystem: None,
             })
         }
     }
@@ -943,6 +947,7 @@ pub(crate) fn mcp_agent_session_context(
             return Ok(HttpAccessContext {
                 principal,
                 iam_state: Some(state),
+                peer_filesystem: None,
             });
         }
         if let Some(principal) = crate::access::iam::principal_for_agent_session_any_status(
@@ -951,6 +956,7 @@ pub(crate) fn mcp_agent_session_context(
             return Ok(HttpAccessContext {
                 principal,
                 iam_state: Some(state),
+                peer_filesystem: None,
             });
         }
     }
@@ -961,6 +967,7 @@ pub(crate) fn mcp_agent_session_context(
             authenticated,
         ),
         iam_state: None,
+        peer_filesystem: None,
     })
 }
 
@@ -1596,6 +1603,7 @@ mod tests {
                 true,
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
 
         let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
@@ -1639,6 +1647,7 @@ mod tests {
         let dashboard_access = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
             iam_state: None,
+            peer_filesystem: None,
         };
         handle_mcp_http_request(
             list,
@@ -1728,6 +1737,7 @@ mod tests {
                 "sess-e2e", "http", true,
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         let outcome = handle_mcp_http_request(
             &call("parked by the session"),
@@ -1753,6 +1763,7 @@ mod tests {
         let dashboard_access = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
             iam_state: None,
+            peer_filesystem: None,
         };
         let outcome = handle_mcp_http_request(
             &call("parked by the owner"),
@@ -1822,6 +1833,7 @@ mod tests {
                             "sess-neg", "http", true,
                         ),
                     iam_state: None,
+                    peer_filesystem: None,
                 },
                 Some("sess-neg".to_string()),
             ),
@@ -1831,6 +1843,7 @@ mod tests {
                         "test", "https",
                     ),
                     iam_state: None,
+                    peer_filesystem: None,
                 },
                 None,
             ),
@@ -1840,6 +1853,7 @@ mod tests {
                         "http",
                     ),
                     iam_state: None,
+                    peer_filesystem: None,
                 },
                 None,
             ),
@@ -1847,6 +1861,7 @@ mod tests {
                 HttpAccessContext {
                     principal: impostor,
                     iam_state: None,
+                    peer_filesystem: None,
                 },
                 None,
             ),
@@ -1948,6 +1963,7 @@ mod tests {
                 "sess-e2e", "http", true,
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         let outcome = handle_mcp_http_request(
             &call("proposed by the session"),
@@ -1978,6 +1994,7 @@ mod tests {
         let dashboard_access = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
             iam_state: None,
+            peer_filesystem: None,
         };
         let outcome = handle_mcp_http_request(
             &call("proposed by the owner"),
@@ -2034,12 +2051,14 @@ mod tests {
         let dashboard_access = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
             iam_state: None,
+            peer_filesystem: None,
         };
         let session_access = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
                 "sess-e2e", "http", true,
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         let rpc = |name: &str, arguments: serde_json::Value| {
             serde_json::json!({

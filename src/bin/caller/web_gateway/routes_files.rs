@@ -2987,6 +2987,7 @@ mod tests {
             HttpAccessContext {
                 principal,
                 iam_state: Some(std::sync::Arc::new(state.clone())),
+                peer_filesystem: None,
             },
             state,
         )
@@ -3010,6 +3011,7 @@ mod tests {
                 "https",
             ),
             iam_state: Some(Default::default()),
+            peer_filesystem: None,
         };
         assert!(authorized_dashboard_local_file_response_blocking(
             &request(&allowed),
@@ -3057,6 +3059,7 @@ mod tests {
         let revoked = HttpAccessContext {
             principal: scoped.principal.clone(),
             iam_state: Some(std::sync::Arc::new(revoked_state)),
+            peer_filesystem: None,
         };
         assert!(authorized_dashboard_local_file_response_blocking(
             &request(&allowed),
@@ -3073,6 +3076,7 @@ mod tests {
                 "test", "loopback",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         assert!(authorized_dashboard_local_file_response_blocking(
             &request(&secret),
@@ -3797,6 +3801,7 @@ mod tests {
                 "http",
             ),
             iam_state: None,
+            peer_filesystem: None,
         }
     }
 

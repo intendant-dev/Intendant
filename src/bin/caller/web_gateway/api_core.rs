@@ -273,6 +273,15 @@ pub(crate) struct RequestAuthority {
     /// without deep-cloning principals/grants/audit history per request
     /// or per context clone (e.g. into `spawn_blocking`).
     pub(crate) iam_state: Option<std::sync::Arc<crate::access::iam::LocalIamState>>,
+    /// The authenticated peer connection's filesystem policy — present
+    /// exactly when this authority was minted from a
+    /// `PeerConnectionIdentity`. Peer principals have no local grant, so
+    /// their filesystem scope travels with the connection identity
+    /// instead of the IAM snapshot; without this, `fs_scope` would read
+    /// a peer as unrestricted (the dashboard tunnel's `Peer` grant arm
+    /// is the parity: a peer is always `Some(policy)`, never owner-class
+    /// `None`).
+    pub(crate) peer_filesystem: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
 }
 
 impl RequestAuthority {
@@ -281,8 +290,15 @@ impl RequestAuthority {
     /// owner surfaces and scope-less grants, matching the dashboard
     /// tunnel's `DashboardControlGrant::filesystem` semantics). A
     /// grant-bearing principal without a readable IAM snapshot fails
-    /// closed to the EMPTY policy, never to unrestricted.
+    /// closed to the EMPTY policy, never to unrestricted; a
+    /// peer-authenticated request always carries its identity's policy.
     pub(crate) fn fs_scope(&self) -> Option<crate::peer::access_policy::FilesystemAccessPolicy> {
+        // A peer's scope rides its connection identity — peers have no
+        // local grant, and a peer is never an unrestricted owner
+        // surface (dashboard-tunnel `Peer` arm parity).
+        if let Some(peer_fs) = &self.peer_filesystem {
+            return Some(peer_fs.clone());
+        }
         match &self.iam_state {
             Some(state) => {
                 crate::access::iam::fs_scope_for_principal(state, &self.principal).cloned()
@@ -345,9 +361,36 @@ mod tests {
                 "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         let decision =
             authority.decision(crate::peer::access_policy::PeerOperation::FilesystemRead);
         assert!(decision.allowed, "{decision:?}");
+    }
+
+    /// A peer-minted authority's filesystem scope is its connection
+    /// identity's policy — never owner-class `None` (review P1, round
+    /// 5): peer principals carry no local grant, so without the carried
+    /// policy `fs_scope` would read a peer as an unrestricted surface
+    /// and a terminal-operator peer's shell would escape its roots.
+    #[test]
+    fn peer_authority_fs_scope_is_the_identity_policy_never_unrestricted() {
+        let policy = crate::peer::access_policy::FilesystemAccessPolicy {
+            read_roots: vec![std::path::PathBuf::from("/srv/peer-read")],
+            write_roots: vec![std::path::PathBuf::from("/srv/peer-work")],
+        };
+        let authority = RequestAuthority {
+            principal: crate::access::iam::AccessPrincipal::peer_daemon(
+                "fp".to_string(),
+                "peer".to_string(),
+                "terminal-operator".to_string(),
+                "peer-http",
+            ),
+            iam_state: None,
+            peer_filesystem: Some(policy.clone()),
+        };
+        let scope = authority.fs_scope().expect("peer scope must be Some");
+        assert_eq!(scope.read_roots, policy.read_roots);
+        assert_eq!(scope.write_roots, policy.write_roots);
     }
 }

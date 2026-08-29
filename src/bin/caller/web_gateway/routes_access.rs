@@ -2896,6 +2896,7 @@ pub(crate) fn authority_free_http_access_context(is_tls: bool) -> HttpAccessCont
             "http"
         }),
         iam_state: None,
+        peer_filesystem: None,
     }
 }
 
@@ -2932,6 +2933,12 @@ pub(crate) fn http_access_context(
         return Ok(HttpAccessContext {
             principal: peer_identity_access_principal(identity, "peer-http"),
             iam_state: None,
+            // The peer's filesystem policy must travel with the
+            // authority: peer principals have no local grant, and
+            // dropping it here would read the peer as an unrestricted
+            // owner surface at every fs-scoped consumer (scoped shell
+            // spawns above all).
+            peer_filesystem: Some(identity.filesystem.clone()),
         });
     }
     let transport = if is_tls { "https" } else { "http" };
@@ -2941,6 +2948,7 @@ pub(crate) fn http_access_context(
         return Ok(HttpAccessContext {
             principal,
             iam_state: Some(state),
+            peer_filesystem: None,
         });
     }
     if tls_client_cert_present {
@@ -2948,6 +2956,7 @@ pub(crate) fn http_access_context(
         return Ok(HttpAccessContext {
             principal: browser_mtls_principal_for_state(&state, None, transport),
             iam_state: Some(state),
+            peer_filesystem: None,
         });
     }
     // The certless fallback is the trusted-local owner lane. Its
@@ -2964,6 +2973,7 @@ pub(crate) fn http_access_context(
             transport,
         ),
         iam_state: None,
+        peer_filesystem: None,
     })
 }
 
@@ -4128,6 +4138,33 @@ mod tests {
         );
     }
 
+    /// A peer-authenticated request's authority carries the connection
+    /// identity's filesystem policy (review P1, round 5): peer
+    /// principals have no local grant, so dropping the policy here made
+    /// `fs_scope` read the peer as an unrestricted owner surface — a
+    /// terminal-capable peer's shell would escape its configured roots.
+    #[test]
+    fn http_access_context_carries_the_peer_identity_filesystem() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = PeerConnectionIdentity {
+            fingerprint: "peerfp01".to_string(),
+            label: "peer-a".to_string(),
+            profile: "terminal-operator".to_string(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots: vec![std::path::PathBuf::from("/srv/peer-read")],
+                write_roots: vec![std::path::PathBuf::from("/srv/peer-work")],
+            },
+            record: None,
+        };
+        let access = http_access_context(tmp.path(), Some(&identity), None, false, true, false)
+            .expect("peer identity resolves an authority");
+        let scope = access
+            .fs_scope()
+            .expect("peer authority must always carry a filesystem scope");
+        assert_eq!(scope.read_roots, identity.filesystem.read_roots);
+        assert_eq!(scope.write_roots, identity.filesystem.write_roots);
+    }
+
     #[test]
     fn browser_mtls_request_cannot_mint_generated_owner_root() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4985,6 +5022,7 @@ mod tests {
                     "golden", "https",
                 ),
                 iam_state: None,
+                peer_filesystem: None,
             };
             let response = collect_access_handler_response(|stream| {
                 handle_access_overview(
@@ -5091,6 +5129,7 @@ mod tests {
                     "golden", "https",
                 ),
                 iam_state: None,
+                peer_filesystem: None,
             };
             let response = collect_access_handler_response(|stream| {
                 handle_access_connect_claim_code(stream, context, cors, origin)
@@ -5141,6 +5180,7 @@ mod tests {
                 "golden", "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
 
         // Invalid JSON: serde's wording for this exact input, derived
@@ -5229,6 +5269,7 @@ mod tests {
                     "golden", "https",
                 ),
                 iam_state: None,
+                peer_filesystem: None,
             };
             let root = dir.path().to_path_buf();
             let response = collect_access_handler_response(|stream| {
@@ -5258,6 +5299,7 @@ mod tests {
                 "golden", "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
 
         // Non-string tier: the validation 400 under the fleet tail.
@@ -5349,6 +5391,7 @@ mod tests {
                 "golden", "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         }
     }
 

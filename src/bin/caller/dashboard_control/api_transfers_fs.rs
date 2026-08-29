@@ -2979,6 +2979,7 @@ mod tests {
                 "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
 
         let unresolvable = "00000000-0000-0000-0000-000000000000";

@@ -303,11 +303,13 @@ mod tests {
         let hosted = RequestAuthority {
             principal: hosted_principal(),
             iam_state: None,
+            peer_filesystem: None,
         };
         assert!(request_authority_is_hosted(&hosted));
         let direct = RequestAuthority {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test"),
             iam_state: None,
+            peer_filesystem: None,
         };
         assert!(!request_authority_is_hosted(&direct));
         // With a state snapshot the central evaluator's provenance rules
@@ -317,6 +319,7 @@ mod tests {
             iam_state: Some(std::sync::Arc::new(
                 crate::access::iam::LocalIamState::default(),
             )),
+            peer_filesystem: None,
         };
         assert!(request_authority_is_hosted(&hosted_with_state));
     }
