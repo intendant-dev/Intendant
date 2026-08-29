@@ -66,6 +66,19 @@ enum ValueKind {
     /// JSON when the value parses as JSON, otherwise the literal string
     /// — ctl's `JSON|TEXT` contract (peer task context).
     JsonOrText,
+    /// ctl's WHEN vocabulary (`+2h`, epoch digits — 10-digit values are
+    /// seconds — RFC3339, `YYYY-MM-DD [HH:MM]`), resolved to epoch ms by
+    /// `ctl::parse_due_ms`. The relative and calendar forms need the
+    /// clock and local timezone, which planning may not read, so the raw
+    /// text rides to dispatch as a key-scoped `"__when:<raw>"` sentinel
+    /// and `substitute_dispatch_sentinels` resolves it (the daemon's
+    /// clock is the one schedules fire on, so it is also the right one
+    /// to parse against).
+    When,
+    /// ctl's INTERVAL vocabulary (`45m`, `2h`, `7d`, `1w`, or raw ms),
+    /// parsed at plan time by `ctl::parse_duration_ms` — durations are
+    /// clock-free, so planning stays pure.
+    Interval,
 }
 
 struct PositionalSpec {
@@ -425,6 +438,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("body", "body", Str, "markdown body"),
             flag!("tag", "tags", StrList, "tag (repeatable)"),
             flag!("kind", "kind", Str, "note|task|question (default task, matching ctl)"),
+            flag!(
+                "due",
+                "due_ms",
+                When,
+                "reminder instant — ctl's WHEN vocabulary: +2h, epoch, RFC3339, YYYY-MM-DD [HH:MM]"
+            ),
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
             flag!(
@@ -1179,11 +1198,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "replacement tag (repeatable, ctl spelling)"
             ),
             flag!(
-                "due-ms",
+                "due",
                 "patch.due_ms",
-                U64,
-                "new due instant in epoch ms (ctl's human --due converts client-side)"
+                When,
+                "new due instant — ctl's WHEN vocabulary: +2h, epoch, RFC3339, YYYY-MM-DD [HH:MM]"
             ),
+            flag!("due-ms", "patch.due_ms", U64, "new due instant, ms since epoch"),
             flag!("clear-tags", "__clear_tags", Bool, "empty the tag list"),
             flag!("clear-due", "__clear_due", Bool, "clear the due instant"),
             flag!("source", "source", Str, "self-described caller label"),
@@ -1255,6 +1275,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("body", "body", Str, "markdown body"),
             flag!("tag", "tags", StrList, "tag (repeatable)"),
+            flag!(
+                "due",
+                "due_ms",
+                When,
+                "reminder instant — ctl's WHEN vocabulary: +2h, epoch, RFC3339, YYYY-MM-DD [HH:MM]"
+            ),
             flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
             flag!("source", "source", Str, "self-described caller label"),
             flag!(
@@ -1345,21 +1371,21 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         seed: r#"{"op":"add_ref"}"#,
         positionals: &[
             p_str("ID", "id", true, false),
-            p_str("LOCATOR", "locator", true, false),
+            p_str("LOCATOR", "__ref_locator", true, false),
         ],
         flags: &[
             flag!(
                 "type",
                 "ref_type",
                 Str,
-                "file|dir|memory|session|url (ctl infers it from the locator client-side)"
+                "file|dir|memory|session|url (overrides a TYPE: prefix)"
             ),
             flag!("must-read", "must_read", Bool, "mark the ref must-read"),
             flag!("label", "label", Str, "ref label"),
             flag!("remove", "__remove_ref", Bool, "detach the ref instead"),
             flag!("source", "source", Str, "self-described caller label"),
         ],
-        help: "Attach (or with --remove, detach) a ref — ctl's spelling; pass --type explicitly",
+        help: "Attach (or with --remove, detach) a ref — [TYPE:]LOCATOR, ctl's grammar (url inferred from http(s); other types need the prefix or --type)",
     },
     CommandSpec {
         path: &["agenda", "relies-add"],
@@ -1572,8 +1598,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!(
                 "at",
                 "fire_at_ms",
-                U64,
-                "fire instant in epoch ms (ctl's human --at vocabulary is converted client-side)"
+                When,
+                "fire instant — ctl's WHEN vocabulary: +2h, epoch, RFC3339, YYYY-MM-DD [HH:MM]"
             ),
             flag!("fire-at-ms", "fire_at_ms", U64, "fire instant, ms since epoch"),
             flag!("orchestrate", "orchestrate", Bool, "orchestrated session"),
@@ -1581,10 +1607,15 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!(
                 "every",
                 "recurrence.every_ms",
-                U64,
-                "recurrence period in ms (ctl's human durations convert client-side)"
+                Interval,
+                "recurrence period — ctl's INTERVAL vocabulary: 45m, 2h, 7d, 1w, or ms"
             ),
-            flag!("until", "recurrence.until_ms", U64, "recurrence end, epoch ms"),
+            flag!(
+                "until",
+                "recurrence.until_ms",
+                When,
+                "recurrence end (WHEN vocabulary)"
+            ),
             flag!(
                 "max-occurrences",
                 "recurrence.max_occurrences",
@@ -1662,15 +1693,15 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!(
                 "at",
                 "fire_at_ms",
-                U64,
-                "first fire instant, epoch ms (ctl's human vocabulary converts client-side)"
+                When,
+                "first fire instant — ctl's WHEN vocabulary: +2h, epoch, RFC3339, YYYY-MM-DD [HH:MM]"
             ),
             flag!("fire-at-ms", "fire_at_ms", U64, "first fire instant"),
             flag!(
                 "every",
                 "every_ms",
-                U64,
-                "recurrence period in ms (ctl spelling)"
+                Interval,
+                "recurrence period — ctl's INTERVAL vocabulary: 45m, 2h, 7d, 1w, or ms"
             ),
             flag!("every-ms", "every_ms", U64, "recurrence period"),
             flag!(
@@ -2198,6 +2229,10 @@ fn insert_value(
                 .map_err(|e| format!("{key}: expected literal JSON ({e})"))?,
             ValueKind::JsonOrText => serde_json::from_str(raw)
                 .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+            // The clock/timezone-dependent forms resolve at dispatch;
+            // planning stays pure by carrying the raw text.
+            ValueKind::When => serde_json::Value::String(format!("__when:{raw}")),
+            ValueKind::Interval => serde_json::Value::from(crate::ctl::parse_duration_ms(raw)?),
         };
     obj.insert(key.to_string(), value);
     Ok(())
@@ -2325,15 +2360,35 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     if obj.remove("__no_enter").is_some() {
         obj.insert("enter".to_string(), serde_json::Value::Bool(false));
     }
-    // The `ask` shape: repeatable --option labels become option objects.
+    // The `ask` shape: repeatable --option values become option objects,
+    // splitting ctl's "Label[:description]" form the way
+    // `ctl::ask_option_entries` does.
     if let Some(options) = obj.remove("__options") {
-        let labels = options.as_array().cloned().unwrap_or_default();
+        let raw_options = options.as_array().cloned().unwrap_or_default();
         obj.insert(
             "options".to_string(),
             serde_json::Value::Array(
-                labels
+                raw_options
                     .into_iter()
-                    .map(|label| serde_json::json!({ "label": label }))
+                    .map(|value| {
+                        let raw = value.as_str().unwrap_or_default();
+                        let (label, description) = match raw.split_once(':') {
+                            Some((label, description)) => (label.trim(), Some(description.trim())),
+                            None => (raw.trim(), None),
+                        };
+                        let mut entry = serde_json::Map::new();
+                        entry.insert(
+                            "label".to_string(),
+                            serde_json::Value::String(label.to_string()),
+                        );
+                        if let Some(description) = description.filter(|d| !d.is_empty()) {
+                            entry.insert(
+                                "description".to_string(),
+                                serde_json::Value::String(description.to_string()),
+                            );
+                        }
+                        serde_json::Value::Object(entry)
+                    })
                     .collect(),
             ),
         );
@@ -2391,6 +2446,43 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         if clear_due {
             patch.insert("due_ms".to_string(), serde_json::Value::Null);
         }
+    }
+    // ctl's `[TYPE:]LOCATOR` ref grammar: a recognized type prefix is
+    // decoded and stripped (an explicit --type overrides the prefix, but
+    // a recognized prefix still leaves the locator); with neither, a
+    // http(s) locator infers url. ctl's remaining inferences probe the
+    // client filesystem — meaningless here — so they refuse in ctl's
+    // own words instead.
+    if let Some(raw) = obj.remove("__ref_locator") {
+        let raw = raw.as_str().unwrap_or_default().to_string();
+        const REF_TYPES: [&str; 5] = ["file", "dir", "memory", "session", "url"];
+        let (prefixed, rest) = match raw.split_once(':') {
+            Some((t, rest)) if REF_TYPES.contains(&t) => (Some(t.to_string()), rest.to_string()),
+            _ => (None, raw.clone()),
+        };
+        if let Some(explicit) = obj.get("ref_type").and_then(serde_json::Value::as_str) {
+            let t = explicit.trim().to_ascii_lowercase();
+            if !REF_TYPES.contains(&t.as_str()) {
+                return Err(format!(
+                    "unknown ref type '{explicit}' (file, dir, memory, session, or url)"
+                ));
+            }
+            obj.insert("ref_type".to_string(), serde_json::Value::String(t));
+        } else if let Some(t) = &prefixed {
+            obj.insert("ref_type".to_string(), serde_json::Value::String(t.clone()));
+        } else if raw.starts_with("http://") || raw.starts_with("https://") {
+            obj.insert(
+                "ref_type".to_string(),
+                serde_json::Value::String("url".to_string()),
+            );
+        } else {
+            return Err(format!(
+                "cannot infer the ref type of {raw:?} — prefix it \
+                 (file:…, dir:…, memory:…, session:…, url:https://…) or pass --type"
+            ));
+        }
+        let locator = if prefixed.is_some() { rest } else { raw };
+        obj.insert("locator".to_string(), serde_json::Value::String(locator));
     }
     // ctl's `--remove` edge forms flip the seeded add op to its remove
     // twin. The relates remove drops/refuses --kind (it types the link
@@ -2486,7 +2578,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
                 );
             } else {
                 return Err(
-                    "agenda schedule requires FIRE_AT_MS (epoch ms) — or a trigger flag, whose omitted instant means armed on approval"
+                    "agenda schedule requires --at WHEN (or FIRE_AT_MS in epoch ms) — or a trigger flag, whose omitted instant means armed on approval"
                         .to_string(),
                 );
             }
@@ -2615,38 +2707,91 @@ fn region_from_csv(flag: &str, csv: &serde_json::Value) -> Result<serde_json::Va
     Ok(serde_json::json!({ "x": x, "y": y, "width": width, "height": height }))
 }
 
+/// The leaf argument keys the registry declares as `When`-kind — the
+/// only keys where a `"__when:"` sentinel is honored at dispatch.
+/// Derived from the registry so a new When flag extends substitution
+/// without a mirror to forget ("derive, don't mirror").
+static WHEN_KEYS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        COMMANDS
+            .iter()
+            .flat_map(|spec| {
+                spec.flags
+                    .iter()
+                    .filter(|flag| flag.kind == ValueKind::When)
+                    .map(|flag| flag.json_key)
+                    .chain(
+                        spec.positionals
+                            .iter()
+                            .filter(|pos| pos.kind == ValueKind::When)
+                            .map(|pos| pos.json_key),
+                    )
+            })
+            .map(|key| key.rsplit('.').next().unwrap_or(key))
+            .collect()
+    });
+
+fn dispatch_now_ms() -> serde_json::Value {
+    serde_json::Value::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    )
+}
+
 /// Substitute the planner's dispatch-time sentinels. The planner is
 /// pure — it cannot know who is calling and reads no clock — so rows
 /// seed `"__caller"` under `holder_id` (a CONSTANT default identity
 /// would make two facade sessions collide as the "same" holder: the
 /// browser-lease registry rejects only a DIFFERENT holder id, so a
 /// constant silently hands one session's exclusive lease to another),
-/// and a triggered schedule's omitted arm floor fills `fire_at_ms`
-/// with `"__now"` (armed on approval). The dispatcher substitutes
-/// after gate resolution — the gate ignores argument values, so
-/// authorization is unaffected — and each sentinel is scoped to the
-/// key the planner seeds it under, never matched by value alone:
+/// a triggered schedule's omitted arm floor fills `fire_at_ms` with
+/// `"__now"` (armed on approval), and `When`-kind values ride as
+/// `"__when:<raw>"` until this step resolves them with
+/// `ctl::parse_due_ms` — the daemon's clock is the one schedules fire
+/// on, so it is also the right one to parse `+2h` and calendar forms
+/// against. The dispatcher substitutes after gate resolution — the
+/// gate ignores argument values, so authorization is unaffected — and
+/// every sentinel is scoped to its key (`__when:` to the
+/// registry-derived [`WHEN_KEYS`]), never matched by value alone:
 /// caller text that happens to spell a sentinel (`notify __now`) must
-/// reach its string-typed tool untouched. Under `fire_at_ms` the
-/// string is unforgeable by callers (the key is U64-kind in every
-/// row, so planning parses caller input to a number or refuses);
-/// `holder_id`'s literal `__caller` is that key's documented
-/// "the caller" default.
-pub(crate) fn substitute_dispatch_sentinels(args: &mut serde_json::Value, identity: &str) {
-    if let Some(obj) = args.as_object_mut() {
-        for (key, value) in obj.iter_mut() {
-            if key == "holder_id" && value.as_str() == Some("__caller") {
-                *value = serde_json::Value::String(identity.to_string());
-            } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
-                *value = serde_json::Value::from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                );
+/// reach its string-typed tool untouched. Under `fire_at_ms` the bare
+/// `"__now"` is unforgeable by callers (the key is U64- or When-kind
+/// in every row, so planning yields a number or a `"__when:"` form);
+/// `holder_id`'s literal `__caller` is that key's documented "the
+/// caller" default. The walk recurses so a When key nested in a built
+/// object (`recurrence.until_ms`) resolves too.
+pub(crate) fn substitute_dispatch_sentinels(
+    args: &mut serde_json::Value,
+    identity: &str,
+) -> Result<(), String> {
+    match args {
+        serde_json::Value::Object(obj) => {
+            for (key, value) in obj.iter_mut() {
+                if key == "holder_id" && value.as_str() == Some("__caller") {
+                    *value = serde_json::Value::String(identity.to_string());
+                } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
+                    *value = dispatch_now_ms();
+                } else if let Some(text) = value
+                    .as_str()
+                    .filter(|_| WHEN_KEYS.contains(key.as_str()))
+                    .and_then(|s| s.strip_prefix("__when:"))
+                {
+                    *value = serde_json::Value::from(crate::ctl::parse_due_ms(text)?);
+                } else {
+                    substitute_dispatch_sentinels(value, identity)?;
+                }
             }
         }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                substitute_dispatch_sentinels(item, identity)?;
+            }
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 /// Resolve one executor call (`inspect`/`act`/`authorize`) into the command
@@ -3357,6 +3502,112 @@ mod tests {
         .unwrap();
         assert_eq!(planned.args["record_id"], "rec-1");
         assert_eq!(planned.args["mode"], "fork");
+        // Round 22: ctl's WHEN/INTERVAL vocabulary on the schedule
+        // family (`+2h`/`1d` instead of pre-converted ms), the
+        // Label:description option split, and the [TYPE:]LOCATOR ref
+        // grammar.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "sweep",
+                "--at",
+                "+2h",
+                "--every",
+                "1d",
+                "--until",
+                "2026-09-01",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["fire_at_ms"], "__when:+2h");
+        assert_eq!(planned.args["recurrence"]["every_ms"], 86_400_000u64);
+        assert_eq!(planned.args["recurrence"]["until_ms"], "__when:2026-09-01");
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda", "schedule", "item-1", "--goal", "g", "--at", "+2h", "--every", "soon",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid interval"), "{err}");
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "patch", "item-1", "--due", "+1d"])).unwrap();
+        assert_eq!(planned.args["patch"]["due_ms"], "__when:+1d");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "add", "water the plants", "--due", "+1w"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["due_ms"], "__when:+1w");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "ask",
+                "Which database?",
+                "--option",
+                "postgres:Existing infra",
+                "--option",
+                "sqlite",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["options"],
+            serde_json::json!([
+                { "label": "postgres", "description": "Existing infra" },
+                { "label": "sqlite" },
+            ])
+        );
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ref", "item-1", "url:https://example.com/x"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["ref_type"], "url");
+        assert_eq!(planned.args["locator"], "https://example.com/x");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ref", "item-1", "https://example.com/y"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["ref_type"], "url", "http(s) infers url");
+        assert_eq!(planned.args["locator"], "https://example.com/y");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ref", "item-1", "memory:project_notes"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["ref_type"], "memory");
+        assert_eq!(planned.args["locator"], "project_notes");
+        // An explicit --type overrides the prefix; the prefix still
+        // leaves the locator (ctl's explicit.or(prefixed)).
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "ref",
+                "item-1",
+                "url:https://example.com/z",
+                "--type",
+                "session",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["ref_type"], "session");
+        assert_eq!(planned.args["locator"], "https://example.com/z");
+        let err =
+            plan_for_meta("act", &argv(&["agenda", "ref", "item-1", "notes.md"])).unwrap_err();
+        assert!(err.contains("cannot infer the ref type"), "{err}");
+        let err = plan_for_meta(
+            "act",
+            &argv(&["agenda", "ref", "item-1", "x", "--type", "ftp"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown ref type"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
@@ -3397,7 +3648,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["goal"], "run the sweep");
-        assert_eq!(planned.args["fire_at_ms"], 1_700_000_000_000u64);
+        // --at is When-kind (round 22): the raw text rides to dispatch
+        // and resolves through ctl's parse_due_ms there.
+        assert_eq!(planned.args["fire_at_ms"], "__when:1700000000000");
+        let mut args = planned.args.clone();
+        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
+        assert_eq!(args["fire_at_ms"], 1_700_000_000_000u64);
         let planned = plan_for_meta(
             "authorize",
             &argv(&["memory", "supersede", "abc123", "--with", "def456"]),
@@ -3603,7 +3859,7 @@ mod tests {
         assert_eq!(planned.args["agent_config"]["agent"], "codex");
         // The dispatch clock sentinel becomes a number.
         let mut args = serde_json::json!({ "fire_at_ms": "__now" });
-        substitute_dispatch_sentinels(&mut args, "sess-1");
+        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
         assert!(args["fire_at_ms"].is_u64());
         let planned = plan_for_meta(
             "act",
@@ -3631,22 +3887,56 @@ mod tests {
     #[test]
     fn dispatch_sentinels_substitute_key_scoped() {
         let mut args = serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" });
-        substitute_dispatch_sentinels(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
         assert_eq!(args["holder_id"], "sess-7");
         assert_eq!(args["workspace_id"], "ws-1");
         let mut args = serde_json::json!({ "holder_id": "alice" });
-        substitute_dispatch_sentinels(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
         assert_eq!(args["holder_id"], "alice");
         // Literal sentinel spellings under other keys are caller data,
         // not sentinels — `notify __now` stays the text "__now".
         let mut args = serde_json::json!({ "body": "__now", "reason": "__caller" });
-        substitute_dispatch_sentinels(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
         assert_eq!(args["body"], "__now");
         assert_eq!(args["reason"], "__caller");
         // And the clock sentinel fills only its own key.
         let mut args = serde_json::json!({ "fire_at_ms": "__now" });
-        substitute_dispatch_sentinels(&mut args, "sess-7");
+        substitute_dispatch_sentinels(&mut args, "sess-7").unwrap();
         assert!(args["fire_at_ms"].is_u64());
+    }
+
+    /// When-kind values ride to dispatch as `"__when:"` strings and
+    /// resolve there through ctl's own `parse_due_ms` — including
+    /// nested keys (`recurrence.until_ms`) and ctl's 10-digit
+    /// epoch-seconds heuristic; a bad form fails with ctl's wording,
+    /// and the sentinel is honored only under registry-declared When
+    /// keys (review round 22).
+    #[test]
+    fn when_sentinels_resolve_with_ctl_vocabulary_at_dispatch() {
+        assert!(WHEN_KEYS.contains("fire_at_ms"));
+        assert!(WHEN_KEYS.contains("until_ms"));
+        assert!(WHEN_KEYS.contains("due_ms"));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut args = serde_json::json!({
+            "fire_at_ms": "__when:+2h",
+            "recurrence": { "until_ms": "__when:1756400000" },
+        });
+        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
+        let fire = args["fire_at_ms"].as_u64().unwrap();
+        assert!(fire >= before + 2 * 3_600_000);
+        assert!(fire <= before + 2 * 3_600_000 + 60_000);
+        // ctl's heuristic: 10-digit values are epoch seconds.
+        assert_eq!(args["recurrence"]["until_ms"], 1_756_400_000_000u64);
+        let mut args = serde_json::json!({ "due_ms": "__when:bogus" });
+        let err = substitute_dispatch_sentinels(&mut args, "sess-1").unwrap_err();
+        assert!(err.contains("could not parse due"), "{err}");
+        // A "__when:" spelling under a non-When key is caller data.
+        let mut args = serde_json::json!({ "body": "__when:+2h" });
+        substitute_dispatch_sentinels(&mut args, "sess-1").unwrap();
+        assert_eq!(args["body"], "__when:+2h");
     }
 
     /// `agenda ask` mirrors ctl's own split (review round 10): plain

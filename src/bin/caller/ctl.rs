@@ -4786,8 +4786,9 @@ pub(crate) fn parse_due_ms(raw: &str) -> Result<u64, String> {
 
 /// A cadence INTERVAL (`--every`): `45m`, `2h`, `7d`, `1w` (leading `+`
 /// tolerated), or raw milliseconds. Distinct from [`parse_due_ms`], which
-/// resolves an instant.
-fn parse_duration_ms(raw: &str) -> Result<u64, String> {
+/// resolves an instant. `pub(crate)`: the MCP facade's Interval values
+/// share this grammar (clock-free, so its planner may call it).
+pub(crate) fn parse_duration_ms(raw: &str) -> Result<u64, String> {
     let raw = raw.trim();
     let body = raw.strip_prefix('+').unwrap_or(raw);
     if let Some(unit_pos) = body.find(|c: char| !c.is_ascii_digit()) {
