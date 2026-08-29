@@ -251,7 +251,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         lane: RiskLane::Act,
         tool: "ask_user",
         seed: "{}",
-        positionals: &[p_str("QUESTION", "question", true, true)],
+        positionals: &[p_str("QUESTION", "question", false, true)],
         flags: &[
             flag!("header", "header", Str, "short topic chip"),
             flag!(
@@ -260,6 +260,37 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 StrList,
                 "choice label (repeatable, max 4)"
             ),
+            flag!(
+                "questions",
+                "questions",
+                Json,
+                "multi-question form: JSON array of question objects (omit QUESTION)"
+            ),
+            flag!("previews", "previews", Json, "preview cards (JSON array)"),
+            flag!("pick-min", "pick_min", U64, "minimum selections (0 = optional)"),
+            flag!("pick-max", "pick_max", U64, "maximum selections (default 1)"),
+            flag!("multi", "multi_select", Bool, "allow multiple selections"),
+            flag!(
+                "free-text",
+                "free_text",
+                Json,
+                "true (default) or false — false requires an option pick"
+            ),
+            flag!(
+                "consequence",
+                "consequence",
+                Str,
+                "what happens if the question lapses unanswered"
+            ),
+            flag!("wait", "wait_seconds", U64, "block seconds (default 300, max 900)"),
+            flag!(
+                "expires",
+                "expiry",
+                Str,
+                "decision window (\"2h\", \"tomorrow 9am\", RFC3339)"
+            ),
+            flag!("park", "park", Bool, "file as a durable agenda question instead of blocking"),
+            flag!("session", "session_id", Str, "ask as another session"),
         ],
         help: "Ask the user a blocking structured question (holds up to 900 s)",
     },
@@ -2361,6 +2392,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["project"], "intendant");
+    }
+
+    /// The blocking-ask decision contract travels whole (review round
+    /// 5): the multi-question form, pick bounds, free-text opt-out,
+    /// consequence, wait override, expiry, and park.
+    #[test]
+    fn ask_row_carries_the_full_decision_contract() {
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "ask",
+                "--questions",
+                "[{\"question\":\"which?\",\"options\":[{\"label\":\"a\"},{\"label\":\"b\"}]}]",
+                "--pick-max",
+                "2",
+                "--free-text",
+                "false",
+                "--consequence",
+                "I proceed with a",
+                "--wait",
+                "600",
+                "--expires",
+                "2h",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "ask_user");
+        assert_eq!(planned.args["questions"][0]["question"], "which?");
+        assert!(planned.args.get("question").is_none(), "positional omitted");
+        assert_eq!(planned.args["pick_max"], 2);
+        assert_eq!(planned.args["free_text"], serde_json::json!(false));
+        assert_eq!(planned.args["consequence"], "I proceed with a");
+        assert_eq!(planned.args["wait_seconds"], 600);
+        assert_eq!(planned.args["expiry"], "2h");
+        let planned = plan_for_meta("act", &argv(&["ask", "ship it?", "--park"])).unwrap();
+        assert_eq!(planned.args["question"], "ship it?");
+        assert_eq!(planned.args["park"], serde_json::json!(true));
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry
