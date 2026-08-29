@@ -368,6 +368,49 @@ fn build_args(
             serde_json::Value::Array(option_entries(&raw_options)),
         );
     }
+    // ctl's file-backed preview forms read files CLIENT-side (the
+    // daemon deliberately accepts inline content only — a sandboxed
+    // agent must not make the unsandboxed daemon read arbitrary
+    // paths), so they refuse by name with the inline alternative.
+    if obj.remove("__preview_file_client").is_some() {
+        return Err(
+            "--preview-html/--preview-image read the referenced file client-side (a ctl \
+             behavior the facade excludes); inline the content yourself and pass \
+             --previews '[{\"label\":..,\"html\":..}]' or \
+             '[{\"label\":..,\"image\":..,\"media_type\":..}]'"
+                .to_string(),
+        );
+    }
+    // ctl's inline preview cards: repeatable --preview-text LABEL=VALUE
+    // with ctl's own split and preview cap.
+    if let Some(specs) = obj.remove("__preview_text") {
+        if obj.contains_key("previews") {
+            return Err(
+                "pass --preview-text cards or the --previews JSON array, not both".to_string(),
+            );
+        }
+        let mut previews = Vec::new();
+        for spec_value in specs.as_array().cloned().unwrap_or_default() {
+            let raw = spec_value.as_str().unwrap_or_default();
+            let split = raw
+                .split_once('=')
+                .map(|(label, text)| (label.trim(), text.trim()));
+            let Some((label, text)) =
+                split.filter(|(label, text)| !label.is_empty() && !text.is_empty())
+            else {
+                return Err(format!("--preview-text expects LABEL=VALUE, got '{raw}'"));
+            };
+            previews.push(serde_json::json!({ "label": label, "text": text }));
+        }
+        if previews.len() > crate::mcp::ASK_USER_MAX_PREVIEWS {
+            return Err(format!(
+                "too many previews: {} (max {})",
+                previews.len(),
+                crate::mcp::ASK_USER_MAX_PREVIEWS
+            ));
+        }
+        obj.insert("previews".to_string(), serde_json::Value::Array(previews));
+    }
     // ctl's `--pick MIN[-MAX]` becomes the explicit pick bounds — the
     // same split and refusals as ctl's own parse.
     if let Some(pick) = obj.remove("__pick") {
@@ -2164,6 +2207,30 @@ mod tests {
         assert_eq!(planned.tool, "take_screenshot");
         let planned = plan_for_meta("authorize", &argv(&["shared", "request-input"])).unwrap();
         assert_eq!(planned.tool, "request_shared_view_input");
+        // Round 32: ctl's inline preview cards translate; the
+        // file-backed forms refuse by name.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["ask", "Choose", "--preview-text", "A=inline details"]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["previews"],
+            serde_json::json!([{ "label": "A", "text": "inline details" }])
+        );
+        let err = plan_for_meta(
+            "act",
+            &argv(&["ask", "Choose", "--preview-text", "no-separator"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("LABEL=VALUE"), "{err}");
+        let err = plan_for_meta(
+            "act",
+            &argv(&["ask", "Choose", "--preview-html", "A=/srv/card.html"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("client-side"), "{err}");
+        assert!(err.contains("--previews"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[

@@ -277,6 +277,24 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Json,
                 "multi-question form: JSON array of question objects (omit QUESTION)"
             ),
+            flag!(
+                "preview-text",
+                "__preview_text",
+                StrList,
+                "LABEL=VALUE inline preview card (repeatable, ctl spelling)"
+            ),
+            flag!(
+                "preview-html",
+                "__preview_file_client",
+                StrList,
+                "ctl-side only: ctl reads the HTML file — here pass --previews"
+            ),
+            flag!(
+                "preview-image",
+                "__preview_file_client",
+                StrList,
+                "ctl-side only: ctl reads the image file — here pass --previews"
+            ),
             flag!("previews", "previews", Json, "preview cards (JSON array)"),
             flag!(
                 "pick",
