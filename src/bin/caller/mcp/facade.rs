@@ -451,6 +451,93 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         )],
         help: "Per-layer display/CU readiness diagnosis",
     },
+    // The terminal family (owner-ruled): reads on inspect; resize/close on
+    // act; open (shell.spawn) and write (command execution in a live
+    // shell) on authorize — writing into a shell IS running commands, the
+    // same class as spawning one.
+    CommandSpec {
+        path: &["terminal", "list"],
+        lane: RiskLane::Inspect,
+        tool: "terminal_list",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "List the shell sessions visible to the caller",
+    },
+    CommandSpec {
+        path: &["terminal", "open"],
+        lane: RiskLane::Authorize,
+        tool: "terminal_open",
+        seed: "{}",
+        positionals: &[p_str("TERMINAL_ID", "terminal_id", false, false)],
+        flags: &[
+            flag!("cols", "cols", U64, "initial columns (default 120)"),
+            flag!("rows", "rows", U64, "initial rows (default 32)"),
+            flag!("shared", "shared", Bool, "visible to other principals"),
+        ],
+        help: "Open or create a shell PTY session (shell-spawn class)",
+    },
+    CommandSpec {
+        path: &["terminal", "read"],
+        lane: RiskLane::Inspect,
+        tool: "terminal_read",
+        seed: "{}",
+        positionals: &[p_str("TERMINAL_ID", "terminal_id", true, false)],
+        flags: &[
+            flag!(
+                "cursor",
+                "cursor",
+                U64,
+                "from a previous read's next_cursor"
+            ),
+            flag!(
+                "max-bytes",
+                "max_bytes",
+                U64,
+                "cap one read (default 16384)"
+            ),
+        ],
+        help: "Cursor-paged read of a shell session's output",
+    },
+    CommandSpec {
+        path: &["terminal", "write"],
+        lane: RiskLane::Authorize,
+        tool: "terminal_write",
+        seed: "{}",
+        positionals: &[
+            p_str("TERMINAL_ID", "terminal_id", true, false),
+            p_str("INPUT", "input", true, true),
+        ],
+        flags: &[flag!(
+            "no-enter",
+            "__no_enter",
+            Bool,
+            "raw keystrokes, no Enter"
+        )],
+        help: "Write a command line (or raw input) into a live shell",
+    },
+    CommandSpec {
+        path: &["terminal", "resize"],
+        lane: RiskLane::Act,
+        tool: "terminal_resize",
+        seed: "{}",
+        positionals: &[
+            p_str("TERMINAL_ID", "terminal_id", true, false),
+            p_u64("COLS", "cols"),
+            p_u64("ROWS", "rows"),
+        ],
+        flags: &[],
+        help: "Resize a shell session's PTY",
+    },
+    CommandSpec {
+        path: &["terminal", "close"],
+        lane: RiskLane::Act,
+        tool: "terminal_close",
+        seed: "{}",
+        positionals: &[p_str("TERMINAL_ID", "terminal_id", true, false)],
+        flags: &[],
+        help: "Close a shell session",
+    },
     // The managed-context recovery family: under rewind-only pressure the
     // dispatcher's pressure gate admits only these (applied to the RESOLVED
     // tool — facade meta names are exempt at the envelope so recovery stays
@@ -781,6 +868,12 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             ));
         }
     }
+    // The `terminal write` shape: --no-enter maps onto the tool's
+    // enter=false (a positive flag would read "submit" — the CLI-shaped
+    // negative reads better in argv).
+    if obj.remove("__no_enter").is_some() {
+        obj.insert("enter".to_string(), serde_json::Value::Bool(false));
+    }
     // The `ask` shape: repeatable --option labels become option objects.
     if let Some(options) = obj.remove("__options") {
         let labels = options.as_array().cloned().unwrap_or_default();
@@ -1045,6 +1138,7 @@ mod tests {
             Op::MemoryRead,
             Op::DisplayView,
             Op::PeerInspect,
+            Op::TerminalView,
         ];
         for spec in COMMANDS {
             let op = crate::mcp::mcp_tool_operation(spec.tool);

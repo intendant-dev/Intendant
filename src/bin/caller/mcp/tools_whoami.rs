@@ -275,6 +275,7 @@ mod tests {
             actor: crate::access::actor::ActorBinding::local_process(Some(
                 "principal:local-process".into(),
             )),
+            fs_scope: None,
         };
         let result = server
             .call_tool_by_name_as_caller("whoami", serde_json::json!({}), None, None, caller)

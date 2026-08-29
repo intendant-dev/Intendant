@@ -1491,6 +1491,7 @@ mod tests {
                 "https",
             ),
             iam_state: None,
+            peer_filesystem: None,
         };
         for (op, access) in [
             (PeerOperation::FilesystemRead, TransferJobAccess::ReadSource),
@@ -1557,6 +1558,7 @@ mod tests {
                 ..crate::access::iam::AccessPrincipal::root_dashboard_session("scoped", "https")
             },
             iam_state: Some(std::sync::Arc::new(state)),
+            peer_filesystem: None,
         };
         assert!(authorize_http_transfer_access(
             &scoped,

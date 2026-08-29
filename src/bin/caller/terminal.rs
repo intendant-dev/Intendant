@@ -127,7 +127,10 @@ impl TerminalActor {
 /// a sandboxed one — the PTY child is confined to the scope's roots (plus
 /// read-only system paths) at the OS level: Landlock on Linux, a Seatbelt
 /// profile on macOS, a restricted token + temporary RESTRICTED ACEs on
-/// Windows (see win_sandbox.rs). `None` scope = today's full shell.
+/// Windows (see win_sandbox.rs). `None` scope = a filesystem-unrestricted
+/// shell; environment secrecy is a separate axis the spawn derives from
+/// the ACTOR, not from the scope — every principal-owned shell gets a
+/// cleared, secret-free environment (see [`PtySession::spawn`]).
 #[derive(Debug, Clone, Default)]
 pub struct ShellSpawnPolicy {
     pub may_spawn: bool,
@@ -201,11 +204,21 @@ fn scoped_shell_cwd(
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
-/// Startup args for a scoped shell. Scoped shells skip rc/profile files:
-/// `$HOME` is outside the sandbox, so a login shell would spray permission
-/// errors trying to read dotfiles it must not see.
+/// Startup args for a secret-free shell: skip rc/profile files. A scoped
+/// shell's `$HOME` is outside the sandbox, so a login shell would spray
+/// permission errors reading dotfiles it must not see; a scope-less
+/// principal shell CAN read its dotfiles, but letting profiles run would
+/// repopulate the cleared environment the moment they execute (API keys
+/// exported in `~/.zshrc` are routine) — the profile skip is what makes
+/// the env clearing in [`PtySession::spawn`] stick.
+///
+/// The empty fallback for unrecognized shells is safe only under a
+/// filesystem sandbox (the rc files are unreadable there); an
+/// UNSANDBOXED principal spawn must never trust it — it goes through
+/// [`principal_shell_program`], which substitutes a shell with a known
+/// suppression mode instead.
 #[cfg(unix)]
-fn scoped_shell_args(shell: &str) -> Vec<String> {
+fn secret_free_shell_args(shell: &str) -> Vec<String> {
     let name = std::path::Path::new(shell)
         .file_name()
         .and_then(|name| name.to_str())
@@ -218,22 +231,74 @@ fn scoped_shell_args(shell: &str) -> Vec<String> {
     }
 }
 
-/// Minimal, secret-free environment for a scoped shell. The daemon process
-/// env holds API keys and infrastructure detail; a scoped principal must
-/// not see any of it, so the child env is cleared and rebuilt. `HOME`
-/// points at the first writable root (shell history, tool caches, and
-/// dotfile writes land inside the scope instead of erroring).
+/// Windows twin of [`secret_free_shell_args`]: `-NoProfile` keeps
+/// PowerShell from running profile scripts that would repopulate the
+/// cleared environment; `/d` skips cmd.exe's AutoRun registry commands.
+/// Returns the complete startup argv for the shell, replacing the
+/// profile-enabled interactive defaults.
+#[cfg(windows)]
+fn secret_free_shell_args(shell: &str) -> Vec<String> {
+    let name = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "powershell" | "pwsh" => vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+        "cmd" => vec!["/d".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// The (program, argv) actually spawned for an UNSANDBOXED
+/// principal-owned shell. Suppressing profile startup is what makes the
+/// cleared environment stick, so only shells with a KNOWN suppression
+/// mode run as themselves; anything else — tcsh reads `~/.tcshrc` on
+/// every start, and an unrecognized shell can't be audited here — is
+/// replaced by bash in `--noprofile --norc` mode. Fail closed on
+/// secrecy, not open on shell preference.
 #[cfg(unix)]
-fn scoped_shell_env(
-    scope: &crate::peer::access_policy::FilesystemAccessPolicy,
-    shell: &str,
-) -> Vec<(String, String)> {
-    let home = scope
-        .write_roots
-        .first()
-        .or_else(|| scope.read_roots.first())
-        .map(|root| root.display().to_string())
-        .unwrap_or_else(|| "/tmp".to_string());
+fn principal_shell_program(shell: &str) -> (String, Vec<String>) {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell);
+    match name {
+        "zsh" | "bash" | "fish" => (shell.to_string(), secret_free_shell_args(shell)),
+        _ => (
+            "/bin/bash".to_string(),
+            vec!["--noprofile".to_string(), "--norc".to_string()],
+        ),
+    }
+}
+
+/// Windows twin of [`principal_shell_program`].
+/// [`crate::platform::interactive_pty_shell`] only ever supplies
+/// powershell or cmd here — both with known suppression — but an
+/// unexpected program still falls back to profile-less PowerShell
+/// rather than running with profiles enabled.
+#[cfg(windows)]
+fn principal_shell_program(shell: &str) -> (String, Vec<String>) {
+    let args = secret_free_shell_args(shell);
+    if args.is_empty() {
+        (
+            "powershell.exe".to_string(),
+            vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+        )
+    } else {
+        (shell.to_string(), args)
+    }
+}
+
+/// Minimal, secret-free environment for a shell whose spawning actor
+/// must not see the daemon's process env (API keys, infrastructure
+/// detail): the child env is cleared and rebuilt from this allowlist.
+/// `home` is where shell history, tool caches, and dotfile writes land —
+/// a sandboxed shell passes its first writable scope root (the real
+/// `$HOME` is outside the sandbox), an unsandboxed principal shell
+/// passes the real home.
+#[cfg(unix)]
+fn secret_free_shell_env(home: String, shell: &str) -> Vec<(String, String)> {
     let path = if cfg!(target_os = "macos") {
         "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     } else {
@@ -256,30 +321,46 @@ fn scoped_shell_env(
     }
     #[cfg(target_os = "macos")]
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        // The daemon's per-user temp dir is allowed read-write in the
-        // Seatbelt profile below.
+        // Unsandboxed principal shells keep the daemon's per-user temp
+        // dir; a SCOPED shell's TMPDIR is overridden to its private
+        // scratch in `scoped_shell_env` (the profile no longer allows
+        // the shared temp trees).
         env.push(("TMPDIR".to_string(), tmpdir));
     }
     env
 }
 
-/// Windows twin of [`scoped_shell_env`]: minimal, secret-free environment
-/// for a scoped shell. `SystemRoot` and `PATHEXT` are load-bearing (process
-/// startup and DLL/command resolution break without them); the profile
-/// family (`USERPROFILE`, `APPDATA`, …) and temp point into the first
-/// writable root so PSReadLine history, tool caches, and temp files land
-/// inside the scope instead of erroring — the real profile is invisible to
-/// the restricted token anyway.
-#[cfg(windows)]
-fn windows_scoped_shell_env(
+/// [`secret_free_shell_env`] for a scoped shell: `HOME` points at the
+/// first writable root so shell history, tool caches, and dotfile writes
+/// land inside the scope instead of erroring, and `TMPDIR` points at the
+/// session-private `scratch` — the shell's whole temp world, since the
+/// shared same-account `/tmp` trees are no longer granted.
+#[cfg(unix)]
+fn scoped_shell_env(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+    shell: &str,
+    scratch: &std::path::Path,
 ) -> Vec<(String, String)> {
-    let profile = scope
+    let home = scope
         .write_roots
         .first()
         .or_else(|| scope.read_roots.first())
         .map(|root| root.display().to_string())
-        .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+        .unwrap_or_else(|| "/tmp".to_string());
+    let mut env = secret_free_shell_env(home, shell);
+    env.retain(|(key, _)| key != "TMPDIR");
+    env.push(("TMPDIR".to_string(), scratch.display().to_string()));
+    env
+}
+
+/// Windows twin of [`secret_free_shell_env`]: minimal, secret-free
+/// environment for a shell whose spawning actor must not see the daemon's
+/// process env. `SystemRoot` and `PATHEXT` are load-bearing (process
+/// startup and DLL/command resolution break without them); the profile
+/// family (`USERPROFILE`, `APPDATA`, …) and temp point into `profile` so
+/// PSReadLine history, tool caches, and temp files have somewhere to land.
+#[cfg(windows)]
+fn windows_secret_free_shell_env(profile: String) -> Vec<(String, String)> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let mut env = vec![
         ("SystemRoot".to_string(), system_root.clone()),
@@ -319,47 +400,104 @@ fn windows_scoped_shell_env(
     env
 }
 
+/// [`windows_secret_free_shell_env`] for a scoped shell: the profile
+/// family points into the first writable root so writes land inside the
+/// scope — the real profile is invisible to the restricted token anyway.
+#[cfg(windows)]
+fn windows_scoped_shell_env(
+    scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+) -> Vec<(String, String)> {
+    let profile = scope
+        .write_roots
+        .first()
+        .or_else(|| scope.read_roots.first())
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+    windows_secret_free_shell_env(profile)
+}
+
 /// Read-only system baseline a scoped shell needs to be a usable shell
 /// (binaries, libraries, config) without exposing user data. `/home`,
-/// `/root`, `/Users`, and `/proc` are deliberately absent.
+/// `/root`, `/Users`, and `/proc` are deliberately absent — and so are
+/// the same-account trees a whole-directory grant would expose:
+///
+/// - bare `/dev` would let the shell open OTHER same-account sessions'
+///   PTYs under `/dev/pts` (reading one steals that session's
+///   keystrokes), so only ownerless device nodes are listed; the
+///   shell's own terminal rides its inherited descriptors plus
+///   `/dev/tty`, which the kernel resolves to the caller's controlling
+///   terminal and can never reach another session;
+/// - bare `/run` would expose `/run/secrets` mounts and plain files
+///   under `/run/user/<uid>`, so only the resolver backends
+///   `/etc/resolv.conf` can point at are listed (the Landlock applier
+///   skips paths that don't exist on this distro).
+///
+/// Landlock rules are additive-only — there is no way to allow a tree
+/// minus a subtree, so the safe entries are enumerated. Nested PTY
+/// allocation inside a scoped shell is deliberately unavailable.
 #[cfg(target_os = "linux")]
 fn scoped_shell_read_baseline() -> Vec<std::path::PathBuf> {
     [
-        "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix",
-        "/run", "/dev",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/etc",
+        "/opt",
+        "/nix",
+        "/run/systemd/resolve",
+        "/run/resolvconf",
+        "/run/NetworkManager",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
     ]
     .iter()
     .map(std::path::PathBuf::from)
     .collect()
 }
 
-/// Writable (read-write) baseline for a scoped shell: terminal devices and
-/// the shared scratch locations every Unix tool assumes.
+/// Writable (read-write) baseline for a scoped shell: the shell's own
+/// terminal lane only. The shared same-account trees that used to be
+/// here — `/dev/pts` (open other sessions' PTYs: inject output, consume
+/// keystrokes), `/dev/shm` and `/tmp`/`/var/tmp` (read other
+/// same-account processes' shared memory and temp files, the daemon's
+/// own included) — are deliberately absent; temp space is a
+/// session-private scratch directory the spawn creates and points
+/// `TMPDIR` at (see [`PtySession::scoped_shell_command`]).
 #[cfg(target_os = "linux")]
 fn scoped_shell_write_baseline() -> Vec<std::path::PathBuf> {
-    [
-        "/dev/null",
-        "/dev/tty",
-        "/dev/pts",
-        "/dev/shm",
-        "/tmp",
-        "/var/tmp",
-    ]
-    .iter()
-    .map(std::path::PathBuf::from)
-    .collect()
+    ["/dev/null", "/dev/tty"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
 }
 
 /// Generate the Seatbelt (sandbox-exec) profile for a scoped shell on
 /// macOS: deny-default, Apple's own dyld bootstrap rules, read-only system
 /// paths, read access on the scope's roots, write access on the write
-/// roots and scratch space. Network is allowed — the scope is a
-/// *filesystem* boundary, matching Landlock semantics on Linux. Mach
-/// lookups stay open too (uid-guarded; shells need libc services); the
-/// boundary this profile enforces is file access.
+/// roots and the session-private `scratch` directory (which replaces the
+/// shared `/tmp` trees and the daemon's `TMPDIR` — same-account temp
+/// files, the daemon's own included, are not the scope's to read).
+/// Network is allowed — the scope is a *filesystem* boundary, matching
+/// Landlock semantics on Linux. Mach lookups stay open too (uid-guarded;
+/// shells need libc services); the boundary this profile enforces is
+/// file access. `/dev` stays broadly allowed for process bootstrap, but
+/// PTY devices are denied last-match-wins: scoped shells run as the
+/// daemon's Unix account, and an open on another session's
+/// `/dev/ttysNNN` injects into or steals from that terminal — the
+/// shell's own terminal rides its inherited descriptors plus
+/// `/dev/tty`, which resolves to the controlling terminal only.
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(
     scope: &crate::peer::access_policy::FilesystemAccessPolicy,
+    scratch: &std::path::Path,
 ) -> Result<String, String> {
     let mut read_paths: Vec<String> = Vec::new();
     for path in [
@@ -380,17 +518,14 @@ fn seatbelt_profile(
         )?);
     }
     let mut exec_paths = read_paths.clone();
-    let mut write_paths: Vec<String> = Vec::new();
-    for path in ["/dev", "/private/tmp", "/private/var/tmp"] {
-        write_paths.push(crate::sandbox::seatbelt_path_literal(
-            std::path::Path::new(path),
-        )?);
-    }
-    if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        let canonical =
-            std::fs::canonicalize(&tmpdir).unwrap_or_else(|_| std::path::PathBuf::from(&tmpdir));
-        write_paths.push(crate::sandbox::seatbelt_path_literal(&canonical)?);
-    }
+    let mut write_paths: Vec<String> = vec![crate::sandbox::seatbelt_path_literal(
+        std::path::Path::new("/dev"),
+    )?];
+    let scratch_canonical =
+        std::fs::canonicalize(scratch).unwrap_or_else(|_| scratch.to_path_buf());
+    let scratch_literal = crate::sandbox::seatbelt_path_literal(&scratch_canonical)?;
+    read_paths.push(scratch_literal.clone());
+    write_paths.push(scratch_literal);
     // Seatbelt matches the REAL path of a file: a rule on a symlinked root
     // (`/tmp/...`, `/var/...`, `/etc/...` on macOS) would never match, so
     // roots are canonicalized first. A root that doesn't resolve is kept
@@ -444,6 +579,7 @@ fn seatbelt_profile(
          (allow file-map-executable {exec})\n\
          (allow file-read* {read})\n\
          (allow file-write* {write})\n\
+         (deny file-read* file-write* (regex #\"^/dev/ttys\"))\n\
          {sensitive}{credential}",
         exec = subpaths(&exec_paths),
         read = subpaths(&read_paths),
@@ -463,6 +599,10 @@ fn seatbelt_profile(
 struct Scrollback {
     buf: VecDeque<u8>,
     capacity: usize,
+    /// Total bytes ever pushed — the monotonic cursor space for
+    /// [`Scrollback::read_since`]. The oldest retained byte sits at
+    /// `written - buf.len()`.
+    written: u64,
 }
 
 impl Scrollback {
@@ -470,15 +610,33 @@ impl Scrollback {
         Self {
             buf: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
+            written: 0,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
         self.buf.extend(data.iter().copied());
+        self.written += data.len() as u64;
         if self.buf.len() > self.capacity {
             let drop = self.buf.len() - self.capacity;
             self.buf.drain(..drop);
         }
+    }
+
+    /// Cursor-paged read for request/response consumers (the MCP terminal
+    /// verbs): `cursor` is an offset in total-bytes-written space (`0` =
+    /// from the oldest retained byte). Returns the bytes from the cursor —
+    /// or from the ring start when the cursor has fallen off the 256 KiB
+    /// window — the next cursor, and whether a gap was skipped (the
+    /// polling analogue of [`OUTPUT_DROPPED_MARKER`]).
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        let oldest = self.written - self.buf.len() as u64;
+        let gap = cursor < oldest && cursor != 0;
+        let start = cursor.clamp(oldest, self.written);
+        let skip = (start - oldest) as usize;
+        let take = self.buf.len().saturating_sub(skip).min(max_bytes);
+        let bytes: Vec<u8> = self.buf.iter().skip(skip).take(take).copied().collect();
+        (bytes, start + take as u64, gap)
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -706,6 +864,13 @@ impl OutputHub {
         }
     }
 
+    /// Cursor-paged passthrough for polling readers — same lock as
+    /// `attach`, so a read is atomic with respect to the reader thread's
+    /// push+fan-out.
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        self.scrollback.read_since(cursor, max_bytes)
+    }
+
     fn attach(&mut self, max_queued_bytes: usize) -> TerminalListener {
         let shared = Arc::new(ListenerShared::new(max_queued_bytes));
         let snapshot = self.scrollback.snapshot();
@@ -733,6 +898,10 @@ pub struct PtySession {
     child_killer: StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     output: StdMutex<OutputHub>,
     alive: StdMutex<bool>,
+    /// The exit status, retained after death so polling readers (which
+    /// were not attached when the `Exited` event fanned out) can still
+    /// learn why the shell died.
+    exit_status: StdMutex<Option<i32>>,
     /// Windows: the refcounted RESTRICTED ACE grants for this session's
     /// scope roots. Held for the session's lifetime so overlapping scoped
     /// shells never lose a shared grant early; dropped (and the ACEs
@@ -746,13 +915,32 @@ pub struct PtySession {
     /// Shared sessions are visible to (and, with terminal.write, usable
     /// by) principals other than the owner. Toggled by the owner or root.
     shared: std::sync::atomic::AtomicBool,
+    /// The filesystem scope this shell was spawned under (`None` =
+    /// unscoped). The OS sandbox is fixed at spawn and cannot be
+    /// retrofitted, so accessors compare this against the owning
+    /// principal's CURRENT scope to refuse sessions whose sandbox no
+    /// longer expresses the grant.
+    spawn_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
+    /// Session-private temp directory of a scoped Unix shell (its
+    /// `TMPDIR`, replacing the shared same-account `/tmp` trees).
+    /// Removed on Drop.
+    scoped_scratch: Option<std::path::PathBuf>,
 }
 
 impl PtySession {
     /// Spawn a new shell under a fresh PTY. The shell defaults to
     /// `$SHELL`, falling back to `/bin/bash`. When `scope` is set the
     /// child is wrapped in an OS sandbox confined to the scope's roots —
-    /// see [`ShellSpawnPolicy`].
+    /// see [`ShellSpawnPolicy`]. Independently of the scope, a
+    /// principal-owned spawn (`owner` set — every non-root actor) never
+    /// inherits the daemon's process environment: the daemon env holds
+    /// provider API keys, so the child env is cleared and rebuilt
+    /// secret-free and the shell starts profile-less (a login shell's rc
+    /// files would repopulate the environment before the principal ever
+    /// types — and a shell with no known suppression mode is substituted
+    /// by profile-less bash, see [`principal_shell_program`]); only
+    /// root-lane shells (the owner's own surfaces) inherit and get the
+    /// login-style startup.
     fn spawn(
         cols: u16,
         rows: u16,
@@ -787,20 +975,72 @@ impl PtySession {
             ),
             None => None,
         };
+        let mut scoped_scratch: Option<std::path::PathBuf> = None;
+        // Any failure between scratch creation and session construction
+        // must remove the scratch dir — after construction, Drop owns it.
+        let cleanup_scratch = |scratch: &Option<std::path::PathBuf>| {
+            if let Some(scratch) = scratch {
+                let _ = std::fs::remove_dir_all(scratch);
+            }
+        };
         let child = if let Some(scope) = scope {
-            let cmd = Self::scoped_shell_command(scope, cwd.as_deref())?;
-            pair.slave
-                .spawn_command(cmd)
-                .map_err(|e| format!("spawn scoped shell: {e}"))?
+            let (cmd, scratch) = Self::scoped_shell_command(scope, cwd.as_deref())?;
+            scoped_scratch = scratch;
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => child,
+                Err(e) => {
+                    cleanup_scratch(&scoped_scratch);
+                    return Err(format!("spawn scoped shell: {e}"));
+                }
+            }
         } else {
             let build_cmd = |program: &str, args: &[String]| {
-                let mut cmd = PtyCommandBuilder::new(program);
-                cmd.args(args);
+                // For a principal-owned spawn the PROGRAM is part of the
+                // secrecy decision, not just the argv: profile-less
+                // startup is what makes the env clearing below stick (a
+                // login shell's rc files run before the principal ever
+                // types and would repopulate the environment), and a
+                // shell without a known suppression mode is substituted
+                // rather than trusted — see `principal_shell_program`.
+                let (program, args) = if owner.is_some() {
+                    principal_shell_program(program)
+                } else {
+                    (program.to_string(), args.to_vec())
+                };
+                let mut cmd = PtyCommandBuilder::new(&program);
+                cmd.args(&args);
                 if let Some(ref dir) = cwd {
                     cmd.cwd(dir);
                 }
-                // Seed TERM so xterm.js gets colors and cursor sequences.
-                cmd.env("TERM", "xterm-256color");
+                if owner.is_some() {
+                    // A principal-owned shell never inherits the daemon's
+                    // process environment, even without a filesystem
+                    // scope (scope-less grants, supervised sessions): the
+                    // daemon env holds provider API keys, and a scoped
+                    // principal reading them through `env` would cross
+                    // the runtime/controller key boundary. Secrecy and
+                    // filesystem confinement are separate axes — this
+                    // shell keeps the real home, it is only secret-free.
+                    // Root-lane shells (the owner's own terminal tabs)
+                    // inherit as before.
+                    cmd.env_clear();
+                    #[cfg(unix)]
+                    let curated = secret_free_shell_env(
+                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+                        &program,
+                    );
+                    #[cfg(windows)]
+                    let curated = windows_secret_free_shell_env(
+                        std::env::var("USERPROFILE")
+                            .unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
+                    );
+                    for (key, value) in curated {
+                        cmd.env(key, value);
+                    }
+                } else {
+                    // Seed TERM so xterm.js gets colors and cursor sequences.
+                    cmd.env("TERM", "xterm-256color");
+                }
                 // Unit-test builds point the spawned shell's HOME at a
                 // per-process scratch: interactive shells write history
                 // (~/.zsh_history, ~/.bash_history) on exit, and terminal
@@ -833,14 +1073,14 @@ impl PtySession {
         };
 
         let child_killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("clone reader: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("take writer: {e}"))?;
+        let reader = pair.master.try_clone_reader().map_err(|e| {
+            cleanup_scratch(&scoped_scratch);
+            format!("clone reader: {e}")
+        })?;
+        let writer = pair.master.take_writer().map_err(|e| {
+            cleanup_scratch(&scoped_scratch);
+            format!("take writer: {e}")
+        })?;
 
         let session = Arc::new(Self {
             master: StdMutex::new(pair.master),
@@ -848,10 +1088,13 @@ impl PtySession {
             child_killer: StdMutex::new(child_killer),
             output: StdMutex::new(OutputHub::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
+            exit_status: StdMutex::new(None),
             #[cfg(windows)]
             scope_grants,
             owner,
             shared: std::sync::atomic::AtomicBool::new(shared),
+            spawn_scope: scope.cloned(),
+            scoped_scratch,
         });
 
         // portable_pty's reader and child wait are both blocking. On Windows,
@@ -895,11 +1138,18 @@ impl PtySession {
     ///   [`SCOPED_SHELL_POLICY_ENV`] (fail-closed when the kernel lacks
     ///   Landlock) and then execs the shell.
     /// - **macOS**: `sandbox-exec -p <generated Seatbelt profile>`.
-    /// - **Windows**: refused — no OS sandbox seam wired up yet.
+    /// - **Windows**: re-exec as `--scoped-shell-exec` under a fully
+    ///   restricted token, with scope-root ACEs stamped daemon-side
+    ///   (win_sandbox.rs).
+    ///
+    /// The returned tuple's second element is the session-private
+    /// scratch directory (the shell's whole temp world on Unix — see
+    /// the baselines above); the caller owns its lifetime and removes
+    /// it when the session drops.
     fn scoped_shell_command(
         scope: &crate::peer::access_policy::FilesystemAccessPolicy,
         project_root: Option<&std::path::Path>,
-    ) -> Result<PtyCommandBuilder, String> {
+    ) -> Result<(PtyCommandBuilder, Option<std::path::PathBuf>), String> {
         #[cfg(windows)]
         {
             // Windows twin of the Linux wrapper: re-exec this binary as
@@ -935,20 +1185,45 @@ impl PtySession {
                 cmd.env(key, value);
             }
             cmd.cwd(cwd);
-            return Ok(cmd);
+            // Windows temp already lands inside the scope (the profile
+            // family points there) — no shared-tree scratch to manage.
+            return Ok((cmd, None));
         }
         #[cfg(unix)]
         {
             let (shell, _) = crate::platform::interactive_pty_shell();
-            let shell_args = scoped_shell_args(&shell);
+            let shell_args = secret_free_shell_args(&shell);
             let cwd = scoped_shell_cwd(
                 scope,
                 project_root.unwrap_or_else(|| std::path::Path::new("/")),
             );
 
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let scratch = {
+                // Session-private temp: the shared `/tmp` trees hold
+                // same-account files (other sessions', the daemon's own)
+                // that are not the scope's to read, so each scoped shell
+                // gets a fresh 0700 directory as its whole temp world —
+                // granted below, pointed at by `TMPDIR`, and removed when
+                // the session drops.
+                let scratch = std::env::temp_dir().join(format!(
+                    "intendant-scoped-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                std::fs::create_dir_all(&scratch)
+                    .map_err(|e| format!("create scoped scratch dir: {e}"))?;
+                let mut perms = std::fs::metadata(&scratch)
+                    .map_err(|e| format!("stat scoped scratch dir: {e}"))?
+                    .permissions();
+                std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+                std::fs::set_permissions(&scratch, perms)
+                    .map_err(|e| format!("restrict scoped scratch dir: {e}"))?;
+                scratch
+            };
+
             #[cfg(target_os = "macos")]
             let (program, args, policy_env) = {
-                let profile = seatbelt_profile(scope)?;
+                let profile = seatbelt_profile(scope, &scratch)?;
                 let mut args = vec!["-p".to_string(), profile, shell.clone()];
                 args.extend(shell_args);
                 ("/usr/bin/sandbox-exec".to_string(), args, None::<String>)
@@ -961,8 +1236,10 @@ impl PtySession {
                 let mut read = scoped_shell_read_baseline();
                 read.extend(scope.read_roots.iter().cloned());
                 read.extend(scope.write_roots.iter().cloned());
+                read.push(scratch.clone());
                 let mut write = scoped_shell_write_baseline();
                 write.extend(scope.write_roots.iter().cloned());
+                write.push(scratch.clone());
                 let policy = serde_json::to_string(&ScopedShellPolicy { read, write })
                     .map_err(|e| format!("encode scoped shell policy: {e}"))?;
                 let mut args = vec!["--scoped-shell-exec".to_string(), shell.clone()];
@@ -983,14 +1260,14 @@ impl PtySession {
                 let mut cmd = PtyCommandBuilder::new(program);
                 cmd.args(&args);
                 cmd.env_clear();
-                for (key, value) in scoped_shell_env(scope, &shell) {
+                for (key, value) in scoped_shell_env(scope, &shell, &scratch) {
                     cmd.env(key, value);
                 }
                 if let Some(policy) = policy_env {
                     cmd.env(SCOPED_SHELL_POLICY_ENV, policy);
                 }
                 cmd.cwd(cwd);
-                Ok(cmd)
+                Ok((cmd, Some(scratch)))
             }
         }
     }
@@ -1101,9 +1378,35 @@ impl PtySession {
             false
         };
         if transitioned {
+            if let Ok(mut retained) = self.exit_status.lock() {
+                *retained = Some(status);
+            }
             let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
             hub.fan_out_exit(status);
         }
+    }
+
+    /// The retained exit status (`None` while alive or if never observed).
+    pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Cursor-paged scrollback read for request/response consumers; see
+    /// [`Scrollback::read_since`] for cursor semantics. Shares `attach`'s
+    /// critical section, so it can neither lose nor duplicate a chunk
+    /// racing in from the reader thread.
+    pub fn read_since(&self, cursor: u64, max_bytes: usize) -> (Vec<u8>, u64, bool) {
+        let hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        hub.read_since(cursor, max_bytes)
+    }
+
+    /// Current PTY geometry, when the master can report it.
+    pub fn size(&self) -> Option<(u16, u16)> {
+        self.master
+            .lock()
+            .ok()
+            .and_then(|master| master.get_size().ok())
+            .map(|size| (size.cols, size.rows))
     }
 
     pub fn shared(&self) -> bool {
@@ -1115,6 +1418,15 @@ impl PtySession {
     #[allow(dead_code)]
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
+    }
+
+    /// The filesystem scope this shell was spawned under (`None` =
+    /// unscoped). The OS sandbox is fixed at spawn: when the owning
+    /// principal's grant scope has since changed, accessors refuse the
+    /// session as stale — close and reopen gets a shell under the
+    /// current scope.
+    pub fn spawn_scope(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+        self.spawn_scope.as_ref()
     }
 
     /// Whether `actor` may see (attach to / act on) this session: root
@@ -1151,6 +1463,11 @@ impl Drop for PtySession {
         // channels signalled.
         if let Ok(hub) = self.output.lock() {
             hub.detach_all();
+        }
+        // The scoped shell's session-private temp world dies with the
+        // session (best-effort — a leftover is inert 0700 scratch).
+        if let Some(scratch) = self.scoped_scratch.take() {
+            let _ = std::fs::remove_dir_all(scratch);
         }
     }
 }
@@ -1216,6 +1533,18 @@ impl Drop for UnpublishedPtyGuard {
 /// replaced it while the opener was unlocked).
 fn slot_is_current(entry: Option<&SessionSlot>, slot: &Arc<OpeningSlot>) -> bool {
     matches!(entry, Some(SessionSlot::Opening(current)) if Arc::ptr_eq(current, slot))
+}
+
+/// One row of [`TerminalRegistry::list_visible`] — the fields a polling
+/// consumer needs to pick a session and start a cursor read.
+#[derive(Debug, Clone)]
+pub struct TerminalSummary {
+    pub key: TerminalKey,
+    pub alive: bool,
+    pub shared: bool,
+    pub can_manage: bool,
+    pub exit_status: Option<i32>,
+    pub size: Option<(u16, u16)>,
 }
 
 /// Process-wide registry of live shell sessions, keyed by
@@ -1465,6 +1794,31 @@ impl TerminalRegistry {
         }
     }
 
+    /// Enumerate the sessions `actor` may see, for request/response
+    /// consumers (the MCP terminal verbs — the push lanes never needed
+    /// enumeration). Reservations in flight are skipped, matching every
+    /// other read's ordering: a spawn that has not published does not
+    /// exist yet.
+    pub async fn list_visible(&self, actor: &TerminalActor) -> Vec<TerminalSummary> {
+        let sessions = self.sessions.read().await;
+        let mut out: Vec<TerminalSummary> = sessions
+            .iter()
+            .filter_map(|(key, slot)| match slot {
+                SessionSlot::Live(session) if session.visible_to(actor) => Some(TerminalSummary {
+                    key: key.clone(),
+                    alive: session.is_alive(),
+                    shared: session.shared(),
+                    can_manage: session.managed_by(actor),
+                    exit_status: session.exit_status(),
+                    size: session.size(),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.terminal_id.cmp(&b.key.terminal_id));
+        out
+    }
+
     /// Close `key` if `actor` may see it. Returns whether a session was
     /// closed. A close racing an in-flight open reads the key as absent
     /// (ordered before the open).
@@ -1517,6 +1871,35 @@ impl TerminalRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The polling cursor: monotonic total-bytes-written space, gap
+    /// reporting when the cursor fell off the ring, clamped forward
+    /// cursors, and `u64::MAX` as the "start at now" high-water probe.
+    #[test]
+    fn scrollback_read_since_cursor_semantics() {
+        let mut ring = Scrollback::new(8);
+        ring.push(b"abcdef");
+        let (bytes, next, gap) = ring.read_since(0, 64);
+        assert_eq!(
+            (bytes.as_slice(), next, gap),
+            (b"abcdef".as_slice(), 6, false)
+        );
+        // Paged read.
+        let (bytes, next, gap) = ring.read_since(2, 2);
+        assert_eq!((bytes.as_slice(), next, gap), (b"cd".as_slice(), 4, false));
+        // Overflow trims the front; a pre-trim cursor reports the gap and
+        // resumes at the oldest retained byte.
+        ring.push(b"ghijkl"); // written=12, retained = "efghijkl"
+        let (bytes, next, gap) = ring.read_since(2, 64);
+        assert_eq!(bytes.as_slice(), b"efghijkl");
+        assert_eq!((next, gap), (12, true));
+        // Cursor 0 means "oldest retained", never a gap.
+        let (_, _, gap) = ring.read_since(0, 64);
+        assert!(!gap);
+        // The high-water probe returns the current cursor and nothing else.
+        let (bytes, next, gap) = ring.read_since(u64::MAX, 0);
+        assert_eq!((bytes.len(), next, gap), (0, 12, false));
+    }
 
     /// Unscoped spawn-allowed policy — the pre-scoping behavior.
     fn spawn_all() -> ShellSpawnPolicy {
@@ -2222,14 +2605,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scoped_shell_args_skip_rc_files_per_shell() {
-        assert_eq!(scoped_shell_args("/bin/zsh"), vec!["-f"]);
+    fn secret_free_shell_args_skip_rc_files_per_shell() {
+        assert_eq!(secret_free_shell_args("/bin/zsh"), vec!["-f"]);
         assert_eq!(
-            scoped_shell_args("/bin/bash"),
+            secret_free_shell_args("/bin/bash"),
             vec!["--noprofile", "--norc"]
         );
-        assert_eq!(scoped_shell_args("/usr/bin/fish"), vec!["--no-config"]);
-        assert!(scoped_shell_args("/bin/sh").is_empty());
+        assert_eq!(secret_free_shell_args("/usr/bin/fish"), vec!["--no-config"]);
+        assert!(secret_free_shell_args("/bin/sh").is_empty());
+    }
+
+    /// A shell without a known profile-suppression mode must never run
+    /// an unsandboxed principal spawn (security review P1): tcsh reads
+    /// `~/.tcshrc` on every start, so an unrecognized `$SHELL` would
+    /// repopulate the cleared environment. It is substituted by
+    /// profile-less bash instead; known shells run as themselves.
+    #[cfg(unix)]
+    #[test]
+    fn principal_shell_program_substitutes_unknown_shells() {
+        assert_eq!(
+            principal_shell_program("/bin/zsh"),
+            ("/bin/zsh".to_string(), vec!["-f".to_string()])
+        );
+        assert_eq!(
+            principal_shell_program("/opt/homebrew/bin/fish"),
+            (
+                "/opt/homebrew/bin/fish".to_string(),
+                vec!["--no-config".to_string()]
+            )
+        );
+        for exotic in ["/bin/tcsh", "/bin/csh", "/usr/local/bin/nu", "/bin/sh"] {
+            assert_eq!(
+                principal_shell_program(exotic),
+                (
+                    "/bin/bash".to_string(),
+                    vec!["--noprofile".to_string(), "--norc".to_string()]
+                ),
+                "{exotic} must be replaced by profile-less bash"
+            );
+        }
+    }
+
+    /// The Windows variant must disable profile/AutoRun startup for the
+    /// interactive shells [`crate::platform::interactive_pty_shell`] can
+    /// return — a profile script would repopulate the cleared environment
+    /// of a principal-owned shell (review P1, round 4).
+    #[cfg(windows)]
+    #[test]
+    fn secret_free_shell_args_disable_windows_profiles() {
+        assert_eq!(
+            secret_free_shell_args("powershell.exe"),
+            vec!["-NoLogo", "-NoProfile"]
+        );
+        assert_eq!(
+            secret_free_shell_args("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            vec!["-NoLogo", "-NoProfile"]
+        );
+        assert_eq!(secret_free_shell_args("cmd.exe"), vec!["/d"]);
+        // An unexpected program falls back to profile-less PowerShell
+        // rather than running with profiles enabled.
+        assert_eq!(
+            principal_shell_program("weird.exe"),
+            (
+                "powershell.exe".to_string(),
+                vec!["-NoLogo".to_string(), "-NoProfile".to_string()]
+            )
+        );
+        assert_eq!(principal_shell_program("cmd.exe").0, "cmd.exe");
     }
 
     #[cfg(unix)]
@@ -2240,12 +2682,16 @@ mod tests {
             read_roots: vec![std::path::PathBuf::from("/srv/data")],
             write_roots: vec![std::path::PathBuf::from("/srv/work")],
         };
-        let env = scoped_shell_env(&scope, "/bin/zsh");
+        let scratch = std::path::Path::new("/tmp/intendant-scoped-test");
+        let env = scoped_shell_env(&scope, "/bin/zsh", scratch);
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("HOME"), Some("/srv/work"));
         assert_eq!(get("SHELL"), Some("/bin/zsh"));
         assert!(get("TERM").is_some());
         assert!(get("PATH").is_some());
+        // The whole temp world is the session-private scratch — never
+        // the daemon's TMPDIR or the shared /tmp trees.
+        assert_eq!(get("TMPDIR"), Some("/tmp/intendant-scoped-test"));
         // Nothing beyond the fixed allowlist leaks in.
         for (key, _) in &env {
             assert!(
@@ -2256,6 +2702,73 @@ mod tests {
         }
     }
 
+    /// A principal-owned shell with NO filesystem scope still gets a
+    /// cleared, secret-free environment: the daemon process env holds
+    /// provider API keys, and environment secrecy must not depend on a
+    /// grant happening to carry a filesystem scope (review P1). Root-lane
+    /// shells keep inheriting — every other PTY test in this module
+    /// spawns as [`TerminalActor::Root`] and exercises that side.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_shell_without_scope_gets_secret_free_env() {
+        // The canary must be present in THIS process's environment while
+        // the shell spawns to prove the child cleared it; mutate and
+        // restore under the crate-wide env lock. The drop guard restores
+        // the variable's prior state on every exit path — declared after
+        // the lock guard so it drops (restoring) while the lock is held.
+        const CANARY: &str = "INTENDANT_TEST_ENV_CANARY";
+        struct RestoreCanary(Option<std::ffi::OsString>);
+        impl Drop for RestoreCanary {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("INTENDANT_TEST_ENV_CANARY", value),
+                    None => std::env::remove_var("INTENDANT_TEST_ENV_CANARY"),
+                }
+            }
+        }
+        let guard = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let restore = RestoreCanary(std::env::var_os(CANARY));
+        std::env::set_var(CANARY, "leak_9418");
+
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let key = TerminalKey::local("principal-env-e2e");
+        let actor = TerminalActor::Principal("principal:client-key:envtest".to_string());
+        let spawned = registry
+            .open_or_attach(
+                key,
+                100,
+                30,
+                &actor,
+                ShellSpawnPolicy {
+                    may_spawn: true,
+                    shared: false,
+                    scope: None,
+                },
+            )
+            .await;
+        // The spawn ran synchronously inside open_or_attach, so the
+        // mutation window ends here regardless of the result.
+        drop(restore);
+        drop(guard);
+        let (session, created) = spawned.unwrap();
+        assert!(created);
+        assert!(
+            session.spawn_scope().is_none(),
+            "an unscoped spawn records no scope"
+        );
+
+        let mut rx = session.attach();
+        expect_output(&mut rx, None, "shell startup").await;
+        // `printenv` exits non-zero when the var is absent, so the echo
+        // fallback is the deterministic pass signal. The sentinel is
+        // quote-split in the typed command so the terminal's echo of the
+        // command line can never satisfy the check; a leaked canary
+        // prints its value, short-circuits the `||`, and the sentinel
+        // never appears (the assertion times out with the transcript).
+        session.write_input(b"printenv INTENDANT_TEST_ENV_CANARY || echo CANARY_ABSENT'_OK'\r");
+        expect_output(&mut rx, Some("CANARY_ABSENT_OK"), "daemon env cleared").await;
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_escapes_and_embeds_roots() {
@@ -2264,7 +2777,8 @@ mod tests {
             read_roots: vec![std::path::PathBuf::from("/srv/spa ced/read")],
             write_roots: vec![std::path::PathBuf::from("/srv/quo\"te")],
         };
-        let profile = seatbelt_profile(&scope).unwrap();
+        let scratch = std::path::Path::new("/srv/scratch-le55");
+        let profile = seatbelt_profile(&scope, scratch).unwrap();
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(subpath \"/srv/spa ced/read\")"));
         assert!(profile.contains("(subpath \"/srv/quo\\\"te\")"));
@@ -2274,12 +2788,51 @@ mod tests {
             .find(|line| line.starts_with("(allow file-read* "))
             .unwrap();
         assert!(read_section.contains("/srv/quo"));
+        // The session-private scratch replaces the shared temp trees
+        // (same-account files are not the scope's to read), and PTY
+        // devices are denied last-match-wins — an open on another
+        // session's /dev/ttysNNN would inject into or steal from that
+        // terminal (security review P1).
+        assert!(profile.contains("(subpath \"/srv/scratch-le55\")"));
+        assert!(!profile.contains("(subpath \"/private/tmp\")"));
+        assert!(!profile.contains("(subpath \"/private/var/tmp\")"));
+        assert!(profile.contains("(deny file-read* file-write* (regex #\"^/dev/ttys\"))"));
         // Control characters are refused outright.
         let bad = FilesystemAccessPolicy {
             read_roots: vec![std::path::PathBuf::from("/srv/evil\nprofile")],
             write_roots: Vec::new(),
         };
-        assert!(seatbelt_profile(&bad).is_err());
+        assert!(seatbelt_profile(&bad, scratch).is_err());
+    }
+
+    /// The Landlock baselines must never grant the shared same-account
+    /// trees (security review P1s): `/dev/pts` opens other sessions'
+    /// PTYs, `/dev/shm` and the `/tmp` trees expose other processes'
+    /// shared memory and temp files, bare `/dev` read covers the pts
+    /// side too, and bare `/run` exposes `/run/secrets` mounts and
+    /// `/run/user/<uid>` files. The shell's own terminal lane, the
+    /// ownerless entropy devices, and the enumerated resolver backends
+    /// stay.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_shell_baselines_exclude_shared_account_trees() {
+        let read = scoped_shell_read_baseline();
+        let write = scoped_shell_write_baseline();
+        for shared in ["/dev", "/dev/pts", "/dev/shm", "/tmp", "/var/tmp", "/run"] {
+            let shared = std::path::PathBuf::from(shared);
+            assert!(!read.contains(&shared), "{shared:?} must not be readable");
+            assert!(!write.contains(&shared), "{shared:?} must not be writable");
+        }
+        for kept in ["/dev/null", "/dev/tty"] {
+            let kept = std::path::PathBuf::from(kept);
+            assert!(read.contains(&kept) || write.contains(&kept));
+            assert!(write.contains(&kept), "{kept:?} is the shell's own lane");
+        }
+        assert!(read.contains(&std::path::PathBuf::from("/dev/urandom")));
+        assert!(
+            read.contains(&std::path::PathBuf::from("/run/systemd/resolve")),
+            "the resolv.conf backend stays enumerated"
+        );
     }
 
     /// Real end-to-end sandbox check (macOS): a scoped PTY shell can read
@@ -2328,6 +2881,18 @@ mod tests {
             .await
             .unwrap();
         assert!(created);
+        assert_eq!(
+            session.spawn_scope().map(|s| s.write_roots.clone()),
+            Some(vec![root.clone()]),
+            "the spawn scope is recorded on the session"
+        );
+        // The session-private temp world was created for the shell
+        // (its TMPDIR; removed when the session drops).
+        let scratch = session
+            .scoped_scratch
+            .clone()
+            .expect("a scoped spawn creates its scratch dir");
+        assert!(scratch.is_dir(), "scratch {scratch:?} must exist");
 
         let mut rx = session.attach();
 

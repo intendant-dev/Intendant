@@ -153,6 +153,7 @@ impl HostedHttpAuthority {
         HttpAccessContext {
             principal: self.verified.principal.clone(),
             iam_state: Some(Arc::clone(&self.verified.iam_state)),
+            peer_filesystem: None,
         }
     }
 

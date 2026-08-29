@@ -2040,6 +2040,7 @@ mod tests {
                     ToolCaller {
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
+                        fs_scope: None,
                     },
                 )
                 .await
@@ -2661,6 +2662,7 @@ mod tests {
                     ToolCaller {
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
+                        fs_scope: None,
                     },
                 )
                 .await
@@ -2908,6 +2910,7 @@ mod tests {
                     ToolCaller {
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
+                        fs_scope: None,
                     },
                 )
                 .await
