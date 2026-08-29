@@ -813,10 +813,19 @@ fn build_args(
             let dial = dial
                 .as_object_mut()
                 .ok_or_else(|| "dial: not an object".to_string())?;
-            dial.insert(
-                "approvals".to_string(),
-                serde_json::Value::Object(approvals),
-            );
+            // Merged per category into whatever --agent-config already
+            // carried: the specific --dial-approve spelling wins its own
+            // categories, unspecified entries survive (round 42 — a
+            // wholesale insert silently dropped them).
+            let approvals_slot = dial
+                .entry("approvals".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let existing = approvals_slot
+                .as_object_mut()
+                .ok_or_else(|| "dial.approvals: not an object".to_string())?;
+            for (category, rule) in approvals {
+                existing.insert(category, rule);
+            }
         }
     }
     // ctl's `--remove` edge forms flip the seeded add op to its remove
@@ -2615,6 +2624,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not both"), "{err}");
+        // Round 42: --dial-approve merges per category into an
+        // --agent-config approvals object — unspecified entries
+        // survive, the specific spelling wins its own.
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "agenda",
+                "start",
+                "item-1",
+                "--agent-config",
+                "{\"dial\":{\"approvals\":{\"shell\":\"ask\",\"network\":\"allow\"}}}",
+                "--dial-approve",
+                "network=deny",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned.args["agent_config"]["dial"]["approvals"],
+            serde_json::json!({ "shell": "ask", "network": "deny" })
+        );
         // Round 39: a full-object flag beside its nested flags is
         // order-independent — the specific spelling wins, the object
         // fills the rest (both orders pinned).
