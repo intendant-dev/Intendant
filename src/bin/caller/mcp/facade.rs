@@ -956,6 +956,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             ),
             flag!("cache", "cache", Str, "none (default) or durable_sccache"),
             flag!("timeout-s", "timeout_s", U64, "1-3600 (default 900)"),
+            flag!(
+                "require-clean",
+                "require_clean",
+                Json,
+                "true (default) or false — false allows a dirty working tree"
+            ),
         ],
         help: "Start a remote command (ARGV is a JSON array of strings)",
     },
@@ -1342,12 +1348,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         path: &["agenda", "request-occurrence"],
-        lane: RiskLane::Act,
+        lane: RiskLane::Authorize,
         tool: "agenda_op",
         seed: r#"{"op":"request_occurrence"}"#,
         positionals: &[p_str("ID", "id", true, false)],
         flags: &[],
-        help: "Request an out-of-schedule occurrence",
+        help: "Fire an out-of-schedule run of an approved recurring effect (authority-class)",
     },
     CommandSpec {
         path: &["agenda", "approve"],
@@ -1392,6 +1398,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("goal", "goal", Str, "goal override"),
             flag!("project-root", "project_root", Str, "project root"),
             flag!("agent-config", "agent_config", Json, "agent launch pins"),
+            flag!(
+                "interactive",
+                "interactive",
+                Json,
+                "true (default) or false — false is the autonomous goal-run"
+            ),
         ],
         help: "Mint, approve, and fire an item's session in one act (owner surface)",
     },
@@ -1458,8 +1470,13 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "request_controller_loop_halt",
         seed: "{}",
         positionals: &[],
-        flags: &[],
-        help: "Halt the controller loop (persistent; one-shot rides ctl)",
+        flags: &[flag!(
+            "persistent",
+            "persistent",
+            Json,
+            "true (default) or false — false halts one cycle only"
+        )],
+        help: "Halt the controller loop",
     },
     CommandSpec {
         path: &["controller", "clear-halt"],
@@ -2206,6 +2223,33 @@ mod tests {
         assert_eq!(planned.args["settle"], 250);
         let err = plan_for_meta("act", &argv(&["cu", "actions", "{not json"])).unwrap_err();
         assert!(err.contains("literal JSON"), "{err}");
+    }
+
+    /// Negative booleans travel as literal JSON (review round 1's P2):
+    /// the option vocabulary that flips a default-true field — the
+    /// autonomous goal-run, the one-shot halt, the dirty-tree remote —
+    /// must be expressible through the facade, and `false` arrives as a
+    /// real JSON bool, not a string.
+    #[test]
+    fn json_flags_express_negative_booleans() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["agenda", "start", "abc123", "--interactive", "false"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["interactive"], serde_json::json!(false));
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["controller", "halt", "--persistent", "false"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["persistent"], serde_json::json!(false));
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["remote", "start", "[\"true\"]", "--require-clean", "false"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["require_clean"], serde_json::json!(false));
     }
 
     /// Verdict seeds survive planning: the memory curation rows carry

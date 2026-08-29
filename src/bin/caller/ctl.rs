@@ -768,12 +768,14 @@ async fn run_events(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
     let mut delivered_any = false;
     loop {
-        let remaining_s = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_secs();
-        if remaining_s == 0 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             break;
         }
+        // Round a positive remainder UP so the budget's final fractional
+        // second still gets a poll — `--for 1` must make one call, not
+        // zero (truncation ate it).
+        let remaining_s = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
         let mut params = Map::new();
         if let Some(since) = &since {
             params.insert("since".into(), Value::String(since.clone()));
