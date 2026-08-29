@@ -204,11 +204,15 @@ fn scoped_shell_cwd(
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
-/// Startup args for a scoped shell. Scoped shells skip rc/profile files:
-/// `$HOME` is outside the sandbox, so a login shell would spray permission
-/// errors trying to read dotfiles it must not see.
+/// Startup args for a secret-free shell: skip rc/profile files. A scoped
+/// shell's `$HOME` is outside the sandbox, so a login shell would spray
+/// permission errors reading dotfiles it must not see; a scope-less
+/// principal shell CAN read its dotfiles, but letting profiles run would
+/// repopulate the cleared environment the moment they execute (API keys
+/// exported in `~/.zshrc` are routine) — the profile skip is what makes
+/// the env clearing in [`PtySession::spawn`] stick.
 #[cfg(unix)]
-fn scoped_shell_args(shell: &str) -> Vec<String> {
+fn secret_free_shell_args(shell: &str) -> Vec<String> {
     let name = std::path::Path::new(shell)
         .file_name()
         .and_then(|name| name.to_str())
@@ -217,6 +221,25 @@ fn scoped_shell_args(shell: &str) -> Vec<String> {
         "zsh" => vec!["-f".to_string()],
         "bash" => vec!["--noprofile".to_string(), "--norc".to_string()],
         "fish" => vec!["--no-config".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// Windows twin of [`secret_free_shell_args`]: `-NoProfile` keeps
+/// PowerShell from running profile scripts that would repopulate the
+/// cleared environment; `/d` skips cmd.exe's AutoRun registry commands.
+/// Returns the complete startup argv for the shell, replacing the
+/// profile-enabled interactive defaults.
+#[cfg(windows)]
+fn secret_free_shell_args(shell: &str) -> Vec<String> {
+    let name = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "powershell" | "pwsh" => vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+        "cmd" => vec!["/d".to_string()],
         _ => Vec::new(),
     }
 }
@@ -809,8 +832,10 @@ impl PtySession {
     /// principal-owned spawn (`owner` set — every non-root actor) never
     /// inherits the daemon's process environment: the daemon env holds
     /// provider API keys, so the child env is cleared and rebuilt
-    /// secret-free; only root-lane shells (the owner's own surfaces)
-    /// inherit.
+    /// secret-free and the shell starts profile-less (a login shell's rc
+    /// files would repopulate the environment before the principal ever
+    /// types); only root-lane shells (the owner's own surfaces) inherit
+    /// and get the login-style startup.
     fn spawn(
         cols: u16,
         rows: u16,
@@ -853,7 +878,16 @@ impl PtySession {
         } else {
             let build_cmd = |program: &str, args: &[String]| {
                 let mut cmd = PtyCommandBuilder::new(program);
-                cmd.args(args);
+                if owner.is_some() {
+                    // Profile-less startup, or the env clearing below is
+                    // theater: a login shell's rc files run before the
+                    // principal ever types and would repopulate the
+                    // cleared environment (API keys exported in dotfiles
+                    // are routine).
+                    cmd.args(secret_free_shell_args(program));
+                } else {
+                    cmd.args(args);
+                }
                 if let Some(ref dir) = cwd {
                     cmd.cwd(dir);
                 }
@@ -1026,7 +1060,7 @@ impl PtySession {
         #[cfg(unix)]
         {
             let (shell, _) = crate::platform::interactive_pty_shell();
-            let shell_args = scoped_shell_args(&shell);
+            let shell_args = secret_free_shell_args(&shell);
             let cwd = scoped_shell_cwd(
                 scope,
                 project_root.unwrap_or_else(|| std::path::Path::new("/")),
@@ -2400,14 +2434,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scoped_shell_args_skip_rc_files_per_shell() {
-        assert_eq!(scoped_shell_args("/bin/zsh"), vec!["-f"]);
+    fn secret_free_shell_args_skip_rc_files_per_shell() {
+        assert_eq!(secret_free_shell_args("/bin/zsh"), vec!["-f"]);
         assert_eq!(
-            scoped_shell_args("/bin/bash"),
+            secret_free_shell_args("/bin/bash"),
             vec!["--noprofile", "--norc"]
         );
-        assert_eq!(scoped_shell_args("/usr/bin/fish"), vec!["--no-config"]);
-        assert!(scoped_shell_args("/bin/sh").is_empty());
+        assert_eq!(secret_free_shell_args("/usr/bin/fish"), vec!["--no-config"]);
+        assert!(secret_free_shell_args("/bin/sh").is_empty());
+    }
+
+    /// The Windows variant must disable profile/AutoRun startup for the
+    /// interactive shells [`crate::platform::interactive_pty_shell`] can
+    /// return — a profile script would repopulate the cleared environment
+    /// of a principal-owned shell (review P1, round 4).
+    #[cfg(windows)]
+    #[test]
+    fn secret_free_shell_args_disable_windows_profiles() {
+        assert_eq!(
+            secret_free_shell_args("powershell.exe"),
+            vec!["-NoLogo", "-NoProfile"]
+        );
+        assert_eq!(
+            secret_free_shell_args("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            vec!["-NoLogo", "-NoProfile"]
+        );
+        assert_eq!(secret_free_shell_args("cmd.exe"), vec!["/d"]);
     }
 
     #[cfg(unix)]
@@ -2445,9 +2497,22 @@ mod tests {
     async fn principal_shell_without_scope_gets_secret_free_env() {
         // The canary must be present in THIS process's environment while
         // the shell spawns to prove the child cleared it; mutate and
-        // restore under the crate-wide env lock.
+        // restore under the crate-wide env lock. The drop guard restores
+        // the variable's prior state on every exit path — declared after
+        // the lock guard so it drops (restoring) while the lock is held.
+        const CANARY: &str = "INTENDANT_TEST_ENV_CANARY";
+        struct RestoreCanary(Option<std::ffi::OsString>);
+        impl Drop for RestoreCanary {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("INTENDANT_TEST_ENV_CANARY", value),
+                    None => std::env::remove_var("INTENDANT_TEST_ENV_CANARY"),
+                }
+            }
+        }
         let guard = crate::test_support::TEST_ENV_LOCK.lock().await;
-        std::env::set_var("INTENDANT_TEST_ENV_CANARY", "leak_9418");
+        let restore = RestoreCanary(std::env::var_os(CANARY));
+        std::env::set_var(CANARY, "leak_9418");
 
         let registry = TerminalRegistry::new(std::env::temp_dir());
         let key = TerminalKey::local("principal-env-e2e");
@@ -2467,7 +2532,7 @@ mod tests {
             .await;
         // The spawn ran synchronously inside open_or_attach, so the
         // mutation window ends here regardless of the result.
-        std::env::remove_var("INTENDANT_TEST_ENV_CANARY");
+        drop(restore);
         drop(guard);
         let (session, created) = spawned.unwrap();
         assert!(created);

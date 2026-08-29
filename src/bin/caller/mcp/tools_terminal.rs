@@ -141,6 +141,22 @@ fn utf8_page_len(bytes: &[u8]) -> usize {
     }
 }
 
+/// [`utf8_page_len`] while the shell lives; the whole page once it has
+/// exited. A split sequence is held back only because a later page can
+/// complete it — after exit no output can ever arrive, so holding a
+/// truncated final sequence would park the cursor forever; delivering it
+/// lossily is the honest end state. (On Windows the exit flag can beat
+/// the reader thread's final drain by a moment, so a tail consumed in
+/// that window may decay into replacement characters — a one-character
+/// cost, against a permanently wedged cursor.)
+fn page_keep_len(bytes: &[u8], alive: bool) -> usize {
+    if alive {
+        utf8_page_len(bytes)
+    } else {
+        bytes.len()
+    }
+}
+
 fn no_registry() -> String {
     serde_json::json!({
         "ok": false,
@@ -278,18 +294,20 @@ impl IntendantServer {
             .clamp(4, TERMINAL_READ_MAX_BYTES);
         let (bytes, next_cursor, gap) = session.read_since(params.cursor.unwrap_or(0), max_bytes);
         // A multibyte UTF-8 sequence split at the page boundary must not
-        // decay into replacement characters on both pages: hold the
-        // incomplete tail back (rewinding the cursor to the boundary) so
-        // the next read re-delivers it whole. Genuinely invalid bytes
-        // mid-page (binary output) stay lossy — that is honest.
-        let kept = utf8_page_len(&bytes);
+        // decay into replacement characters on both pages: while the
+        // shell lives, hold the incomplete tail back (rewinding the
+        // cursor to the boundary) so the next read re-delivers it whole;
+        // once it has exited, deliver everything. Genuinely invalid
+        // bytes mid-page (binary output) stay lossy — that is honest.
+        let alive = session.is_alive();
+        let kept = page_keep_len(&bytes, alive);
         let next_cursor = next_cursor - (bytes.len() - kept) as u64;
         serde_json::json!({
             "ok": true,
             "output": String::from_utf8_lossy(&bytes[..kept]),
             "next_cursor": next_cursor,
             "gap": gap,
-            "alive": session.is_alive(),
+            "alive": alive,
             "exit_status": session.exit_status(),
         })
         .to_string()
@@ -418,6 +436,21 @@ mod tests {
             "incomplete prefix held, not consumed"
         );
         assert_eq!(utf8_page_len(b""), 0);
+    }
+
+    /// Once the shell has exited nothing can ever complete a split
+    /// sequence, so a truncated final tail is delivered lossily instead
+    /// of parking the cursor forever (review P2, round 4); while it
+    /// lives the tail is held for the page that completes it.
+    #[test]
+    fn dead_sessions_consume_split_tails() {
+        assert_eq!(page_keep_len(&[b'a', 0xc3], true), 1, "live: tail held");
+        assert_eq!(
+            page_keep_len(&[b'a', 0xc3], false),
+            2,
+            "dead: tail delivered lossily"
+        );
+        assert_eq!(page_keep_len(&[0xc3], false), 1, "dead: bare prefix too");
     }
 
     #[test]
