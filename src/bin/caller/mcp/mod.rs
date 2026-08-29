@@ -647,10 +647,11 @@ impl IntendantServer {
             // dispatch.
             "inspect" | "act" | "authorize" => {
                 match facade::plan_for_meta(name, &args).and_then(|mut planned| {
-                    // Seeded "__caller" identity defaults become THIS
-                    // caller's identity: the gate-bound session when one
-                    // exists, else the principal, else the facade label —
-                    // so two facade sessions never collide as one holder.
+                    // Seed-declared identity defaults (carried out-of-band
+                    // on the plan) become THIS caller's identity: the
+                    // gate-bound session when one exists, else the
+                    // principal, else the facade label — so two facade
+                    // sessions never collide as one holder.
                     // When-vocabulary values (`--at +2h`) resolve here
                     // too, so their parse failures land as tool errors
                     // exactly like plan failures.

@@ -452,7 +452,14 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("body", "body", Str, "markdown body"),
             flag!("tag", "tags", StrList, "tag (repeatable)"),
-            flag!("kind", "kind", Str, "note|task|question (default task, matching ctl)"),
+            flag!(
+                "kind",
+                "__kind_explicit",
+                Str,
+                "note|task|question (default task, matching ctl)"
+            ),
+            flag!("note", "__kind_note", Bool, "park a note (ctl shorthand)"),
+            flag!("task", "__kind_task", Bool, "park a task (ctl shorthand, the default)"),
             flag!(
                 "due",
                 "due_ms",
@@ -1195,8 +1202,16 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "remote_command",
         seed: r#"{"op":"wait"}"#,
         positionals: &[p_str("JOB_ID", "job_id", true, false)],
-        flags: &[flag!("wait-s", "wait_s", U64, "one bounded wait, 1-60s")],
-        help: "Wait one bounded chunk for a remote job (chunk longer waits client-side)",
+        flags: &[
+            flag!(
+                "for",
+                "__wait_for",
+                U64,
+                "wait budget in seconds (ctl spelling; one bounded chunk here, max 60)"
+            ),
+            flag!("wait-s", "wait_s", U64, "one bounded wait, 1-60s"),
+        ],
+        help: "Wait one bounded chunk for a remote job (ctl's --for loops longer budgets client-side)",
     },
     CommandSpec {
         path: &["remote", "cancel"],
@@ -2302,12 +2317,17 @@ pub(crate) fn is_facade_executor(name: &str) -> bool {
 
 /// One resolved, ready-to-dispatch call. `spec` rides along so the
 /// dispatcher can substitute sentinels at the exact argument paths the
-/// registry declares — never inside caller-owned opaque JSON.
+/// registry declares — never inside caller-owned opaque JSON — and
+/// `caller_defaults` names the top-level keys whose seed-declared
+/// caller-identity default the argv left unfilled: they are absent
+/// from `args` until the dispatcher fills the caller's identity, so no
+/// input string is reserved.
 #[derive(Debug)]
 pub(crate) struct PlannedCall {
     pub(crate) tool: &'static str,
     pub(crate) args: serde_json::Value,
     pub(crate) spec: &'static CommandSpec,
+    pub(crate) caller_defaults: Vec<String>,
 }
 
 fn argv_from_args(args: &serde_json::Value) -> Result<Vec<String>, String> {
@@ -2399,9 +2419,17 @@ fn insert_value(
 }
 
 /// Pure argv → arguments builder for one command. No I/O, no environment,
-/// no expansion: values are literal strings.
-fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, String> {
-    let mut obj = match serde_json::from_str::<serde_json::Value>(spec.seed) {
+/// no expansion: values are literal strings. Returns the built
+/// object plus the top-level keys whose seed declared a caller-identity
+/// default (`"__caller"`) that the argv did NOT override: those keys are
+/// REMOVED from the object and returned by name, so the dispatcher can
+/// fill the caller's identity out-of-band — a caller's own literal
+/// `"__caller"` value stays caller data (review round 25).
+fn build_args(
+    spec: &CommandSpec,
+    rest: &[String],
+) -> Result<(serde_json::Value, Vec<String>), String> {
+    let seed = match serde_json::from_str::<serde_json::Value>(spec.seed) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => {
             return Err(format!(
@@ -2410,6 +2438,14 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             ))
         }
     };
+    let mut obj = seed.clone();
+    // Top-level keys the ARGV wrote (flags, positionals, the greedy
+    // tail) — the discriminator between a seed default and an explicit
+    // caller value that happens to spell the same string.
+    let mut written: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    fn outer(key: &'static str) -> &'static str {
+        key.split('.').next().unwrap_or(key)
+    }
 
     let mut positional_index = 0usize;
     let mut greedy_parts: Vec<String> = Vec::new();
@@ -2461,6 +2497,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
                     .ok_or_else(|| format!("--{flag_name} needs a value"))?
             };
             insert_value(&mut obj, flag.json_key, flag.kind, &raw)?;
+            written.insert(outer(flag.json_key));
         } else if let Some(pos) = spec.positionals.get(positional_index) {
             if pos.greedy {
                 greedy_key = Some(pos.json_key);
@@ -2468,6 +2505,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
                 greedy_parts.push(token.clone());
             } else {
                 insert_value(&mut obj, pos.json_key, pos.kind, token)?;
+                written.insert(outer(pos.json_key));
                 positional_index += 1;
             }
         } else if greedy_key.is_some() {
@@ -2493,6 +2531,17 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             _ => serde_json::Value::String(greedy_parts.join(" ")),
         };
         obj.insert(key.to_string(), value);
+        written.insert(outer(key));
+    }
+    // Seed-declared caller-identity defaults the argv left alone: strip
+    // them and hand the key names back for the dispatcher's out-of-band
+    // fill (an argv-written value — even the literal "__caller" — stays).
+    let mut caller_defaults = Vec::new();
+    for (key, value) in &seed {
+        if value.as_str() == Some("__caller") && !written.contains(key.as_str()) {
+            obj.remove(key);
+            caller_defaults.push(key.clone());
+        }
     }
     // Dot-aware presence walk, matching `insert_value`'s nesting.
     fn key_present(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
@@ -2622,6 +2671,50 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
         let (ref_type, locator) = ref_type_and_locator(raw, explicit.as_deref())?;
         obj.insert("ref_type".to_string(), serde_json::Value::String(ref_type));
         obj.insert("locator".to_string(), serde_json::Value::String(locator));
+    }
+    // ctl's `agenda add` kind vocabulary: an explicit --kind wins (its
+    // value validated and lowercased in ctl's words, the selectors
+    // ignored beside it — ctl's own precedence); otherwise the
+    // valueless --note/--task shorthands pick the kind, refusing the
+    // contradictory pair.
+    let kind_note = obj.remove("__kind_note").is_some();
+    let kind_task = obj.remove("__kind_task").is_some();
+    if let Some(explicit) = obj.remove("__kind_explicit") {
+        let raw = explicit.as_str().unwrap_or_default();
+        let kind = match raw.trim().to_ascii_lowercase().as_str() {
+            kind @ ("note" | "task" | "question") => kind.to_string(),
+            other => return Err(format!("unknown kind '{other}' (note, task, or question)")),
+        };
+        obj.insert("kind".to_string(), serde_json::Value::String(kind));
+    } else if kind_note && kind_task {
+        return Err("pass --note or --task, not both".to_string());
+    } else if kind_note {
+        obj.insert(
+            "kind".to_string(),
+            serde_json::Value::String("note".to_string()),
+        );
+    } else if kind_task {
+        obj.insert(
+            "kind".to_string(),
+            serde_json::Value::String("task".to_string()),
+        );
+    }
+    // ctl's `remote wait --for` budgets a CLIENT-side chunking loop;
+    // the facade waits one bounded server chunk, so the ctl spelling
+    // maps through only within the chunk cap.
+    if let Some(budget) = obj.remove("__wait_for") {
+        if obj.contains_key("wait_s") {
+            return Err("pass --for or --wait-s, not both".to_string());
+        }
+        let seconds = budget.as_u64().unwrap_or_default();
+        if !(1..=60).contains(&seconds) {
+            return Err(
+                "--for budgets ctl's client-side wait loop — the facade waits one bounded \
+                 chunk (1-60s); pass --for 60 or less and re-invoke until the job is terminal"
+                    .to_string(),
+            );
+        }
+        obj.insert("wait_s".to_string(), serde_json::Value::from(seconds));
     }
     // ctl's park-time ref gesture on `agenda add`/`agenda ask`:
     // repeatable `--ref [TYPE:]LOCATOR`, with `--must-read`/`--label`
@@ -2980,7 +3073,7 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
             }
         }
     }
-    Ok(serde_json::Value::Object(obj))
+    Ok((serde_json::Value::Object(obj), caller_defaults))
 }
 
 /// Split ctl's "Label[:description]" option values into option objects
@@ -3085,35 +3178,41 @@ fn value_at_path<'a>(
     }
 }
 
-/// Substitute the planner's dispatch-time sentinels. The planner is
-/// pure — it cannot know who is calling and reads no clock — so rows
-/// seed `"__caller"` under `holder_id` (a CONSTANT default identity
-/// would make two facade sessions collide as the "same" holder: the
-/// browser-lease registry rejects only a DIFFERENT holder id, so a
-/// constant silently hands one session's exclusive lease to another),
-/// a triggered schedule's omitted arm floor fills `fire_at_ms` with
-/// `"__now"` (armed on approval), and `When`-kind values ride as
+/// Substitute the planner's dispatch-time defaults. The planner is
+/// pure — it cannot know who is calling and reads no clock — so a
+/// seed-declared caller-identity default (browser acquire's holder: a
+/// CONSTANT default would make two facade sessions collide as the
+/// "same" holder, and the browser-lease registry rejects only a
+/// DIFFERENT holder id, so a constant silently hands one session's
+/// exclusive lease to another) rides OUT-OF-BAND as
+/// `PlannedCall::caller_defaults` — the key is absent from the args
+/// until this step fills the caller's identity, so no input string is
+/// reserved and a caller's own literal `"__caller"` stays caller
+/// data. A triggered schedule's omitted arm floor fills `fire_at_ms`
+/// with `"__now"` (armed on approval; unforgeable — the key is U64-
+/// or When-kind in every row, so planning never passes that string
+/// through from input), and `When`-kind values ride as
 /// `"__when:<raw>"` until this step resolves them with
 /// `ctl::parse_due_ms` — the daemon's clock is the one schedules fire
 /// on, so it is also the right one to parse `+2h` and calendar forms
 /// against. The dispatcher substitutes after gate resolution — the
 /// gate ignores argument values, so authorization is unaffected — and
-/// every sentinel is scoped to the exact place the planner put it,
-/// never matched by value or key name alone: `__caller`/`__now` at
-/// their top-level seeded keys, and `__when:` only at the dotted paths
-/// the resolved row declares as When-kind. Caller-owned opaque JSON
-/// (a peer task's `--context`, a raw `--recurrence` object) is never
-/// walked, so caller data that happens to spell a sentinel — even
-/// under a same-named key — reaches its tool untouched.
+/// every substitution is scoped to the exact place the planner put
+/// it: `__when:` only at the dotted paths the resolved row declares
+/// as When-kind. Caller-owned opaque JSON (a peer task's `--context`,
+/// a raw `--recurrence` object) is never walked, so caller data that
+/// happens to spell a sentinel — even under a same-named key —
+/// reaches its tool untouched.
 pub(crate) fn substitute_dispatch_sentinels(
     planned: &mut PlannedCall,
     identity: &str,
 ) -> Result<(), String> {
     if let Some(obj) = planned.args.as_object_mut() {
+        for key in &planned.caller_defaults {
+            obj.insert(key.clone(), serde_json::Value::String(identity.to_string()));
+        }
         for (key, value) in obj.iter_mut() {
-            if key == "holder_id" && value.as_str() == Some("__caller") {
-                *value = serde_json::Value::String(identity.to_string());
-            } else if key == "fire_at_ms" && value.as_str() == Some("__now") {
+            if key == "fire_at_ms" && value.as_str() == Some("__now") {
                 *value = dispatch_now_ms();
             }
         }
@@ -3166,11 +3265,12 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
         ));
     }
     let rest = &argv[spec.path.len()..];
-    let built = build_args(spec, rest)?;
+    let (built, caller_defaults) = build_args(spec, rest)?;
     Ok(PlannedCall {
         tool: spec.tool,
         args: built,
         spec,
+        caller_defaults,
     })
 }
 
@@ -4108,6 +4208,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("pass --option too"), "{err}");
+        // Round 25: --note/--task kind shorthands and remote wait's
+        // --for budget.
+        let planned =
+            plan_for_meta("act", &argv(&["agenda", "add", "remember this", "--note"])).unwrap();
+        assert_eq!(planned.args["kind"], "note");
+        let planned = plan_for_meta("act", &argv(&["agenda", "add", "do this", "--task"])).unwrap();
+        assert_eq!(planned.args["kind"], "task");
+        let err =
+            plan_for_meta("act", &argv(&["agenda", "add", "x", "--note", "--task"])).unwrap_err();
+        assert!(err.contains("pass --note or --task, not both"), "{err}");
+        // ctl's precedence: an explicit --kind wins over a selector.
+        let planned = plan_for_meta(
+            "act",
+            &argv(&["agenda", "add", "x", "--kind", "QUESTION", "--note"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["kind"], "question");
+        let err =
+            plan_for_meta("act", &argv(&["agenda", "add", "x", "--kind", "reminder"])).unwrap_err();
+        assert!(err.contains("unknown kind"), "{err}");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&["remote", "wait", "job-1", "--for", "30"]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["wait_s"], 30);
+        let err = plan_for_meta(
+            "authorize",
+            &argv(&["remote", "wait", "job-1", "--for", "300"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("one bounded"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
@@ -4393,24 +4525,36 @@ mod tests {
             tool: spec.tool,
             args,
             spec,
+            caller_defaults: Vec::new(),
         }
     }
 
-    /// The dispatcher replaces the identity sentinel with the caller's
-    /// own identity, so two facade sessions never collide as the same
-    /// lease holder (review round 10); explicit values pass untouched.
-    /// Sentinels are KEY-scoped (review round 21): caller text that
-    /// merely spells a sentinel under some other key reaches its
-    /// string-typed tool untouched.
+    /// The dispatcher fills seed-declared identity defaults with the
+    /// caller's own identity, so two facade sessions never collide as
+    /// the same lease holder (review round 10) — carried OUT-OF-BAND
+    /// as `caller_defaults` (review round 25), so no input string is
+    /// reserved: an explicit literal `"__caller"` is caller data and
+    /// survives, as does any sentinel spelling under other keys.
     #[test]
     fn dispatch_sentinels_substitute_key_scoped() {
-        let mut planned = planned_with(
-            &["browser", "acquire"],
-            serde_json::json!({ "holder_id": "__caller", "workspace_id": "ws-1" }),
-        );
+        // The defaulted form: planning strips the seed marker and
+        // records the key; dispatch fills the identity.
+        let planned = plan_for_meta("act", &argv(&["browser", "acquire", "ws-1"])).unwrap();
+        assert_eq!(planned.caller_defaults, vec!["holder_id".to_string()]);
+        assert!(planned.args.get("holder_id").is_none());
+        let mut planned = planned;
         substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
         assert_eq!(planned.args["holder_id"], "sess-7");
-        assert_eq!(planned.args["workspace_id"], "ws-1");
+        // An explicit holder — even the literal sentinel spelling —
+        // is caller data and passes untouched.
+        let mut planned = plan_for_meta(
+            "act",
+            &argv(&["browser", "acquire", "ws-1", "--holder", "__caller"]),
+        )
+        .unwrap();
+        assert!(planned.caller_defaults.is_empty());
+        substitute_dispatch_sentinels(&mut planned, "sess-7").unwrap();
+        assert_eq!(planned.args["holder_id"], "__caller");
         let mut planned = planned_with(
             &["browser", "acquire"],
             serde_json::json!({ "holder_id": "alice" }),
@@ -4609,13 +4753,15 @@ mod tests {
             plan_for_meta("inspect", &argv(&["display", "read-frame", "frame-7"])).unwrap();
         assert_eq!(planned.args["frame_id"], "frame-7");
         let planned = plan_for_meta("act", &argv(&["browser", "acquire", "ws-1"])).unwrap();
-        assert_eq!(
-            planned.args["holder_id"], "__caller",
-            "the identity sentinel travels to dispatch, which substitutes the caller"
+        assert!(
+            planned.args.get("holder_id").is_none()
+                && planned.caller_defaults == vec!["holder_id".to_string()],
+            "the identity default travels out-of-band; dispatch fills the caller"
         );
         let planned =
             plan_for_meta("act", &argv(&["browser", "acquire", "ws-1", "sess-4"])).unwrap();
         assert_eq!(planned.args["holder_id"], "sess-4");
+        assert!(planned.caller_defaults.is_empty());
         let planned = plan_for_meta("act", &argv(&["agenda", "unblock", "item-1"])).unwrap();
         assert_eq!(planned.args["blocker_id"], "");
         let planned =
