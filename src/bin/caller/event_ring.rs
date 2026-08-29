@@ -36,11 +36,19 @@ const RING_CAPACITY: usize = 1024;
 /// ring must never become a session-transcript hoard.
 const RING_MAX_BYTES: usize = 2 * 1024 * 1024;
 
-/// One retained event: its ingest-assigned sequence number and the
-/// pre-serialized `OutboundEvent` JSON (`{"event":"…", …}`).
+/// One retained event: its ingest-assigned sequence number, the
+/// `OutboundEvent` tag and owning session (extracted once at ingest so
+/// delivery-time filtering and session scoping never re-parse), and the
+/// pre-serialized JSON (`{"event":"…", …}`).
 #[derive(Debug, Clone)]
 pub struct RingEntry {
     pub seq: u64,
+    /// The serde tag ("session_started", …; "event_gap" for the
+    /// synthetic loss marker).
+    pub event: String,
+    /// The session the event belongs to (`None` = daemon-wide, e.g. an
+    /// approval raised outside any session).
+    pub session_id: Option<String>,
     pub json: String,
 }
 
@@ -83,13 +91,18 @@ impl EventRing {
 
     /// Append one serialized event, assign its sequence number, evict
     /// oldest entries past the count/byte bounds, and wake pollers.
-    pub fn push(&self, json: String) -> u64 {
+    pub fn push(&self, event: String, session_id: Option<String>, json: String) -> u64 {
         let seq = {
             let mut inner = self.inner.lock().expect("event ring lock");
             let seq = inner.next_seq;
             inner.next_seq += 1;
             inner.bytes += json.len();
-            inner.entries.push_back(RingEntry { seq, json });
+            inner.entries.push_back(RingEntry {
+                seq,
+                event,
+                session_id,
+                json,
+            });
             while inner.entries.len() > RING_CAPACITY
                 || (inner.bytes > RING_MAX_BYTES && inner.entries.len() > 1)
             {
@@ -192,9 +205,21 @@ pub fn spawn_event_ring_fold(
                         continue;
                     }
                     if let Some(outbound) = app_event_to_outbound(&event) {
-                        match serde_json::to_string(&outbound) {
-                            Ok(json) => {
-                                ring.push(json);
+                        match serde_json::to_value(&outbound) {
+                            Ok(value) => {
+                                // Tag and owning session are extracted
+                                // once here so delivery can name-filter
+                                // and session-scope without re-parsing.
+                                let name = value
+                                    .get("event")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let session_id = value
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+                                ring.push(name, session_id, value.to_string());
                             }
                             Err(err) => {
                                 eprintln!("[event-ring] serialize outbound event: {err}");
@@ -204,6 +229,8 @@ pub fn spawn_event_ring_fold(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     ring.push(
+                        "event_gap".to_string(),
+                        None,
                         serde_json::json!({ "event": "event_gap", "skipped": skipped }).to_string(),
                     );
                 }
@@ -233,8 +260,8 @@ mod tests {
     fn cursors_advance_and_read_in_order() {
         let ring = EventRing::new();
         assert_eq!(ring.current_seq(), 0);
-        assert_eq!(ring.push("{\"event\":\"a\"}".into()), 1);
-        assert_eq!(ring.push("{\"event\":\"b\"}".into()), 2);
+        assert_eq!(ring.push("a".into(), None, "{\"event\":\"a\"}".into()), 1);
+        assert_eq!(ring.push("b".into(), None, "{\"event\":\"b\"}".into()), 2);
         assert_eq!(ring.current_seq(), 2);
         let (events, gap) = ring.since(0, 100);
         assert!(!gap);
@@ -251,7 +278,7 @@ mod tests {
     fn eviction_is_visible_as_a_gap() {
         let ring = EventRing::new();
         for i in 0..(RING_CAPACITY + 10) {
-            ring.push(format!("{{\"event\":\"e{i}\"}}"));
+            ring.push("e".into(), None, format!("{{\"event\":\"e{i}\"}}"));
         }
         // The first 10 entries were evicted: a cursor at 0 reports the
         // gap; a cursor at the eviction boundary does not.
@@ -267,9 +294,9 @@ mod tests {
     fn byte_bound_evicts_oldest_but_keeps_the_newest() {
         let ring = EventRing::new();
         let big = "x".repeat(RING_MAX_BYTES / 2);
-        ring.push(big.clone());
-        ring.push(big.clone());
-        ring.push(big);
+        ring.push("big".into(), None, big.clone());
+        ring.push("big".into(), None, big.clone());
+        ring.push("big".into(), None, big);
         let (events, gap) = ring.since(0, usize::MAX);
         assert!(gap);
         assert!(
@@ -290,7 +317,7 @@ mod tests {
     #[test]
     fn out_of_range_cursor_is_harmless() {
         let ring = EventRing::new();
-        ring.push("{\"event\":\"a\"}".into());
+        ring.push("a".into(), None, "{\"event\":\"a\"}".into());
         let (events, _) = ring.since(u64::MAX, 10);
         assert!(events.is_empty());
     }
@@ -299,7 +326,7 @@ mod tests {
     fn max_caps_one_page() {
         let ring = EventRing::new();
         for i in 0..10 {
-            ring.push(format!("{{\"event\":\"e{i}\"}}"));
+            ring.push("e".into(), None, format!("{{\"event\":\"e{i}\"}}"));
         }
         let (events, _) = ring.since(0, 3);
         assert_eq!(entry_seqs(&events), vec![1, 2, 3]);
@@ -335,7 +362,7 @@ mod tests {
             let ring = ring.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                ring.push("{\"event\":\"wake\"}".into());
+                ring.push("wake".into(), None, "{\"event\":\"wake\"}".into());
             })
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), notified)

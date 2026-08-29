@@ -97,7 +97,10 @@ commands". Its cursors are opaque, bound to the minting principal, and
 invalidated by a daemon restart (the error says so); the underlying ring
 ingests only the lifecycle families the `session.inspect` read tools
 already serve, so the stream is push semantics over existing authority,
-never new authority. A facade call is authorized as the **resolved** command's
+never new authority — and delivery is session-scoped for agent-session
+callers (a supervised backend on its session-bound token sees only its
+own session's events, sessionless events withheld, matching the scoped
+approval reads). A facade call is authorized as the **resolved** command's
 operation against the caller's principal, at every ingress, before any side
 effect — a parse failure never dispatches, and a command invoked through the
 wrong lane is redirected to the right tool by name. Argv values are literal

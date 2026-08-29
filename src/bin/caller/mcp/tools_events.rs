@@ -12,16 +12,20 @@
 //!   fails loudly instead of silently reading wrong positions.
 //! - Cursors are PRINCIPAL-BOUND (the design-review amendment): the tag
 //!   commits to the acting principal, and a cursor minted under another
-//!   principal is refused. Visibility is uniform today (everything in
-//!   the ring is `session.inspect`-class), so the binding is
-//!   forward-compatibility for per-principal filtering, not a secrecy
-//!   boundary by itself.
+//!   principal is refused.
+//! - Delivery is SESSION-SCOPED for agent-session callers (security
+//!   review P1): a supervised backend using its session-bound MCP token
+//!   sees only its gate-bound session's events — the
+//!   `get_pending_approval_scoped` discipline — with sessionless events
+//!   failing closed; every other caller class keeps the daemon-wide
+//!   view its `session.inspect` grant already reads. Cursor positions
+//!   stay global (coarse volume metadata, not content).
 //! - `since` omitted = start at NOW: the first call returns the current
 //!   cursor (optionally waiting for the next event), never the
 //!   backlog.
 
 use super::*;
-use crate::event_ring::EventRing;
+use crate::event_ring::{EventRing, RingEntry};
 use std::sync::Arc;
 
 /// Long-poll ceiling — the `remote wait` chunk contract.
@@ -86,19 +90,37 @@ fn decode_cursor(cursor: &str) -> Option<(u64, u64, u64)> {
     Some((epoch, seq, tag))
 }
 
-/// Which delivered events a filter keeps. The `event_gap` loss marker
-/// is exempt: a filtering caller must still learn it missed events.
-fn passes_filter(json: &str, filter: &Option<Vec<String>>) -> bool {
+/// Which delivered events a name filter keeps. The `event_gap` loss
+/// marker is exempt: a filtering caller must still learn it missed
+/// events.
+fn passes_filter(entry: &RingEntry, filter: &Option<Vec<String>>) -> bool {
     let Some(names) = filter else {
         return true;
     };
-    let tag = serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(String::from));
-    match tag {
-        Some(tag) => tag == "event_gap" || names.iter().any(|n| n == &tag),
-        // An unparsable entry is delivered rather than silently eaten.
-        None => true,
+    entry.event == "event_gap" || names.iter().any(|n| n == &entry.event)
+}
+
+/// Session scoping at delivery (security review P1): an agent-session
+/// caller — a supervised backend using its session-bound MCP token —
+/// sees only its gate-bound session's events, mirroring
+/// `get_pending_approval_scoped`'s discipline; sessionless events fail
+/// closed for it, and a scope whose gate bound no id sees nothing.
+/// The synthetic `event_gap` loss marker is exempt — it carries no
+/// content beyond "events were missed", and a scoped caller must still
+/// learn its view lost events. Every other caller class keeps the
+/// daemon-wide view its `session.inspect` grant already reads.
+fn visible_to_scope(entry: &RingEntry, scope: &McpToolScope<'_>) -> bool {
+    match scope {
+        McpToolScope::Unrestricted => true,
+        McpToolScope::AgentSession { session_id } => {
+            if entry.event == "event_gap" {
+                return true;
+            }
+            match (entry.session_id.as_deref(), session_id) {
+                (Some(entry_session), Some(bound)) => entry_session == *bound,
+                _ => false,
+            }
+        }
     }
 }
 
@@ -173,6 +195,7 @@ impl IntendantServer {
             .clamp(1, EVENTS_PAGE_MAX);
         let wait_s = params.wait_s.unwrap_or(0).min(EVENTS_WAIT_MAX_S);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_s);
+        let scope = McpToolScope::from_actor(actor);
 
         let mut delivered: Vec<String> = Vec::new();
         let mut gap = false;
@@ -184,7 +207,7 @@ impl IntendantServer {
             gap |= gap_now;
             for entry in entries {
                 scan_seq = entry.seq;
-                if passes_filter(&entry.json, &filter) {
+                if visible_to_scope(&entry, &scope) && passes_filter(&entry, &filter) {
                     delivered.push(entry.json);
                 }
                 if delivered.len() >= max_events {
@@ -264,7 +287,7 @@ mod tests {
     #[test]
     fn cursor_validation_refuses_foreign_stale_and_future_cursors() {
         let ring = EventRing::new();
-        ring.push("{\"event\":\"a\"}".into());
+        ring.push("a".into(), None, "{\"event\":\"a\"}".into());
         let tag = 0x77;
         let ok = encode_cursor(ring.epoch(), 1, tag);
         assert_eq!(validate_cursor(&ok, &ring, tag), Ok(1));
@@ -292,9 +315,17 @@ mod tests {
         let state = crate::mcp::tests::test_state();
         let ring = Arc::new(EventRing::new());
         for i in 0..250 {
-            ring.push(format!("{{\"event\":\"session_started\",\"n\":{i}}}"));
+            ring.push(
+                "session_started".into(),
+                Some("sess-x".into()),
+                format!("{{\"event\":\"session_started\",\"n\":{i}}}"),
+            );
         }
-        ring.push("{\"event\":\"approval_required\",\"id\":9}".into());
+        ring.push(
+            "approval_required".into(),
+            Some("sess-x".into()),
+            "{\"event\":\"approval_required\",\"id\":9}".into(),
+        );
         state.write().await.event_ring = Some(ring.clone());
         let server = IntendantServer::new(state, crate::event::EventBus::new());
 
@@ -328,20 +359,120 @@ mod tests {
         );
     }
 
+    /// End-to-end session scoping through the tool (security review
+    /// P1): an agent-session caller polling the full stream receives
+    /// only its gate-bound session's events — another session's events
+    /// and sessionless approvals are withheld, while the cursor still
+    /// advances past them.
+    #[tokio::test]
+    async fn agent_session_callers_see_only_their_session_through_the_tool() {
+        let state = crate::mcp::tests::test_state();
+        let ring = Arc::new(EventRing::new());
+        ring.push(
+            "turn_started".into(),
+            Some("sess-a".into()),
+            "{\"event\":\"turn_started\",\"session_id\":\"sess-a\"}".into(),
+        );
+        ring.push(
+            "turn_started".into(),
+            Some("sess-b".into()),
+            "{\"event\":\"turn_started\",\"session_id\":\"sess-b\"}".into(),
+        );
+        ring.push(
+            "approval_required".into(),
+            None,
+            "{\"event\":\"approval_required\",\"id\":1}".into(),
+        );
+        state.write().await.event_ring = Some(ring.clone());
+        let server = IntendantServer::new(state, crate::event::EventBus::new());
+
+        let actor = crate::access::actor::ActorBinding::agent_session(
+            Some("principal:agent".into()),
+            "sess-a".into(),
+        );
+        let start = encode_cursor(
+            ring.epoch(),
+            0,
+            cursor_principal_tag(ToolCallerTrust::Scoped, &actor),
+        );
+        let result = server
+            .events_tool(
+                EventsParams {
+                    since: Some(start),
+                    wait_s: Some(0),
+                    filter: None,
+                    max_events: None,
+                },
+                ToolCallerTrust::Scoped,
+                &actor,
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["ok"], true, "{result}");
+        let events = parsed["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 1, "{result}");
+        assert_eq!(events[0]["session_id"], "sess-a");
+        assert_eq!(
+            parsed["current_seq"].as_u64(),
+            Some(3),
+            "the cursor advances past withheld events"
+        );
+    }
+
+    fn entry(event: &str, session_id: Option<&str>) -> RingEntry {
+        RingEntry {
+            seq: 1,
+            event: event.to_string(),
+            session_id: session_id.map(String::from),
+            json: format!("{{\"event\":\"{event}\"}}"),
+        }
+    }
+
     /// The `event_gap` loss marker always passes a filter — a filtering
     /// caller must still learn it missed events.
     #[test]
     fn filters_keep_gap_markers_and_matching_names() {
         let filter = Some(vec!["approval_required".to_string()]);
-        assert!(passes_filter(
-            "{\"event\":\"approval_required\",\"id\":1}",
-            &filter
+        assert!(passes_filter(&entry("approval_required", None), &filter));
+        assert!(!passes_filter(&entry("session_started", None), &filter));
+        assert!(passes_filter(&entry("event_gap", None), &filter));
+        assert!(passes_filter(&entry("anything", None), &None));
+    }
+
+    /// Session scoping at delivery (security review P1): an
+    /// agent-session caller sees only its gate-bound session's events;
+    /// sessionless events fail closed, an unbound scope sees nothing,
+    /// the loss marker stays visible, and every other caller class
+    /// keeps the daemon-wide view.
+    #[test]
+    fn agent_session_scope_confines_delivery_to_the_bound_session() {
+        let mine = McpToolScope::AgentSession {
+            session_id: Some("sess-a"),
+        };
+        assert!(visible_to_scope(
+            &entry("turn_started", Some("sess-a")),
+            &mine
         ));
-        assert!(!passes_filter("{\"event\":\"session_started\"}", &filter));
-        assert!(passes_filter(
-            "{\"event\":\"event_gap\",\"skipped\":9}",
-            &filter
+        assert!(!visible_to_scope(
+            &entry("turn_started", Some("sess-b")),
+            &mine
         ));
-        assert!(passes_filter("{\"event\":\"anything\"}", &None));
+        assert!(
+            !visible_to_scope(&entry("approval_required", None), &mine),
+            "sessionless events fail closed for session-scoped callers"
+        );
+        assert!(
+            visible_to_scope(&entry("event_gap", None), &mine),
+            "the loss marker stays visible"
+        );
+        let unbound = McpToolScope::AgentSession { session_id: None };
+        assert!(
+            !visible_to_scope(&entry("turn_started", Some("sess-a")), &unbound),
+            "a scope whose gate bound no id sees nothing"
+        );
+        assert!(visible_to_scope(
+            &entry("turn_started", Some("sess-b")),
+            &McpToolScope::Unrestricted
+        ));
     }
 }
