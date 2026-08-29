@@ -430,6 +430,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "open (default) | done | retired"
             ),
             flag!("all", "__all_statuses", Bool, "the whole ledger, every status"),
+            flag!("open", "__list_open", Bool, "open items (the default, explicit — ctl selector)"),
+            flag!("done", "__list_done", Bool, "done items (ctl selector)"),
+            flag!("retired", "__list_retired", Bool, "retired items (ctl selector)"),
             flag!("q", "q", Str, "server-side search"),
         ],
         help: "List agenda items (default: open work). ctl's --blocked/--frontier/--under and its bare-list answered-union are client-side renders over this read — fetch and derive",
@@ -600,6 +603,22 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "user_session, display_99, …"
         )],
         help: "Screenshot a display (returns an image content block)",
+    },
+    CommandSpec {
+        // ctl routes `cu screenshot` through the display handler — the
+        // same tool by another documented name.
+        path: &["cu", "screenshot"],
+        lane: RiskLane::Inspect,
+        tool: "take_screenshot",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!(
+            "target",
+            "display_target",
+            Str,
+            "user_session, display_99, …"
+        )],
+        help: "Screenshot a display (ctl's cu alias; ctl's --output is a client-side file write)",
     },
     CommandSpec {
         path: &["display", "status"],
@@ -2947,10 +2966,29 @@ fn build_args(
             }
         }
     }
-    // The `agenda list --all` shape: lift the seeded open-status default
-    // so the whole ledger (every status) comes back.
+    // ctl's list lifecycle selectors, in ctl's own precedence (--all
+    // lifts the status filter entirely; then --done, --retired, --open
+    // rewrite the seeded open default).
+    let list_open = obj.remove("__list_open").is_some();
+    let list_done = obj.remove("__list_done").is_some();
+    let list_retired = obj.remove("__list_retired").is_some();
     if obj.remove("__all_statuses").is_some() {
         obj.remove("status");
+    } else if list_done {
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("done".to_string()),
+        );
+    } else if list_retired {
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("retired".to_string()),
+        );
+    } else if list_open {
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("open".to_string()),
+        );
     }
     // ctl's structured `agenda ask` flags: any of --option/--multi/
     // --pick/--header makes the decision-card form (ctl's own
@@ -4240,6 +4278,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("one bounded"), "{err}");
+        // Round 26: cu screenshot (ctl's display alias) and the list
+        // lifecycle selectors.
+        let planned = plan_for_meta(
+            "inspect",
+            &argv(&["cu", "screenshot", "--target", "display_2"]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "take_screenshot");
+        assert_eq!(planned.args["display_target"], "display_2");
+        let planned = plan_for_meta("inspect", &argv(&["agenda", "list", "--done"])).unwrap();
+        assert_eq!(planned.args["status"], "done");
+        let planned = plan_for_meta("inspect", &argv(&["agenda", "list", "--retired"])).unwrap();
+        assert_eq!(planned.args["status"], "retired");
+        let planned = plan_for_meta("inspect", &argv(&["agenda", "list", "--open"])).unwrap();
+        assert_eq!(planned.args["status"], "open");
+        // ctl's precedence: --all lifts the filter even beside --done.
+        let planned =
+            plan_for_meta("inspect", &argv(&["agenda", "list", "--all", "--done"])).unwrap();
+        assert!(planned.args.get("status").is_none());
         let planned = plan_for_meta(
             "authorize",
             &argv(&[
