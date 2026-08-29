@@ -1615,6 +1615,35 @@ impl TerminalRegistry {
 mod tests {
     use super::*;
 
+    /// The polling cursor: monotonic total-bytes-written space, gap
+    /// reporting when the cursor fell off the ring, clamped forward
+    /// cursors, and `u64::MAX` as the "start at now" high-water probe.
+    #[test]
+    fn scrollback_read_since_cursor_semantics() {
+        let mut ring = Scrollback::new(8);
+        ring.push(b"abcdef");
+        let (bytes, next, gap) = ring.read_since(0, 64);
+        assert_eq!(
+            (bytes.as_slice(), next, gap),
+            (b"abcdef".as_slice(), 6, false)
+        );
+        // Paged read.
+        let (bytes, next, gap) = ring.read_since(2, 2);
+        assert_eq!((bytes.as_slice(), next, gap), (b"cd".as_slice(), 4, false));
+        // Overflow trims the front; a pre-trim cursor reports the gap and
+        // resumes at the oldest retained byte.
+        ring.push(b"ghijkl"); // written=12, retained = "efghijkl"
+        let (bytes, next, gap) = ring.read_since(2, 64);
+        assert_eq!(bytes.as_slice(), b"efghijkl");
+        assert_eq!((next, gap), (12, true));
+        // Cursor 0 means "oldest retained", never a gap.
+        let (_, _, gap) = ring.read_since(0, 64);
+        assert!(!gap);
+        // The high-water probe returns the current cursor and nothing else.
+        let (bytes, next, gap) = ring.read_since(u64::MAX, 0);
+        assert_eq!((bytes.len(), next, gap), (0, 12, false));
+    }
+
     /// Unscoped spawn-allowed policy — the pre-scoping behavior.
     fn spawn_all() -> ShellSpawnPolicy {
         ShellSpawnPolicy {

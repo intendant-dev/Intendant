@@ -109,6 +109,27 @@ fn terminal_actor(
     }
 }
 
+/// How much of `bytes` to deliver so the page ends on a UTF-8 boundary:
+/// the whole page when it is valid or ends mid-page-invalid (binary —
+/// lossy is honest), trimmed when the tail is an INCOMPLETE multibyte
+/// sequence a later page completes. A page smaller than one sequence is
+/// delivered whole so progress is always made.
+fn utf8_page_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(err) => {
+            if err.error_len().is_some() {
+                // Invalid sequence inside the page — not a boundary split.
+                bytes.len()
+            } else if err.valid_up_to() == 0 && !bytes.is_empty() {
+                bytes.len()
+            } else {
+                err.valid_up_to()
+            }
+        }
+    }
+}
+
 fn no_registry() -> String {
     serde_json::json!({
         "ok": false,
@@ -161,6 +182,7 @@ impl IntendantServer {
         params: TerminalOpenParams,
         trust: ToolCallerTrust,
         actor: &crate::access::actor::ActorBinding,
+        fs_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
     ) -> String {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
@@ -179,7 +201,12 @@ impl IntendantServer {
             // which never spawn).
             may_spawn: true,
             shared: params.shared.unwrap_or(false),
-            scope: None,
+            // The caller's grant-resolved filesystem scope, stated by the
+            // ingress gate (dashboard-tunnel parity): a scoped grant's
+            // shell is OS-sandboxed to its roots with a cleared
+            // environment, and an ungated caller's default is the empty
+            // scope — never an unrestricted, key-bearing shell.
+            scope: fs_scope,
         };
         match registry
             .open_or_attach(
@@ -232,9 +259,18 @@ impl IntendantServer {
             .unwrap_or(TERMINAL_READ_DEFAULT_BYTES)
             .min(TERMINAL_READ_MAX_BYTES);
         let (bytes, next_cursor, gap) = session.read_since(params.cursor.unwrap_or(0), max_bytes);
+        // A multibyte UTF-8 sequence split at the page boundary must not
+        // decay into replacement characters on both pages: hold the
+        // incomplete tail back (rewinding the cursor to the boundary) so
+        // the next read re-delivers it whole. Genuinely invalid bytes
+        // mid-page (binary output) stay lossy — that is honest — and a
+        // page smaller than one sequence is delivered as-is so a tiny
+        // max_bytes still makes progress.
+        let kept = utf8_page_len(&bytes);
+        let next_cursor = next_cursor - (bytes.len() - kept) as u64;
         serde_json::json!({
             "ok": true,
-            "output": String::from_utf8_lossy(&bytes),
+            "output": String::from_utf8_lossy(&bytes[..kept]),
             "next_cursor": next_cursor,
             "gap": gap,
             "alive": session.is_alive(),
@@ -320,6 +356,28 @@ impl IntendantServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multibyte sequence split at the page boundary is held back for
+    /// the next page instead of decaying into replacement characters on
+    /// both sides (review P2); binary garbage stays lossy, and a page
+    /// smaller than one sequence still makes progress.
+    #[test]
+    fn utf8_page_len_holds_back_incomplete_tails() {
+        let s = "ab\u{00e9}".as_bytes(); // 'é' = 2 bytes
+        assert_eq!(utf8_page_len(&s[..3]), 2, "split tail held back");
+        assert_eq!(utf8_page_len(s), 4, "complete page delivered whole");
+        assert_eq!(
+            utf8_page_len(&[0xff, 0x61]),
+            2,
+            "invalid mid-page stays lossy"
+        );
+        assert_eq!(
+            utf8_page_len(&s[2..3]),
+            1,
+            "sub-sequence page still progresses"
+        );
+        assert_eq!(utf8_page_len(b""), 0);
+    }
 
     #[test]
     fn scoped_actor_without_principal_owns_nothing() {

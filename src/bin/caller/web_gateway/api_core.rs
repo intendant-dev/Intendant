@@ -276,6 +276,24 @@ pub(crate) struct RequestAuthority {
 }
 
 impl RequestAuthority {
+    /// The filesystem scope on the acting principal's active grant, for
+    /// sandboxing scoped shell spawns. `None` = no scope (unrestricted —
+    /// owner surfaces and scope-less grants, matching the dashboard
+    /// tunnel's `DashboardControlGrant::filesystem` semantics). A
+    /// grant-bearing principal without a readable IAM snapshot fails
+    /// closed to the EMPTY policy, never to unrestricted.
+    pub(crate) fn fs_scope(&self) -> Option<crate::peer::access_policy::FilesystemAccessPolicy> {
+        match &self.iam_state {
+            Some(state) => {
+                crate::access::iam::fs_scope_for_principal(state, &self.principal).cloned()
+            }
+            None if self.principal.grant_id.is_some() => {
+                Some(crate::peer::access_policy::FilesystemAccessPolicy::default())
+            }
+            None => None,
+        }
+    }
+
     pub(crate) fn decision(
         &self,
         op: crate::peer::access_policy::PeerOperation,

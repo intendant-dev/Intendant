@@ -596,6 +596,7 @@ impl IntendantServer {
         let ToolCaller {
             trust: caller,
             actor,
+            fs_scope,
         } = caller;
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
@@ -653,6 +654,7 @@ impl IntendantServer {
                         ToolCaller {
                             trust: caller,
                             actor,
+                            fs_scope,
                         },
                     ))
                     .await
@@ -976,7 +978,8 @@ impl IntendantServer {
             "terminal_open" => {
                 let Parameters(params) = parse_params::<TerminalOpenParams>(args)?;
                 Ok(text_tool_result(
-                    self.terminal_open_tool(params, caller, &actor).await,
+                    self.terminal_open_tool(params, caller, &actor, fs_scope)
+                        .await,
                 ))
             }
             "terminal_read" => {
@@ -2678,6 +2681,12 @@ impl ToolCallerTrust {
 pub struct ToolCaller {
     pub trust: ToolCallerTrust,
     pub actor: crate::access::actor::ActorBinding,
+    /// The filesystem scope sandboxing any shell this caller spawns
+    /// (`terminal_open`): `None` = unrestricted (owner surfaces and
+    /// scope-less grants — dashboard-tunnel parity). Constructors default
+    /// to the EMPTY policy — fail closed — until a gate resolves the real
+    /// scope via [`Self::with_fs_scope`].
+    pub fs_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
 }
 
 impl ToolCaller {
@@ -2687,6 +2696,7 @@ impl ToolCaller {
         Self {
             trust: ToolCallerTrust::Scoped,
             actor: crate::access::actor::ActorBinding::unattributed(),
+            fs_scope: Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
         }
     }
 
@@ -2701,7 +2711,21 @@ impl ToolCaller {
         Self {
             trust: ToolCallerTrust::from_principal(principal),
             actor: crate::access::actor::ActorBinding::from_principal(principal, gate_session),
+            // Fail-closed until the gate states the real scope — an
+            // ungated ToolCaller sandboxes any shell it spawns to nothing.
+            fs_scope: Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
         }
+    }
+
+    /// State the caller's resolved filesystem scope (the gate's job:
+    /// `RequestAuthority::fs_scope` on HTTP, `DashboardControlGrant::
+    /// filesystem` on the tunnel). `None` = unrestricted.
+    pub fn with_fs_scope(
+        mut self,
+        fs_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
+    ) -> Self {
+        self.fs_scope = fs_scope;
+        self
     }
 }
 

@@ -1274,7 +1274,8 @@ pub(crate) async fn api_mcp_tool_call_response(
             // names a session on this lane, so the actor carries the
             // dashboard principal only (the `session_id` param above is
             // context selection, not identity).
-            crate::mcp::ToolCaller::from_gate(&runtime.grant.access_principal(), None),
+            crate::mcp::ToolCaller::from_gate(&runtime.grant.access_principal(), None)
+                .with_fs_scope(runtime.grant.filesystem()),
         )
         .await
     {

@@ -555,7 +555,8 @@ pub(crate) async fn handle_mcp_http_request(
                     args,
                     session_id,
                     codex_managed_context,
-                    crate::mcp::ToolCaller::from_gate(&access.principal, gate_session.clone()),
+                    crate::mcp::ToolCaller::from_gate(&access.principal, gate_session.clone())
+                        .with_fs_scope(access.fs_scope()),
                 )
                 .await
             {
