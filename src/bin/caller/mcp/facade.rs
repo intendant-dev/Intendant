@@ -1606,12 +1606,20 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         tool: "request_controller_loop_halt",
         seed: "{}",
         positionals: &[],
-        flags: &[flag!(
-            "persistent",
-            "persistent",
-            Json,
-            "true (default) or false — false halts one cycle only"
-        )],
+        flags: &[
+            flag!(
+                "one-shot",
+                "__one_shot",
+                Bool,
+                "halt one cycle only (ctl spelling)"
+            ),
+            flag!(
+                "persistent",
+                "persistent",
+                Json,
+                "true (default) or false — false halts one cycle only"
+            ),
+        ],
         help: "Halt the controller loop",
     },
     CommandSpec {
@@ -1787,12 +1795,27 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             p_str("GROUP_ID", "group_id", true, false),
             p_str("BRANCH_SESSION_ID", "branch_session_id", true, false),
         ],
-        flags: &[flag!(
-            "expected-canonical",
-            "expected_canonical_session_id",
-            Str,
-            "CAS guard"
-        )],
+        flags: &[
+            flag!("group-id", "group_id", Str, "ctl-spelling alias for GROUP_ID"),
+            flag!(
+                "branch-session-id",
+                "branch_session_id",
+                Str,
+                "ctl-spelling alias for BRANCH_SESSION_ID"
+            ),
+            flag!(
+                "expected-canonical-session-id",
+                "expected_canonical_session_id",
+                Str,
+                "CAS guard (ctl spelling)"
+            ),
+            flag!(
+                "expected-canonical",
+                "expected_canonical_session_id",
+                Str,
+                "CAS guard"
+            ),
+        ],
         help: "Claim a fission branch as canonical (CAS over lineage)",
     },
 ];
@@ -2086,6 +2109,10 @@ fn build_args(spec: &CommandSpec, rest: &[String]) -> Result<serde_json::Value, 
     // ctl's `--allow-dirty` is the negative of the tool's require_clean.
     if obj.remove("__allow_dirty").is_some() {
         obj.insert("require_clean".to_string(), serde_json::Value::Bool(false));
+    }
+    // ctl's `--one-shot` is the negative of the halt's persistent field.
+    if obj.remove("__one_shot").is_some() {
+        obj.insert("persistent".to_string(), serde_json::Value::Bool(false));
     }
     // ctl's `audio spawn --args '{...}'` passes the tool object whole;
     // entries fill only keys the decomposed flags did not set.
@@ -2801,6 +2828,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.args["item_id"], "item-9");
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "context",
+                "claim-fission",
+                "--group-id",
+                "g-1",
+                "--branch-session-id",
+                "sess-b",
+                "--expected-canonical-session-id",
+                "sess-a",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["group_id"], "g-1");
+        assert_eq!(planned.args["branch_session_id"], "sess-b");
+        assert_eq!(planned.args["expected_canonical_session_id"], "sess-a");
+        let planned =
+            plan_for_meta("authorize", &argv(&["controller", "halt", "--one-shot"])).unwrap();
+        assert_eq!(planned.args["persistent"], serde_json::json!(false));
         let planned = plan_for_meta(
             "act",
             &argv(&["display", "request", "--reason", "please share"]),
