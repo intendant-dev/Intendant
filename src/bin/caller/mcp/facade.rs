@@ -380,6 +380,16 @@ fn build_args(
             serde_json::Value::Array(option_entries(&raw_options)),
         );
     }
+    // ctl's `session note --image PATH` reads and base64-encodes the
+    // file client-side — same exclusion class as the preview files.
+    if obj.remove("__image_file_client").is_some() {
+        return Err(
+            "--image reads and encodes the file client-side (a ctl behavior the facade \
+             excludes); base64 the content yourself and pass --images \
+             '[{\"media_type\":..,\"data\":..,\"name\"?:..}]'"
+                .to_string(),
+        );
+    }
     // ctl's `--schema FILE|-` reads the multi-question JSON from the
     // caller's file or stdin — client I/O the pure registry excludes;
     // the refusal names the inline form.
@@ -2271,6 +2281,21 @@ mod tests {
         let err = plan_for_meta("act", &argv(&["ask", "--schema", "/srv/q.json"])).unwrap_err();
         assert!(err.contains("client-side"), "{err}");
         assert!(err.contains("--questions"), "{err}");
+        // Round 34: session note's file-reading --image is the same
+        // named exclusion class.
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "session",
+                "note",
+                "look at this",
+                "--image",
+                "/tmp/shot.png",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("client-side"), "{err}");
+        assert!(err.contains("--images"), "{err}");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[

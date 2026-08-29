@@ -364,6 +364,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("source", "source", Str, "short source label"),
             flag!("session", "session_id", Str, "post into another session"),
             flag!(
+                "image",
+                "__image_file_client",
+                StrList,
+                "ctl-side only: ctl reads and encodes the file — here pass --images"
+            ),
+            flag!(
                 "images",
                 "images",
                 Json,
