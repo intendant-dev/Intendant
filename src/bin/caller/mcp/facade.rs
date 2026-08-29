@@ -58,6 +58,11 @@ enum ValueKind {
     Bool,
     /// Repeatable string flag collected into a JSON array.
     StrList,
+    /// A literal JSON value (object/array/scalar) parsed from the argv
+    /// string at plan time — a parse failure is a plan error, never a
+    /// dispatch. The argv value is the JSON text itself; the CLI-side
+    /// `@file`/stdin expansions stay client-side as ever.
+    Json,
 }
 
 struct PositionalSpec {
@@ -114,6 +119,16 @@ const fn p_u64(name: &'static str, json_key: &'static str) -> PositionalSpec {
         json_key,
         kind: ValueKind::U64,
         required: true,
+        greedy: false,
+    }
+}
+
+const fn p_json(name: &'static str, json_key: &'static str, required: bool) -> PositionalSpec {
+    PositionalSpec {
+        name,
+        json_key,
+        kind: ValueKind::Json,
+        required,
         greedy: false,
     }
 }
@@ -627,6 +642,980 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         ],
         help: "Read the accessibility element tree",
     },
+    CommandSpec {
+        path: &["cu", "actions"],
+        lane: RiskLane::Act,
+        tool: "execute_cu_actions",
+        seed: "{}",
+        positionals: &[p_json("ACTIONS", "actions", true)],
+        flags: &[
+            flag!("target", "display_target", Str, "display target"),
+            flag!(
+                "coordinate-space",
+                "coordinate_space",
+                Str,
+                "pixel (default) or normalized_1000"
+            ),
+            flag!("observe", "observe", Str, "pixels|ax|auto|none"),
+            flag!("annotate", "annotate", Bool, "draw click crosshairs"),
+            flag!("settle", "settle", Json, "true/false or settle cap ms"),
+        ],
+        help: "Execute a JSON array of computer-use actions",
+    },
+    CommandSpec {
+        path: &["display", "create"],
+        lane: RiskLane::Act,
+        tool: "create_virtual_display",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("width", "width", U64, "width px (default 1920)"),
+            flag!("height", "height", U64, "height px (default 1080)"),
+        ],
+        help: "Create a virtual display",
+    },
+    CommandSpec {
+        path: &["display", "frames"],
+        lane: RiskLane::Inspect,
+        tool: "list_frames",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("stream", "stream", Str, "stream filter, e.g. display_99"),
+            flag!("count", "count", U64, "max frames (default 20)"),
+        ],
+        help: "List captured display frames",
+    },
+    CommandSpec {
+        path: &["display", "read-frame"],
+        lane: RiskLane::Inspect,
+        tool: "read_frame",
+        seed: "{}",
+        positionals: &[p_str("FRAME_ID", "frame_id", true, false)],
+        flags: &[flag!(
+            "stream",
+            "stream",
+            Str,
+            "stream filter when FRAME_ID is \"latest\""
+        )],
+        help: "Read one captured frame (\"latest\" works)",
+    },
+    CommandSpec {
+        path: &["display", "take"],
+        lane: RiskLane::Act,
+        tool: "take_display",
+        seed: "{}",
+        positionals: &[p_u64("DISPLAY_ID", "display_id")],
+        flags: &[],
+        help: "Claim a display for this agent",
+    },
+    CommandSpec {
+        path: &["display", "release"],
+        lane: RiskLane::Act,
+        tool: "release_display",
+        seed: "{}",
+        positionals: &[p_u64("DISPLAY_ID", "display_id")],
+        flags: &[flag!("note", "note", Str, "why control is released")],
+        help: "Release a claimed display",
+    },
+    CommandSpec {
+        path: &["display", "grant-user"],
+        lane: RiskLane::Authorize,
+        tool: "grant_user_display",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!(
+            "display-id",
+            "display_id",
+            U64,
+            "user-session display (omit = primary)"
+        )],
+        help: "Mint agent access to the user's session display",
+    },
+    CommandSpec {
+        path: &["display", "revoke-user"],
+        lane: RiskLane::Authorize,
+        tool: "revoke_user_display",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("display-id", "display_id", U64, "omit = primary"),
+            flag!("note", "note", Str, "why revoked"),
+        ],
+        help: "Revoke agent access to the user's session display",
+    },
+    CommandSpec {
+        path: &["display", "request"],
+        lane: RiskLane::Act,
+        tool: "request_user_display",
+        seed: "{}",
+        positionals: &[p_str("REASON", "reason", true, true)],
+        flags: &[
+            flag!(
+                "access",
+                "access",
+                Str,
+                "view (default) or view_and_control"
+            ),
+            flag!("wait", "wait_seconds", U64, "wait for decision (cap 600)"),
+            flag!("session", "session_id", Str, "attribution session id"),
+        ],
+        help: "Ask the user to share their display (asks only; blocks)",
+    },
+    CommandSpec {
+        path: &["browser", "providers"],
+        lane: RiskLane::Inspect,
+        tool: "browser_workspace_providers",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "List browser workspace providers",
+    },
+    CommandSpec {
+        path: &["browser", "list"],
+        lane: RiskLane::Inspect,
+        tool: "list_browser_workspaces",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "List browser workspaces",
+    },
+    CommandSpec {
+        path: &["browser", "create"],
+        lane: RiskLane::Act,
+        tool: "create_browser_workspace",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("url", "url", Str, "URL to open (omit = about:blank)"),
+            flag!("label", "label", Str, "dashboard label"),
+            flag!(
+                "provider",
+                "provider",
+                Str,
+                "auto|cdp|system_cdp|playwright|agent_browser|stream"
+            ),
+            flag!("owner-session", "owner_session_id", Str, "owning session"),
+            flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
+        ],
+        help: "Create a browser workspace",
+    },
+    CommandSpec {
+        path: &["browser", "close"],
+        lane: RiskLane::Act,
+        tool: "close_browser_workspace",
+        seed: "{}",
+        positionals: &[p_str("WORKSPACE_ID", "workspace_id", true, false)],
+        flags: &[flag!("reason", "reason", Str, "why closed")],
+        help: "Close a browser workspace",
+    },
+    CommandSpec {
+        path: &["browser", "acquire"],
+        lane: RiskLane::Act,
+        tool: "acquire_browser_workspace",
+        seed: "{}",
+        positionals: &[
+            p_str("WORKSPACE_ID", "workspace_id", true, false),
+            p_str("HOLDER_ID", "holder_id", true, false),
+        ],
+        flags: &[
+            flag!("holder-kind", "holder_kind", Str, "holder kind"),
+            flag!("note", "note", Str, "lease note"),
+            flag!("force", "force", Bool, "steal a live lease"),
+        ],
+        help: "Acquire a browser workspace lease",
+    },
+    CommandSpec {
+        path: &["browser", "release"],
+        lane: RiskLane::Act,
+        tool: "release_browser_workspace",
+        seed: "{}",
+        positionals: &[p_str("WORKSPACE_ID", "workspace_id", true, false)],
+        flags: &[
+            flag!("holder-id", "holder_id", Str, "holder releasing"),
+            flag!("note", "note", Str, "release note"),
+        ],
+        help: "Release a browser workspace lease",
+    },
+    CommandSpec {
+        path: &["shared", "show"],
+        lane: RiskLane::Act,
+        tool: "show_shared_view",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("target", "display_target", Str, "display target"),
+            flag!("display-id", "display_id", U64, "numeric display id"),
+            flag!("reason", "reason", Str, "why the user should watch"),
+            flag!(
+                "focus-region",
+                "focus_region",
+                Json,
+                "{\"x\":..,\"y\":..,\"width\":..,\"height\":..} normalized 0-1"
+            ),
+        ],
+        help: "Show the shared view of a display to the user",
+    },
+    CommandSpec {
+        path: &["shared", "focus"],
+        lane: RiskLane::Act,
+        tool: "focus_shared_view",
+        seed: "{}",
+        positionals: &[p_json("REGION", "region", true)],
+        flags: &[
+            flag!("target", "display_target", Str, "display target"),
+            flag!("display-id", "display_id", U64, "numeric display id"),
+            flag!("note", "note", Str, "short label"),
+        ],
+        help: "Focus the shared view on a normalized region",
+    },
+    CommandSpec {
+        path: &["shared", "focus-clear"],
+        lane: RiskLane::Act,
+        tool: "clear_shared_view_focus",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!("reason", "reason", Str, "why focus cleared")],
+        help: "Clear the shared-view focus region",
+    },
+    CommandSpec {
+        path: &["shared", "input"],
+        lane: RiskLane::Authorize,
+        tool: "request_shared_view_input",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("target", "display_target", Str, "display target"),
+            flag!("display-id", "display_id", U64, "numeric display id"),
+            flag!("reason", "reason", Str, "why input authority is wanted"),
+        ],
+        help: "Ask the user for shared-view input authority",
+    },
+    CommandSpec {
+        path: &["shared", "hide"],
+        lane: RiskLane::Act,
+        tool: "hide_shared_view",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!("reason", "reason", Str, "why dismissed")],
+        help: "Hide the shared view",
+    },
+    CommandSpec {
+        path: &["shared", "capture"],
+        lane: RiskLane::Inspect,
+        tool: "capture_shared_view_frame",
+        seed: "{}",
+        positionals: &[],
+        flags: &[
+            flag!("target", "display_target", Str, "display target"),
+            flag!("display-id", "display_id", U64, "numeric display id"),
+            flag!("reason", "reason", Str, "note in the shared-view banner"),
+        ],
+        help: "Capture one shared-view frame",
+    },
+    CommandSpec {
+        path: &["settings", "autonomy"],
+        lane: RiskLane::Authorize,
+        tool: "set_autonomy",
+        seed: "{}",
+        positionals: &[p_str("LEVEL", "level", true, false)],
+        flags: &[],
+        help: "Set the global autonomy level (low|medium|high|full)",
+    },
+    CommandSpec {
+        path: &["settings", "verbosity"],
+        lane: RiskLane::Act,
+        tool: "set_verbosity",
+        seed: "{}",
+        positionals: &[p_str("LEVEL", "level", true, false)],
+        flags: &[],
+        help: "Set output verbosity (quiet|normal|verbose|debug)",
+    },
+    CommandSpec {
+        path: &["remote", "start"],
+        lane: RiskLane::Authorize,
+        tool: "remote_command",
+        seed: r#"{"op":"start"}"#,
+        positionals: &[p_json("ARGV", "argv", true)],
+        flags: &[
+            flag!("host", "host", Str, "remote host selector"),
+            flag!("branch", "branch", Str, "branch to run on"),
+            flag!("cwd", "cwd", Str, "working directory"),
+            flag!("env", "env", Json, "environment object {\"K\":\"V\"}"),
+            flag!(
+                "source",
+                "source",
+                Str,
+                "git_revision (default) or working_tree"
+            ),
+            flag!(
+                "expected-revision",
+                "expected_revision",
+                Str,
+                "revision guard"
+            ),
+            flag!("cache", "cache", Str, "none (default) or durable_sccache"),
+            flag!("timeout-s", "timeout_s", U64, "1-3600 (default 900)"),
+        ],
+        help: "Start a remote command (ARGV is a JSON array of strings)",
+    },
+    CommandSpec {
+        path: &["remote", "status"],
+        lane: RiskLane::Authorize,
+        tool: "remote_command",
+        seed: r#"{"op":"status"}"#,
+        positionals: &[p_str("JOB_ID", "job_id", true, false)],
+        flags: &[],
+        help: "Remote job status (read semantics; rides the shell-spawn op)",
+    },
+    CommandSpec {
+        path: &["remote", "wait"],
+        lane: RiskLane::Authorize,
+        tool: "remote_command",
+        seed: r#"{"op":"wait"}"#,
+        positionals: &[p_str("JOB_ID", "job_id", true, false)],
+        flags: &[flag!("wait-s", "wait_s", U64, "one bounded wait, 1-60s")],
+        help: "Wait one bounded chunk for a remote job (chunk longer waits client-side)",
+    },
+    CommandSpec {
+        path: &["remote", "cancel"],
+        lane: RiskLane::Authorize,
+        tool: "remote_command",
+        seed: r#"{"op":"cancel"}"#,
+        positionals: &[p_str("JOB_ID", "job_id", true, false)],
+        flags: &[],
+        help: "Cancel a remote job",
+    },
+    CommandSpec {
+        path: &["agenda", "patch"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"patch"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_json("PATCH", "patch", true),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Merge-patch an item (absent = keep, null = clear)",
+    },
+    CommandSpec {
+        path: &["agenda", "reopen"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"reopen"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Reopen a completed/retired item",
+    },
+    CommandSpec {
+        path: &["agenda", "retire"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"retire"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Retire an item without completing it",
+    },
+    CommandSpec {
+        path: &["agenda", "pickup"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"pick_up"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Pick up an item to work it",
+    },
+    CommandSpec {
+        path: &["agenda", "acknowledge"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"acknowledge_answer"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Acknowledge an answered question",
+    },
+    CommandSpec {
+        path: &["agenda", "ask"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"ask"}"#,
+        positionals: &[p_json("QUESTIONS", "questions", true)],
+        flags: &[
+            flag!("body", "body", Str, "markdown body"),
+            flag!("tag", "tags", StrList, "tag (repeatable)"),
+            flag!("due-ms", "due_ms", U64, "reminder instant, ms since epoch"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Park a durable question (QUESTIONS is a JSON array)",
+    },
+    CommandSpec {
+        path: &["agenda", "block"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"set_blocker"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("CRITERION", "criterion", true, true),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Set a blocker criterion on an item",
+    },
+    CommandSpec {
+        path: &["agenda", "unblock"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"clear_blocker"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("BLOCKER_ID", "blocker_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Clear a blocker",
+    },
+    CommandSpec {
+        path: &["agenda", "relies-add"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_relies_on"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Add a relies-on edge",
+    },
+    CommandSpec {
+        path: &["agenda", "relies-remove"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"remove_relies_on"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Remove a relies-on edge",
+    },
+    CommandSpec {
+        path: &["agenda", "part-add"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_part_of"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("PARENT_ID", "parent_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Add a part-of placement",
+    },
+    CommandSpec {
+        path: &["agenda", "part-remove"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"remove_part_of"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("PARENT_ID", "parent_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Remove a part-of placement",
+    },
+    CommandSpec {
+        path: &["agenda", "place"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"place"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("UNDER", "under", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Re-parent an item under a hub",
+    },
+    CommandSpec {
+        path: &["agenda", "relates-add"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_relates_to"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[
+            flag!(
+                "link-kind",
+                "link_kind",
+                Str,
+                "closed relates-to vocabulary"
+            ),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Add a relates-to link",
+    },
+    CommandSpec {
+        path: &["agenda", "relates-remove"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"remove_relates_to"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("TARGET_ID", "target_id", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Remove a relates-to link",
+    },
+    CommandSpec {
+        path: &["agenda", "ref-add"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"add_ref"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("REF_TYPE", "ref_type", true, false),
+            p_str("LOCATOR", "locator", true, false),
+        ],
+        flags: &[
+            flag!("must-read", "must_read", Bool, "mark the ref must-read"),
+            flag!("label", "label", Str, "ref label"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Attach a ref (file|dir|memory|session|url + locator)",
+    },
+    CommandSpec {
+        path: &["agenda", "ref-remove"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"remove_ref"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("REF_TYPE", "ref_type", true, false),
+            p_str("LOCATOR", "locator", true, false),
+        ],
+        flags: &[flag!(
+            "source",
+            "source",
+            Str,
+            "self-described caller label"
+        )],
+        help: "Detach a ref",
+    },
+    CommandSpec {
+        path: &["agenda", "attest"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"attest"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("OCCURRENCE", "occurrence", true, false),
+            p_str("OUTCOME", "outcome", true, false),
+        ],
+        flags: &[
+            flag!("note", "note", Str, "attestation note"),
+            flag!(
+                "refs",
+                "refs",
+                Json,
+                "binding refs [{\"locator\":..,\"sha256\":..}] (digests computed client-side)"
+            ),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Attest an occurrence outcome",
+    },
+    CommandSpec {
+        path: &["agenda", "schedule"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"propose_effect"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_u64("FIRE_AT_MS", "fire_at_ms"),
+            p_str("GOAL", "goal", true, true),
+        ],
+        flags: &[
+            flag!("orchestrate", "orchestrate", Bool, "orchestrated session"),
+            flag!("interactive", "interactive", Bool, "interactive session"),
+            flag!("recurrence", "recurrence", Json, "{\"every_ms\":..}"),
+            flag!("agent-config", "agent_config", Json, "agent launch pins"),
+            flag!("trigger", "trigger", Json, "{\"kind\":\"on_unblock\"} etc."),
+            flag!("project-root", "project_root", Str, "project root"),
+            flag!(
+                "binding-refs",
+                "binding_refs",
+                Json,
+                "[{\"locator\":..,\"sha256\":..}] (digests computed client-side)"
+            ),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Propose a scheduled effect (owner approval binds it later)",
+    },
+    CommandSpec {
+        path: &["agenda", "stamp"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"stamp"}"#,
+        positionals: &[p_str("DEFINITION", "definition", true, false)],
+        flags: &[
+            flag!("project-root", "project_root", Str, "project root"),
+            flag!("fire-at-ms", "fire_at_ms", U64, "first fire instant"),
+            flag!("every-ms", "every_ms", U64, "recurrence period"),
+            flag!(
+                "suspend-after",
+                "suspend_after",
+                U64,
+                "suspend after N failures"
+            ),
+            flag!("agent-config", "agent_config", Json, "agent launch pins"),
+            flag!(
+                "annotation",
+                "annotations",
+                StrList,
+                "annotation (repeatable)"
+            ),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Stamp a sealed automation definition",
+    },
+    CommandSpec {
+        path: &["agenda", "request-occurrence"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"request_occurrence"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[],
+        help: "Request an out-of-schedule occurrence",
+    },
+    CommandSpec {
+        path: &["agenda", "approve"],
+        lane: RiskLane::Authorize,
+        tool: "agenda_op",
+        seed: r#"{"op":"approve_effect"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("DIGEST", "digest", true, false),
+        ],
+        flags: &[],
+        help: "Bind owner approval to a scheduled effect's manifest digest",
+    },
+    CommandSpec {
+        path: &["agenda", "revoke-schedule"],
+        lane: RiskLane::Authorize,
+        tool: "agenda_op",
+        seed: r#"{"op":"revoke_effect"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[],
+        help: "Revoke an approved scheduled effect",
+    },
+    CommandSpec {
+        path: &["agenda", "withdraw"],
+        lane: RiskLane::Act,
+        tool: "agenda_op",
+        seed: r#"{"op":"withdraw_effect"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[
+            flag!("reason", "reason", Str, "why withdrawn"),
+            flag!("source", "source", Str, "self-described caller label"),
+        ],
+        help: "Withdraw a proposed scheduled effect",
+    },
+    CommandSpec {
+        path: &["agenda", "start"],
+        lane: RiskLane::Authorize,
+        tool: "agenda_op",
+        seed: r#"{"op":"start_now"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[
+            flag!("goal", "goal", Str, "goal override"),
+            flag!("project-root", "project_root", Str, "project root"),
+            flag!("agent-config", "agent_config", Json, "agent launch pins"),
+        ],
+        help: "Mint, approve, and fire an item's session in one act (owner surface)",
+    },
+    CommandSpec {
+        path: &["memory", "accept"],
+        lane: RiskLane::Authorize,
+        tool: "memory_judge",
+        seed: r#"{"verdict":"accept"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!("reason", "reason", Str, "rationale")],
+        help: "Accept a proposed memory claim (owner curation)",
+    },
+    CommandSpec {
+        path: &["memory", "dispute"],
+        lane: RiskLane::Authorize,
+        tool: "memory_judge",
+        seed: r#"{"verdict":"dispute"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!("reason", "reason", Str, "rationale")],
+        help: "Dispute a memory claim (owner curation)",
+    },
+    CommandSpec {
+        path: &["memory", "retire"],
+        lane: RiskLane::Authorize,
+        tool: "memory_judge",
+        seed: r#"{"verdict":"retire"}"#,
+        positionals: &[p_str("ID", "id", true, false)],
+        flags: &[flag!("reason", "reason", Str, "rationale")],
+        help: "Retire a memory claim (owner curation)",
+    },
+    CommandSpec {
+        path: &["memory", "supersede"],
+        lane: RiskLane::Authorize,
+        tool: "memory_judge",
+        seed: r#"{"verdict":"supersede"}"#,
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("REPLACEMENT", "replacement", true, false),
+        ],
+        flags: &[flag!("reason", "reason", Str, "rationale")],
+        help: "Supersede a memory claim with a replacement (owner curation)",
+    },
+    CommandSpec {
+        path: &["controller", "status"],
+        lane: RiskLane::Inspect,
+        tool: "get_controller_loop_status",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "Controller loop status",
+    },
+    CommandSpec {
+        path: &["controller", "restart-status"],
+        lane: RiskLane::Inspect,
+        tool: "get_restart_status",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "Scheduled-restart status",
+    },
+    CommandSpec {
+        path: &["controller", "halt"],
+        lane: RiskLane::Authorize,
+        tool: "request_controller_loop_halt",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "Halt the controller loop (persistent; one-shot rides ctl)",
+    },
+    CommandSpec {
+        path: &["controller", "clear-halt"],
+        lane: RiskLane::Authorize,
+        tool: "clear_controller_loop_halt",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "Clear a controller loop halt",
+    },
+    CommandSpec {
+        path: &["controller", "intervene"],
+        lane: RiskLane::Authorize,
+        tool: "intervene_controller_loop",
+        seed: "{}",
+        positionals: &[p_str("MODE", "mode", true, false)],
+        flags: &[],
+        help: "Intervene in the controller loop (stop|abort)",
+    },
+    CommandSpec {
+        path: &["controller", "schedule"],
+        lane: RiskLane::Authorize,
+        tool: "schedule_controller_restart",
+        seed: "{}",
+        positionals: &[
+            p_str("CONTROLLER_ID", "controller_id", true, false),
+            p_str("GOAL", "north_star_goal", true, true),
+        ],
+        flags: &[
+            flag!("reason", "reason", Str, "why restart"),
+            flag!("after", "restart_after", Str, "turn_end (default) or now"),
+            flag!(
+                "command",
+                "restart_command",
+                Str,
+                "restart command override"
+            ),
+            flag!("auto-start", "auto_start_task", Bool, "auto-start the task"),
+            flag!("max-attempts", "max_attempts", U64, "default 1"),
+            flag!("cooldown-sec", "cooldown_sec", U64, "default 30"),
+        ],
+        help: "Schedule a controller restart",
+    },
+    CommandSpec {
+        path: &["controller", "cancel"],
+        lane: RiskLane::Authorize,
+        tool: "cancel_controller_restart",
+        seed: "{}",
+        positionals: &[],
+        flags: &[flag!(
+            "restart-id",
+            "restart_id",
+            Str,
+            "guard: reject on mismatch"
+        )],
+        help: "Cancel a scheduled controller restart",
+    },
+    CommandSpec {
+        path: &["controller", "complete"],
+        lane: RiskLane::Authorize,
+        tool: "controller_turn_complete",
+        seed: "{}",
+        positionals: &[
+            p_str("RESTART_ID", "restart_id", true, false),
+            p_str("TOKEN", "turn_complete_token", true, false),
+        ],
+        flags: &[
+            flag!("status", "status", Str, "completion status"),
+            flag!("handoff-summary", "handoff_summary", Str, "handoff summary"),
+        ],
+        help: "Report a controller turn complete",
+    },
+    CommandSpec {
+        path: &["audio", "spawn"],
+        lane: RiskLane::Authorize,
+        tool: "spawn_live_audio",
+        seed: "{}",
+        positionals: &[
+            p_str("ID", "id", true, false),
+            p_str("PROVIDER", "provider", true, false),
+        ],
+        flags: &[
+            flag!(
+                "playbook",
+                "playbook",
+                Str,
+                "system prompt / goal (required by the tool)"
+            ),
+            flag!(
+                "response-schema",
+                "response_schema",
+                Json,
+                "{\"fields\":[..]} (required by the tool)"
+            ),
+            flag!(
+                "timeout-secs",
+                "timeout_secs",
+                U64,
+                "hard timeout (default 300)"
+            ),
+            flag!("voice", "voice", Str, "voice name"),
+            flag!("model", "model", Str, "model override"),
+            flag!("initial-message", "initial_message", Str, "text sent first"),
+        ],
+        help: "Spawn a live audio session (openai|gemini)",
+    },
+    CommandSpec {
+        path: &["peer", "list"],
+        lane: RiskLane::Inspect,
+        tool: "list_peers",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "List federated peers",
+    },
+    CommandSpec {
+        path: &["peer", "message"],
+        lane: RiskLane::Act,
+        tool: "peer_send_message",
+        seed: "{}",
+        positionals: &[
+            p_str("PEER_ID", "peer_id", true, false),
+            p_str("MESSAGE", "message", true, true),
+        ],
+        flags: &[flag!("session", "session", Str, "peer-side session scope")],
+        help: "Send a message to a peer daemon",
+    },
+    CommandSpec {
+        path: &["peer", "task"],
+        lane: RiskLane::Authorize,
+        tool: "peer_delegate_task",
+        seed: "{}",
+        positionals: &[
+            p_str("PEER_ID", "peer_id", true, false),
+            p_str("INSTRUCTIONS", "instructions", true, true),
+        ],
+        flags: &[flag!("context", "context", Json, "free-form JSON context")],
+        help: "Delegate an autonomous task to a peer daemon",
+    },
+    CommandSpec {
+        path: &["context", "claim-fission"],
+        lane: RiskLane::Authorize,
+        tool: "claim_fission_canonical",
+        seed: "{}",
+        positionals: &[
+            p_str("GROUP_ID", "group_id", true, false),
+            p_str("BRANCH_SESSION_ID", "branch_session_id", true, false),
+        ],
+        flags: &[flag!(
+            "expected-canonical",
+            "expected_canonical_session_id",
+            Str,
+            "CAS guard"
+        )],
+        help: "Claim a fission branch as canonical (CAS over lineage)",
+    },
 ];
 
 /// The meta-tool names the facade serves.
@@ -757,6 +1746,9 @@ fn insert_value(
                 .ok_or_else(|| format!("{key}: not an array"))?
                 .push(serde_json::Value::String(raw.to_string()));
             return Ok(());
+        }
+        ValueKind::Json => {
+            serde_json::from_str(raw).map_err(|e| format!("{key}: expected literal JSON ({e})"))?
         }
     };
     obj.insert(key.to_string(), value);
@@ -982,6 +1974,7 @@ fn usage_line(spec: &CommandSpec) -> String {
         match flag.kind {
             ValueKind::Bool => out.push_str(&format!(" [--{}]", flag.name)),
             ValueKind::StrList => out.push_str(&format!(" [--{} V]…", flag.name)),
+            ValueKind::Json => out.push_str(&format!(" [--{} JSON]", flag.name)),
             _ => out.push_str(&format!(" [--{} V]", flag.name)),
         }
     }
@@ -1192,6 +2185,52 @@ mod tests {
         assert_eq!(planned.args["tags"], serde_json::json!(["house", "urgent"]));
     }
 
+    /// Json-kind values parse into real JSON at plan time — a structured
+    /// param arrives as an array/object on the wire, and malformed JSON
+    /// is a plan error that never dispatches.
+    #[test]
+    fn json_kind_values_parse_at_plan_time() {
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "cu",
+                "actions",
+                "[{\"type\":\"screenshot\"}]",
+                "--settle",
+                "250",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "execute_cu_actions");
+        assert_eq!(planned.args["actions"][0]["type"], "screenshot");
+        assert_eq!(planned.args["settle"], 250);
+        let err = plan_for_meta("act", &argv(&["cu", "actions", "{not json"])).unwrap_err();
+        assert!(err.contains("literal JSON"), "{err}");
+    }
+
+    /// Verdict seeds survive planning: the memory curation rows carry
+    /// their verdict in the seed and the positionals land beside it.
+    #[test]
+    fn seeded_verdict_rows_plan_complete_args() {
+        let planned = plan_for_meta(
+            "authorize",
+            &argv(&[
+                "memory",
+                "supersede",
+                "abc12345",
+                "def67890",
+                "--reason",
+                "newer",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.tool, "memory_judge");
+        assert_eq!(planned.args["verdict"], "supersede");
+        assert_eq!(planned.args["id"], "abc12345");
+        assert_eq!(planned.args["replacement"], "def67890");
+        assert_eq!(planned.args["reason"], "newer");
+    }
+
     #[test]
     fn plan_is_fail_closed_on_unknowns() {
         assert!(plan_for_meta("inspect", &argv(&["no-such"])).is_err());
@@ -1340,7 +2379,14 @@ mod tests {
         assert_eq!(facade_tool_advertised("docs", read_only), Some(true));
         assert_eq!(facade_tool_advertised("events", read_only), Some(true));
         assert_eq!(facade_tool_advertised("inspect", read_only), Some(true));
-        assert_eq!(facade_tool_advertised("act", read_only), Some(false));
+        // A display.view principal legitimately passes act rows now: the
+        // shared-view verbs mutate what the user WATCHES, and the daemon
+        // has always classed them under the view operation — so act is
+        // advertised. A principal holding only the pure-read ops still
+        // sees no act.
+        assert_eq!(facade_tool_advertised("act", read_only), Some(true));
+        let stats_only = |op: Op| matches!(op, Op::StatsRead | Op::SessionInspect);
+        assert_eq!(facade_tool_advertised("act", stats_only), Some(false));
         assert_eq!(facade_tool_advertised("authorize", read_only), Some(false));
         let approvals_only = |op: Op| op == Op::Approval;
         assert_eq!(

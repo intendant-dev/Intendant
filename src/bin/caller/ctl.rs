@@ -106,6 +106,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         }
         "dashboard-url" => run_dashboard_url(&config)?,
         "logs" => run_logs(&client, &config, &command[1..]).await?,
+        "events" => run_events(&client, &config, &command[1..]).await?,
         "tools" | "tool" => run_tools(&client, &config, &command[1..]).await?,
         "display" => run_display(&client, &config, &command[1..]).await?,
         "browser" | "browsers" => run_browser(&client, &config, &command[1..]).await?,
@@ -716,6 +717,143 @@ async fn run_logs(client: &reqwest::Client, config: &Config, raw: &[String]) -> 
     insert_usize(&mut map, "limit", args.one("--limit"))?;
     let response = call_tool(client, config, "get_logs", Value::Object(map)).await?;
     print_tool_response(response, config, None)
+}
+
+/// `ctl events`: the daemon lifecycle stream made CLI-shaped — the
+/// facade `events` verb driven with the remote-wait chunking idiom
+/// (client budget split into ≤60s server polls). One-shot by default
+/// (returns on the first delivered batch — the long-poll contract);
+/// `--follow` keeps streaming batches until the `--for` budget ends.
+/// Events print as NDJSON on stdout; the resumable cursor and gap
+/// warnings ride stderr so pipelines see only events.
+async fn run_events(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    ensure_help(raw, help_events)?;
+    let args = parse_command_args(
+        raw,
+        &["--since", "--for", "--filter", "--max"],
+        &["--follow"],
+    )?;
+    if let Some(extra) = args.positional.first() {
+        return Err(format!(
+            "events takes no positional arguments (got {extra:?})"
+        ));
+    }
+    let follow = args.bools.contains("--follow");
+    let total_s = match args.one("--for") {
+        Some(value) => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| format!("--for {value:?} is not a number of seconds"))?;
+            if parsed == 0 {
+                return Err("--for must be at least 1 second".to_string());
+            }
+            parsed
+        }
+        None => 900,
+    };
+    let max_events = match args.one("--max") {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("--max {value:?} is not a number"))?,
+        ),
+        None => None,
+    };
+    let mut since = args.one("--since").map(str::to_string);
+    let filter = args.one("--filter").map(str::to_string);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(total_s);
+    let mut delivered_any = false;
+    loop {
+        let remaining_s = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        if remaining_s == 0 {
+            break;
+        }
+        let mut params = Map::new();
+        if let Some(since) = &since {
+            params.insert("since".into(), Value::String(since.clone()));
+        }
+        params.insert("wait_s".into(), Value::from(remaining_s.clamp(1, 60)));
+        if let Some(filter) = &filter {
+            params.insert("filter".into(), Value::String(filter.clone()));
+        }
+        if let Some(max) = max_events {
+            params.insert("max_events".into(), Value::from(max));
+        }
+        let response = call_tool(client, config, "events", Value::Object(params)).await?;
+        if config.raw {
+            // Raw is a one-shot transport dump, matching the other verbs.
+            return print_json(&response);
+        }
+        let envelope = events_envelope(&response)?;
+        let events = envelope
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if config.json {
+            print_json(&envelope)?;
+        } else {
+            for event in &events {
+                println!(
+                    "{}",
+                    serde_json::to_string(event).map_err(|e| format!("serialize event: {e}"))?
+                );
+            }
+        }
+        if envelope.get("gap").and_then(Value::as_bool) == Some(true) {
+            eprintln!(
+                "events: gap — events were missed; resync state via the read commands and continue from the cursor below"
+            );
+        }
+        if let Some(cursor) = envelope.get("next_cursor").and_then(Value::as_str) {
+            since = Some(cursor.to_string());
+        }
+        delivered_any |= !events.is_empty();
+        if delivered_any && !follow {
+            break;
+        }
+    }
+    if !delivered_any {
+        eprintln!("events: nothing arrived within {total_s}s");
+    }
+    if let Some(cursor) = &since {
+        eprintln!("events: next cursor {cursor}");
+    }
+    Ok(())
+}
+
+/// Unwrap the `events` tool's `{ok, events, next_cursor, …}` envelope
+/// from a tools/call response, surfacing MCP and tool errors as ctl
+/// errors.
+fn events_envelope(response: &Value) -> Result<Value, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!(
+            "MCP error: {}",
+            serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string())
+        ));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = single_text_content(result)
+        .ok_or_else(|| "events result carried no text content".to_string())?;
+    let envelope: Value = serde_json::from_str(text)
+        .map_err(|_| format!("events returned unparseable output: {text}"))?;
+    match envelope.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(envelope),
+        Some(false) => Err(envelope
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or(text)
+            .to_string()),
+        None => Err(format!("events returned unexpected output: {text}")),
+    }
 }
 
 async fn run_tools(
@@ -5683,6 +5821,7 @@ Commands:\n\
   whoami                    This caller's gate-resolved identity: daemon + harness session ids, project root, log dir\n\
   dashboard-url             Print the local dashboard URL carrying this boot's loopback admission token\n\
   logs                      Read log entries\n\
+  events                    Long-poll the daemon lifecycle event stream (cursor-resumable)\n\
   tools                     Lazy MCP tool discovery and generic calls\n\
   display                   Displays, frames, screenshots, display claims\n\
   browser                   Browser workspaces and leases\n\
@@ -5745,6 +5884,21 @@ fn help_logs() {
     println!(
         "Usage: intendant ctl logs [--since-id N] [--level LEVEL] [--limit N]\n\
 Levels include info, model, agent, error, warn, subagent, debug."
+    );
+}
+
+fn help_events() {
+    println!(
+        "Usage: intendant ctl events [--since CURSOR] [--for SECS] [--filter NAMES] [--max N] [--follow]\n\
+\n\
+Long-poll the daemon's session/approval/task lifecycle event stream.\n\
+Returns on the first delivered batch (up to --for seconds, default 900,\n\
+chunked into <=60s server polls); --follow keeps streaming batches until\n\
+the budget ends. Events print as NDJSON on stdout; the resumable cursor\n\
+and gap warnings ride stderr, so pipelines see only events. --filter is\n\
+a comma-separated list of event names (e.g. approval_required); a gap\n\
+means events were missed — resync via the read commands and continue\n\
+from the printed cursor."
     );
 }
 
