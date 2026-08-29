@@ -26,14 +26,18 @@
 use crate::*;
 
 /// Handles for the session listeners every mode spawns first:
-/// the recording listener, the user-display grant/revoke listener, and
-/// the session-list cache invalidator.
+/// the recording listener, the user-display grant/revoke listener, the
+/// session-list cache invalidator, and the daemon event ring's bus fold
+/// (plus the ring itself, handed to the MCP state for the `events`
+/// long-poll verb).
 /// tokio tasks detach on drop; the struct mirrors the original
 /// keep-until-scope-end bindings.
 pub(crate) struct SessionListeners {
     pub(crate) _recording_listener: tokio::task::JoinHandle<()>,
     pub(crate) _user_display_listener: tokio::task::JoinHandle<()>,
     pub(crate) _session_list_cache_invalidator: tokio::task::JoinHandle<()>,
+    pub(crate) _event_ring_fold: tokio::task::JoinHandle<()>,
+    pub(crate) event_ring: Arc<crate::event_ring::EventRing>,
 }
 
 pub(crate) fn spawn_session_listeners(
@@ -54,10 +58,13 @@ pub(crate) fn spawn_session_listeners(
         Some(frame_registry.clone()),
     );
     let _session_list_cache_invalidator = spawn_session_list_cache_invalidator(bus.subscribe());
+    let (event_ring, _event_ring_fold) = crate::event_ring::start_event_ring(bus);
     SessionListeners {
         _recording_listener,
         _user_display_listener,
         _session_list_cache_invalidator,
+        _event_ring_fold,
+        event_ring,
     }
 }
 
@@ -250,6 +257,9 @@ pub(crate) fn spawn_mode_web_gateway(
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
     query_ctx: Option<web_gateway::WebQueryCtx>,
     active_session_log: Option<SharedSessionLog>,
+    // The daemon event ring from this mode's `SessionListeners`, wired
+    // into the MCP state for the `events` long-poll verb.
+    event_ring: Option<Arc<crate::event_ring::EventRing>>,
 ) -> Result<GatewaySpawn, CallerError> {
     let mut config = web_gateway::build_config(
         project.config.presence.live_provider.as_deref(),
@@ -314,6 +324,7 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.frame_registry = Some(frame_registry.clone());
     mcp_http_state.session_registry = Some(session_registry.clone());
     mcp_http_state.peer_registry = Some(peer_registry.clone());
+    mcp_http_state.event_ring = event_ring;
     mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
     // The gateway shape always has an answerable frontend: a dashboard can
     // attach while an `ask_user` blocks, so asks wait instead of

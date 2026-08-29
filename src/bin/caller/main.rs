@@ -53,6 +53,7 @@ pub(crate) use intendant_core::error;
 pub(crate) use intendant_display as display;
 mod display_peer_ids;
 mod event;
+mod event_ring;
 mod external_agent;
 mod external_wrapper_index;
 mod file_watcher;

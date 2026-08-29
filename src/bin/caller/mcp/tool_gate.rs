@@ -231,7 +231,7 @@ pub(crate) enum ToolProfileFamily {
     Core,
     Screen,
     Managed,
-    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): five tools,
+    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): six tools,
     /// everything else discovered lazily through help/docs.
     Facade,
 }
@@ -297,7 +297,9 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // guards a hypothetical ingress that skips gate-side resolution:
         // it falls to the restrictive default rather than anything
         // broader, and never authorizes the envelope as a whole.
-        "inspect" | "act" | "authorize" | "help" | "docs" => PeerOperation::RuntimeControl,
+        "inspect" | "act" | "authorize" | "help" | "docs" | "events" => {
+            PeerOperation::RuntimeControl
+        }
         // The terminal family (owner-ruled 2026-08-28: controlling agents
         // get terminal access, R2 tentatively at Operate). Reads ride
         // terminal.view; input/resize/close ride terminal.write; open is
@@ -581,6 +583,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             "docs",
             "The embedded Intendant operating skills: no argument lists them; a skill name returns its full text plus its support-file manifest; skill + file fetches one bundled support file (judgment and workflow guidance beyond command syntax).",
             crate::mcp::facade::FacadeDocsParams
+        ),
+    );
+    push(
+        "events",
+        manual_http_tool_definition!(
+            "events",
+            "Cursor long-poll over the daemon's session/approval/task lifecycle events. Omit since to start at now; pass wait_s (max 60) to block until something happens; re-poll with the returned next_cursor. gap=true means events were missed — resync via the read commands. filter is a comma-separated list of event names.",
+            crate::mcp::tools_events::EventsParams
         ),
     );
 

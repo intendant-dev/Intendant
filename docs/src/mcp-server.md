@@ -70,7 +70,7 @@ served display/CU and shared-view set — its allowlist also names the
 browser-workspace and raw frame tools, which currently have no served
 `tools/list` definitions anywhere and are reachable only by direct call;
 `managed` (alias `managed-context`) advertises `get_status` plus the managed
-rewind/fission set; `facade` advertises only the five meta-tools of the
+rewind/fission set; `facade` advertises only the six meta-tools of the
 CLI-shaped facade (next section); `full` — or omitting `tool_profile` —
 keeps the whole
 list, and unknown profile names fall back to the `core` bootstrap set (the
@@ -82,14 +82,22 @@ hidden HTTP tools remain callable (the lazy `ctl tools call` path).
 ### The facade profile
 
 `tool_profile=facade` is the context-efficient control surface: instead of a
-typed schema per capability, it advertises five meta-tools and everything
+typed schema per capability, it advertises six meta-tools and everything
 else is discovered lazily. `inspect`, `act`, and `authorize` each execute
 one registered command per call, named as an argv array
 (`{"argv":["agenda","list","--status","open"]}`) — risk-split so MCP hosts
 can auto-allow reads and gate authority-class calls per tool. `help` renders
 the command map from the registry (families first, then per-family usage
 lines with each command's lane); `docs` lists and fetches the embedded
-operating skills. A facade call is authorized as the **resolved** command's
+operating skills. `events` is the cursor long-poll over the daemon's
+session/approval/task lifecycle stream — omit `since` to start at now,
+pass `wait_s` (≤60) to block until something happens, re-poll with the
+returned `next_cursor`, and treat `gap: true` as "resync via the read
+commands". Its cursors are opaque, bound to the minting principal, and
+invalidated by a daemon restart (the error says so); the underlying ring
+ingests only the lifecycle families the `session.inspect` read tools
+already serve, so the stream is push semantics over existing authority,
+never new authority. A facade call is authorized as the **resolved** command's
 operation against the caller's principal, at every ingress, before any side
 effect — a parse failure never dispatches, and a command invoked through the
 wrong lane is redirected to the right tool by name. Argv values are literal

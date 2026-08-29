@@ -41,7 +41,7 @@ pub(crate) async fn run_headless_mode(
     let task = task.unwrap();
 
     let bus = EventBus::new();
-    let _session_listeners = startup::wiring::spawn_session_listeners(
+    let session_listeners = startup::wiring::spawn_session_listeners(
         &bus,
         &recording_registry,
         &session_registry,
@@ -443,6 +443,7 @@ pub(crate) async fn run_headless_mode(
             outbound_tx.clone(),
             query_ctx,
             Some(session_log.clone()),
+            Some(session_listeners.event_ring.clone()),
         )?;
         eprintln!("{}", gateway.log_line);
         headless_peer_registry = Some(gateway.peer_registry.clone());
