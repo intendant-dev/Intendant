@@ -1591,6 +1591,17 @@ mod tests {
         serde_json::json!({ "argv": parts })
     }
 
+    /// A platform-absolute test path: the absolute-locator check runs
+    /// on the daemon's own platform, so unix-spelled pins must speak
+    /// Windows paths on a Windows test host.
+    fn abs_path(unix: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix.replace('/', "\\"))
+        } else {
+            unix.to_string()
+        }
+    }
+
     #[test]
     fn plan_builds_seeded_tagged_args() {
         let planned = plan_for_meta(
@@ -2374,12 +2385,14 @@ mod tests {
         let err =
             plan_for_meta("act", &argv(&["agenda", "ref", "item-1", "file:notes.md"])).unwrap_err();
         assert!(err.contains("absolute path"), "{err}");
+        let abs = abs_path("/srv/notes.md");
+        let file_ref = format!("file:{abs}");
         let planned = plan_for_meta(
             "act",
-            &argv(&["agenda", "add", "x", "--ref", "file:/srv/notes.md"]),
+            &argv(&["agenda", "add", "x", "--ref", file_ref.as_str()]),
         )
         .unwrap();
-        assert_eq!(planned.args["refs"][0]["locator"], "/srv/notes.md");
+        assert_eq!(planned.args["refs"][0]["locator"], abs.as_str());
         // Round 30: the shared-focus positional speaks the same CSV as
         // --region, and ctl's browser path aliases resolve.
         let planned = plan_for_meta("act", &argv(&["shared", "focus", "0,0,1,1"])).unwrap();
@@ -2812,13 +2825,14 @@ mod tests {
             .is_err(),
             "kind types the link being added"
         );
+        let abs = abs_path("/srv/notes.md");
         let planned = plan_for_meta(
             "act",
             &argv(&[
                 "agenda",
                 "ref",
                 "item-1",
-                "/srv/notes.md",
+                abs.as_str(),
                 "--type",
                 "file",
                 "--must-read",
