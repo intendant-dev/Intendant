@@ -179,10 +179,12 @@ fn insert_value(
     let value =
         match kind {
             ValueKind::Str => serde_json::Value::String(raw.to_string()),
-            ValueKind::U64 => serde_json::Value::from(
-                raw.parse::<u64>()
-                    .map_err(|_| format!("{key}: expected an unsigned integer, got {raw:?}"))?,
-            ),
+            ValueKind::U64 => serde_json::Value::from(raw.parse::<u64>().map_err(|_| {
+                format!(
+                    "{key}: expected an unsigned integer, got {:?}",
+                    shown_value(raw)
+                )
+            })?),
             ValueKind::Bool => serde_json::Value::Bool(true),
             ValueKind::StrList => {
                 let entry = obj
@@ -201,7 +203,17 @@ fn insert_value(
             // The clock/timezone-dependent forms resolve at dispatch;
             // planning stays pure by carrying the raw text.
             ValueKind::When => serde_json::Value::String(format!("__when:{raw}")),
-            ValueKind::Interval => serde_json::Value::from(crate::ctl::parse_duration_ms(raw)?),
+            ValueKind::Interval => {
+                // Bounded before ctl's parser, whose refusals echo the
+                // raw value — planning runs pre-auth (security review).
+                if raw.len() > 64 {
+                    return Err(format!(
+                        "{key}: interval too long ({} bytes; try 45m, 2h, 7d, 1w, or ms)",
+                        raw.len()
+                    ));
+                }
+                serde_json::Value::from(crate::ctl::parse_duration_ms(raw)?)
+            }
         };
     obj.insert(key.to_string(), value);
     Ok(())
@@ -1176,11 +1188,35 @@ fn ref_type_and_locator(raw: &str, explicit: Option<&str>) -> Result<(String, St
     Ok((ref_type, locator.to_string()))
 }
 
+/// Cap a caller value reflected into a planning error: planning runs
+/// during the ingress gate's resolution — BEFORE the operation check —
+/// so an oversized value must never be echoed wholesale (security
+/// review: pre-auth reflection is a memory lever).
+fn shown_value(raw: &str) -> String {
+    if raw.chars().count() > 48 {
+        let mut cut: String = raw.chars().take(48).collect();
+        cut.push('…');
+        cut
+    } else {
+        raw.to_string()
+    }
+}
+
 /// Parse ctl's compact region CSV ("x,y,width,height", normalized 0-1)
 /// into the region object the display tools take; `flag` names the
 /// spelling in refusals.
 fn region_from_csv(flag: &str, csv: &serde_json::Value) -> Result<serde_json::Value, String> {
     let text = csv.as_str().unwrap_or_default();
+    // Bounded BEFORE parsing or reflecting: planning runs pre-auth in
+    // the ingress gate, and an unbounded CSV would be collected into a
+    // Vec<f64> (an 8 MB probe cost ~49 MB RSS) before IAM could deny
+    // the call (security review). Four normalized floats fit easily.
+    if text.len() > 128 {
+        return Err(format!(
+            "--{flag} expects x,y,width,height (got {} bytes)",
+            text.len()
+        ));
+    }
     let parts: Vec<f64> = text
         .split(',')
         .map(|p| p.trim().parse::<f64>())
@@ -2859,6 +2895,41 @@ mod tests {
         .unwrap();
         assert_eq!(planned.args["occurrence"], "occ-1");
         assert_eq!(planned.args["outcome"], "achieved");
+    }
+
+    /// Planning runs pre-auth in the ingress gate, so an oversized
+    /// value must refuse cheaply — before any per-element collection —
+    /// and must never be reflected near its own size (security
+    /// review: the region CSV is byte-capped ahead of its Vec<f64>,
+    /// and plan-error reflections are char-capped).
+    #[test]
+    fn oversized_values_refuse_cheaply_without_reflection() {
+        let huge = "1,".repeat(1 << 20);
+        let err = plan_for_meta(
+            "act",
+            &argv(&["shared", "focus", "--region", huge.as_str()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("bytes"), "{err}");
+        assert!(err.len() < 200, "reflected {} bytes", err.len());
+        let err = plan_for_meta(
+            "act",
+            &argv(&[
+                "agenda",
+                "schedule",
+                "item-1",
+                "--goal",
+                "g",
+                "--at",
+                "+1h",
+                "--every",
+                huge.as_str(),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.len() < 200, "reflected {} bytes", err.len());
+        let err = plan_for_meta("act", &argv(&["ask", "q", "--wait", huge.as_str()])).unwrap_err();
+        assert!(err.len() < 200, "reflected {} bytes", err.len());
     }
 
     /// Wrap raw args in a [`PlannedCall`] for a named registry row —
