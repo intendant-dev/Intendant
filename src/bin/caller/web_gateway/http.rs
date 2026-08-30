@@ -382,6 +382,24 @@ pub(crate) fn http_header_present(header_text: &str, header_name: &str) -> bool 
     http_header_value(header_text, header_name).is_some()
 }
 
+/// Every field line of a repeatable header, in order of appearance.
+/// List-valued fields (`Accept`, `Accept-Encoding`, …) may legally
+/// arrive split across several field lines — RFC 9110 folds them into
+/// one comma-joined list — so list semantics must consult all of them;
+/// [`http_header_value`] sees only the first line and is for singleton
+/// fields.
+pub(crate) fn http_header_values<'a>(
+    header_text: &'a str,
+    header_name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    header_text.lines().skip(1).filter_map(move |line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(header_name)
+            .then_some(value.trim())
+    })
+}
+
 /// Whether the request head's `Accept-Encoding` admits gzip (tolerant:
 /// case-insensitive header name and token, `x-gzip` alias, `;q=0` rejects).
 pub(crate) fn accept_encoding_allows_gzip(header_text: &str) -> bool {
@@ -1484,6 +1502,20 @@ pub(crate) fn extract_header_value(header_text: &str, name: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Repeatable headers fold across field lines: the plural reader
+    /// returns every occurrence in order, while the singleton reader
+    /// keeps its first-line contract.
+    #[test]
+    fn header_values_folds_repeated_field_lines() {
+        let head = "POST /mcp HTTP/1.1\r\naccept: application/json\r\nAccept: text/event-stream\r\nHost: h\r\n\r\n";
+        assert_eq!(
+            http_header_values(head, "accept").collect::<Vec<_>>(),
+            vec!["application/json", "text/event-stream"]
+        );
+        assert_eq!(http_header_value(head, "accept"), Some("application/json"));
+        assert_eq!(http_header_values(head, "x-absent").next(), None);
+    }
 
     #[test]
     fn http_response_builder_reproduces_legacy_framing_byte_for_byte() {

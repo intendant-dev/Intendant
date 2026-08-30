@@ -55,6 +55,40 @@ pub(crate) fn fission_tool(name: &str) -> bool {
     )
 }
 
+/// The held-POST verbs: tools whose handlers can hold one `tools/call`
+/// past a ~60 s client/proxy idle window because they block on a human
+/// or on a long timer. The HTTP transport answers these as per-request
+/// SSE when the caller accepts it (`web_gateway::mcp_gate`); every
+/// other tool answers as plain JSON. The classification lives here,
+/// beside the other per-tool classifications, so a new held verb is
+/// declared once instead of mirrored into the gateway.
+///
+/// - `ask_user` — waits up to `ASK_USER_MAX_WAIT_SECS` (900 s) on the
+///   human's answer.
+/// - `request_user_display` — waits on the display-grant decision
+///   (caller-set `wait_secs`).
+/// - `spawn_live_audio` — always-consent gate
+///   (`live_audio::SPAWN_CONSENT_WAIT`, 300 s), then the voice
+///   conversation runs to its own completion.
+/// - `fission_control` — `op=wait` blocks up to 300 s
+///   (`clamp_fission_wait_timeout_s`); the quick ops answer in one
+///   frame, which the stream carries just as well.
+///
+/// Deliberately not held — capped at or under the window: the `events`
+/// long-poll (`EVENTS_WAIT_MAX_S` = 60, pinned by the test below), the
+/// cloud CU round trip (60 s), and the codex thread-action waits
+/// (20 s).
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 4] = [
+    "ask_user",
+    "request_user_display",
+    "spawn_live_audio",
+    "fission_control",
+];
+
+pub(crate) fn mcp_held_post_tool(name: &str) -> bool {
+    MCP_HELD_POST_TOOLS.contains(&name)
+}
+
 pub(crate) fn with_default_mcp_session_id(
     mut args: serde_json::Value,
     session_id: Option<&str>,
@@ -1836,6 +1870,58 @@ mod tests {
                     "router tool `{}` must declare a `\"type\": \"object\"` schema root \
                      — the stdio transport serves it verbatim",
                     tool.name
+                );
+            }
+        });
+    }
+
+    /// The held-POST classification tracks the real tool surface: every
+    /// held name is an advertised router tool, so a rename breaks here
+    /// instead of silently downgrading the verb to the plain JSON
+    /// answer that dies at the idle timeout; and the `events` long-poll
+    /// — deliberately excluded — stays at or under the window the
+    /// exclusion assumed, so raising its cap forces reclassification.
+    #[test]
+    fn held_post_classification_tracks_the_tool_surface() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        assert!(
+            crate::mcp::tools_events::EVENTS_WAIT_MAX_S <= 60,
+            "the events long-poll cap crossed the held-POST window: move `events` into MCP_HELD_POST_TOOLS"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            // Hidden-but-callable is a real category (`spawn_live_audio`
+            // and `fission_control` have dispatch arms but no listing),
+            // so no listing can be the universe: run each held name
+            // through the real dispatch with unparseable args instead. A
+            // live arm fails fast on its typed params; only a renamed or
+            // removed tool produces the unknown-tool fall-through.
+            let control = server
+                .call_tool_by_name_for_session(
+                    "definitely_not_a_tool",
+                    serde_json::json!([]),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("the unknown-tool probe must refuse");
+            assert!(
+                control.contains("Unknown tool"),
+                "the dispatch fall-through moved — reanchor this pin: {control}"
+            );
+            for held in MCP_HELD_POST_TOOLS {
+                let outcome = server
+                    .call_tool_by_name_for_session(held, serde_json::json!([]), None, None)
+                    .await;
+                assert!(
+                    !matches!(&outcome, Err(error) if error.contains("Unknown tool")),
+                    "held-POST tool `{held}` has no dispatch arm (renamed?)"
                 );
             }
         });

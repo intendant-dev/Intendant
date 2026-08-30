@@ -601,12 +601,9 @@ pub(crate) async fn handle_mcp_http_request(
     })
 }
 
-/// The held-POST verbs whose calls can outlive client and proxy idle
-/// timeouts (an ask waits up to 900 s on the human; a display request
-/// waits on the grant): per-request SSE keeps those responses warm.
-/// Everything shorter answers as plain JSON — `events` and the remote
-/// waits already self-chunk under 60 s.
-const MCP_SSE_STREAMED_TOOLS: [&str; 2] = ["ask_user", "request_user_display"];
+// Which verbs stream is not this gate's call: `crate::mcp` classifies
+// its held-POST tools (`mcp_held_post_tool`) beside its other per-tool
+// gates, and this file only carries the SSE mechanics.
 const MCP_SSE_KEEPALIVE_SECS: u64 = 15;
 /// A progress token is a correlation handle (spec: string or integer),
 /// not a payload: reflecting it in every keepalive means an unbounded
@@ -657,7 +654,10 @@ struct McpSsePlan {
 }
 
 fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
-    let accepts_sse = http_header_value(header_text, "accept").is_some_and(accepts_event_stream);
+    // `Accept` is list-valued and may legally arrive split across
+    // repeated field lines; fold every line (the parser is an ANY over
+    // comma-separated ranges, so per-line ANY equals the joined list).
+    let accepts_sse = http_header_values(header_text, "accept").any(accepts_event_stream);
     if !accepts_sse {
         return None;
     }
@@ -673,11 +673,11 @@ fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    if !MCP_SSE_STREAMED_TOOLS.contains(&name) {
+    if !crate::mcp::mcp_held_post_tool(name) {
         static NULL_ARGS: serde_json::Value = serde_json::Value::Null;
         let args = params.get("arguments").unwrap_or(&NULL_ARGS);
         let tool = crate::mcp::facade_resolved_tool(name, args)?;
-        if !MCP_SSE_STREAMED_TOOLS.contains(&tool) {
+        if !crate::mcp::mcp_held_post_tool(tool) {
             return None;
         }
     }
@@ -1295,6 +1295,41 @@ mod tests {
                 .unwrap()
                 .progress_token,
             Some(serde_json::json!(42))
+        );
+        // Every held verb streams, not just the ask pair: the
+        // consent-gated and long-poll tools ride the same
+        // classification.
+        for held in crate::mcp::MCP_HELD_POST_TOOLS {
+            let call = serde_json::json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": held, "arguments": {} },
+            })
+            .to_string();
+            assert!(
+                mcp_sse_plan(sse_headers, &call).is_some(),
+                "held verb `{held}` must stream"
+            );
+        }
+    }
+
+    /// `Accept` is list-valued: a client may legally split the list
+    /// across repeated field lines, and selection folds every line —
+    /// a first-line-only read would silently downgrade a compliant
+    /// held call to the plain JSON answer that dies at the idle
+    /// timeout.
+    #[test]
+    fn sse_selection_folds_repeated_accept_field_lines() {
+        let ask = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "ask_user", "arguments": { "question": "go?" } },
+        })
+        .to_string();
+        let split = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\nAccept: text/event-stream\r\n\r\n";
+        assert!(mcp_sse_plan(split, &ask).is_some());
+        let rejected = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\nAccept: text/event-stream;q=0\r\n\r\n";
+        assert!(
+            mcp_sse_plan(rejected, &ask).is_none(),
+            "a q=0 rejection on a later line is still a rejection"
         );
     }
 

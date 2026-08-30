@@ -28,8 +28,11 @@ use super::*;
 use crate::event_ring::{EventRing, RingEntry};
 use std::sync::Arc;
 
-/// Long-poll ceiling — the `remote wait` chunk contract.
-const EVENTS_WAIT_MAX_S: u64 = 60;
+/// Long-poll ceiling — the `remote wait` chunk contract. Also the
+/// reason `events` stays out of `MCP_HELD_POST_TOOLS`: at or under this
+/// cap a call answers before a ~60 s idle window closes, so it takes
+/// plain JSON, not per-request SSE (`tool_gate` pins the pairing).
+pub(crate) const EVENTS_WAIT_MAX_S: u64 = 60;
 const EVENTS_PAGE_DEFAULT: usize = 100;
 const EVENTS_PAGE_MAX: usize = 500;
 
