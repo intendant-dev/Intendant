@@ -693,6 +693,20 @@ fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
     Some(McpSsePlan { progress_token })
 }
 
+/// The SSE response head. `X-Accel-Buffering: no` orders nginx-family
+/// reverse proxies not to buffer the stream — a proxy that holds the
+/// 15 s frames until the request completes recreates exactly the idle
+/// silence the stream exists to prevent.
+fn sse_response_head(mcp_cors: &str) -> String {
+    HttpResponse::new("200 OK")
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .header_segment(mcp_cors)
+        .header("Connection", "close")
+        .into_string()
+}
+
 /// One SSE event frame. Compact JSON carries no raw newlines, but data
 /// lines split defensively — a newline inside a data payload would
 /// otherwise break the frame grammar.
@@ -804,19 +818,6 @@ pub(crate) async fn handle_mcp_post(
         // per-tool decision still runs inside the dispatch, and a
         // denial simply arrives as the stream's only message.
         if let Some(plan) = mcp_sse_plan(header_text, &body_text) {
-            let head = HttpResponse::new("200 OK")
-                .header("Content-Type", "text/event-stream")
-                .header("Cache-Control", "no-cache")
-                .header_segment(&mcp_cors)
-                .header("Connection", "close")
-                .into_string();
-            // Flushed, not just written: over TLS a completed write can
-            // leave ciphertext buffered, and the whole point of the
-            // stream is 15 s of guaranteed WIRE activity (review).
-            if stream.write_all(head.as_bytes()).await.is_err() || stream.flush().await.is_err() {
-                finalize_http_stream(&mut stream).await;
-                return;
-            }
             let call = handle_mcp_http_request(
                 &body_text,
                 mcp,
@@ -828,12 +829,23 @@ pub(crate) async fn handle_mcp_post(
                 &bus,
             );
             tokio::pin!(call);
+            // Establish the stream. Flushed, not just written: over TLS
+            // a completed write can leave ciphertext buffered, and the
+            // whole point of the stream is 15 s of guaranteed WIRE
+            // activity. If the head cannot be written — the client or a
+            // proxy reset between delivering the POST and reading the
+            // response — the accepted call still runs to its own
+            // completion below: plain-POST semantics never let a
+            // disconnect cancel a held verb, so only the writing is
+            // skipped.
+            let head = sse_response_head(&mcp_cors);
+            let mut client_gone =
+                stream.write_all(head.as_bytes()).await.is_err() || stream.flush().await.is_err();
             let mut keepalive =
                 tokio::time::interval(std::time::Duration::from_secs(MCP_SSE_KEEPALIVE_SECS));
             keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             keepalive.tick().await; // consume the immediate first tick
             let mut ticks = 0u64;
-            let mut client_gone = false;
             let outcome = loop {
                 tokio::select! {
                     outcome = &mut call => break outcome,
@@ -1374,6 +1386,24 @@ mod tests {
         assert_eq!(payload["method"], "notifications/progress");
         assert_eq!(payload["params"]["progressToken"], "tok-1");
         assert_eq!(payload["params"]["progress"], 3);
+    }
+
+    /// The SSE head carries the stream contract end to end: 200, the
+    /// event-stream content type, no-cache, the caller's CORS segment,
+    /// and the anti-buffering order — an nginx-family proxy that holds
+    /// the 15 s frames until completion would recreate exactly the idle
+    /// silence the stream exists to prevent.
+    #[test]
+    fn sse_response_head_defeats_proxy_buffering() {
+        let head = sse_response_head("Access-Control-Allow-Origin: https://a\r\nVary: Origin\r\n");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Content-Type: text/event-stream\r\n"));
+        assert!(head.contains("Cache-Control: no-cache\r\n"));
+        assert!(head.contains("X-Accel-Buffering: no\r\n"));
+        assert!(head.contains("Access-Control-Allow-Origin: https://a\r\n"));
+        assert!(head.contains("Vary: Origin\r\n"));
+        assert!(head.contains("Connection: close\r\n"));
+        assert!(head.ends_with("\r\n\r\n"));
     }
 
     /// The stateless `/mcp` endpoint negotiates `initialize` per spec: echo

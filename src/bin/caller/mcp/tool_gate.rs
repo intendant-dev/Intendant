@@ -73,16 +73,26 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 /// - `fission_control` — `op=wait` blocks up to 300 s
 ///   (`clamp_fission_wait_timeout_s`); the quick ops answer in one
 ///   frame, which the stream carries just as well.
+/// - `execute_cu_actions` — a caller-supplied action list sleeps its
+///   `wait`/`hold_key` millisecond durations verbatim
+///   (`computer_use.rs`), so a sequence legitimately outlives the
+///   window.
+/// - `peer_execute_cu_actions` — the same caller-paced actions run on
+///   a federated peer, bounded only by `PEER_MCP_TIMEOUT` (120 s).
 ///
-/// Deliberately not held — capped at or under the window: the `events`
-/// long-poll (`EVENTS_WAIT_MAX_S` = 60, pinned by the test below), the
-/// cloud CU round trip (60 s), and the codex thread-action waits
-/// (20 s).
-pub(crate) const MCP_HELD_POST_TOOLS: [&str; 4] = [
+/// Deliberately not held — quick by design, with caps at or under the
+/// window: the `events` long-poll (`EVENTS_WAIT_MAX_S` = 60, pinned by
+/// the test below), the cloud CU round trip (60 s), and the codex
+/// thread-action waits (20 s). The remaining peer round trips share
+/// `PEER_MCP_TIMEOUT` as a transport bound, but they are sub-second
+/// lookups — a cap is a bound, not a hold (the `events` reading).
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 6] = [
     "ask_user",
     "request_user_display",
     "spawn_live_audio",
     "fission_control",
+    "execute_cu_actions",
+    "peer_execute_cu_actions",
 ];
 
 pub(crate) fn mcp_held_post_tool(name: &str) -> bool {
