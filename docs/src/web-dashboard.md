@@ -2277,7 +2277,7 @@ response omits the header.
 | POST | `/api/peers/{peer_id}/dashboard-control-webrtc` | federation (per method/path) | own origin | bounded | Relay dashboard-control WebRTC signaling to a connected peer |
 | any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peers sub-router catch-all (handler-owned JSON 404/405 for unknown subpaths and undeclared methods) |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
-| POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
+| POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications; held-POST verbs answer as per-request SSE when accepted) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
 | DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
 <!-- gateway-route-table:end -->

@@ -601,6 +601,87 @@ pub(crate) async fn handle_mcp_http_request(
     })
 }
 
+/// The held-POST verbs whose calls can outlive client and proxy idle
+/// timeouts (an ask waits up to 900 s on the human; a display request
+/// waits on the grant): per-request SSE keeps those responses warm.
+/// Everything shorter answers as plain JSON — `events` and the remote
+/// waits already self-chunk under 60 s.
+const MCP_SSE_STREAMED_TOOLS: [&str; 2] = ["ask_user", "request_user_display"];
+const MCP_SSE_KEEPALIVE_SECS: u64 = 15;
+
+/// The per-request SSE decision for one `POST /mcp` body (MCP
+/// Streamable HTTP, 2026-07-28 shape: the server may answer any POST
+/// as an event stream). Streams only when the client accepts
+/// `text/event-stream`, the message is a `tools/call` REQUEST (an id —
+/// notifications take their 202), and the named (or facade-resolved)
+/// tool is a held-POST verb. Argument VALUES are never parsed here —
+/// facade resolution is argv-only, the same pre-auth cost class as the
+/// gate.
+struct McpSsePlan {
+    /// The client's `_meta.progressToken`, when it sent one: keepalives
+    /// ride as `notifications/progress` events. Without it they ride as
+    /// SSE comment lines (progress notifications require the token).
+    progress_token: Option<serde_json::Value>,
+}
+
+fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
+    let accepts_sse = http_header_value(header_text, "accept")
+        .is_some_and(|accept| accept.to_ascii_lowercase().contains("text/event-stream"));
+    if !accepts_sse {
+        return None;
+    }
+    let msg: serde_json::Value = serde_json::from_str(body_text).ok()?;
+    if msg.get("id").is_none_or(serde_json::Value::is_null) {
+        return None;
+    }
+    if msg.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let params = msg.get("params")?;
+    let name = params
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !MCP_SSE_STREAMED_TOOLS.contains(&name) {
+        static NULL_ARGS: serde_json::Value = serde_json::Value::Null;
+        let args = params.get("arguments").unwrap_or(&NULL_ARGS);
+        let tool = crate::mcp::facade_resolved_tool(name, args)?;
+        if !MCP_SSE_STREAMED_TOOLS.contains(&tool) {
+            return None;
+        }
+    }
+    let progress_token = params
+        .get("_meta")
+        .and_then(|meta| meta.get("progressToken"))
+        .cloned();
+    Some(McpSsePlan { progress_token })
+}
+
+/// One SSE event frame. Compact JSON carries no raw newlines, but data
+/// lines split defensively — a newline inside a data payload would
+/// otherwise break the frame grammar.
+fn sse_frame(event: &str, data: &str) -> String {
+    let mut out = format!("event: {event}\n");
+    for line in data.split('\n') {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// A spec-shaped `notifications/progress` keepalive (progress counts
+/// ticks; no total — the held verbs have none).
+fn sse_progress_frame(token: &serde_json::Value, ticks: u64) -> String {
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": token, "progress": ticks },
+    });
+    sse_frame("message", &notification.to_string())
+}
+
 // Parameter count rides until a request-context bundle collapses the
 // shared per-connection arguments (open cleanup; not load-bearing).
 #[allow(clippy::too_many_arguments)]
@@ -678,6 +759,76 @@ pub(crate) async fn handle_mcp_post(
         };
         let (mcp_session_id, codex_managed_context, tool_profile) =
             mcp_context_from_request_line(request_line);
+        // Per-request SSE (Streamable HTTP): a held-POST verb whose
+        // client accepts an event stream answers as one — keepalives
+        // (progress notifications when the request carried a token)
+        // every 15 s defeat client/proxy idle timeouts, then the final
+        // JSON-RPC response closes the stream. Everything else keeps
+        // the plain-JSON leg below. Authorization is unchanged: the
+        // per-tool decision still runs inside the dispatch, and a
+        // denial simply arrives as the stream's only message.
+        if let Some(plan) = mcp_sse_plan(header_text, &body_text) {
+            let head = HttpResponse::new("200 OK")
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header_segment(&mcp_cors)
+                .header("Connection", "close")
+                .into_string();
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+            let call = handle_mcp_http_request(
+                &body_text,
+                mcp,
+                mcp_session_id.as_deref(),
+                codex_managed_context,
+                tool_profile.as_deref(),
+                &mcp_access,
+                mcp_gate_session(header_text),
+                &bus,
+            );
+            tokio::pin!(call);
+            let mut keepalive =
+                tokio::time::interval(std::time::Duration::from_secs(MCP_SSE_KEEPALIVE_SECS));
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            keepalive.tick().await; // consume the immediate first tick
+            let mut ticks = 0u64;
+            let mut client_gone = false;
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut call => break outcome,
+                    _ = keepalive.tick(), if !client_gone => {
+                        ticks += 1;
+                        let frame = match &plan.progress_token {
+                            Some(token) => sse_progress_frame(token, ticks),
+                            None => ": keepalive\n\n".to_string(),
+                        };
+                        if stream.write_all(frame.as_bytes()).await.is_err() {
+                            // The client hung up. The verb still runs to
+                            // completion — plain-POST semantics, where a
+                            // disconnect is only ever noticed at the
+                            // final write — so an in-flight ask keeps
+                            // its own lifecycle.
+                            client_gone = true;
+                        }
+                    }
+                }
+            };
+            if !client_gone {
+                let final_frame = match outcome {
+                    McpHttpOutcome::Response(resp) => {
+                        sse_frame("message", &serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                    // Unreachable for a planned tools/call request
+                    // (notifications never plan); close the stream bare.
+                    McpHttpOutcome::Accepted => String::new(),
+                };
+                let _ = stream.write_all(final_frame.as_bytes()).await;
+            }
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let outcome = handle_mcp_http_request(
             &body_text,
             mcp,
@@ -974,6 +1125,104 @@ pub(crate) fn mcp_agent_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-request SSE plan fires only for the exact intersection:
+    /// an event-stream-accepting client, a `tools/call` REQUEST, and a
+    /// held-POST verb (typed name or facade-resolved) — and it lifts
+    /// the client's progress token when one rides the request. Values
+    /// are never parsed: a facade call with garbage arguments still
+    /// plans by its argv alone.
+    #[test]
+    fn sse_plan_gates_on_accept_request_shape_and_held_verbs() {
+        let sse_headers =
+            "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json, text/event-stream\r\n\r\n";
+        let json_headers = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\n\r\n";
+        let ask = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "ask_user", "arguments": { "question": "go?" } },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &ask).is_some());
+        assert!(
+            mcp_sse_plan(json_headers, &ask).is_none(),
+            "no event-stream accept, no stream"
+        );
+        // A short verb answers as plain JSON even when SSE is accepted.
+        let status = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "get_status", "arguments": {} },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &status).is_none());
+        // Notifications (no id) never stream; nor do non-call methods.
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0", "method": "tools/call",
+            "params": { "name": "ask_user", "arguments": {} },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &notification).is_none());
+        let list = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &list).is_none());
+        // Facade resolution is argv-only: `act ["ask", ...]` streams.
+        let facade_ask = serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "act", "arguments": { "argv": ["ask", "which one?"] } },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &facade_ask).is_some());
+        let facade_status = serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "inspect", "arguments": { "argv": ["status"] } },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &facade_status).is_none());
+        // The progress token rides out of _meta when present.
+        let with_token = serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {
+                "name": "ask_user",
+                "arguments": { "question": "go?" },
+                "_meta": { "progressToken": "tok-1" },
+            },
+        })
+        .to_string();
+        let plan = mcp_sse_plan(sse_headers, &with_token).unwrap();
+        assert_eq!(plan.progress_token, Some(serde_json::json!("tok-1")));
+        assert!(mcp_sse_plan(sse_headers, &ask)
+            .unwrap()
+            .progress_token
+            .is_none());
+    }
+
+    /// SSE frames follow the event-stream grammar: an event line, one
+    /// data line per payload line, a blank terminator; the progress
+    /// frame is a spec-shaped notifications/progress message.
+    #[test]
+    fn sse_frames_speak_the_event_stream_grammar() {
+        assert_eq!(
+            sse_frame("message", "{\"a\":1}"),
+            "event: message\ndata: {\"a\":1}\n\n"
+        );
+        assert_eq!(
+            sse_frame("message", "line1\nline2"),
+            "event: message\ndata: line1\ndata: line2\n\n"
+        );
+        let frame = sse_progress_frame(&serde_json::json!("tok-1"), 3);
+        assert!(frame.starts_with("event: message\ndata: "));
+        assert!(frame.ends_with("\n\n"));
+        let payload: serde_json::Value = serde_json::from_str(
+            frame
+                .trim_start_matches("event: message\ndata: ")
+                .trim_end(),
+        )
+        .unwrap();
+        assert_eq!(payload["method"], "notifications/progress");
+        assert_eq!(payload["params"]["progressToken"], "tok-1");
+        assert_eq!(payload["params"]["progress"], 3);
+    }
 
     /// The stateless `/mcp` endpoint negotiates `initialize` per spec: echo
     /// a requested revision it implements, otherwise answer with the newest
