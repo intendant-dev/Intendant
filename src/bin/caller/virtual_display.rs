@@ -5,7 +5,7 @@
 //! fleet display live from the browser". This module lets a frontend create
 //! (and destroy) an Xvfb display through the exact machinery agent sessions
 //! use: `vision::launch_display` for the process, `activate_user_display`
-//! for the capture session, `DisplayReady`/`DisplayCaptureLost` for the
+//! for the capture session, and distinct ready/create-failed events for the
 //! outcome.
 //!
 //! Ownership model: a created display is **daemon-owned** — like an
@@ -19,7 +19,7 @@
 //! loss reaps it explicitly.
 
 use crate::display;
-use crate::display_glue::{activate_user_display, report_user_display_capture_unavailable};
+use crate::display_glue::activate_user_display;
 use crate::event::{AppEvent, EventBus};
 use crate::frames;
 use crate::types::LogLevel;
@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 /// Xvfb guards for dashboard-created virtual displays, keyed by display
 /// number. Owned as plain task-local state by the user-display listener —
-/// single consumer, no locking. Dropping a guard kills the Xvfb and cleans
-/// its X lock/socket.
+/// single consumer, no locking. Async teardown asks the exact child to exit;
+/// Drop hard-kills that child without waiting. Ambiguous residual X state is
+/// preserved and skipped.
 pub(crate) type VirtualDisplayGuards = HashMap<u32, vision::XvfbGuard>;
 
 /// Default resolution for a dashboard-created display. Human-facing desktop
@@ -45,11 +46,6 @@ const MIN_WIDTH: u32 = 320;
 const MIN_HEIGHT: u32 = 240;
 const MAX_WIDTH: u32 = 3840;
 const MAX_HEIGHT: u32 = 2160;
-
-/// Failure-report id for platforms where no display number is ever
-/// allocated. Must never match a real capture session: the
-/// DisplayCaptureLost handler tears down whatever session carries the id.
-const VIRTUAL_DISPLAY_UNSUPPORTED_SENTINEL: u32 = u32::MAX;
 
 /// Resolve requested dimensions: defaults for omitted axes, bounds-checked,
 /// rounded down to even (VP8 rejects odd frame dimensions).
@@ -71,8 +67,7 @@ pub(crate) fn virtual_display_dimensions(
 /// Handle `ControlMsg::CreateVirtualDisplay`: launch an Xvfb at a free
 /// display number and register its capture session so every dashboard gets
 /// a streaming tile. All failure paths report through
-/// `DisplayCaptureLost` — the dashboard surfaces that as an error toast —
-/// and never leave an unguarded Xvfb behind.
+/// `VirtualDisplayCreateFailed` and never leave an unguarded Xvfb behind.
 pub(crate) async fn create_virtual_display(
     bus: &EventBus,
     session_registry: &display::SharedSessionRegistry,
@@ -81,16 +76,10 @@ pub(crate) async fn create_virtual_display(
     width: Option<u32>,
     height: Option<u32>,
 ) {
-    // Unsupported platforms bail before any display number is chosen. The
-    // error still flows through DisplayCaptureLost (the channel dashboards
-    // and MCP callers toast), but against a sentinel id: with no allocation
-    // the natural fallback id is 0, and the DisplayCaptureLost handler
-    // tears down whatever live session matches — a failed macOS create once
-    // killed the real display-0 capture that way.
+    // Unsupported platforms bail before any display lifecycle exists.
     if !vision::virtual_displays_supported() {
-        report_user_display_capture_unavailable(
+        report_virtual_display_create_failed(
             bus,
-            VIRTUAL_DISPLAY_UNSUPPORTED_SENTINEL,
             "virtual display create failed: virtual displays are Xvfb-based and Linux-only; \
              use \"Your display\" to stream this machine's desktop instead",
         );
@@ -112,17 +101,25 @@ pub(crate) async fn create_virtual_display(
     let (width, height) = match virtual_display_dimensions(width, height) {
         Ok(dims) => dims,
         Err(reason) => {
-            // No display number was consumed; report against the display
-            // the allocator would pick so the toast is still actionable.
-            let config = vision::virtual_display_config(DEFAULT_WIDTH, DEFAULT_HEIGHT, &exclude);
-            let id = virtual_target_id(&config);
-            report_user_display_capture_unavailable(bus, id, reason);
+            report_virtual_display_create_failed(bus, reason);
             return;
         }
     };
 
-    let config = vision::virtual_display_config(width, height, &exclude);
-    let display_id = virtual_target_id(&config);
+    let Some(config) = vision::virtual_display_config(width, height, &exclude) else {
+        report_virtual_display_create_failed(
+            bus,
+            "virtual display create failed: no unoccupied X display is available",
+        );
+        return;
+    };
+    let Some(display_id) = virtual_target_id(&config) else {
+        report_virtual_display_create_failed(
+            bus,
+            "virtual display create failed: allocator returned a non-virtual target",
+        );
+        return;
+    };
 
     match vision::launch_display(&config).await {
         Ok(guard) => {
@@ -141,42 +138,47 @@ pub(crate) async fn create_virtual_display(
             // guarded Xvfb running with no tile and no way to destroy it.
             // (`get_any` for symmetry — this is lifecycle bookkeeping, not
             // an agent lookup, though virtual displays are never hidden.)
-            if session_registry.read().await.get_any(display_id).is_none()
-                && guards.remove(&display_id).is_some()
-            {
-                eprintln!("[virtual_display] :{display_id} activation failed — Xvfb reaped");
+            if session_registry.read().await.get_any(display_id).is_none() {
+                reap_virtual_display(guards, display_id, "activation failed").await;
             }
         }
         Err(e) => {
-            report_user_display_capture_unavailable(bus, display_id, create_failure_reason(&e));
+            report_virtual_display_create_failed(bus, create_failure_reason(&e));
         }
     }
 }
 
-/// Drop the guard for a dashboard-created display, killing its Xvfb and
-/// cleaning the X lock/socket. Returns whether this display was ours.
+fn report_virtual_display_create_failed(bus: &EventBus, reason: impl Into<String>) {
+    let reason = reason.into();
+    eprintln!("[virtual_display] {reason}");
+    bus.send(AppEvent::VirtualDisplayCreateFailed { reason });
+}
+
+/// Drop the guard for a dashboard-created display, stopping its exact Xvfb
+/// child while preserving any ambiguous residual X state. Returns whether
+/// this display was ours.
 /// Reaped on tile close (`UserDisplayRevoked`) and on capture loss (the
 /// Xvfb died, or activation never produced a session).
-pub(crate) fn reap_virtual_display(
+pub(crate) async fn reap_virtual_display(
     guards: &mut VirtualDisplayGuards,
     display_id: u32,
     context: &str,
 ) -> bool {
-    if guards.remove(&display_id).is_some() {
+    if let Some(guard) = guards.remove(&display_id) {
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
+        guard.shutdown().await;
         true
     } else {
         false
     }
 }
 
-fn virtual_target_id(config: &vision::DisplayConfig) -> u32 {
+fn virtual_target_id(config: &vision::DisplayConfig) -> Option<u32> {
     match config.target {
-        DisplayTarget::Virtual { id } => id,
-        // virtual_display_config always returns a Virtual target; keep a
-        // sane value if that invariant ever changes rather than panicking
-        // in the listener task.
-        DisplayTarget::UserSession => 0,
+        DisplayTarget::Virtual { id } => Some(id),
+        // `virtual_display_config` promises a virtual target. Fail closed if
+        // that invariant ever changes: display 0 may be a real user session.
+        DisplayTarget::UserSession => None,
     }
 }
 
@@ -229,11 +231,44 @@ mod tests {
         assert!(err.contains("out of range"), "{err}");
     }
 
-    #[test]
-    fn reap_is_scoped_to_created_displays() {
+    #[tokio::test]
+    async fn reap_is_scoped_to_created_displays() {
         let mut guards = VirtualDisplayGuards::new();
         // Nothing created from the dashboard: reap must refuse — agent
         // Xvfbs and user displays are not ours to kill.
-        assert!(!reap_virtual_display(&mut guards, 99, "test"));
+        assert!(!reap_virtual_display(&mut guards, 99, "test").await);
+    }
+
+    #[test]
+    fn user_session_target_never_falls_back_to_display_zero() {
+        let config = vision::DisplayConfig {
+            target: DisplayTarget::UserSession,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        };
+        assert_eq!(virtual_target_id(&config), None);
+    }
+
+    #[tokio::test]
+    async fn unallocated_failure_cannot_collide_with_max_display_session() {
+        let backend = Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let session = Arc::new(crate::display::DisplaySession::new(u32::MAX, backend));
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry
+            .write()
+            .await
+            .insert(u32::MAX, Arc::clone(&session));
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        report_virtual_display_create_failed(&bus, "virtual display create failed: exhausted");
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::VirtualDisplayCreateFailed { .. }
+        ));
+        assert!(registry.read().await.get_any(u32::MAX).is_some());
     }
 }

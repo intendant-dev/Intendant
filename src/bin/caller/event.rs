@@ -739,6 +739,13 @@ pub enum AppEvent {
         reason: String,
     },
 
+    /// A virtual-display create request failed before any display lifecycle
+    /// existed. Deliberately carries no display id: consumers must never
+    /// interpret this as capture loss or tear down a registered session.
+    VirtualDisplayCreateFailed {
+        reason: String,
+    },
+
     /// The OS screen-share approval dialog has been raised on the guest
     /// desktop and we're waiting for the user to approve. The dashboard
     /// surfaces this as a banner so a remote user (e.g. via the web UI)
@@ -2592,13 +2599,14 @@ pub enum ControlMsg {
     /// that gives a claimed headless box a working display without any
     /// agent tool call. The daemon allocates the display number, launches
     /// Xvfb through the same machinery agent sessions use, registers a
-    /// capture session, and announces it with `DisplayReady`; failures
-    /// surface as `DisplayCaptureLost` with an actionable reason. The
+    /// capture session, and announces it with `DisplayReady`; pre-lifecycle
+    /// failures surface as `VirtualDisplayCreateFailed` with an actionable
+    /// reason. The
     /// created display is daemon-owned: closing its tile
     /// (`RevokeUserDisplay` on its id) destroys it, a graceful daemon exit
-    /// drops its guard, and a hard kill leaves it to the standard Xvfb
-    /// orphan-reclaim on the next allocation (signal shutdown is
-    /// `process::exit` — no `Drop`). Linux-only mechanism — other
+    /// drops its guard, and a hard kill leaves fail-closed residue that later
+    /// allocations skip (signal shutdown is `process::exit` — no `Drop`).
+    /// Linux-only mechanism — other
     /// platforms report a clear error.
     CreateVirtualDisplay {
         /// Optional resolution; defaults to 1920x1080. Values are clamped
@@ -3869,6 +3877,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 reason: reason.clone(),
             })
         }
+        AppEvent::VirtualDisplayCreateFailed { reason } => Some(OutboundEvent::LogEntry {
+            level: "error".to_string(),
+            source: "display".to_string(),
+            content: reason.clone(),
+            turn: None,
+            session_id: None,
+            user_turn_index: None,
+            user_turn_revision: None,
+            replacement_for_user_turn_index: None,
+            attachments: Vec::new(),
+        }),
         AppEvent::DisplayApprovalPending {
             display_id,
             backend,
@@ -4258,6 +4277,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::DisplayTaken { .. }
             | AppEvent::DisplayReleased { .. }
             | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCreateFailed { .. }
             | AppEvent::DisplayApprovalPending { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::UserDisplayGranted { .. }
@@ -4508,6 +4528,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::DisplayCaptureLost { display_id, reason } => {
             log.warn(&format!("Display :{} capture lost: {}", display_id, reason));
+        }
+        AppEvent::VirtualDisplayCreateFailed { reason } => {
+            log.warn(reason);
         }
         AppEvent::DisplayApprovalPending {
             display_id,
@@ -6626,6 +6649,24 @@ mod tests {
                 height: Some(800)
             }
         ));
+    }
+
+    #[test]
+    fn virtual_display_create_failure_wire_is_not_a_lifecycle_event() {
+        let outbound = app_event_to_outbound(&AppEvent::VirtualDisplayCreateFailed {
+            reason: "virtual display create failed: exhausted".to_string(),
+        })
+        .expect("create failure is visible to frontends");
+        let value = serde_json::to_value(outbound).unwrap();
+        assert_eq!(
+            value.get("event").and_then(serde_json::Value::as_str),
+            Some("log_entry")
+        );
+        assert_eq!(
+            value.get("source").and_then(serde_json::Value::as_str),
+            Some("display")
+        );
+        assert!(value.get("display_id").is_none());
     }
 
     #[test]

@@ -1473,14 +1473,16 @@ pub(crate) async fn handle_control_command_mcp(
         ControlMsg::CreateVirtualDisplay { .. } => {
             // The user-display listener (spawned in every mode) owns the
             // actual work — Xvfb launch, capture session, DisplayReady /
-            // DisplayCaptureLost — by consuming this same bus event. This
-            // arm only acknowledges receipt on the MCP control surface.
+            // DisplayCaptureLost, or an id-free create-failure log entry —
+            // by consuming this same bus event. This arm only acknowledges
+            // receipt on the MCP control surface.
             emit_control_result(
                 control_tx,
                 "create_virtual_display",
                 true,
                 "virtual display creation requested — outcome arrives as \
-                 display_ready or display_capture_lost"
+                 display_ready, display_capture_lost after allocation, or an \
+                 error log_entry before a display lifecycle exists"
                     .to_string(),
                 None,
             );
@@ -1814,6 +1816,41 @@ mod tests {
                 .await
                 .is_err(),
             "standalone refusals must not forward lifecycle commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_virtual_display_ack_names_pre_lifecycle_failure_surface() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let bus = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::CreateVirtualDisplay {
+                width: Some(1280),
+                height: Some(800),
+            },
+        )
+        .await;
+
+        assert_eq!(resource, Some(RESOURCE_LOGS_URI));
+        let event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for create_virtual_display command_result")
+            .expect("broadcast recv failed");
+        let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(json["event"], "command_result");
+        assert_eq!(json["action"], "create_virtual_display");
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["message"],
+            "virtual display creation requested — outcome arrives as display_ready, \
+             display_capture_lost after allocation, or an error log_entry before a \
+             display lifecycle exists"
         );
     }
 
