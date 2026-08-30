@@ -1612,6 +1612,8 @@ async fn start_worker_display_session(
     // `state` only receives the Xvfb guard, which exists on Linux alone.
     #[cfg(not(target_os = "linux"))]
     let _ = &mut *state;
+    #[cfg(target_os = "linux")]
+    let mut launched_xvfb = None;
 
     let mock_synthetic = std::env::var("INTENDANT_MOCK_DISPLAY").as_deref() == Ok("synthetic")
         && std::env::var("PROVIDER").as_deref() == Ok("mock");
@@ -1633,16 +1635,20 @@ async fn start_worker_display_session(
             let id = match existing {
                 Some(id) => id,
                 None => {
-                    let id = crate::vision::conventional_virtual_display().unwrap_or(99);
-                    let config = crate::vision::DisplayConfig {
-                        target: intendant_platform::DisplayTarget::Virtual { id },
-                        width: 1280,
-                        height: 800,
+                    let config = worker_virtual_display_config_in(std::path::Path::new("/tmp"))?;
+                    let intendant_platform::DisplayTarget::Virtual { id } = config.target else {
+                        return Err(
+                            "worker display allocator returned a non-virtual target".to_string()
+                        );
                     };
                     let guard = crate::vision::launch_display(&config)
                         .await
                         .map_err(|e| format!("launch Xvfb for the worker display: {e}"))?;
-                    state._xvfb = Some(guard);
+                    // Keep the exact-child guard local until the capture
+                    // backend and session have both started. Any startup
+                    // error before then drops it immediately instead of
+                    // leaving a failed display alive in worker state.
+                    launched_xvfb = Some(guard);
                     id
                 }
             };
@@ -1674,7 +1680,21 @@ async fn start_worker_display_session(
         .await
         .insert(display_id, Arc::clone(&session));
     state.registry = Some(registry);
+    #[cfg(target_os = "linux")]
+    {
+        state._xvfb = launched_xvfb;
+    }
     Ok((display_id, session))
+}
+
+#[cfg(target_os = "linux")]
+fn worker_virtual_display_config_in(
+    lock_dir: &std::path::Path,
+) -> Result<crate::vision::DisplayConfig, String> {
+    crate::vision::virtual_display_config_in(lock_dir, 1280, 800, &[]).ok_or_else(|| {
+        "worker display needs an unoccupied X display in the Intendant virtual-display range"
+            .to_string()
+    })
 }
 
 /// Ensure the worker display session exists, creating it on first use.
@@ -2416,6 +2436,45 @@ async fn serve_worker_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_allocator_skips_occupied_99_and_selects_100() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".X11-unix")).unwrap();
+        let lock = tmp.path().join(".X99-lock");
+        std::fs::write(&lock, b"foreign\n").unwrap();
+
+        let config = worker_virtual_display_config_in(tmp.path()).unwrap();
+        assert!(matches!(
+            config.target,
+            intendant_platform::DisplayTarget::Virtual { id: 100 }
+        ));
+        assert_eq!(std::fs::read(lock).unwrap(), b"foreign\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_allocator_propagates_exhaustion_without_launching() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".X11-unix")).unwrap();
+        for id in 99..200 {
+            std::fs::write(tmp.path().join(format!(".X{id}-lock")), b"occupied\n").unwrap();
+        }
+
+        let error = worker_virtual_display_config_in(tmp.path())
+            .err()
+            .expect("fully occupied range must fail");
+        assert!(error.contains("unoccupied X display"), "{error}");
+        assert_eq!(
+            std::fs::read(tmp.path().join(".X99-lock")).unwrap(),
+            b"occupied\n"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".X199-lock")).unwrap(),
+            b"occupied\n"
+        );
+    }
 
     #[test]
     fn tokens_are_single_use_and_expiring() {

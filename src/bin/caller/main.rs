@@ -1225,7 +1225,12 @@ async fn maybe_auto_launch_xvfb(
         });
         return;
     }
-    let config = vision::display_config_for_provider(provider_name);
+    let Some(config) = vision::display_config_for_provider(provider_name) else {
+        slog(session_log, |l| {
+            l.warn("No unoccupied virtual display is available; skipping Xvfb auto-launch")
+        });
+        return;
+    };
     let trigger = if facts.has_capture_screen {
         "captureScreen"
     } else {
@@ -3075,7 +3080,8 @@ pub fn spawn_user_display_listener(
                         &mut virtual_display_guards,
                         display_id,
                         "tile closed",
-                    );
+                    )
+                    .await;
                 }
                 Ok(AppEvent::DisplayCaptureLost {
                     display_id,
@@ -3095,7 +3101,8 @@ pub fn spawn_user_display_listener(
                         &mut virtual_display_guards,
                         display_id,
                         "capture lost",
-                    );
+                    )
+                    .await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     // A missed grant/revoke/capture-loss leaves no trustworthy
@@ -3109,7 +3116,12 @@ pub fn spawn_user_display_listener(
                          closing all display sessions fail-closed"
                     );
                     let sessions = session_registry.write().await.drain();
-                    virtual_display_guards.clear();
+                    // Gracefully reap guards concurrently. Serially awaiting
+                    // each bounded shutdown here would compound the timeout
+                    // and make lag recovery itself keep falling behind.
+                    for (_, guard) in std::mem::take(&mut virtual_display_guards) {
+                        tokio::spawn(guard.shutdown());
+                    }
                     for session in sessions {
                         tokio::spawn(async move {
                             session.stop().await;

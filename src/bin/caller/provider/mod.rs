@@ -1064,12 +1064,12 @@ pub fn select_cu_provider(
                 CallerError::Config("CU provider=gemini but no GEMINI_API_KEY found.".into())
             })?;
             let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
-            let display = crate::vision::display_config_for_provider("gemini");
+            let display = crate::vision::display_resolution_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             let mut p = GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.cu_enabled = true;
-            p.cu_display = Some((display.width, display.height));
+            p.cu_display = Some(display);
             Ok(Box::new(p))
         }
         Some("anthropic") => {
@@ -1077,12 +1077,12 @@ pub fn select_cu_provider(
                 CallerError::Config("CU provider=anthropic but no ANTHROPIC_API_KEY found.".into())
             })?;
             let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
-            let display = crate::vision::display_config_for_provider("anthropic");
+            let display = crate::vision::display_resolution_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             let mut p = AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.cu_enabled = true;
-            p.cu_display = Some((display.width, display.height));
+            p.cu_display = Some(display);
             Ok(Box::new(p))
         }
         Some("openai") => {
@@ -1091,12 +1091,12 @@ pub fn select_cu_provider(
                 return Err(chatgpt_native_cu_error());
             }
             let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
-            let display = crate::vision::display_config_for_provider("openai");
+            let display = crate::vision::display_resolution_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             let mut p = OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.set_cu_enabled(true);
-            p.cu_display = Some((display.width, display.height));
+            p.cu_display = Some(display);
             Ok(Box::new(p))
         }
         Some(other) => Err(CallerError::Config(format!(
@@ -1111,7 +1111,7 @@ pub fn select_cu_provider(
             let chatgpt_openai_only = matches!(&openai_key, Some(OpenAIAuth::ChatGpt));
             if let Some(OpenAIAuth::ApiKey(key)) = openai_key {
                 let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
-                let display = crate::vision::display_config_for_provider("openai");
+                let display = crate::vision::display_resolution_for_provider("openai");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
                 let mut p = OpenAIProvider::new_with_tools(
@@ -1122,27 +1122,27 @@ pub fn select_cu_provider(
                     escalate_tools,
                 );
                 p.set_cu_enabled(true);
-                p.cu_display = Some((display.width, display.height));
+                p.cu_display = Some(display);
                 Ok(Box::new(p))
             } else if let Some(key) = anthropic_key {
                 let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
-                let display = crate::vision::display_config_for_provider("anthropic");
+                let display = crate::vision::display_resolution_for_provider("anthropic");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
                 let mut p =
                     AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
                 p.cu_enabled = true;
-                p.cu_display = Some((display.width, display.height));
+                p.cu_display = Some(display);
                 Ok(Box::new(p))
             } else if let Some(key) = gemini_key {
                 let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
-                let display = crate::vision::display_config_for_provider("gemini");
+                let display = crate::vision::display_resolution_for_provider("gemini");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
                 let mut p =
                     GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
                 p.cu_enabled = true;
-                p.cu_display = Some((display.width, display.height));
+                p.cu_display = Some(display);
                 Ok(Box::new(p))
             } else {
                 if chatgpt_openai_only {

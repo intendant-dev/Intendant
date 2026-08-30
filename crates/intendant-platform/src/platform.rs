@@ -140,6 +140,27 @@ pub fn request_graceful_terminate(pid: u32) -> bool {
     }
 }
 
+/// Create a FIFO for Unix-only lock-file regression tests. Keeping this tiny
+/// wrapper here preserves `platform.rs` as the crate's documented unsafe
+/// island; production code never calls it.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn create_test_fifo(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "FIFO test path contains an interior NUL",
+        )
+    })?;
+    // SAFETY: `path` is a live NUL-terminated string and mode 0600 is valid.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Return the main display's dimensions on macOS, in **points** (the
 /// logical/global display coordinate space), not backing pixels.
 ///

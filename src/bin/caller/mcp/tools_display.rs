@@ -143,16 +143,15 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
+        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
     )]
     pub(crate) async fn create_virtual_display(
         &self,
         Parameters(params): Parameters<CreateVirtualDisplayParams>,
     ) -> String {
-        // Outcome events carry only a display id, so the fresh display is
-        // recognized by not having existed before the request (the
-        // unsupported-platform failure uses a sentinel id, which is
-        // likewise never a live id).
+        // Ready events carry the allocated display id; pre-lifecycle failures
+        // have their own id-free event and therefore cannot collide with or
+        // retire any registered display session.
         let session_registry = self.state.read().await.session_registry.clone();
         let known: std::collections::HashSet<u32> =
             crate::display::enumerate_displays_with_sessions(&session_registry)
@@ -188,16 +187,15 @@ impl IntendantServer {
                          federated peers now."
                     );
                 }
-                Ok(Ok(AppEvent::DisplayCaptureLost { display_id, reason }))
-                    if !known.contains(&display_id) =>
-                {
-                    // The handler's failure reasons already carry this
-                    // prefix (virtual_display.rs phrases them for the
-                    // dashboard's capture-lost surface); only bare
-                    // reasons need it added.
+                Ok(Ok(AppEvent::VirtualDisplayCreateFailed { reason })) => {
                     if reason.starts_with("virtual display create failed") {
                         return reason;
                     }
+                    return format!("virtual display create failed: {reason}");
+                }
+                Ok(Ok(AppEvent::DisplayCaptureLost { display_id, reason }))
+                    if !known.contains(&display_id) =>
+                {
                     return format!("virtual display create failed: {reason}");
                 }
                 Ok(Ok(_)) => continue,

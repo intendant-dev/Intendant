@@ -36,25 +36,16 @@ impl Drop for DebugScreen {
 }
 
 /// Find a free display in the 50-59 range for debug use.
-/// On non-Linux platforms the X lock file helpers are stubs, so this
-/// returns the first display in range immediately.
+/// Every lock- or socket-backed slot is skipped; this path never reclaims a
+/// live server or removes ambiguous filesystem state.
 #[allow(dead_code)]
-pub fn find_free_debug_display() -> u32 {
-    for id in DEBUG_DISPLAY_MIN..=DEBUG_DISPLAY_MAX {
-        let lock = format!("/tmp/.X{}-lock", id);
-        if !std::path::Path::new(&lock).exists() {
-            return id;
-        }
-        if vision::is_lock_stale(&lock) {
-            vision::remove_stale_lock(id);
-            return id;
-        }
-        if vision::is_our_xvfb(&lock, id) {
-            vision::kill_and_reclaim(&lock, id);
-            return id;
-        }
-    }
-    DEBUG_DISPLAY_MAX // fallback
+pub fn find_free_debug_display() -> Option<u32> {
+    find_free_debug_display_in(std::path::Path::new("/tmp"))
+}
+
+fn find_free_debug_display_in(lock_dir: &std::path::Path) -> Option<u32> {
+    (DEBUG_DISPLAY_MIN..=DEBUG_DISPLAY_MAX)
+        .find(|&id| vision::virtual_display_slot_is_absent(lock_dir, id))
 }
 
 /// Returns `<state root>/recordings/` (`~/.intendant/recordings/` by
@@ -101,7 +92,8 @@ pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
 /// Set up a debug screen: Xvfb + passive Firefox.
 #[cfg(target_os = "linux")]
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
-    let display_id = find_free_debug_display();
+    let display_id = find_free_debug_display()
+        .ok_or_else(|| "No safely reusable debug display in :50..:59".to_string())?;
     let config = vision::DisplayConfig {
         target: super::computer_use::DisplayTarget::Virtual { id: display_id },
         width: 1280,
@@ -277,8 +269,25 @@ mod tests {
 
     #[test]
     fn find_free_debug_display_in_range() {
-        let id = find_free_debug_display();
+        let tmp = tempfile::tempdir().unwrap();
+        let id = find_free_debug_display_in(tmp.path()).expect("empty temp range is free");
         assert!(id >= DEBUG_DISPLAY_MIN && id <= DEBUG_DISPLAY_MAX);
+    }
+
+    #[test]
+    fn find_free_debug_display_fails_closed_when_range_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sockets = tmp.path().join(".X11-unix");
+        std::fs::create_dir(&sockets).unwrap();
+        for id in DEBUG_DISPLAY_MIN..=DEBUG_DISPLAY_MAX {
+            let path = if id % 2 == 0 {
+                tmp.path().join(format!(".X{id}-lock"))
+            } else {
+                sockets.join(format!("X{id}"))
+            };
+            std::fs::write(path, b"ambiguous\n").unwrap();
+        }
+        assert_eq!(find_free_debug_display_in(tmp.path()), None);
     }
 
     #[test]

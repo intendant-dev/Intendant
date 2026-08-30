@@ -1,5 +1,9 @@
 use intendant_core::error::CallerError;
 #[cfg(target_os = "linux")]
+use std::io::Read as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use tokio::process::Child;
 
@@ -12,110 +16,78 @@ pub struct DisplayConfig {
     pub height: u32,
 }
 
-// ── X11 lock file helpers (Linux only) ──────────────────────────────────────
-
-/// Read the PID from an X lock file. Returns `None` if the file can't be read or parsed.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_lock_pid(lock_path: &str) -> Option<u32> {
-    let contents = std::fs::read_to_string(lock_path).ok()?;
-    contents.trim().parse().ok()
+fn lock_path_in(lock_dir: &std::path::Path, display_id: u32) -> std::path::PathBuf {
+    lock_dir.join(format!(".X{display_id}-lock"))
 }
 
-/// Check if a lock file is stale (the PID inside is no longer running).
 #[cfg(target_os = "linux")]
-pub fn is_lock_stale(lock_path: &str) -> bool {
-    match read_lock_pid(lock_path) {
-        Some(pid) => !crate::platform::process_alive(pid),
-        None => false, // can't read/parse → assume not stale
-    }
+fn socket_path_in(lock_dir: &std::path::Path, display_id: u32) -> std::path::PathBuf {
+    lock_dir.join(".X11-unix").join(format!("X{display_id}"))
 }
 
-/// Check whether the process owning a lock file is an Xvfb instance for the given display.
-/// Returns true if the process cmdline starts with "Xvfb :<id>".
-#[cfg(target_os = "linux")]
-pub fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
-    let pid = match read_lock_pid(lock_path) {
-        Some(p) => p,
-        None => return false,
-    };
-    let cmdline_str = match crate::platform::process_cmdline(pid) {
-        Some(s) => s,
-        None => return false,
-    };
-    let expected = format!("Xvfb :{}", display_id);
-    cmdline_str.starts_with(&expected)
+fn path_entry_absent(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
-/// Kill the process that owns a lock file (if alive) and clean up.
+/// Whether neither an X lock nor socket directory entry exists for a display.
+/// `symlink_metadata` deliberately treats dangling symlinks as occupied.
+pub fn virtual_display_slot_is_absent(lock_dir: &std::path::Path, display_id: u32) -> bool {
+    path_entry_absent(&lock_dir.join(format!(".X{display_id}-lock")))
+        && path_entry_absent(&lock_dir.join(".X11-unix").join(format!("X{display_id}")))
+}
+
 #[cfg(target_os = "linux")]
-pub fn kill_and_reclaim(lock_path: &str, display_id: u32) {
-    let Some(pid) = read_lock_pid(lock_path) else {
-        eprintln!(
-            "[vision] refusing to reclaim X lock {} for display {}: no readable pid",
-            lock_path, display_id
-        );
-        return;
-    };
-    // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
-    match std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+fn read_lock_pid_path(lock_path: &std::path::Path) -> Option<u32> {
+    const MAX_X_LOCK_BYTES: usize = 32;
+
+    let entry_metadata = std::fs::symlink_metadata(lock_path).ok()?;
+    if !entry_metadata.file_type().is_file()
+        || entry_metadata.len() == 0
+        || entry_metadata.len() > MAX_X_LOCK_BYTES as u64
     {
-        Ok(status) if status.success() => {
-            for _ in 0..10 {
-                if !crate::platform::process_alive(pid) {
-                    remove_stale_lock(display_id);
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            eprintln!(
-                "[vision] kill -9 reported success for Xvfb pid {} on display {}, but process is still alive; leaving lock in place",
-                pid, display_id
-            );
-        }
-        Ok(status) => {
-            eprintln!(
-                "[vision] kill -9 failed for Xvfb pid {} on display {} with status {}; leaving lock in place",
-                pid, display_id, status
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "[vision] failed to run kill for Xvfb pid {} on display {}: {}; leaving lock in place",
-                pid, display_id, err
-            );
-        }
+        return None;
     }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_X_LOCK_BYTES as u64
+    {
+        return None;
+    }
+    let mut bytes = [0_u8; MAX_X_LOCK_BYTES + 1];
+    let read = file.read(&mut bytes).ok()?;
+    if read == 0 || read > MAX_X_LOCK_BYTES {
+        return None;
+    }
+    let pid = std::str::from_utf8(&bytes[..read])
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let pid_t = libc::pid_t::try_from(pid).ok()?;
+    (pid_t > 0).then_some(pid)
 }
 
-/// Remove a stale X lock file and its socket.
 #[cfg(target_os = "linux")]
-pub fn remove_stale_lock(id: u32) {
-    let lock = format!("/tmp/.X{}-lock", id);
-    let socket = format!("/tmp/.X11-unix/X{}", id);
-    let _ = std::fs::remove_file(&lock);
-    let _ = std::fs::remove_file(&socket);
+fn xvfb_state_established(lock_dir: &std::path::Path, display_id: u32, pid: u32) -> bool {
+    read_lock_pid_path(&lock_path_in(lock_dir, display_id)) == Some(pid)
+        && std::fs::symlink_metadata(socket_path_in(lock_dir, display_id))
+            .is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
-// Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn is_lock_stale(_lock_path: &str) -> bool {
-    false
+#[cfg(target_os = "linux")]
+fn owned_xvfb_paths_are_cleared(lock_dir: &std::path::Path, display_id: u32) -> bool {
+    virtual_display_slot_is_absent(lock_dir, display_id)
 }
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
-    false
-}
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
-#[cfg(not(target_os = "linux"))]
-pub fn remove_stale_lock(_id: u32) {}
 
 // ── Display config ──────────────────────────────────────────────────────────
 
@@ -124,19 +96,24 @@ pub fn remove_stale_lock(_id: u32) {}
 /// Resolutions are chosen to minimize token cost while maintaining UI readability,
 /// matching each provider's internal image processing pipeline so that the Xvfb
 /// resolution = screenshot resolution = what the model sees (no scaling).
-pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
-    let (width, height) = match provider_name {
+/// Returns `None` when every virtual-display slot is occupied.
+pub fn display_config_for_provider(provider_name: &str) -> Option<DisplayConfig> {
+    let (width, height) = display_resolution_for_provider(provider_name);
+    Some(DisplayConfig {
+        target: DisplayTarget::Virtual {
+            id: find_free_display()?,
+        },
+        width,
+        height,
+    })
+}
+
+pub fn display_resolution_for_provider(provider_name: &str) -> (u32, u32) {
+    match provider_name {
         "openai" => (1024, 768),    // 3 tiles of 512x512 → ~595 tokens
         "anthropic" => (819, 1456), // 9:16 within 1568px limit → ~1590 tokens
         "gemini" => (768, 1024),    // 2 tiles of 768x768 → ~516 tokens
         _ => (1024, 768),           // safe default
-    };
-    DisplayConfig {
-        target: DisplayTarget::Virtual {
-            id: find_free_display(),
-        },
-        width,
-        height,
     }
 }
 
@@ -155,55 +132,35 @@ const VIRTUAL_DISPLAY_END: u32 = 200;
 /// Find a free X display number, preferring :99.
 ///
 /// Strategy for each candidate display:
-/// 1. No lock file → use it
-/// 2. Lock file with dead PID → clean up and use it
-/// 3. Lock file with live Xvfb process for this display → kill and reclaim it
-///    (it's an orphan from a previous intendant session)
-/// 4. Lock file with some other live process → skip to next display
+/// 1. No lock or socket → use it
+/// 2. Any lock or socket entry → leave it untouched and skip
 #[cfg(target_os = "linux")]
-fn find_free_display() -> u32 {
+fn find_free_display() -> Option<u32> {
     find_free_display_in(std::path::Path::new("/tmp"), &[])
 }
 
-/// Lock-dir-injectable core of [`find_free_display`]. Tests pin a temp dir
-/// so the scan never probes the real X11 locks — a live :99 on a shared box
-/// (or a CI runner that also hosts a daemon) must never be examined, let
-/// alone reclaimed, by a unit test.
+/// Lock-dir-injectable core of [`find_free_display`]. Tests pin a temp dir so
+/// the scan never probes the machine's real X11 entries.
 ///
 /// `exclude` lists display numbers this process knows are live and its own
-/// (held `XvfbGuard`s, registered capture sessions). Step 3's orphan
-/// reclaim would otherwise kill them: a guard-held `:99` looks exactly like
-/// an orphaned Xvfb to the lock-file scan, so allocating a *second* display
-/// must skip it rather than reclaim it.
+/// (held `XvfbGuard`s, registered capture sessions).
 #[cfg(target_os = "linux")]
-fn find_free_display_in(lock_dir: &std::path::Path, exclude: &[u32]) -> u32 {
+fn find_free_display_in(lock_dir: &std::path::Path, exclude: &[u32]) -> Option<u32> {
     for id in PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END {
         if exclude.contains(&id) {
             continue;
         }
-        let lock = lock_dir.join(format!(".X{}-lock", id));
-        if !lock.exists() {
-            return id;
-        }
-        let lock = lock.to_string_lossy();
-        // Lock file exists — check if the owning process is dead
-        if is_lock_stale(&lock) {
-            remove_stale_lock(id);
-            return id;
-        }
-        // Process is alive — reclaim if it's an orphaned Xvfb for this display
-        if is_our_xvfb(&lock, id) {
-            kill_and_reclaim(&lock, id);
-            return id;
+        if virtual_display_slot_is_absent(lock_dir, id) {
+            return Some(id);
         }
     }
-    199 // fallback
+    None
 }
 
 /// On non-Linux platforms, return 0 as a sentinel for the native display.
 #[cfg(not(target_os = "linux"))]
-fn find_free_display() -> u32 {
-    0
+fn find_free_display() -> Option<u32> {
+    Some(0)
 }
 
 /// Allocate a virtual-display config at an explicit resolution, for callers
@@ -211,22 +168,41 @@ fn find_free_display() -> u32 {
 /// pipeline (the dashboard's keyless "new virtual display" path). Same
 /// allocator as [`display_config_for_provider`], provider-independent size.
 ///
-/// `exclude` must list virtual-display numbers the caller already holds
-/// alive (guards, registered capture sessions) so the allocator never
-/// reclaims them as orphans — see [`find_free_display_in`].
-pub fn virtual_display_config(width: u32, height: u32, exclude: &[u32]) -> DisplayConfig {
+/// `exclude` must list virtual-display numbers the caller already holds alive.
+/// Returns `None` when every slot is occupied or excluded.
+pub fn virtual_display_config(width: u32, height: u32, exclude: &[u32]) -> Option<DisplayConfig> {
     #[cfg(target_os = "linux")]
-    let id = find_free_display_in(std::path::Path::new("/tmp"), exclude);
+    return virtual_display_config_in(std::path::Path::new("/tmp"), width, height, exclude);
     #[cfg(not(target_os = "linux"))]
     let id = {
         let _ = exclude;
-        find_free_display()
+        find_free_display()?
     };
-    DisplayConfig {
+    #[cfg(not(target_os = "linux"))]
+    Some(DisplayConfig {
         target: DisplayTarget::Virtual { id },
         width,
         height,
-    }
+    })
+}
+
+/// Lock-directory-injectable Linux allocator used by hermetic callers and
+/// tests. It has the same fail-closed semantics as [`virtual_display_config`]
+/// and never mutates the supplied directory.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn virtual_display_config_in(
+    lock_dir: &std::path::Path,
+    width: u32,
+    height: u32,
+    exclude: &[u32],
+) -> Option<DisplayConfig> {
+    let id = find_free_display_in(lock_dir, exclude)?;
+    Some(DisplayConfig {
+        target: DisplayTarget::Virtual { id },
+        width,
+        height,
+    })
 }
 
 /// Whether a live X server socket exists for virtual display `:id`.
@@ -275,18 +251,74 @@ pub fn conventional_virtual_display() -> Option<u32> {
 
 // ── Xvfb guard ──────────────────────────────────────────────────────────────
 
-/// Guard that kills the Xvfb process when dropped.
-/// Cleans up the lock file and socket after killing.
+/// Guard that kills the exact child Xvfb process when dropped.
 pub struct XvfbGuard {
     child: Child,
+    #[cfg(target_os = "linux")]
     display_id: u32,
+    #[cfg(target_os = "linux")]
+    pid: u32,
+}
+
+impl XvfbGuard {
+    /// Ask this guard's exact child to exit and reap it without blocking a
+    /// runtime worker. Graceful waiting is bounded; the fallback hard-kills
+    /// only the spawned child. X lock/socket residue is never removed because
+    /// its ownership is ambiguous once the child has exited.
+    pub async fn shutdown(mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.report_residual_state();
+                    return;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("[vision] failed to inspect Xvfb child before shutdown: {err}");
+                    let _ = self.child.kill().await;
+                    return;
+                }
+            }
+
+            if crate::platform::request_graceful_terminate(self.pid) {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), self.child.wait())
+                    .await
+                {
+                    Ok(Ok(_)) => {
+                        self.report_residual_state();
+                        return;
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("[vision] failed to reap Xvfb child after SIGTERM: {err}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        // `Child::kill` targets this guard's exact spawned child and awaits
+        // its exit. Drop remains the nonblocking fallback if this future is
+        // cancelled before the await completes.
+        let _ = self.child.kill().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn report_residual_state(&self) {
+        if !owned_xvfb_paths_are_cleared(std::path::Path::new("/tmp"), self.display_id) {
+            eprintln!(
+                "[vision] Xvfb exited but left state on display {}; preserving it",
+                self.display_id
+            );
+        }
+    }
 }
 
 impl Drop for XvfbGuard {
     fn drop(&mut self) {
+        // Drop cannot wait: hard-kill this guard's exact spawned child and
+        // leave reaping to Tokio. Normal async teardown calls `shutdown`.
         let _ = self.child.start_kill();
-        // Clean up lock file and socket so the display number can be reused
-        remove_stale_lock(self.display_id);
     }
 }
 
@@ -309,7 +341,7 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     let display_arg = format!(":{}", display_id);
     let screen_arg = format!("{}x{}x24", config.width, config.height);
 
-    let child = tokio::process::Command::new("Xvfb")
+    let mut child = tokio::process::Command::new("Xvfb")
         .args([&display_arg, "-screen", "0", &screen_arg, "-ac"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -338,6 +370,26 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
         )));
     }
 
+    if child
+        .try_wait()
+        .map_err(|err| CallerError::Config(format!("Failed to inspect Xvfb: {err}")))?
+        .is_some()
+    {
+        return Err(CallerError::Config(format!(
+            "Xvfb on display {display_arg} exited during startup"
+        )));
+    }
+    let pid = child.id().ok_or_else(|| {
+        CallerError::Config(format!(
+            "Xvfb on display {display_arg} has no observable process id"
+        ))
+    })?;
+    if !xvfb_state_established(std::path::Path::new("/tmp"), display_id, pid) {
+        return Err(CallerError::Config(format!(
+            "Xvfb on display {display_arg} did not establish its expected lock and socket"
+        )));
+    }
+
     // Preserve the user's original DISPLAY before overriding with virtual display.
     // This is used by DisplayTarget::UserSession to resolve the user's actual display.
     if std::env::var("INTENDANT_USER_DISPLAY").is_err() {
@@ -349,7 +401,11 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
-    Ok(XvfbGuard { child, display_id })
+    Ok(XvfbGuard {
+        child,
+        display_id,
+        pid,
+    })
 }
 
 /// Virtual display launch is not available on non-Linux platforms.
@@ -450,80 +506,181 @@ pub fn detect_x11_display() -> Option<String> {
 mod tests {
     use super::*;
 
-    // Crate-local env lock, same role as the caller's
-    // `test_support::TEST_ENV_LOCK`: serializes env-mutating tests within
-    // this test binary. A lock cannot serialize across crates' separate
-    // test processes anyway, so crate-local is exactly as strong.
-    #[cfg(not(target_os = "macos"))]
-    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn display_config_openai() {
-        let config = display_config_for_provider("openai");
-        assert_eq!(config.width, 1024);
-        assert_eq!(config.height, 768);
+        assert_eq!(display_resolution_for_provider("openai"), (1024, 768));
     }
 
     #[test]
     fn display_config_anthropic() {
-        let config = display_config_for_provider("anthropic");
-        assert_eq!(config.width, 819);
-        assert_eq!(config.height, 1456);
+        assert_eq!(display_resolution_for_provider("anthropic"), (819, 1456));
     }
 
     #[test]
     fn display_config_gemini() {
-        let config = display_config_for_provider("gemini");
-        assert_eq!(config.width, 768);
-        assert_eq!(config.height, 1024);
+        assert_eq!(display_resolution_for_provider("gemini"), (768, 1024));
     }
 
     #[test]
     fn display_config_unknown_defaults_to_openai() {
-        let config = display_config_for_provider("unknown-provider");
-        assert_eq!(config.width, 1024);
-        assert_eq!(config.height, 768);
+        assert_eq!(
+            display_resolution_for_provider("unknown-provider"),
+            (1024, 768)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_lock_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".X11-unix")).unwrap();
+        tmp
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn find_free_display_avoids_existing() {
-        let tmp = tempfile::tempdir().unwrap();
-        // :99 is occupied by a live, non-Xvfb process (this test itself), so
-        // the scan must leave it alone and settle on :100.
-        std::fs::write(
-            tmp.path().join(".X99-lock"),
-            format!("{}\n", std::process::id()),
-        )
-        .unwrap();
-        assert_eq!(find_free_display_in(tmp.path(), &[]), 100);
+    fn exited_owned_xvfb_is_reusable_only_after_its_paths_are_gone() {
+        let tmp = test_lock_dir();
+        assert!(owned_xvfb_paths_are_cleared(tmp.path(), 99));
+
+        let lock = lock_path_in(tmp.path(), 99);
+        std::fs::write(&lock, "replacement\n").unwrap();
+        assert!(!owned_xvfb_paths_are_cleared(tmp.path(), 99));
+        assert!(lock.exists());
+
+        std::fs::remove_file(&lock).unwrap();
+        let socket = socket_path_in(tmp.path(), 99);
+        std::fs::write(&socket, b"replacement").unwrap();
+        assert!(!owned_xvfb_paths_are_cleared(tmp.path(), 99));
+        assert!(socket.exists());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn find_free_display_skips_excluded_ids_without_reclaiming() {
-        let tmp = tempfile::tempdir().unwrap();
-        // :99 has a stale lock (dead pid). Without the exclusion the scan
-        // would clean it up and hand out 99; a caller that still holds :99
-        // alive (guard, capture session) must get the next number and the
-        // lock file must survive untouched.
-        let lock = tmp.path().join(".X99-lock");
-        std::fs::write(&lock, " 1999999999\n").unwrap();
-        assert_eq!(find_free_display_in(tmp.path(), &[99]), 100);
-        assert!(lock.exists(), "excluded display's lock must not be touched");
-        assert_eq!(find_free_display_in(tmp.path(), &[99, 100, 101]), 102);
+    fn owned_xvfb_startup_requires_matching_pid_and_socket() {
+        let tmp = test_lock_dir();
+        std::fs::write(lock_path_in(tmp.path(), 99), "4201\n").unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(socket_path_in(tmp.path(), 99)).unwrap();
+
+        assert!(xvfb_state_established(tmp.path(), 99, 4201));
+        assert!(!xvfb_state_established(tmp.path(), 99, 9999));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unowned_lock_is_skipped_without_mutation() {
+        let tmp = test_lock_dir();
+        let lock = lock_path_in(tmp.path(), 99);
+        std::fs::write(&lock, "4101\n").unwrap();
+
+        assert_eq!(find_free_display_in(tmp.path(), &[]), Some(100));
+        assert_eq!(std::fs::read(&lock).unwrap(), b"4101\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injectable_virtual_config_skips_occupied_99() {
+        let tmp = test_lock_dir();
+        let lock = lock_path_in(tmp.path(), 99);
+        std::fs::write(&lock, "foreign\n").unwrap();
+
+        let config = virtual_display_config_in(tmp.path(), 1280, 800, &[]).unwrap();
+        assert!(matches!(config.target, DisplayTarget::Virtual { id: 100 }));
+        assert_eq!(std::fs::read(lock).unwrap(), b"foreign\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dangling_symlinks_are_occupied_and_untouched() {
+        let tmp = test_lock_dir();
+        let lock = lock_path_in(tmp.path(), 99);
+        let socket = socket_path_in(tmp.path(), 100);
+        std::os::unix::fs::symlink("missing-lock-target", &lock).unwrap();
+        std::os::unix::fs::symlink("missing-socket-target", &socket).unwrap();
+
+        assert_eq!(find_free_display_in(tmp.path(), &[]), Some(101));
+        assert!(std::fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_lock_is_rejected_without_blocking_or_mutation() {
+        let tmp = test_lock_dir();
+        let lock = lock_path_in(tmp.path(), 99);
+        crate::platform::create_test_fifo(&lock).unwrap();
+
+        assert_eq!(read_lock_pid_path(&lock), None);
+        assert_eq!(find_free_display_in(tmp.path(), &[]), Some(100));
+        assert!(std::fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_and_malformed_locks_are_bounded_and_untouched() {
+        let tmp = test_lock_dir();
+        let oversized_lock = lock_path_in(tmp.path(), 99);
+        let malformed_lock = lock_path_in(tmp.path(), 100);
+        std::fs::write(&oversized_lock, vec![b'7'; 4096]).unwrap();
+        std::fs::write(&malformed_lock, "not-a-pid\n").unwrap();
+
+        assert_eq!(read_lock_pid_path(&oversized_lock), None);
+        assert_eq!(read_lock_pid_path(&malformed_lock), None);
+        assert_eq!(find_free_display_in(tmp.path(), &[]), Some(101));
+        assert_eq!(std::fs::metadata(&oversized_lock).unwrap().len(), 4096);
+        assert_eq!(std::fs::read(&malformed_lock).unwrap(), b"not-a-pid\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_pid_parser_requires_positive_pid_t_range() {
+        let tmp = test_lock_dir();
+        let lock = lock_path_in(tmp.path(), 99);
+        std::fs::write(&lock, " 42\n").unwrap();
+        assert_eq!(read_lock_pid_path(&lock), Some(42));
+        std::fs::write(&lock, "0\n").unwrap();
+        assert_eq!(read_lock_pid_path(&lock), None);
+        std::fs::write(&lock, format!("{}\n", i64::from(i32::MAX) + 1)).unwrap();
+        assert_eq!(read_lock_pid_path(&lock), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exhausted_range_returns_none_without_mutation() {
+        let tmp = test_lock_dir();
+        for id in PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END {
+            std::fs::write(lock_path_in(tmp.path(), id), format!("occupied-{id}\n")).unwrap();
+        }
+
+        assert_eq!(find_free_display_in(tmp.path(), &[]), None);
+        assert_eq!(
+            std::fs::read(lock_path_in(tmp.path(), PREFERRED_DISPLAY)).unwrap(),
+            b"occupied-99\n"
+        );
+        assert_eq!(
+            std::fs::read(lock_path_in(tmp.path(), VIRTUAL_DISPLAY_END - 1)).unwrap(),
+            b"occupied-199\n"
+        );
+        assert!(virtual_display_config_in(tmp.path(), 1280, 800, &[]).is_none());
+    }
+
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn virtual_display_config_carries_requested_resolution() {
-        let config = virtual_display_config(1920, 1080, &[]);
+        let config = virtual_display_config(1920, 1080, &[]).unwrap();
         assert_eq!((config.width, config.height), (1920, 1080));
         let DisplayTarget::Virtual { id } = config.target else {
             panic!("virtual_display_config must target a virtual display");
         };
-        #[cfg(target_os = "linux")]
-        assert!((99..200).contains(&id));
-        #[cfg(not(target_os = "linux"))]
         assert_eq!(id, 0);
     }
 
@@ -534,11 +691,9 @@ mod tests {
         std::fs::write(tmp.path().join("X0"), b"").unwrap();
         std::fs::write(tmp.path().join("X99"), b"").unwrap();
         std::fs::write(tmp.path().join("X250"), b"").unwrap();
-        // User-session servers (:0) and out-of-range numbers never count.
         assert!(!virtual_display_socket_exists_in(tmp.path(), 0));
         assert!(virtual_display_socket_exists_in(tmp.path(), 99));
         assert!(!virtual_display_socket_exists_in(tmp.path(), 250));
-        // In-range but no socket.
         assert!(!virtual_display_socket_exists_in(tmp.path(), 150));
     }
 
@@ -546,101 +701,5 @@ mod tests {
     #[test]
     fn virtual_display_socket_probe_is_linux_only() {
         assert!(!virtual_display_socket_exists(99));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn is_lock_stale_nonexistent_file() {
-        assert!(!is_lock_stale("/tmp/.X_nonexistent_test-lock"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn stale_lock_detection_and_cleanup() {
-        // Create a lock file with a definitely-dead PID
-        let test_id = 198; // high number unlikely to conflict
-        let lock = format!("/tmp/.X{}-lock", test_id);
-        let socket_dir = "/tmp/.X11-unix";
-        let socket = format!("{}/X{}", socket_dir, test_id);
-        // Use PID 1999999999 which cannot exist
-        std::fs::write(&lock, " 1999999999\n").unwrap();
-        assert!(is_lock_stale(&lock));
-        remove_stale_lock(test_id);
-        assert!(!std::path::Path::new(&lock).exists());
-        // Clean up socket if it was created
-        let _ = std::fs::remove_file(&socket);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_lock_pid_nonexistent() {
-        assert_eq!(read_lock_pid("/tmp/.X_nonexistent_test-lock"), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_lock_pid_valid() {
-        let lock = "/tmp/.X197-test-lock";
-        std::fs::write(lock, " 12345\n").unwrap();
-        assert_eq!(read_lock_pid(lock), Some(12345));
-        let _ = std::fs::remove_file(lock);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn is_our_xvfb_dead_pid() {
-        // Lock with dead PID — is_our_xvfb should return false (can't read cmdline)
-        let lock = "/tmp/.X197-test-lock2";
-        std::fs::write(lock, " 1999999999\n").unwrap();
-        assert!(!is_our_xvfb(lock, 197));
-        let _ = std::fs::remove_file(lock);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn preferred_display_is_99() {
-        assert_eq!(PREFERRED_DISPLAY, 99);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn find_free_display_prefers_99() {
-        // When :99 is free, find_free_display should return 99
-        let lock = format!("/tmp/.X{}-lock", PREFERRED_DISPLAY);
-        if !std::path::Path::new(&lock).exists() {
-            assert_eq!(find_free_display(), 99);
-        }
-        // If :99 is taken we can only assert >= 99
-        assert!(find_free_display() >= 99);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn is_display_accessible_no_display_set() {
-        // Serialize with every other env-mutating test: this test unsets
-        // DISPLAY, and is_display_accessible() itself re-sets it as a side
-        // effect when it detects a live X socket.
-        let _guard = TEST_ENV_LOCK.blocking_lock();
-        let prev = std::env::var("DISPLAY").ok();
-        std::env::remove_var("DISPLAY");
-        // With DISPLAY unset the function deliberately probes /tmp/.X11-unix
-        // and may legitimately find (and authorize against) a real X server —
-        // on such a box "inaccessible" is simply not the true state. Only
-        // assert the no-display outcome where no socket exists (CI runners,
-        // headless boxes) — the same environment-conditional pattern as
-        // find_free_display_prefers_99 above.
-        #[cfg(not(target_os = "windows"))]
-        let have_socket = detect_x11_display().is_some();
-        #[cfg(target_os = "windows")]
-        let have_socket = false;
-        if !have_socket {
-            assert!(!is_display_accessible());
-        }
-        // Restore DISPLAY exactly; the probe may have set it as a side
-        // effect, and leaking it would perturb every later display test.
-        match prev {
-            Some(d) => std::env::set_var("DISPLAY", d),
-            None => std::env::remove_var("DISPLAY"),
-        }
     }
 }

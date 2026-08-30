@@ -1047,6 +1047,9 @@ pub fn spawn_event_listener(
                             format!("Display :{} capture lost: {}", display_id, reason),
                         );
                     }
+                    AppEvent::VirtualDisplayCreateFailed { ref reason } => {
+                        s.push_log(LogLevel::Warn, reason.clone());
+                    }
                     AppEvent::DisplayApprovalPending {
                         display_id,
                         backend,

@@ -1203,6 +1203,12 @@ impl AppEventUpcaster {
                 .displays
                 .lost(*display_id, Some(format!("capture_lost: {reason}"))),
 
+            AppEvent::VirtualDisplayCreateFailed { reason } => vec![log_event(
+                LogLevel::Error,
+                "display",
+                reason.clone(),
+            )],
+
             AppEvent::DisplayApprovalPending {
                 display_id: _,
                 backend,
@@ -4443,6 +4449,13 @@ mod tests {
         assert_parity(AppEvent::DisplayCaptureLost {
             display_id: 1,
             reason: "backend_crashed".into(),
+        });
+    }
+
+    #[test]
+    fn parity_virtual_display_create_failed() {
+        assert_parity(AppEvent::VirtualDisplayCreateFailed {
+            reason: "no unoccupied X display is available".into(),
         });
     }
 
