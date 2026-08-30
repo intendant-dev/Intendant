@@ -608,6 +608,38 @@ pub(crate) async fn handle_mcp_http_request(
 /// waits already self-chunk under 60 s.
 const MCP_SSE_STREAMED_TOOLS: [&str; 2] = ["ask_user", "request_user_display"];
 const MCP_SSE_KEEPALIVE_SECS: u64 = 15;
+/// A progress token is a correlation handle (spec: string or integer),
+/// not a payload: reflecting it in every keepalive means an unbounded
+/// one would amplify a near-cap request into ~1 GiB over a 900 s ask
+/// (review: bound before reflecting). Oversized or non-scalar tokens
+/// downgrade to comment keepalives.
+const MCP_SSE_PROGRESS_TOKEN_MAX_BYTES: usize = 256;
+/// A keepalive write that cannot make progress within this window means
+/// the client stopped reading: stop writing (the verb still runs to its
+/// own lifecycle) instead of letting a blocked `write_all` starve the
+/// select loop that polls the call future.
+const MCP_SSE_WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// RFC 9110 Accept negotiation, narrowed to the one question asked:
+/// does this header accept `text/event-stream` with a non-zero
+/// quality? A bare substring check would treat `text/event-stream;q=0`
+/// — an explicit rejection — as acceptance (review).
+fn accepts_event_stream(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        if media != "text/event-stream" {
+            return false;
+        }
+        for param in parts {
+            let param = param.trim().to_ascii_lowercase();
+            if let Some(q) = param.strip_prefix("q=") {
+                return q.trim().parse::<f32>().map(|q| q > 0.0).unwrap_or(false);
+            }
+        }
+        true
+    })
+}
 
 /// The per-request SSE decision for one `POST /mcp` body (MCP
 /// Streamable HTTP, 2026-07-28 shape: the server may answer any POST
@@ -625,8 +657,7 @@ struct McpSsePlan {
 }
 
 fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
-    let accepts_sse = http_header_value(header_text, "accept")
-        .is_some_and(|accept| accept.to_ascii_lowercase().contains("text/event-stream"));
+    let accepts_sse = http_header_value(header_text, "accept").is_some_and(accepts_event_stream);
     if !accepts_sse {
         return None;
     }
@@ -653,6 +684,11 @@ fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
     let progress_token = params
         .get("_meta")
         .and_then(|meta| meta.get("progressToken"))
+        .filter(|token| match token {
+            serde_json::Value::Number(_) => true,
+            serde_json::Value::String(s) => s.len() <= MCP_SSE_PROGRESS_TOKEN_MAX_BYTES,
+            _ => false,
+        })
         .cloned();
     Some(McpSsePlan { progress_token })
 }
@@ -774,7 +810,10 @@ pub(crate) async fn handle_mcp_post(
                 .header_segment(&mcp_cors)
                 .header("Connection", "close")
                 .into_string();
-            if stream.write_all(head.as_bytes()).await.is_err() {
+            // Flushed, not just written: over TLS a completed write can
+            // leave ciphertext buffered, and the whole point of the
+            // stream is 15 s of guaranteed WIRE activity (review).
+            if stream.write_all(head.as_bytes()).await.is_err() || stream.flush().await.is_err() {
                 finalize_http_stream(&mut stream).await;
                 return;
             }
@@ -804,12 +843,26 @@ pub(crate) async fn handle_mcp_post(
                             Some(token) => sse_progress_frame(token, ticks),
                             None => ": keepalive\n\n".to_string(),
                         };
-                        if stream.write_all(frame.as_bytes()).await.is_err() {
-                            // The client hung up. The verb still runs to
-                            // completion — plain-POST semantics, where a
-                            // disconnect is only ever noticed at the
-                            // final write — so an in-flight ask keeps
-                            // its own lifecycle.
+                        // Flush each frame (wire activity, not buffer
+                        // activity), and bound the write: a client that
+                        // stopped reading must not park this loop on a
+                        // blocked write_all — that would stop polling
+                        // the call future itself (review).
+                        let wrote = tokio::time::timeout(
+                            std::time::Duration::from_secs(MCP_SSE_WRITE_TIMEOUT_SECS),
+                            async {
+                                stream.write_all(frame.as_bytes()).await?;
+                                stream.flush().await
+                            },
+                        )
+                        .await;
+                        if !matches!(wrote, Ok(Ok(()))) {
+                            // The client hung up (or stopped reading).
+                            // The verb still runs to completion —
+                            // plain-POST semantics, where a disconnect
+                            // is only ever noticed at the final write —
+                            // so an in-flight ask keeps its own
+                            // lifecycle; we just stop writing.
                             client_gone = true;
                         }
                     }
@@ -825,6 +878,7 @@ pub(crate) async fn handle_mcp_post(
                     McpHttpOutcome::Accepted => String::new(),
                 };
                 let _ = stream.write_all(final_frame.as_bytes()).await;
+                let _ = stream.flush().await;
             }
             finalize_http_stream(&mut stream).await;
             return;
@@ -1195,6 +1249,69 @@ mod tests {
             .unwrap()
             .progress_token
             .is_none());
+        // A progress token is a bounded correlation handle, never a
+        // payload: an oversized or non-scalar token downgrades to
+        // comment keepalives instead of being reflected every 15 s.
+        let huge_token = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "ask_user",
+                "arguments": { "question": "go?" },
+                "_meta": { "progressToken": "x".repeat(MCP_SSE_PROGRESS_TOKEN_MAX_BYTES + 1) },
+            },
+        })
+        .to_string();
+        assert!(
+            mcp_sse_plan(sse_headers, &huge_token)
+                .unwrap()
+                .progress_token
+                .is_none(),
+            "oversized token downgrades"
+        );
+        let object_token = serde_json::json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": {
+                "name": "ask_user",
+                "arguments": { "question": "go?" },
+                "_meta": { "progressToken": { "not": "a scalar" } },
+            },
+        })
+        .to_string();
+        assert!(mcp_sse_plan(sse_headers, &object_token)
+            .unwrap()
+            .progress_token
+            .is_none());
+        let int_token = serde_json::json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {
+                "name": "ask_user",
+                "arguments": { "question": "go?" },
+                "_meta": { "progressToken": 42 },
+            },
+        })
+        .to_string();
+        assert_eq!(
+            mcp_sse_plan(sse_headers, &int_token)
+                .unwrap()
+                .progress_token,
+            Some(serde_json::json!(42))
+        );
+    }
+
+    /// Accept negotiation is media-range aware: `;q=0` is an explicit
+    /// rejection, not acceptance; non-zero qualities and the bare form
+    /// accept; other media types never match.
+    #[test]
+    fn event_stream_acceptance_honors_quality_values() {
+        assert!(accepts_event_stream("text/event-stream"));
+        assert!(accepts_event_stream("application/json, text/event-stream"));
+        assert!(accepts_event_stream("Text/Event-Stream; q=0.5"));
+        assert!(!accepts_event_stream(
+            "application/json, text/event-stream;q=0"
+        ));
+        assert!(!accepts_event_stream("text/event-stream;q=0.0"));
+        assert!(!accepts_event_stream("application/json"));
+        assert!(!accepts_event_stream("text/event-streamer"));
     }
 
     /// SSE frames follow the event-stream grammar: an event line, one
