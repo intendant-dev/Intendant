@@ -1722,6 +1722,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cancelled_starting_reservation_is_removed_and_closed() {
+        let id = format!("bw-cancel-test-{}", uuid::Uuid::new_v4().simple());
+        let mut workspace = sample_workspace(&id);
+        workspace.status = BrowserWorkspaceStatus::Starting;
+        global_registry().write().await.insert(workspace, None);
+
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        drop(StartingReservationGuard::new(id.clone(), bus));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !global_registry().read().await.workspaces.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled reservation cleanup");
+
+        match events.recv().await.expect("closed cancellation event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                workspace: Some(workspace),
+                ..
+            } => {
+                assert_eq!(kind, "closed");
+                assert_eq!(workspace_id.as_deref(), Some(id.as_str()));
+                assert_eq!(workspace.status, BrowserWorkspaceStatus::Closed);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_publishes_serialized_lease_state() {
+        let id = format!("bw-lease-test-{}", uuid::Uuid::new_v4().simple());
+        global_registry()
+            .write()
+            .await
+            .insert(sample_workspace(&id), None);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+
+        let acquired = acquire_workspace(
+            AcquireBrowserWorkspaceRequest {
+                workspace_id: id.clone(),
+                holder_id: "audit-agent".to_string(),
+                holder_kind: Some("agent".to_string()),
+                note: None,
+                force: false,
+            },
+            &bus,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acquired
+                .lease
+                .as_ref()
+                .map(|lease| lease.holder_id.as_str()),
+            Some("audit-agent")
+        );
+        match events.recv().await.expect("lease event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                workspace: Some(workspace),
+                ..
+            } => {
+                assert_eq!(kind, "lease_acquired");
+                assert_eq!(workspace_id.as_deref(), Some(id.as_str()));
+                assert_eq!(workspace, acquired);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        global_registry().write().await.remove(&id);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn explicit_browser_display_binding_is_strict_and_canonical() {
