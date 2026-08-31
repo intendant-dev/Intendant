@@ -39429,7 +39429,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '821cdd1c6b3f2d3d';
+const INTENDANT_APP_BUILD = 'ed341936f8fbb480';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -136510,10 +136510,13 @@ function handleBrowserWorkspaceMessage(d) {
     return;
   }
   if (d.event !== 'browser_workspace_changed') return;
-  if (d.workspace && d.workspace.id) {
-    browserWorkspaces.set(String(d.workspace.id), d.workspace);
-  } else if (d.workspace_id && d.kind === 'closed') {
+  // Closed is a tombstone even when older/newer senders include the final
+  // workspace snapshot. Prioritizing the payload retained a hidden Closed
+  // row forever and let failed Starting reservations accumulate client-side.
+  if (d.workspace_id && d.kind === 'closed') {
     browserWorkspaces.delete(String(d.workspace_id));
+  } else if (d.workspace && d.workspace.id) {
+    browserWorkspaces.set(String(d.workspace.id), d.workspace);
   }
   const status = document.getElementById('browser-workspace-status');
   if (status && d.kind === 'error') {
@@ -138600,7 +138603,6 @@ function renderAggregateStatTiles(el, cards) {
     el.appendChild(card);
   }
 }
-
 /* ── static/app/57a-sessions-list.js ── */
 // ── Sessions list rendering: windowed, signature-guarded, node-stable ──
 // The corpus (_cachedSessions) can be thousands of rows; the DOM holds only

@@ -101,12 +101,6 @@ impl IntendantServer {
         };
         match crate::browser_workspace::acquire_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_acquired".to_string(),
-                    workspace_id: Some(workspace.id.clone()),
-                    workspace: Some(workspace.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
@@ -125,12 +119,6 @@ impl IntendantServer {
         };
         match crate::browser_workspace::release_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_released".to_string(),
-                    workspace_id: Some(workspace.id.clone()),
-                    workspace: Some(workspace.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),

@@ -186,10 +186,13 @@ function handleBrowserWorkspaceMessage(d) {
     return;
   }
   if (d.event !== 'browser_workspace_changed') return;
-  if (d.workspace && d.workspace.id) {
-    browserWorkspaces.set(String(d.workspace.id), d.workspace);
-  } else if (d.workspace_id && d.kind === 'closed') {
+  // Closed is a tombstone even when older/newer senders include the final
+  // workspace snapshot. Prioritizing the payload retained a hidden Closed
+  // row forever and let failed Starting reservations accumulate client-side.
+  if (d.workspace_id && d.kind === 'closed') {
     browserWorkspaces.delete(String(d.workspace_id));
+  } else if (d.workspace && d.workspace.id) {
+    browserWorkspaces.set(String(d.workspace.id), d.workspace);
   }
   const status = document.getElementById('browser-workspace-status');
   if (status && d.kind === 'error') {
@@ -2276,4 +2279,3 @@ function renderAggregateStatTiles(el, cards) {
     el.appendChild(card);
   }
 }
-
