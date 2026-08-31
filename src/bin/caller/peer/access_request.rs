@@ -1548,6 +1548,20 @@ mod tests {
     use crate::access::certs::{ensure_certs, ServerNames};
     use crate::project::ProjectConfig;
 
+    /// Every knock in this module rides a lenient rate config: the
+    /// create limiter is process-global, so a test leaning on the
+    /// DEFAULT caps is really asserting how many knocks the tests
+    /// before it made — plain `cargo test` shares one process, which
+    /// nextest's process-per-test model hides locally. The limiter's
+    /// own test isolates itself with far-future timestamps instead.
+    fn lenient_config() -> PeerAccessRequestConfig {
+        PeerAccessRequestConfig {
+            max_creates_per_window: 4096,
+            max_creates_per_source_per_window: 256,
+            ..Default::default()
+        }
+    }
+
     fn setup_certs(dir: &Path) {
         let names = ServerNames::new(
             "127.0.0.1".parse().unwrap(),
@@ -1742,7 +1756,7 @@ mod tests {
         // card URL the request arrived on.
         let card_url = "https://target/.well-known/agent-card.json";
         let origin = "https://target";
-        let config = PeerAccessRequestConfig::default();
+        let config = lenient_config();
         let source = format!(
             "test-tier-{}-{:?}",
             unix_timestamp(),
@@ -1926,7 +1940,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -1965,7 +1979,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2010,7 +2024,7 @@ mod tests {
             requested_class: class,
         };
         let card = "https://target/.well-known/agent-card.json".to_string();
-        let config = PeerAccessRequestConfig::default();
+        let config = lenient_config();
         let created = create_pending_request(
             certs.path(),
             build(
@@ -2100,7 +2114,7 @@ mod tests {
                     requested_class: class,
                 };
             let card = "https://target/.well-known/agent-card.json";
-            let config = PeerAccessRequestConfig::default();
+            let config = lenient_config();
             let barrier = std::sync::Barrier::new(2);
             let (agent_side, peer_side) = std::thread::scope(|scope| {
                 let agent = scope.spawn(|| {
@@ -2180,7 +2194,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2221,7 +2235,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2267,7 +2281,7 @@ mod tests {
             request2,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2325,7 +2339,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2366,7 +2380,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             None,
         )
         .unwrap();
@@ -2456,7 +2470,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             None,
-            &PeerAccessRequestConfig::default(),
+            &lenient_config(),
             Some(target_key.clone()),
         )
         .unwrap();
