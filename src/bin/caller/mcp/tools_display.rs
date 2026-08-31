@@ -5,6 +5,8 @@
 
 use super::*;
 
+const VIRTUAL_DISPLAY_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl IntendantServer {
     #[tool(
         description = "List browser workspace provider availability for local semantic browser control and streamed fallback."
@@ -156,7 +158,7 @@ impl IntendantServer {
                 width: params.width,
                 height: params.height,
             }));
-        match waiter.wait(std::time::Duration::from_secs(60)).await {
+        match waiter.wait(std::time::Duration::from_secs(20)).await {
             Ok(crate::event::VirtualDisplayCreateOutcome::Created {
                 display_id,
                 width,
@@ -225,7 +227,7 @@ impl IntendantServer {
                 note: params.note,
             },
         ));
-        match waiter.wait(std::time::Duration::from_secs(20)).await {
+        match waiter.wait(VIRTUAL_DISPLAY_DESTROY_TIMEOUT).await {
             Ok(crate::event::VirtualDisplayDestroyOutcome::Destroyed {
                 display_id,
                 capture_generation,
@@ -254,7 +256,10 @@ impl IntendantServer {
                 "request_id": request_id,
                 "display_id": params.display_id,
                 "capture_generation": params.capture_generation,
-                "error": "virtual display destruction did not return its correlated result within 60s"
+                "error": format!(
+                    "virtual display destruction did not return its correlated result within {}s",
+                    VIRTUAL_DISPLAY_DESTROY_TIMEOUT.as_secs()
+                )
             })
             .to_string(),
             Err(crate::event::VirtualDisplayDestroyWaitError::Closed) => serde_json::json!({
