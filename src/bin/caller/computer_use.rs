@@ -1059,11 +1059,13 @@ pub async fn execute_actions(
     let session_only = matches!(
         effective_backend,
         DisplayBackend::Wayland | DisplayBackend::Windows
-    );
+    ) || target_uses_private_x11_session(target);
 
     if session_only {
         // Session-only backends: capture and input both live in the display
-        // pipeline (Wayland portal / Windows DXGI + SendInput).
+        // pipeline (Wayland portal, Windows DXGI + SendInput, or an
+        // authenticated private X11 connection). Private X11 must never fall
+        // back to ambient xauth discovery or unauthenticated subprocesses.
         let Some(live) = lookup_display_session(session_registry, &target).await else {
             return CuBatchOutcome {
                 results: vec![CuActionResult::failed(no_session_message(
@@ -1176,6 +1178,19 @@ pub async fn execute_actions(
         outcome.metrics_line(),
     );
     outcome
+}
+
+fn target_uses_private_x11_session(target: DisplayTarget) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(target, DisplayTarget::Virtual { id } if
+            crate::vision::virtual_display_x11_authorization(id).is_some())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        false
+    }
 }
 
 /// The X11/macOS action loop: subprocess/CGEvent input injection, session

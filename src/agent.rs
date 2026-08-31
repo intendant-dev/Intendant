@@ -1,5 +1,7 @@
 use crate::error::AgentError;
-use crate::models::{AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus};
+use crate::models::{
+    AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus, RuntimeX11Authorization,
+};
 // `MetadataExt` exposes the POSIX `mode`/`uid`/`gid` accessors used by
 // `inspectPath`. They don't exist on Windows metadata, so the import (and
 // the fields it powers) are gated to Unix; the Windows arm of the
@@ -261,6 +263,10 @@ pub struct Agent {
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
     available_displays: Vec<i32>,
     session_xauthority: Option<PathBuf>,
+    /// Controller-authenticated, batch-scoped authorization paths for
+    /// daemon-owned private displays. Unlike `session_xauthority`, these do
+    /// not come from ambient account or display-manager state.
+    runtime_x11_authorities: HashMap<i32, PathBuf>,
     /// Restriction-only mode minted by the controller for the OS-free mock
     /// display rig. It disables every runtime path that can discover, select,
     /// authenticate to, or capture a native display.
@@ -285,6 +291,7 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays: vec![],
             session_xauthority: None,
+            runtime_x11_authorities: HashMap::new(),
             synthetic_display_runtime: false,
             human_response_token: None,
             runtime_protocol_token: None,
@@ -311,6 +318,7 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays,
             session_xauthority,
+            runtime_x11_authorities: HashMap::new(),
             synthetic_display_runtime,
             human_response_token: None,
             runtime_protocol_token: None,
@@ -350,6 +358,33 @@ impl Agent {
     pub fn with_runtime_protocol_token(mut self, token: Option<String>) -> Self {
         self.runtime_protocol_token = token;
         self
+    }
+
+    /// Adopt controller-selected private-display authorization paths for this
+    /// one runtime batch. Invalid/user-session display ids are ignored; the
+    /// controller never authorizes those through this internal lane.
+    pub fn with_runtime_x11_authorizations(
+        mut self,
+        authorizations: Vec<RuntimeX11Authorization>,
+    ) -> Self {
+        self.runtime_x11_authorities = authorizations
+            .into_iter()
+            .filter(|authorization| authorization.display_id > 0)
+            .map(|authorization| (authorization.display_id, authorization.xauthority_path))
+            .collect();
+        self
+    }
+
+    /// Select the exact private authorization for `display_id` when the
+    /// controller supplied one, otherwise preserve the ordinary merged
+    /// session authorization behavior. A stale private path is deliberately
+    /// returned as-is so display teardown fails closed instead of silently
+    /// falling back to an ambient cookie.
+    fn xauthority_for_display(&self, display_id: i32) -> Option<&Path> {
+        self.runtime_x11_authorities
+            .get(&display_id)
+            .map(PathBuf::as_path)
+            .or(self.session_xauthority.as_deref())
     }
 
     fn resolve_log_dir() -> Result<PathBuf, AgentError> {
@@ -786,8 +821,8 @@ impl Agent {
         for name in shell_env_scrub_list(std::env::vars_os().map(|(k, _)| k)) {
             cmd_builder.env_remove(&name);
         }
-        if !self.synthetic_display_runtime {
-            if let Some(ref xauth) = self.session_xauthority {
+        if let Some(display_id) = display_id {
+            if let Some(xauth) = self.xauthority_for_display(display_id) {
                 cmd_builder.env("XAUTHORITY", xauth);
             }
         }
@@ -893,7 +928,7 @@ impl Agent {
                 &format!(":{}", display),
                 &screenshot_path.to_string_lossy(),
             ]);
-            if let Some(ref xauth) = self.session_xauthority {
+            if let Some(xauth) = self.xauthority_for_display(display) {
                 cmd_builder.env("XAUTHORITY", xauth);
             }
             cmd_builder.output().await?
@@ -2131,11 +2166,33 @@ mod tests {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays: vec![],
             session_xauthority: None,
+            runtime_x11_authorities: HashMap::new(),
             synthetic_display_runtime: true,
             human_response_token: None,
             runtime_protocol_token: None,
         };
         (agent, log_dir)
+    }
+
+    #[test]
+    fn controller_xauthority_is_selected_per_display_and_precedes_ambient_merge() {
+        let (mut agent, _log_dir) = create_test_agent();
+        agent.session_xauthority = Some(PathBuf::from("/fixture/ambient.Xauthority"));
+        let agent = agent.with_runtime_x11_authorizations(vec![RuntimeX11Authorization {
+            display_id: 137,
+            xauthority_path: PathBuf::from("/fixture/private-137.Xauthority"),
+        }]);
+
+        assert_eq!(
+            agent.xauthority_for_display(137),
+            Some(Path::new("/fixture/private-137.Xauthority")),
+            "the exact controller-selected private credential must win"
+        );
+        assert_eq!(
+            agent.xauthority_for_display(99),
+            Some(Path::new("/fixture/ambient.Xauthority")),
+            "ordinary displays retain the existing merged-session behavior"
+        );
     }
 
     #[test]
@@ -2493,6 +2550,7 @@ mod tests {
     async fn process_input_exec_returns_result() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_x11_authorizations: vec![],
             runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
@@ -2519,6 +2577,7 @@ mod tests {
     async fn process_input_unknown_function() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_x11_authorizations: vec![],
             runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
@@ -2537,6 +2596,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_x11_authorizations: vec![],
             runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
@@ -2564,6 +2624,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_x11_authorizations: vec![],
             runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![
@@ -2859,6 +2920,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("integration.txt");
         let input = AgentInput {
+            runtime_x11_authorizations: vec![],
             runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {

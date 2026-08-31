@@ -56,10 +56,19 @@ fn browser_bindable_displays() -> &'static Mutex<HashSet<u32>> {
 /// create/reap lifecycle that also retires browser workspaces. Generic
 /// session-local Xvfb guards are intentionally excluded.
 pub(crate) fn process_owns_browser_bindable_display(display_id: u32) -> bool {
-    browser_bindable_displays()
+    let lifecycle_owned = browser_bindable_displays()
         .lock()
         .is_ok_and(|displays| displays.contains(&display_id))
-        && vision::process_owns_virtual_display(display_id)
+        && vision::process_owns_virtual_display(display_id);
+    #[cfg(target_os = "linux")]
+    {
+        lifecycle_owned && vision::virtual_display_x11_authorization(display_id).is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lifecycle_owned;
+        false
+    }
 }
 
 fn register_browser_bindable_display(display_id: u32) {
@@ -102,7 +111,6 @@ impl VirtualDisplayGuards {
     ) {
         self.processes.insert(display_id, guard);
         self.ownership.insert(display_id, ownership);
-        register_browser_bindable_display(display_id);
     }
 
     fn remove(&mut self, display_id: &u32) -> Option<vision::XvfbGuard> {
@@ -227,7 +235,7 @@ pub(crate) async fn create_virtual_display(
         return;
     };
 
-    match vision::launch_display(&config).await {
+    match vision::launch_private_display(&config).await {
         Ok(guard) => {
             let capture_generation = format!("vdcg-{}", uuid::Uuid::new_v4().simple());
             guards.insert(
@@ -332,6 +340,11 @@ pub(crate) async fn handle_virtual_display_capture_readiness(
         .await;
         return;
     }
+
+    // A browser may bind only after capture has stayed live through the
+    // readiness window. Before this point the X server exists but is not a
+    // usable, evidence-producing workspace.
+    register_browser_bindable_display(display_id);
 
     let request_id = ownership.request_id.clone();
     let width = ownership.width;

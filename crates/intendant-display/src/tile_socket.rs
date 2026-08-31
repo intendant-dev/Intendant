@@ -81,12 +81,12 @@ impl DisplaySession {
         let session_epoch = self.session_epoch;
         let display_id = self.display_id;
         let backend_kind = self.backend.kind();
-        let display_hint = self.backend.x11_display_hint();
+        let damage_hint = self.backend.x11_damage_hint();
         let (initial_w, initial_h) = self.backend.resolution();
 
         let task = tokio::spawn(async move {
             let mut damage =
-                make_damage_backend(initial_w, initial_h, backend_kind, display_hint.as_deref());
+                make_damage_backend(initial_w, initial_h, backend_kind, damage_hint.as_ref());
             let mut frame_diff: Option<capture::frame_diff::FrameDiffDamageTracker> = Some(
                 capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX),
             );

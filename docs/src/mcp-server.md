@@ -347,7 +347,7 @@ claim instead.
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
-| `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
+| `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer. On Linux, each dashboard-created display has a fresh daemon-held Xauthority cookie and no X11 TCP listener; capture, input, and its bound browser authenticate explicitly. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
 | `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
 | `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
@@ -412,8 +412,10 @@ active holder. On Linux, `display_target` can bind a local CDP workspace to a
 virtual display returned by this daemon's `create_virtual_display` tool (for
 example, `display_99`). Intendant rejects user-session, session-local,
 out-of-range, and foreign X servers. It reserves the binding before launch,
-rechecks its lifecycle before promotion, and retires the browser when that
-display is destroyed.
+waits for authenticated capture readiness before admitting a browser, rechecks
+the display lifecycle before promotion, and retires the browser when that
+display is destroyed. The Xauthority path and cookie remain runtime-only and
+are never included in workspace records or portable evidence receipts.
 
 | Tool                          | Description | Params |
 |-------------------------------|-------------|--------|

@@ -28,6 +28,14 @@ pub struct Command {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
     pub commands: Vec<Command>,
+    /// Controller-selected Xauthority files for daemon-owned private X11
+    /// displays referenced by this batch. The controller removes any
+    /// model-supplied value and rebuilds this list from live display state
+    /// immediately before spawning the runtime. Paths travel only over the
+    /// runtime's one-shot stdin; each GUI command receives only the entry for
+    /// its selected display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_x11_authorizations: Vec<RuntimeX11Authorization>,
     /// Controller-minted per-spawn secret authenticating runtime JSONL
     /// results. The controller overwrites any model-supplied value before
     /// spawn, and strips it again after verification. It is delivered only
@@ -44,6 +52,12 @@ pub struct AgentInput {
     /// answers accepted unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_response_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeX11Authorization {
+    pub display_id: i32,
+    pub xauthority_path: std::path::PathBuf,
 }
 
 #[allow(dead_code)]

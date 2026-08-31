@@ -1096,6 +1096,13 @@ async fn launch_cdp_browser(
     command.kill_on_drop(true);
     #[cfg(target_os = "linux")]
     if let Some(binding) = display_binding.as_ref() {
+        let authorization = crate::vision::virtual_display_x11_authorization(binding.display_id)
+            .ok_or_else(|| {
+                BrowserWorkspaceError::Launch(format!(
+                    "browser workspace display {} has no live private X11 authorization",
+                    binding.canonical
+                ))
+            })?;
         // A bound workspace must use only its leased X11 display. Ambient
         // Wayland/Xauthority state belongs to the daemon's login session and
         // must not redirect or authorize this isolated browser child.
@@ -1103,7 +1110,7 @@ async fn launch_cdp_browser(
             .env("DISPLAY", format!(":{}", binding.display_id))
             .env("XDG_SESSION_TYPE", "x11")
             .env_remove("WAYLAND_DISPLAY")
-            .env_remove("XAUTHORITY")
+            .env("XAUTHORITY", authorization.xauthority_path())
             .arg("--ozone-platform=x11");
     }
     command

@@ -2,9 +2,9 @@ use intendant_core::error::CallerError;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
@@ -134,10 +134,51 @@ const PREFERRED_DISPLAY: u32 = 99;
 const VIRTUAL_DISPLAY_END: u32 = 200;
 
 #[cfg(target_os = "linux")]
-static OWNED_XVFB_PROCESSES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
+static OWNED_XVFB_PROCESSES: OnceLock<Mutex<HashMap<u32, OwnedXvfbProcess>>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
-fn owned_xvfb_processes() -> &'static Mutex<HashMap<u32, u32>> {
+#[derive(Clone)]
+struct OwnedXvfbProcess {
+    pid: u32,
+    authorization: Option<X11Authorization>,
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateX11Authorization {
+    authorization: X11Authorization,
+    _directory: tempfile::TempDir,
+}
+
+/// Daemon-held credentials for one Intendant-owned X11 display.
+///
+/// This value is intentionally not serializable. It may be passed only to
+/// in-process display clients and to the exact browser child bound to this
+/// display; portable receipts must never contain either field.
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct X11Authorization {
+    xauthority_path: std::path::PathBuf,
+    protocol: Vec<u8>,
+    cookie: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl X11Authorization {
+    pub fn xauthority_path(&self) -> &std::path::Path {
+        &self.xauthority_path
+    }
+
+    pub fn protocol(&self) -> &[u8] {
+        &self.protocol
+    }
+
+    pub fn cookie(&self) -> &[u8] {
+        &self.cookie
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_xvfb_processes() -> &'static Mutex<HashMap<u32, OwnedXvfbProcess>> {
     OWNED_XVFB_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -155,13 +196,19 @@ pub fn managed_virtual_display_id(display_id: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn register_owned_xvfb(display_id: u32, pid: u32) -> Result<(), CallerError> {
+fn register_owned_xvfb(
+    display_id: u32,
+    pid: u32,
+    authorization: Option<X11Authorization>,
+) -> Result<(), CallerError> {
     let mut owned = owned_xvfb_processes()
         .lock()
         .map_err(|_| CallerError::Config("owned Xvfb registry is unavailable".to_string()))?;
-    if let Some(existing_pid) = owned.insert(display_id, pid) {
-        if existing_pid != pid {
-            owned.insert(display_id, existing_pid);
+    let owned_process = OwnedXvfbProcess { pid, authorization };
+    if let Some(existing) = owned.insert(display_id, owned_process) {
+        if existing.pid != pid {
+            let existing_pid = existing.pid;
+            owned.insert(display_id, existing);
             return Err(CallerError::Config(format!(
                 "display :{display_id} is already owned by Xvfb process {existing_pid}"
             )));
@@ -173,7 +220,7 @@ fn register_owned_xvfb(display_id: u32, pid: u32) -> Result<(), CallerError> {
 #[cfg(target_os = "linux")]
 fn unregister_owned_xvfb(display_id: u32, pid: u32) {
     if let Ok(mut owned) = owned_xvfb_processes().lock() {
-        if owned.get(&display_id) == Some(&pid) {
+        if owned.get(&display_id).is_some_and(|owned| owned.pid == pid) {
             owned.remove(&display_id);
         }
     }
@@ -191,7 +238,7 @@ pub fn process_owns_virtual_display(display_id: u32) -> bool {
         let pid = owned_xvfb_processes()
             .lock()
             .ok()
-            .and_then(|owned| owned.get(&display_id).copied());
+            .and_then(|owned| owned.get(&display_id).map(|owned| owned.pid));
         pid.is_some_and(|pid| {
             crate::platform::process_alive(pid)
                 && xvfb_state_established(std::path::Path::new("/tmp"), display_id, pid)
@@ -202,6 +249,23 @@ pub fn process_owns_virtual_display(display_id: u32) -> bool {
         let _ = display_id;
         false
     }
+}
+
+/// Return the private X11 authorization for a live display owned by this
+/// process. Generic `-ac` agent-loop displays deliberately return `None`.
+#[cfg(target_os = "linux")]
+pub fn virtual_display_x11_authorization(display_id: u32) -> Option<X11Authorization> {
+    if !managed_virtual_display_id(display_id) {
+        return None;
+    }
+    let owned = owned_xvfb_processes().lock().ok()?;
+    let process = owned.get(&display_id)?;
+    if !crate::platform::process_alive(process.pid)
+        || !xvfb_state_established(std::path::Path::new("/tmp"), display_id, process.pid)
+    {
+        return None;
+    }
+    process.authorization.clone()
 }
 
 /// Find a free X display number, preferring :99.
@@ -333,6 +397,8 @@ pub struct XvfbGuard {
     display_id: u32,
     #[cfg(target_os = "linux")]
     pid: u32,
+    #[cfg(target_os = "linux")]
+    _authorization: Option<PrivateX11Authorization>,
 }
 
 impl XvfbGuard {
@@ -417,6 +483,144 @@ impl Drop for XvfbGuard {
 
 // ── Display launch (Linux / X11) ────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
+const X11_AUTH_PROTOCOL: &[u8] = b"MIT-MAGIC-COOKIE-1";
+
+#[cfg(target_os = "linux")]
+fn append_xauthority_field(record: &mut Vec<u8>, value: &[u8]) -> Result<(), CallerError> {
+    let length = u16::try_from(value.len()).map_err(|_| {
+        CallerError::Config("Xauthority field exceeded the 16-bit format limit".to_string())
+    })?;
+    record.extend_from_slice(&length.to_be_bytes());
+    record.extend_from_slice(value);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn encode_xauthority_record(
+    display_id: u32,
+    hostname: &[u8],
+    cookie: &[u8],
+) -> Result<Vec<u8>, CallerError> {
+    const FAMILY_LOCAL: u16 = 256;
+    let display = display_id.to_string();
+    let mut record = Vec::with_capacity(
+        2 + 2 + hostname.len() + 2 + display.len() + 2 + X11_AUTH_PROTOCOL.len() + 2 + cookie.len(),
+    );
+    record.extend_from_slice(&FAMILY_LOCAL.to_be_bytes());
+    append_xauthority_field(&mut record, hostname)?;
+    append_xauthority_field(&mut record, display.as_bytes())?;
+    append_xauthority_field(&mut record, X11_AUTH_PROTOCOL)?;
+    append_xauthority_field(&mut record, cookie)?;
+    Ok(record)
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_x11_authorization(
+    display_id: u32,
+) -> Result<PrivateX11Authorization, CallerError> {
+    let hostname = crate::platform::local_hostname_bytes().map_err(|error| {
+        CallerError::Config(format!(
+            "Failed to read local hostname for Xauthority: {error}"
+        ))
+    })?;
+    let mut cookie = vec![0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut cookie))
+        .map_err(|error| {
+            CallerError::Config(format!("Failed to generate Xauthority cookie: {error}"))
+        })?;
+    create_private_x11_authorization_from_parts(
+        display_id,
+        &hostname,
+        cookie,
+        &std::env::temp_dir(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_x11_authorization_from_parts(
+    display_id: u32,
+    hostname: &[u8],
+    cookie: Vec<u8>,
+    temp_root: &std::path::Path,
+) -> Result<PrivateX11Authorization, CallerError> {
+    if hostname.is_empty() || hostname.contains(&0) {
+        return Err(CallerError::Config(
+            "Xauthority hostname must be nonempty and NUL-free".to_string(),
+        ));
+    }
+    if cookie.len() != 16 {
+        return Err(CallerError::Config(
+            "MIT-MAGIC-COOKIE-1 data must contain exactly 16 bytes".to_string(),
+        ));
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("intendant-xauthority-")
+        // `tempfile` defaults directories to 0777 masked by the host umask;
+        // a group-friendly umask can therefore expose the pathname at
+        // creation time. Supplying 0700 reaches mkdir(2) atomically and the
+        // umask may only make it more restrictive.
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(temp_root)
+        .map_err(|error| {
+            CallerError::Config(format!(
+                "Failed to create private Xauthority directory: {error}"
+            ))
+        })?;
+    let directory_mode = directory
+        .path()
+        .metadata()
+        .map_err(|error| {
+            CallerError::Config(format!("Failed to inspect Xauthority directory: {error}"))
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if directory_mode != 0o700 {
+        return Err(CallerError::Config(format!(
+            "Private Xauthority directory has unsafe mode {directory_mode:o}"
+        )));
+    }
+
+    let record = encode_xauthority_record(display_id, hostname, &cookie)?;
+    let path = directory.path().join("Xauthority");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| {
+            CallerError::Config(format!("Failed to create private Xauthority file: {error}"))
+        })?;
+    file.write_all(&record)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            CallerError::Config(format!(
+                "Failed to persist private Xauthority file: {error}"
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        CallerError::Config(format!(
+            "Failed to inspect private Xauthority file: {error}"
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(CallerError::Config(
+            "Private Xauthority file is not a mode-0600 regular file".to_string(),
+        ));
+    }
+
+    Ok(PrivateX11Authorization {
+        authorization: X11Authorization {
+            xauthority_path: path,
+            protocol: X11_AUTH_PROTOCOL.to_vec(),
+            cookie,
+        },
+        _directory: directory,
+    })
+}
+
 /// Launch Xvfb on the given display with the given resolution.
 /// The config's target must be `DisplayTarget::Virtual`; returns
 /// `CallerError::Config` otherwise.
@@ -426,6 +630,30 @@ impl Drop for XvfbGuard {
 /// browser subprocesses.
 #[cfg(target_os = "linux")]
 pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
+    launch_display_with_authorization(config, None).await
+}
+
+/// Launch an Xvfb whose Unix socket requires a fresh private per-display
+/// MIT-MAGIC-COOKIE and whose TCP listener is disabled.
+#[cfg(target_os = "linux")]
+pub async fn launch_private_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
+    let display_id = match config.target {
+        DisplayTarget::Virtual { id } => id,
+        DisplayTarget::UserSession => {
+            return Err(CallerError::Config(
+                "Cannot launch Xvfb for the user session display".to_string(),
+            ))
+        }
+    };
+    let authorization = create_private_x11_authorization(display_id)?;
+    launch_display_with_authorization(config, Some(authorization)).await
+}
+
+#[cfg(target_os = "linux")]
+async fn launch_display_with_authorization(
+    config: &DisplayConfig,
+    authorization: Option<PrivateX11Authorization>,
+) -> Result<XvfbGuard, CallerError> {
     let display_id = match config.target {
         DisplayTarget::Virtual { id } => id,
         DisplayTarget::UserSession => {
@@ -437,8 +665,18 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     let display_arg = format!(":{}", display_id);
     let screen_arg = format!("{}x{}x24", config.width, config.height);
 
-    let mut child = tokio::process::Command::new("Xvfb")
-        .args([&display_arg, "-screen", "0", &screen_arg, "-ac"])
+    let mut command = tokio::process::Command::new("Xvfb");
+    command
+        .args([&display_arg, "-screen", "0", &screen_arg])
+        .args(["-nolisten", "tcp"]);
+    if let Some(authorization) = authorization.as_ref() {
+        command
+            .arg("-auth")
+            .arg(authorization.authorization.xauthority_path());
+    } else {
+        command.arg("-ac");
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -452,12 +690,15 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Verify the display is accessible
-    let check = tokio::process::Command::new("xdpyinfo")
+    let mut check_command = tokio::process::Command::new("xdpyinfo");
+    check_command
         .args(["-display", &display_arg])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+        .stderr(Stdio::null());
+    if let Some(authorization) = authorization.as_ref() {
+        check_command.env("XAUTHORITY", authorization.authorization.xauthority_path());
+    }
+    let check = check_command.status().await;
 
     if check.map(|s| !s.success()).unwrap_or(true) {
         return Err(CallerError::Config(format!(
@@ -485,12 +726,19 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
             "Xvfb on display {display_arg} did not establish its expected lock and socket"
         )));
     }
-    register_owned_xvfb(display_id, pid)?;
+    register_owned_xvfb(
+        display_id,
+        pid,
+        authorization
+            .as_ref()
+            .map(|authorization| authorization.authorization.clone()),
+    )?;
 
     Ok(XvfbGuard {
         child,
         display_id,
         pid,
+        _authorization: authorization,
     })
 }
 
@@ -499,6 +747,13 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
 pub async fn launch_display(_config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
     Err(CallerError::Config(
         "Virtual display launch is only available on Linux".into(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn launch_private_display(_config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
+    Err(CallerError::Config(
+        "Private virtual display launch is only available on Linux".into(),
     ))
 }
 
@@ -793,18 +1048,68 @@ mod tests {
 
         let display_id = VIRTUAL_DISPLAY_END - 1;
         unregister_owned_xvfb(display_id, 41_001);
-        register_owned_xvfb(display_id, 41_001).unwrap();
-        assert!(register_owned_xvfb(display_id, 41_002).is_err());
+        register_owned_xvfb(display_id, 41_001, None).unwrap();
+        assert!(register_owned_xvfb(display_id, 41_002, None).is_err());
         unregister_owned_xvfb(display_id, 41_002);
         assert_eq!(
-            owned_xvfb_processes().lock().unwrap().get(&display_id),
-            Some(&41_001)
+            owned_xvfb_processes()
+                .lock()
+                .unwrap()
+                .get(&display_id)
+                .map(|process| process.pid),
+            Some(41_001)
         );
         unregister_owned_xvfb(display_id, 41_001);
         assert!(!owned_xvfb_processes()
             .lock()
             .unwrap()
             .contains_key(&display_id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xauthority_record_is_binary_safe_and_display_scoped() {
+        let hostname = b"capture-host";
+        let cookie = [0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 254, 255];
+        let record = encode_xauthority_record(137, hostname, &cookie).unwrap();
+
+        fn take_field<'a>(record: &'a [u8], cursor: &mut usize) -> &'a [u8] {
+            let length = u16::from_be_bytes([record[*cursor], record[*cursor + 1]]) as usize;
+            *cursor += 2;
+            let field = &record[*cursor..*cursor + length];
+            *cursor += length;
+            field
+        }
+
+        assert_eq!(u16::from_be_bytes([record[0], record[1]]), 256);
+        let mut cursor = 2;
+        assert_eq!(take_field(&record, &mut cursor), hostname);
+        assert_eq!(take_field(&record, &mut cursor), b"137");
+        assert_eq!(take_field(&record, &mut cursor), X11_AUTH_PROTOCOL);
+        assert_eq!(take_field(&record, &mut cursor), cookie);
+        assert_eq!(cursor, record.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_xauthority_is_mode_restricted_and_ephemeral() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let authorization = create_private_x11_authorization_from_parts(
+            137,
+            b"fixture-host",
+            vec![7_u8; 16],
+            temp_root.path(),
+        )
+        .unwrap();
+        let path = authorization.authorization.xauthority_path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(authorization.authorization.protocol(), X11_AUTH_PROTOCOL);
+        assert_eq!(authorization.authorization.cookie().len(), 16);
+        drop(authorization);
+        assert!(!path.exists());
     }
 
     #[cfg(not(target_os = "linux"))]

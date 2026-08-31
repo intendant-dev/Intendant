@@ -10,6 +10,7 @@ use tokio::time::{timeout, Duration};
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const RUNTIME_PROTOCOL_TOKEN_FIELD: &str = "runtime_protocol_token";
+const RUNTIME_X11_AUTHORIZATIONS_FIELD: &str = "runtime_x11_authorizations";
 
 /// Per-batch askHuman answer tokens, keyed by the batch's log dir. The
 /// runtime only accepts a `human_response` file whose first line matches
@@ -129,6 +130,89 @@ fn arm_runtime_protocol_token(json_input: &str) -> (Option<String>, Option<Strin
         serde_json::Value::String(token.clone()),
     );
     (Some(parsed.to_string()), Some(token))
+}
+
+/// Replace any model-supplied private-display authorization list with paths
+/// selected from the controller's live Xvfb registry. Only GUI-capable
+/// commands' explicit positive display ids, plus the caller-owned default
+/// virtual display, are considered. The resulting list rides the runtime's
+/// one-shot stdin rather than ambient process state.
+fn arm_runtime_x11_authorizations(
+    json_input: &str,
+    virtual_display_id: Option<u32>,
+) -> Option<String> {
+    arm_runtime_x11_authorizations_with(json_input, virtual_display_id, |display_id| {
+        #[cfg(target_os = "linux")]
+        {
+            crate::vision::virtual_display_x11_authorization(display_id)
+                .map(|authorization| authorization.xauthority_path().to_path_buf())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = display_id;
+            None
+        }
+    })
+}
+
+fn arm_runtime_x11_authorizations_with<Resolve>(
+    json_input: &str,
+    virtual_display_id: Option<u32>,
+    mut resolve: Resolve,
+) -> Option<String>
+where
+    Resolve: FnMut(u32) -> Option<PathBuf>,
+{
+    let mut parsed: serde_json::Value = serde_json::from_str(json_input).ok()?;
+    let map = parsed.as_object_mut()?;
+    // Delete first so an empty/unsupported resolution can never preserve a
+    // forged model value.
+    map.remove(RUNTIME_X11_AUTHORIZATIONS_FIELD);
+
+    let mut display_ids = std::collections::BTreeSet::new();
+    if let Some(display_id) = virtual_display_id {
+        if display_id > 0 {
+            display_ids.insert(display_id);
+        }
+    }
+    if let Some(commands) = map.get("commands").and_then(serde_json::Value::as_array) {
+        for command in commands {
+            let Some(function) = command.get("function").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !matches!(function, "execAsAgent" | "execPty" | "captureScreen") {
+                continue;
+            }
+            let Some(display_id) = command.get("display").and_then(serde_json::Value::as_i64)
+            else {
+                continue;
+            };
+            if let Ok(display_id) = u32::try_from(display_id) {
+                if display_id > 0 {
+                    display_ids.insert(display_id);
+                }
+            }
+        }
+    }
+
+    let authorizations: Vec<serde_json::Value> = display_ids
+        .into_iter()
+        .filter_map(|display_id| {
+            resolve(display_id).map(|xauthority_path| {
+                serde_json::json!({
+                    "display_id": display_id,
+                    "xauthority_path": xauthority_path,
+                })
+            })
+        })
+        .collect();
+    if !authorizations.is_empty() {
+        map.insert(
+            RUNTIME_X11_AUTHORIZATIONS_FIELD.to_string(),
+            serde_json::to_value(authorizations).expect("runtime X11 authorizations serialize"),
+        );
+    }
+    Some(parsed.to_string())
 }
 
 /// Write an askHuman answer the runtime will accept: the batch token (when
@@ -818,6 +902,8 @@ async fn run_agent_inner(
     // environment.
     let (protocol_input, protocol_token) = arm_runtime_protocol_token(json_input);
     let protocol_input = protocol_input.as_deref().unwrap_or(json_input);
+    let x11_input = arm_runtime_x11_authorizations(protocol_input, virtual_display_id);
+    let protocol_input = x11_input.as_deref().unwrap_or(protocol_input);
     let (human_input, _human_token_guard) = if has_ask_human {
         arm_human_response_token(protocol_input, log_dir)
     } else {
@@ -1087,6 +1173,49 @@ mod tests {
 
         assert_eq!(arm_runtime_protocol_token("not json"), (None, None));
         assert_eq!(arm_runtime_protocol_token("[]"), (None, None));
+    }
+
+    #[test]
+    fn runtime_x11_authorizations_are_controller_selected_and_display_scoped() {
+        let forged = r#"{
+            "commands":[
+                {"function":"execAsAgent","nonce":1,"display":137},
+                {"function":"captureScreen","nonce":2,"display":138},
+                {"function":"execPty","nonce":3,"display":137},
+                {"function":"inspectPath","nonce":4,"display":139},
+                {"function":"execAsAgent","nonce":5,"display":-1}
+            ],
+            "runtime_x11_authorizations":[
+                {"display_id":1,"xauthority_path":"/model/forged"}
+            ]
+        }"#;
+        let mut resolved = Vec::new();
+        let armed = arm_runtime_x11_authorizations_with(forged, Some(140), |display_id| {
+            resolved.push(display_id);
+            match display_id {
+                137 => Some(PathBuf::from("/controller/private-137")),
+                140 => Some(PathBuf::from("/controller/private-140")),
+                _ => None,
+            }
+        })
+        .expect("valid batch JSON must re-serialize");
+        assert_eq!(resolved, vec![137, 138, 140]);
+
+        let parsed: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        assert_eq!(
+            parsed[RUNTIME_X11_AUTHORIZATIONS_FIELD],
+            serde_json::json!([
+                {"display_id": 137, "xauthority_path": "/controller/private-137"},
+                {"display_id": 140, "xauthority_path": "/controller/private-140"},
+            ])
+        );
+        assert!(!armed.contains("/model/forged"));
+
+        let stripped = arm_runtime_x11_authorizations_with(forged, None, |_| None)
+            .expect("valid batch JSON must re-serialize");
+        let stripped: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert!(stripped.get(RUNTIME_X11_AUTHORIZATIONS_FIELD).is_none());
+        assert!(arm_runtime_x11_authorizations_with("not json", None, |_| None).is_none());
     }
 
     #[test]

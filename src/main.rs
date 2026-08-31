@@ -179,6 +179,7 @@ async fn main() -> Result<(), AgentError> {
 
     // Create agent instance
     let agent = Agent::new()?
+        .with_runtime_x11_authorizations(input.runtime_x11_authorizations.clone())
         .with_human_response_token(input.human_response_token.clone())
         .with_runtime_protocol_token(input.runtime_protocol_token.clone());
 
