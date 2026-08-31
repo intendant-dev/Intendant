@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::process::Child;
 use tokio::sync::RwLock;
 
+use crate::event::{AppEvent, EventBus};
+
 pub type SharedBrowserWorkspaceRegistry = Arc<RwLock<BrowserWorkspaceRegistry>>;
 
 static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = OnceLock::new();
@@ -650,6 +652,7 @@ pub async fn ensure_managed_chromium(
 
 pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
+    bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     let requested_provider = BrowserWorkspaceProvider::parse(request.provider.as_deref());
     let placement = match request
@@ -824,6 +827,17 @@ pub async fn create_workspace(
                     registry
                         .children
                         .insert(workspace.id.clone(), launched_child);
+                    // Publish while the registry write guard still serializes
+                    // this Ready transition with display retirement. If the
+                    // display is reaped next, its Error event must follow this
+                    // creation event; it can never be overtaken by a stale
+                    // Ready clone returned to the caller.
+                    bus.send(AppEvent::BrowserWorkspaceChanged {
+                        kind: "created".to_string(),
+                        workspace_id: Some(committed.id.clone()),
+                        workspace: Some(committed.clone()),
+                        message: None,
+                    });
                     Ok(committed)
                 } else {
                     Err("browser workspace launch child was unavailable".to_string())

@@ -815,13 +815,8 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 display_target: display_target.clone(),
                 profile_dir: profile_dir.clone(),
             };
-            match crate::browser_workspace::create_workspace(request).await {
-                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "created".to_string(),
-                    workspace: Some(workspace),
-                    workspace_id: None,
-                    message: None,
-                }),
+            match crate::browser_workspace::create_workspace(request, &state.bus).await {
+                Ok(_) => {}
                 Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "error".to_string(),
                     workspace: None,

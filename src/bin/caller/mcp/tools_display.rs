@@ -38,14 +38,8 @@ impl IntendantServer {
             display_target: params.display_target,
             profile_dir: params.profile_dir,
         };
-        match crate::browser_workspace::create_workspace(request).await {
+        match crate::browser_workspace::create_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "created".to_string(),
-                    workspace: Some(workspace.clone()),
-                    workspace_id: Some(workspace.id.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => {
