@@ -439,7 +439,11 @@ function attentionNavigate(item) {
     // If the request resolved between the click and restoration, still land
     // on the surface where a fresh request will appear.
     if (typeof routeTo === 'function') {
-      try { routeTo('activity', 'log'); } catch (_) {}
+      try {
+        if (routeTo('activity', 'log') === false) return;
+      } catch (_) {
+        return;
+      }
     }
   }
   if (sid) {

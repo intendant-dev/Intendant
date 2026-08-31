@@ -72,12 +72,18 @@ function showDisplayRequest(d) {
   if (id === undefined || id === null) return;
   const access = d.access === 'view_and_control' ? 'view_and_control' : 'view';
   const expiresAt = Number(d.expires_unix_ms || 0);
-  if (expiresAt && expiresAt <= Date.now()) return; // stale bootstrap replay
+  if (expiresAt && expiresAt <= Date.now()) return false; // stale bootstrap replay
 
   // A display request is a doorbell, not just an attention badge: bring its
   // handling surface into view even when the owner is elsewhere in the app.
+  // Route refusal preserves live annotation/callout work on Displays; in that
+  // case leave the request cached/attended instead of claiming a hidden panel.
   if (typeof routeTo === 'function') {
-    try { routeTo('activity', 'log'); } catch (_) {}
+    try {
+      if (routeTo('activity', 'log') === false) return false;
+    } catch (_) {
+      return false;
+    }
   }
   hideAllPanels();
   pendingDisplayRequest = { id, sessionId: d.session_id || '', access };
@@ -177,6 +183,7 @@ function showDisplayRequest(d) {
   revealActivityLogPanel();
   document.getElementById('display-request-panel').classList.add('visible');
   setApprovalIndicator(true);
+  return true;
 }
 
 window.sendDisplayRequestDecision = function (decision) {
@@ -205,8 +212,7 @@ function restoreDisplayRequestPanel(sessionId, id) {
     liveDisplayRequests.delete(key);
     return false;
   }
-  showDisplayRequest(request);
-  return true;
+  return showDisplayRequest(request) === true;
 }
 
 function handleDisplayRequestRaised(d) {
