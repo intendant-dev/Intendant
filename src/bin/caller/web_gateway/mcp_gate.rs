@@ -13,6 +13,7 @@ mod legacy;
 #[allow(hidden_glob_reexports)]
 pub(crate) use legacy::*;
 
+#[cfg(test)]
 const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
 
 fn skills_extension_method(body: &str) -> Option<&str> {
@@ -37,7 +38,6 @@ fn skills_initialize_result(requested: Option<&str>) -> serde_json::Value {
         "protocolVersion": legacy::negotiated_mcp_protocol_version(requested),
         "capabilities": {
             "tools": {},
-            "resources": {},
             "extensions": {
                 "io.modelcontextprotocol/skills": {}
             }
@@ -257,11 +257,11 @@ mod skills_extension_tests {
     }
 
     #[test]
-    fn initialize_advertises_the_namespaced_skills_extension() {
+    fn initialize_advertises_only_implemented_capabilities() {
         let result = skills_initialize_result(Some("2025-06-18"));
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert!(result["capabilities"]["tools"].is_object());
-        assert!(result["capabilities"]["resources"].is_object());
+        assert!(result["capabilities"].get("resources").is_none());
         assert!(result["capabilities"]["extensions"][SKILLS_EXTENSION].is_object());
         assert!(result["instructions"]
             .as_str()
