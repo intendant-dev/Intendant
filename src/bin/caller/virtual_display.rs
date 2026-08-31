@@ -500,14 +500,7 @@ pub(crate) async fn reap_virtual_display(
     // while teardown removes bindability before scanning every reservation.
     // No creator can appear after the scan, and read-time reconciliation
     // cannot consume the transition before its push events are collected.
-    for workspace in crate::browser_workspace::close_display_binding(display_id, context).await {
-        bus.send(AppEvent::BrowserWorkspaceChanged {
-            kind: "display_retired".to_string(),
-            workspace_id: Some(workspace.id.clone()),
-            message: workspace.message.clone(),
-            workspace: Some(workspace),
-        });
-    }
+    crate::browser_workspace::close_display_binding(display_id, context, bus).await;
     if let Some(guard) = guard {
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
         guard.shutdown().await;
