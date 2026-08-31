@@ -487,30 +487,6 @@ impl Drop for XvfbGuard {
 const X11_AUTH_PROTOCOL: &[u8] = b"MIT-MAGIC-COOKIE-1";
 
 #[cfg(target_os = "linux")]
-fn local_hostname() -> Result<Vec<u8>, CallerError> {
-    let mut bytes = [0_u8; 256];
-    // SAFETY: `bytes` is writable for its full declared length. gethostname
-    // writes at most that many bytes and retains no pointer.
-    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
-        return Err(CallerError::Config(format!(
-            "Failed to read local hostname for Xauthority: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
-        return Err(CallerError::Config(
-            "Local hostname exceeded the Xauthority buffer".to_string(),
-        ));
-    };
-    if end == 0 {
-        return Err(CallerError::Config(
-            "Local hostname is empty; cannot create Xauthority".to_string(),
-        ));
-    }
-    Ok(bytes[..end].to_vec())
-}
-
-#[cfg(target_os = "linux")]
 fn append_xauthority_field(record: &mut Vec<u8>, value: &[u8]) -> Result<(), CallerError> {
     let length = u16::try_from(value.len()).map_err(|_| {
         CallerError::Config("Xauthority field exceeded the 16-bit format limit".to_string())
@@ -577,7 +553,12 @@ fn create_private_x11_authorization(
         .map_err(|error| {
             CallerError::Config(format!("Failed to generate Xauthority cookie: {error}"))
         })?;
-    let record = encode_xauthority_record(display_id, &local_hostname()?, &cookie)?;
+    let hostname = crate::platform::local_hostname_bytes().map_err(|error| {
+        CallerError::Config(format!(
+            "Failed to read local hostname for Xauthority: {error}"
+        ))
+    })?;
+    let record = encode_xauthority_record(display_id, &hostname, &cookie)?;
     let path = directory.path().join("Xauthority");
     let mut file = std::fs::OpenOptions::new()
         .write(true)

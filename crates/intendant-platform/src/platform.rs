@@ -140,6 +140,43 @@ pub fn request_graceful_terminate(pid: u32) -> bool {
     }
 }
 
+/// Return this host's native hostname bytes for local operating-system
+/// protocols such as Xauthority. The bytes exclude the terminating NUL.
+///
+/// Keeping the FFI here preserves `platform.rs` as the Unix unsafe-code
+/// island; callers receive an ordinary safe Rust result.
+pub fn local_hostname_bytes() -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        let mut bytes = [0_u8; 256];
+        // SAFETY: `bytes` is writable for its full declared length.
+        // gethostname writes at most that many bytes and retains no pointer.
+        if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "local hostname exceeded the operating-system buffer",
+            )
+        })?;
+        if end == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "local hostname is empty",
+            ));
+        }
+        Ok(bytes[..end].to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native hostname bytes are unavailable on this platform",
+        ))
+    }
+}
+
 /// Create a FIFO for Unix-only lock-file regression tests. Keeping this tiny
 /// wrapper here preserves `platform.rs` as the crate's documented unsafe
 /// island; production code never calls it.
@@ -2299,6 +2336,14 @@ mod owner_private_acl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_hostname_bytes_are_nonempty_and_nul_free() {
+        let hostname = local_hostname_bytes().expect("Unix host must expose its hostname");
+        assert!(!hostname.is_empty());
+        assert!(!hostname.contains(&0));
+    }
 
     #[test]
     fn path_leaf_link_probe_accepts_real_entries() {
