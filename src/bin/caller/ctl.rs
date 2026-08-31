@@ -44,7 +44,10 @@ struct CommandArgs {
     bools: BTreeSet<String>,
 }
 
+mod image_output;
 mod remote;
+
+use image_output::{image_contents, save_image_output};
 
 pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
     let (config, command) = parse_global_args(raw_args)?;
@@ -1050,10 +1053,14 @@ async fn run_display(
         "screenshot" => {
             ensure_help(&raw[1..], help_display_screenshot)?;
             let args = parse_command_args(&raw[1..], &["--target", "--output"], &[])?;
+            let output = output_path(args.one("--output"));
+            if config.raw && output.is_some() {
+                return Err("--raw cannot be combined with --output".to_string());
+            }
             let mut map = Map::new();
             insert_string(&mut map, "display_target", args.one("--target"));
             let response = call_tool(client, config, "take_screenshot", Value::Object(map)).await?;
-            print_tool_response(response, config, output_path(args.one("--output")))?;
+            print_tool_response(response, config, output)?;
         }
         "status" | "readiness" | "ready" => {
             ensure_help(&raw[1..], help_display_status)?;
@@ -1327,9 +1334,13 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 map.insert("settle".to_string(), Value::from(cap_ms));
             }
             insert_string(&mut map, "coordinate_space", args.one("--coordinate-space"));
+            let output = output_path(args.one("--output"));
+            if config.raw && output.is_some() {
+                return Err("--raw cannot be combined with --output".to_string());
+            }
             let response =
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
-            print_tool_response(response, config, output_path(args.one("--output")))?;
+            print_tool_response(response, config, output)?;
         }
         "screenshot" => {
             let next = std::iter::once("screenshot".to_string())
@@ -1444,6 +1455,10 @@ async fn run_shared(
             )?;
             let mut map = shared_target_map(&args)?;
             insert_string(&mut map, "reason", args.one("--reason"));
+            let output = output_path(args.one("--output"));
+            if config.raw && output.is_some() {
+                return Err("--raw cannot be combined with --output".to_string());
+            }
             let response = call_tool(
                 client,
                 config,
@@ -1451,7 +1466,7 @@ async fn run_shared(
                 Value::Object(map),
             )
             .await?;
-            print_tool_response(response, config, output_path(args.one("--output")))?;
+            print_tool_response(response, config, output)?;
         }
         other => return Err(format!("unknown shared command '{other}'")),
     }
@@ -5543,6 +5558,9 @@ fn print_tool_response(
     output_path: Option<PathBuf>,
 ) -> Result<(), String> {
     if config.raw {
+        if output_path.is_some() {
+            return Err("--raw cannot be combined with --output".to_string());
+        }
         return print_json(&response);
     }
     if let Some(error) = response.get("error") {
@@ -5552,30 +5570,47 @@ fn print_tool_response(
     let result = response
         .get("result")
         .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
-    if config.json {
-        if let Some(text) = single_text_content(result) {
-            if let Ok(value) = serde_json::from_str::<Value>(text) {
-                return print_json(&value);
-            }
-        }
-        return print_json(result);
-    }
+    let tool_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Some(path) = output_path {
-        if result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            for text in text_contents(result) {
-                println!("{text}");
+        if tool_error {
+            if config.json {
+                print_json(result)?;
+            } else {
+                for text in text_contents(result) {
+                    println!("{text}");
+                }
             }
             return Err("tool returned isError=true".to_string());
         }
-        save_first_image_or_path(result, &path)?;
+        let receipt = save_image_output(result, &path)?;
+        if config.json {
+            let receipt = serde_json::to_value(receipt)
+                .map_err(|e| format!("failed to serialize image receipt: {e}"))?;
+            return print_json(&receipt);
+        }
         for text in text_contents(result) {
             println!("{text}");
         }
         println!("wrote {}", path.display());
+        return Ok(());
+    }
+    if config.json {
+        if let Some(text) = single_text_content(result) {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                print_json(&value)?;
+                if tool_error {
+                    return Err("tool returned isError=true".to_string());
+                }
+                return Ok(());
+            }
+        }
+        print_json(result)?;
+        if tool_error {
+            return Err("tool returned isError=true".to_string());
+        }
         return Ok(());
     }
     let mut printed = false;
@@ -5595,11 +5630,7 @@ fn print_tool_response(
     if !printed {
         print_json(result)?;
     }
-    if result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if tool_error {
         return Err("tool returned isError=true".to_string());
     }
     Ok(())
@@ -5623,62 +5654,6 @@ fn text_contents(result: &Value) -> impl Iterator<Item = &str> {
         .flat_map(|content| content.iter())
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|item| item.get("text").and_then(Value::as_str))
-}
-
-fn image_contents(result: &Value) -> impl Iterator<Item = (&str, &str)> {
-    result
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flat_map(|content| content.iter())
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
-        .filter_map(|item| {
-            let data = item.get("data").and_then(Value::as_str)?;
-            let mime = item
-                .get("mimeType")
-                .or_else(|| item.get("mime_type"))
-                .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream");
-            Some((data, mime))
-        })
-}
-
-fn save_first_image_or_path(result: &Value, path: &PathBuf) -> Result<(), String> {
-    if let Some((data, _mime)) = image_contents(result).next() {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| format!("failed to decode image data: {e}"))?;
-        return std::fs::write(path, bytes)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()));
-    }
-
-    if let Some(source) = screenshot_path_from_text(result) {
-        std::fs::copy(&source, path).map_err(|e| {
-            format!(
-                "failed to copy screenshot from {} to {}: {e}",
-                source.display(),
-                path.display()
-            )
-        })?;
-        return Ok(());
-    }
-
-    Err(
-        "tool result did not include an image content block or readable screenshot_path"
-            .to_string(),
-    )
-}
-
-fn screenshot_path_from_text(result: &Value) -> Option<PathBuf> {
-    text_contents(result)
-        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .find_map(|value| {
-            value
-                .get("screenshot_path")
-                .or_else(|| value.get("path"))
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-        })
 }
 
 fn print_json(value: &Value) -> Result<(), String> {
@@ -7722,59 +7697,6 @@ mod tests {
     fn peer_task_args_omits_absent_context() {
         let value = peer_task_args(&args(&["peer-1", "go"])).expect("task args should parse");
         assert!(value.get("context").is_none());
-    }
-
-    #[test]
-    fn save_output_copies_screenshot_path_when_image_block_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let source = dir.path().join("captured.png");
-        let output = dir.path().join("requested.png");
-        let png_bytes = b"\x89PNG\r\n\x1a\npath-backed";
-        std::fs::write(&source, png_bytes).expect("write source");
-
-        let result = serde_json::json!({
-            "content": [{
-                "type": "text",
-                "text": serde_json::json!({
-                    "status": "screenshot captured",
-                    "screenshot_path": source,
-                    "width": 10,
-                    "height": 20
-                }).to_string()
-            }]
-        });
-
-        save_first_image_or_path(&result, &output).expect("save from screenshot_path");
-        assert_eq!(std::fs::read(output).expect("read output"), png_bytes);
-    }
-
-    #[test]
-    fn save_output_prefers_inline_image_block_over_screenshot_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let source = dir.path().join("captured.png");
-        let output = dir.path().join("requested.png");
-        std::fs::write(&source, b"path-backed").expect("write source");
-
-        let inline_bytes = b"\x89PNG\r\n\x1a\ninline";
-        let inline = base64::engine::general_purpose::STANDARD.encode(inline_bytes);
-        let result = serde_json::json!({
-            "content": [
-                {
-                    "type": "text",
-                    "text": serde_json::json!({
-                        "screenshot_path": source
-                    }).to_string()
-                },
-                {
-                    "type": "image",
-                    "data": inline,
-                    "mimeType": "image/png"
-                }
-            ]
-        });
-
-        save_first_image_or_path(&result, &output).expect("save from image block");
-        assert_eq!(std::fs::read(output).expect("read output"), inline_bytes);
     }
 
     fn peer_config(card_url: &str, label: Option<&str>) -> crate::project::PeerConfig {
