@@ -62,6 +62,12 @@ pub enum ActorKind {
     Dashboard,
     /// A federated peer daemon acting under its granted profile.
     Peer,
+    /// An enrolled agent client (the R1 MCP sidecar lane): a machine
+    /// principal driving this daemon under its granted profile.
+    /// Deliberately distinct from `Peer` — a tenant edge that admits
+    /// federated daemons has made no decision about foreign agents —
+    /// and never a dashboard/owner-surface class.
+    Agent,
     /// The daemon itself, on schedule — a daemon-internal task (the
     /// GitHub PR scanner, the agenda scheduler's write-backs, the ask
     /// resolver) writing with no session, no gate, and no human at the
@@ -92,6 +98,7 @@ impl ActorKind {
             ActorKind::LocalProcess => "local_process",
             ActorKind::Dashboard => "dashboard",
             ActorKind::Peer => "peer",
+            ActorKind::Agent => "agent",
             ActorKind::Daemon => "daemon",
             ActorKind::Unattributed => "unattributed",
         }
@@ -166,6 +173,14 @@ impl ActorBinding {
         }
     }
 
+    pub fn agent(principal_id: Option<String>) -> Self {
+        Self {
+            kind: ActorKind::Agent,
+            principal_id,
+            session_id: None,
+        }
+    }
+
     /// The daemon itself, on schedule. In-process construction only —
     /// see the [`ActorKind::Daemon`] docs; no gate can produce this and
     /// [`ActorBinding::from_principal`] must never gain an arm for it
@@ -232,6 +247,7 @@ impl ActorBinding {
             | "connect_account"
             | "" => Self::dashboard(id),
             "peer_daemon" => Self::peer(id),
+            "agent_client" => Self::agent(id),
             // Unknown principal classes stay visibly unclassified while
             // still naming the principal the gate bound. `hosted_lease`
             // lands here DELIBERATELY: the agenda and memory tenant edges

@@ -131,6 +131,13 @@ type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 const CARD_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PEER_CLIENT_HEADER: &str = "x-intendant-peer";
 pub const PEER_CLIENT_HEADER_VALUE: &str = "1";
+/// The agent lane's fail-closed opt-in, sibling of `x-intendant-peer`:
+/// the R1 sidecar declares itself so an unknown certificate that
+/// CLAIMS the agent lane is refused outright instead of falling
+/// through to the browser-mTLS ladder. The header is the lane
+/// declaration; the identity record's class is the authority.
+pub const AGENT_CLIENT_HEADER: &str = "x-intendant-agent";
+pub const AGENT_CLIENT_HEADER_VALUE: &str = "1";
 
 pub struct IntendantWsTransport {
     spec: TransportSpec,

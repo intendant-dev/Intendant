@@ -1739,8 +1739,8 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'agent_client', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, enrolled agent clients, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
       },
       role_ceilings: {
         connect_account: 'role:none',

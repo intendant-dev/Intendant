@@ -2312,10 +2312,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // Browser-enrolled certificates resolve no record and
                     // are refused byte-identically; the owner-name
                     // (custom-domain) lane stays lease-only.
+                    // Peer daemons only: the agent class (R1 sidecar)
+                    // has no relay WS admission at all — its scoped
+                    // lane is `POST /mcp`, and nothing the sidecar
+                    // does needs a socket.
                     let admitted_relay_peer_ws = config.connect.relay_peer_admission
                         && base_discovery_only_ws
                         && !custom_domain_selected
-                        && peer_connection_identity.is_some();
+                        && peer_connection_identity.as_ref().is_some_and(|identity| {
+                            matches!(
+                                identity.class,
+                                crate::peer::access_policy::IdentityClass::Peer
+                            )
+                        });
                     let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");

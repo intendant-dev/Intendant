@@ -618,6 +618,46 @@ impl AccessPrincipal {
         }
     }
 
+    /// The R1 agent-client principal: an enrolled machine identity
+    /// driving this daemon over `/mcp` (the MCP sidecar lane). Its own
+    /// kind — never `peer_daemon` — so every peer-shaped code path
+    /// refuses it unless it opted in, and its own actor arm attributes
+    /// it. Authority is the granted profile alone, evaluated exactly
+    /// like a peer's (`evaluate_principal_operation`), which keeps the
+    /// lane rule airtight: no agent profile reaches `AccessManage` or
+    /// `CredentialsManage` at any grant.
+    pub fn agent_client(
+        fingerprint: impl Into<String>,
+        label: impl Into<String>,
+        profile: impl Into<String>,
+        transport: impl Into<String>,
+    ) -> Self {
+        let fingerprint = fingerprint.into();
+        let profile = profile.into();
+        let label = label.into();
+        Self {
+            id: format!("principal:agent-client:{fingerprint}"),
+            kind: "agent_client".to_string(),
+            label: if label.trim().is_empty() {
+                fingerprint.clone()
+            } else {
+                label
+            },
+            source: "peer_identity_store".to_string(),
+            role_id: format!("role:agent-profile:{profile}"),
+            grant_id: Some(format!("grant:agent-profile:{fingerprint}")),
+            transport: transport.into(),
+            peer_profile: Some(profile),
+            account: None,
+            organization: None,
+            authn: Vec::new(),
+            authn_kind: None,
+            authn_binding: None,
+            authn_origin: None,
+            hosted_connect: false,
+        }
+    }
+
     pub fn local_user_client(
         principal: &IamPrincipal,
         grant: &IamGrant,
@@ -2337,6 +2377,7 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
     const ENFORCED_PRINCIPAL_KINDS: &[&str] = &[
         "root_session",
         "peer_daemon",
+        "agent_client",
         "human_user",
         "browser_certificate",
         "agent_session",
@@ -2365,7 +2406,7 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "user_client_grants": true,
             "principal_binding": "root_peer_and_local_user_client",
             "enforced_principal_kinds": ENFORCED_PRINCIPAL_KINDS,
-            "reason": "The daemon enforces trusted owner/root dashboard sessions, approved daemon peer profiles, browser/native mTLS identities (including mTLS-bound human-user grants), supervised agent sessions, MCP token holders, and trusted local-process grants. Browser client-key and Connect-account records remain available for enrollment, fleet signatures, attribution, migration, and audit. Peer offers can verify a browser key for attribution, but no alpha request ingress admits either record kind as its controlling IAM principal. Every admitted request is still evaluated per operation."
+            "reason": "The daemon enforces trusted owner/root dashboard sessions, approved daemon peer profiles, enrolled agent clients, browser/native mTLS identities (including mTLS-bound human-user grants), supervised agent sessions, MCP token holders, and trusted local-process grants. Browser client-key and Connect-account records remain available for enrollment, fleet signatures, attribution, migration, and audit. Peer offers can verify a browser key for attribution, but no alpha request ingress admits either record kind as its controlling IAM principal. Every admitted request is still evaluated per operation."
         },
         "role_ceilings": load.state.role_ceilings.clone(),
         "hosted_origins": load.state.hosted_origins.clone(),
@@ -2533,12 +2574,17 @@ pub fn evaluate_principal_operation(
             op,
             "root dashboard session grants all operations",
         ),
-        "peer_daemon" => {
+        kind @ ("peer_daemon" | "agent_client") => {
+            let lane = if kind == "agent_client" {
+                "agent"
+            } else {
+                "peer"
+            };
             let Some(profile) = principal.peer_profile.as_deref() else {
                 return AccessDecision::denied(
                     principal,
                     op,
-                    "peer daemon principal has no profile",
+                    format!("{lane} principal has no profile"),
                 );
             };
             if crate::access::access_policy::profile_allows_operation(profile, op) {
@@ -2546,7 +2592,7 @@ pub fn evaluate_principal_operation(
                     principal,
                     op,
                     format!(
-                        "peer profile {profile} allows {}",
+                        "{lane} profile {profile} allows {}",
                         operation_permission_id(op)
                     ),
                 )
@@ -2555,7 +2601,7 @@ pub fn evaluate_principal_operation(
                     principal,
                     op,
                     format!(
-                        "peer profile {profile} does not allow {}",
+                        "{lane} profile {profile} does not allow {}",
                         operation_permission_id(op)
                     ),
                 )
@@ -2615,12 +2661,16 @@ fn evaluate_principal_operation_with_state_and_fleet_zone(
             "Connect account records are discovery metadata and never authenticate to the daemon",
         );
     }
-    if principal.hosted_connect && matches!(principal.kind.as_str(), "root_session" | "peer_daemon")
+    if principal.hosted_connect
+        && matches!(
+            principal.kind.as_str(),
+            "root_session" | "peer_daemon" | "agent_client"
+        )
     {
         return AccessDecision::denied(
             principal,
             op,
-            "hosted Connect transport can never exercise a trusted-root or peer principal",
+            "hosted Connect transport can never exercise a trusted-root, peer, or agent principal",
         );
     }
     // A composite human record may retain a browser key as audit/attribution
@@ -2651,7 +2701,10 @@ fn evaluate_principal_operation_with_state_and_fleet_zone(
             "the default build treats hosted Connect as discovery-only; hosted control is immutably disabled",
         );
     }
-    if matches!(principal.kind.as_str(), "root_session" | "peer_daemon") {
+    if matches!(
+        principal.kind.as_str(),
+        "root_session" | "peer_daemon" | "agent_client"
+    ) {
         return evaluate_principal_operation(principal, op);
     }
 

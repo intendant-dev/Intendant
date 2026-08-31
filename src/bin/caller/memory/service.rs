@@ -340,6 +340,19 @@ impl MemoryService {
             actor.kind,
             GateActorKind::Dashboard | GateActorKind::LocalProcess
         );
+        // The agent lane (enrolled R1 agent clients) is deliberately
+        // not admitted at the memory edge in its first cut — not even
+        // propose. Which memory verbs a foreign agent principal may
+        // exercise is an owner ruling that has not been made; the peer
+        // propose admission was its own ruling and the classes are
+        // distinct by construction. Refused by name so the choice is
+        // visible, not a fall-through.
+        if matches!(actor.kind, GateActorKind::Agent) {
+            return Err(MemoryError::NotPermitted {
+                verb: verb.as_str(),
+                actor: actor.kind.as_str(),
+            });
+        }
         if owner_surface || verb == Verb::Propose {
             return Ok(());
         }
@@ -381,6 +394,13 @@ impl MemoryService {
                 }),
             ),
             GateActorKind::Peer => (ActorKind::Peer, actor.principal_id.clone()),
+            // Unreachable while `authorize_write` refuses the agent
+            // lane by name above. Kept total instead of panicking: the
+            // kernel vocabulary has no agent class yet, so a future
+            // admission ruling maps here deliberately — until then the
+            // free-form id still carries the full agent principal, so
+            // even a bug that reached this arm stays id-honest.
+            GateActorKind::Agent => (ActorKind::Peer, actor.principal_id.clone()),
         }
     }
 
