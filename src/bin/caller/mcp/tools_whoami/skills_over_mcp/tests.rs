@@ -94,11 +94,17 @@ fn openai_profile_folds_every_effective_skill_into_one_importable_package() {
     add_user_skill(&state_root, "owner-workflow", "Unique owner body marker.");
     let server = test_server(home.path());
     let list = server
-        .skills_over_mcp_list(&serde_json::json!({}), Some("openai"))
+        .skills_over_mcp_list(&serde_json::json!({ "profile": "openai" }), None)
         .unwrap();
     let skills = list["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0]["frontmatter"]["name"], openai::AGGREGATE_NAME);
+    let aggregate_uri = skills[0]["uri"].as_str().unwrap();
+    let get = server
+        .skills_over_mcp_get(&serde_json::json!({ "uri": aggregate_uri }), None)
+        .unwrap();
+    assert_eq!(get["skill"], skills[0]);
+
     let resources = skills[0]["resources"].as_array().unwrap();
     assert!(resources.len() >= 2);
     assert!(resources.len() <= openai::RESOURCE_LIMIT);
@@ -107,7 +113,7 @@ fn openai_profile_folds_every_effective_skill_into_one_importable_package() {
     for resource in resources {
         let uri = resource["uri"].as_str().unwrap();
         let read = server
-            .skills_over_mcp_read_resource(&serde_json::json!({ "uri": uri }), Some("openai"))
+            .skills_over_mcp_read_resource(&serde_json::json!({ "uri": uri }), None)
             .unwrap();
         all_text.push_str(read["contents"][0]["text"].as_str().unwrap());
     }
