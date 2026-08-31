@@ -23,7 +23,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a browser workspace. provider=cdp launches managed Chromium with an isolated profile and CDP endpoint. On Linux, display_target can bind it to an explicit Intendant-owned virtual display; user-session and foreign displays are rejected. provider=system_cdp deliberately uses the installed system browser."
+        description = "Create a browser workspace. provider=cdp launches managed Chromium with an isolated profile and CDP endpoint. On Linux, display_target can bind it to an explicit daemon-created virtual display returned by create_virtual_display; user-session, session-local, and foreign displays are rejected. provider=system_cdp deliberately uses the installed system browser."
     )]
     pub(crate) async fn create_browser_workspace(
         &self,

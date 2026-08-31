@@ -984,7 +984,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "display-target",
                 "display_target",
                 Str,
-                "Intendant-owned virtual display"
+                "daemon-created virtual display"
             ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
         ],

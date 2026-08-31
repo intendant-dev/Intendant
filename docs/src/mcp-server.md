@@ -409,10 +409,11 @@ Testing into Intendant's managed cache. The wire contract already carries
 federated peer-hosted browsers can slot in later. Each workspace has a lease,
 so concurrent agents must explicitly acquire it and use `force` to take over an
 active holder. On Linux, `display_target` can bind a local CDP workspace to a
-virtual display previously created by this same Intendant daemon (for example,
-`display_99`). Intendant rejects user-session displays, out-of-range targets,
-and X servers it does not own, and rechecks ownership immediately before
-launching the browser.
+virtual display returned by this daemon's `create_virtual_display` tool (for
+example, `display_99`). Intendant rejects user-session, session-local,
+out-of-range, and foreign X servers. It reserves the binding before launch,
+rechecks its lifecycle before promotion, and retires the browser when that
+display is destroyed.
 
 | Tool                          | Description | Params |
 |-------------------------------|-------------|--------|

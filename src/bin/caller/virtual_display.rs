@@ -25,8 +25,8 @@ use crate::frames;
 use crate::types::LogLevel;
 use crate::vision;
 use intendant_platform::DisplayTarget;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Xvfb guards for dashboard-created virtual displays, keyed by display
@@ -45,6 +45,33 @@ struct VirtualDisplayOwnership {
 pub(crate) struct VirtualDisplayGuards {
     processes: HashMap<u32, vision::XvfbGuard>,
     ownership: HashMap<u32, VirtualDisplayOwnership>,
+}
+
+fn browser_bindable_displays() -> &'static Mutex<HashSet<u32>> {
+    static DISPLAYS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    DISPLAYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether this exact daemon-owned display participates in the correlated
+/// create/reap lifecycle that also retires browser workspaces. Generic
+/// session-local Xvfb guards are intentionally excluded.
+pub(crate) fn process_owns_browser_bindable_display(display_id: u32) -> bool {
+    browser_bindable_displays()
+        .lock()
+        .is_ok_and(|displays| displays.contains(&display_id))
+        && vision::process_owns_virtual_display(display_id)
+}
+
+fn register_browser_bindable_display(display_id: u32) {
+    if let Ok(mut displays) = browser_bindable_displays().lock() {
+        displays.insert(display_id);
+    }
+}
+
+fn unregister_browser_bindable_display(display_id: u32) {
+    if let Ok(mut displays) = browser_bindable_displays().lock() {
+        displays.remove(&display_id);
+    }
 }
 
 impl VirtualDisplayGuards {
@@ -75,6 +102,7 @@ impl VirtualDisplayGuards {
     ) {
         self.processes.insert(display_id, guard);
         self.ownership.insert(display_id, ownership);
+        register_browser_bindable_display(display_id);
     }
 
     fn remove(&mut self, display_id: &u32) -> Option<vision::XvfbGuard> {
@@ -85,6 +113,14 @@ impl VirtualDisplayGuards {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.processes.is_empty() && self.ownership.is_empty()
+    }
+}
+
+impl Drop for VirtualDisplayGuards {
+    fn drop(&mut self) {
+        for display_id in self.ownership.keys().copied().collect::<Vec<_>>() {
+            unregister_browser_bindable_display(display_id);
+        }
     }
 }
 
@@ -469,10 +505,15 @@ pub(crate) async fn reap_virtual_display(
                 workspace: Some(workspace),
             });
         }
+        // Keep the display browser-bindable until every dependent workspace
+        // has been atomically retired. This prevents read-time reconciliation
+        // from winning the race and suppressing the push lifecycle event.
+        unregister_browser_bindable_display(display_id);
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
         guard.shutdown().await;
         true
     } else {
+        unregister_browser_bindable_display(display_id);
         false
     }
 }

@@ -221,8 +221,8 @@ pub struct CreateBrowserWorkspaceRequest {
     pub peer_id: Option<String>,
     #[serde(default)]
     pub owner_session_id: Option<String>,
-    /// Explicit Intendant-owned virtual display (`display_99`, `:99`, or
-    /// `99`). User-session and foreign X servers are rejected.
+    /// Explicit daemon-created virtual display (`display_99`, `:99`, or
+    /// `99`). User-session, session-local, and foreign X servers are rejected.
     #[serde(default)]
     pub display_target: Option<String>,
     #[serde(default)]
@@ -310,8 +310,21 @@ impl BrowserWorkspaceRegistry {
         Some((workspace, child))
     }
 
+    fn mark_start_error(&mut self, id: &str, message: &str) -> Option<BrowserWorkspace> {
+        let workspace = self.workspaces.get_mut(id)?;
+        if workspace.status == BrowserWorkspaceStatus::Starting {
+            workspace.status = BrowserWorkspaceStatus::Error;
+            workspace.lease = None;
+            workspace.message = Some(message.to_string());
+            workspace.updated_at = now_string();
+        }
+        Some(workspace.clone())
+    }
+
     fn reconcile_display_bindings(&mut self) -> Vec<RetiredBrowserWorkspace> {
-        self.reconcile_display_bindings_with(crate::vision::process_owns_virtual_display)
+        self.reconcile_display_bindings_with(
+            crate::virtual_display::process_owns_browser_bindable_display,
+        )
     }
 
     fn reconcile_display_bindings_with(
@@ -687,25 +700,19 @@ pub async fn create_workspace(
         .map(parse_browser_display_binding)
         .transpose()?;
     if let Some(binding) = display_binding.as_ref() {
-        if !crate::vision::process_owns_virtual_display(binding.display_id) {
+        if !crate::virtual_display::process_owns_browser_bindable_display(binding.display_id) {
             return Err(BrowserWorkspaceError::Unsupported(format!(
-                "browser workspace display {} is not a live virtual display owned by this Intendant process",
+                "browser workspace display {} is not a live daemon-created virtual display",
                 binding.canonical
             )));
         }
     }
+    let bound_display_id = display_binding.as_ref().map(|binding| binding.display_id);
     let profile_dir = request
         .profile_dir
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_profile_dir(&id));
-    std::fs::create_dir_all(&profile_dir).map_err(|e| {
-        BrowserWorkspaceError::Io(format!(
-            "failed to create browser workspace profile {}: {e}",
-            profile_dir.display()
-        ))
-    })?;
-
     let mut workspace = BrowserWorkspace {
         label: request
             .label
@@ -747,7 +754,36 @@ pub async fn create_workspace(
         id,
     };
 
-    let (child, cdp) = launch_cdp_browser(&workspace, &profile_dir).await?;
+    // Publish the Starting reservation before filesystem work or browser
+    // launch. Display teardown can now retire this exact binding instead of
+    // racing past a workspace that exists only on this task's stack.
+    global_registry()
+        .write()
+        .await
+        .insert(workspace.clone(), None);
+
+    if let Err(error) = std::fs::create_dir_all(&profile_dir) {
+        let message = format!(
+            "failed to create browser workspace profile {}: {error}",
+            profile_dir.display()
+        );
+        global_registry()
+            .write()
+            .await
+            .mark_start_error(&workspace.id, &message);
+        return Err(BrowserWorkspaceError::Io(message));
+    }
+
+    let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir).await {
+        Ok(launched) => launched,
+        Err(error) => {
+            global_registry()
+                .write()
+                .await
+                .mark_start_error(&workspace.id, &error.to_string());
+            return Err(error);
+        }
+    };
     workspace.browser_executable = Some(cdp.executable.path.display().to_string());
     workspace.browser_executable_source = Some(cdp.executable.source);
     workspace.process_id = cdp.process_id;
@@ -759,11 +795,49 @@ pub async fn create_workspace(
     workspace.message = Some("ready".to_string());
     workspace.updated_at = now_string();
 
-    global_registry()
-        .write()
-        .await
-        .insert(workspace.clone(), Some(child));
-    Ok(workspace)
+    let mut child = Some(child);
+    let commit = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let display_is_live = bound_display_id.is_none_or(|display_id| {
+            crate::virtual_display::process_owns_browser_bindable_display(display_id)
+        });
+        let current = registry.workspaces.get_mut(&workspace.id);
+        match current {
+            None => Err("browser workspace was closed during launch".to_string()),
+            Some(current) if current.status != BrowserWorkspaceStatus::Starting => Err(current
+                .message
+                .clone()
+                .unwrap_or_else(|| "browser workspace was retired during launch".to_string())),
+            Some(current) if !display_is_live => {
+                let message = "bound virtual display was retired during browser launch".to_string();
+                current.status = BrowserWorkspaceStatus::Error;
+                current.lease = None;
+                current.message = Some(message.clone());
+                current.updated_at = now_string();
+                Err(message)
+            }
+            Some(current) => {
+                if let Some(launched_child) = child.take() {
+                    *current = workspace.clone();
+                    let committed = current.clone();
+                    registry
+                        .children
+                        .insert(workspace.id.clone(), launched_child);
+                    Ok(committed)
+                } else {
+                    Err("browser workspace launch child was unavailable".to_string())
+                }
+            }
+        }
+    };
+    match commit {
+        Ok(committed) => Ok(committed),
+        Err(message) => {
+            terminate_workspace_process(cdp.process_id, child);
+            Err(BrowserWorkspaceError::Launch(message))
+        }
+    }
 }
 
 pub async fn list_workspaces() -> Vec<BrowserWorkspace> {
@@ -881,9 +955,9 @@ async fn launch_cdp_browser(
         .map(parse_browser_display_binding)
         .transpose()?;
     if let Some(binding) = display_binding.as_ref() {
-        if !crate::vision::process_owns_virtual_display(binding.display_id) {
+        if !crate::virtual_display::process_owns_browser_bindable_display(binding.display_id) {
             return Err(BrowserWorkspaceError::Launch(format!(
-                "browser workspace display {} stopped being owned before browser launch",
+                "browser workspace display {} left the daemon-created lifecycle before browser launch",
                 binding.canonical
             )));
         }
@@ -1628,6 +1702,7 @@ mod tests {
     fn display_retirement_targets_only_workspaces_bound_to_that_display() {
         let mut registry = BrowserWorkspaceRegistry::default();
         let mut retired = sample_workspace("bw-retired");
+        retired.status = BrowserWorkspaceStatus::Starting;
         retired.display_target = Some("display_99".to_string());
         retired.lease = Some(BrowserWorkspaceLease {
             holder_id: "agent-a".to_string(),
