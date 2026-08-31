@@ -5600,18 +5600,10 @@ fn print_tool_response(
     if config.json {
         if let Some(text) = single_text_content(result) {
             if let Ok(value) = serde_json::from_str::<Value>(text) {
-                print_json(&value)?;
-                if tool_error {
-                    return Err("tool returned isError=true".to_string());
-                }
-                return Ok(());
+                return print_json(&value);
             }
         }
-        print_json(result)?;
-        if tool_error {
-            return Err("tool returned isError=true".to_string());
-        }
-        return Ok(());
+        return print_json(result);
     }
     let mut printed = false;
     for text in text_contents(result) {
