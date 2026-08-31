@@ -1377,18 +1377,39 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
     })
 }
 
+/// Bounds for the prefix-only stream-mode resolution below: enough
+/// leading tokens to cover every registered command path and every
+/// alias rewrite (the registry test pins the headroom), each token
+/// capped at a size no real path token approaches.
+const MAX_COMMAND_PATH_TOKENS: usize = 6;
+const MAX_COMMAND_TOKEN_BYTES: usize = 64;
+
 /// The underlying tool an executor call resolves to, if it resolves —
-/// argv-only, values never parsed (the [`resolve_meta_argv`]
-/// discipline), so a transport may consult it pre-dispatch (per-request
-/// SSE mode selection) at the same cost class as the gate. `None`: not
-/// an executor call, or its path does not resolve.
+/// bounded and argv-PREFIX-only: at most the leading command-path
+/// tokens are read, each size-capped, never the whole argv, so a
+/// near-cap request cannot buy a second full argv materialization
+/// before the IAM decision (dispatch's own resolution is the first and
+/// only full one). The divergence class is harmless by construction:
+/// this chooses stream framing, never authorization — dispatch
+/// re-resolves exactly — and every refusal here just answers as plain
+/// JSON. `None`: not an executor call, the path does not resolve
+/// within the bound, or the lane mismatches (dispatch refuses those
+/// fast, so nothing held is lost).
 pub(crate) fn facade_resolved_tool(name: &str, args: &serde_json::Value) -> Option<&'static str> {
-    match name {
-        "inspect" | "act" | "authorize" => resolve_meta_argv(name, args)
-            .ok()
-            .map(|(_, spec)| spec.tool),
-        _ => None,
+    if !matches!(name, "inspect" | "act" | "authorize") {
+        return None;
     }
+    let argv = args.get("argv")?.as_array()?;
+    let prefix: Vec<String> = argv
+        .iter()
+        .take(MAX_COMMAND_PATH_TOKENS)
+        .map_while(serde_json::Value::as_str)
+        .take_while(|token| token.len() <= MAX_COMMAND_TOKEN_BYTES)
+        .map(str::to_string)
+        .collect();
+    let prefix = normalize_aliases(prefix);
+    let spec = resolve_path(&prefix).ok()?;
+    (spec.lane.tool_name() == name).then_some(spec.tool)
 }
 
 /// The gate-side authorization resolver. `None`: not a facade tool (fall
@@ -3423,6 +3444,69 @@ mod tests {
             facade_gate_operation("help", &serde_json::json!({})),
             Some(Op::StatsRead)
         );
+    }
+
+    /// The stream-mode resolver reads a bounded argv prefix, and on
+    /// every registered spelling it answers exactly what full
+    /// resolution answers; the bounds provably cover the registry, a
+    /// near-cap tail costs nothing, and every out-of-bound shape
+    /// refuses to plain JSON rather than resolving differently.
+    #[test]
+    fn facade_resolved_tool_is_prefix_bounded_and_registry_exact() {
+        for spec in COMMANDS {
+            assert!(
+                spec.path.len() <= MAX_COMMAND_PATH_TOKENS,
+                "path {:?} outgrew the prefix window — raise MAX_COMMAND_PATH_TOKENS",
+                spec.path
+            );
+            for token in spec.path {
+                assert!(
+                    token.len() <= MAX_COMMAND_TOKEN_BYTES,
+                    "path token {token:?} outgrew the token cap"
+                );
+            }
+            let call = serde_json::json!({ "argv": spec.path });
+            assert_eq!(
+                facade_resolved_tool(spec.lane.tool_name(), &call),
+                Some(spec.tool),
+                "bare path {:?} must resolve on its own lane",
+                spec.path
+            );
+            for meta in ["inspect", "act", "authorize"] {
+                if meta != spec.lane.tool_name() {
+                    assert_eq!(
+                        facade_resolved_tool(meta, &call),
+                        None,
+                        "path {:?} must refuse the {meta} lane",
+                        spec.path
+                    );
+                }
+            }
+        }
+        for (alias, canonical) in COMMAND_ALIASES {
+            assert!(alias.len() <= MAX_COMMAND_PATH_TOKENS);
+            assert!(canonical.len() <= MAX_COMMAND_PATH_TOKENS);
+        }
+        // A huge tail beyond the prefix window neither helps nor
+        // hurts: the held ask row still resolves with ten thousand
+        // near-cap tokens behind it.
+        let mut tail: Vec<serde_json::Value> = vec!["ask".into(), "go?".into()];
+        tail.extend((0..10_000).map(|_| serde_json::Value::String("x".repeat(64))));
+        assert_eq!(
+            facade_resolved_tool("act", &serde_json::json!({ "argv": tail })),
+            Some("ask_user")
+        );
+        // An oversized or non-string leading token stops the path read
+        // — refusal, never a different resolution.
+        assert_eq!(
+            facade_resolved_tool("act", &serde_json::json!({ "argv": ["x".repeat(65)] })),
+            None
+        );
+        assert_eq!(
+            facade_resolved_tool("act", &serde_json::json!({ "argv": [42, "ask"] })),
+            None
+        );
+        assert_eq!(facade_resolved_tool("act", &serde_json::json!({})), None);
     }
 
     #[test]
