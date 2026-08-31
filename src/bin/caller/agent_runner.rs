@@ -213,12 +213,51 @@ fn apply_user_display_grant_env(cmd: &mut Command, user_display_granted: bool) {
     }
 }
 
+/// Display and desktop-session variables that a synthetic child must never
+/// inherit. The synthetic mock backend is an OS-free test seam: allowing even
+/// one of these through can reconnect a shell command to the owner's X11,
+/// Wayland, or desktop-bus session after Xvfb allocation has been skipped.
+const DISPLAY_SESSION_ENV_VARS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    "INTENDANT_USER_DISPLAY",
+    USER_DISPLAY_GRANTED_ENV,
+];
+
 /// Scope one runtime child to its session-owned Xvfb. `None` preserves the
 /// ordinary inherited/user-session display selected by the existing child
-/// environment policy. A virtual child must not retain Wayland selection:
-/// otherwise GUI programs can ignore DISPLAY and connect to the owner's
-/// compositor through WAYLAND_DISPLAY/XDG_RUNTIME_DIR.
-fn apply_virtual_display_env(cmd: &mut Command, virtual_display_id: Option<u32>) {
+/// environment policy unless the fail-closed synthetic backend is armed. A
+/// virtual child must not retain Wayland selection: otherwise GUI programs
+/// can ignore DISPLAY and connect to the owner's compositor through
+/// WAYLAND_DISPLAY/XDG_RUNTIME_DIR.
+fn apply_virtual_display_env(
+    cmd: &mut Command,
+    virtual_display_id: Option<u32>,
+    synthetic_display_armed: bool,
+) {
+    if synthetic_display_armed {
+        for key in DISPLAY_SESSION_ENV_VARS {
+            cmd.env_remove(key);
+        }
+        // The runtime is a separate process and cannot observe the caller's
+        // process-local synthetic `armed` bit. Mint a restriction-only marker
+        // so it also skips host-global X discovery and never injects DISPLAY
+        // into model-driven descendants.
+        cmd.env(
+            crate::display::synthetic::RUNTIME_MARKER_ENV,
+            crate::display::synthetic::RUNTIME_MARKER_VALUE,
+        );
+        return;
+    }
+    // Never honor an ambient copy: only the validated synthetic branch above
+    // may mint the marker for a runtime child.
+    cmd.env_remove(crate::display::synthetic::RUNTIME_MARKER_ENV);
     if let Some(display_id) = virtual_display_id {
         cmd.env("DISPLAY", format!(":{display_id}"));
         #[cfg(target_os = "linux")]
@@ -881,7 +920,11 @@ async fn run_agent_inner(
     // bypass DISPLAY. `launch_display` deliberately leaves the daemon-wide
     // environment alone so concurrent sessions and browser workspaces cannot
     // inherit each other's X servers.
-    apply_virtual_display_env(&mut cmd, virtual_display_id);
+    apply_virtual_display_env(
+        &mut cmd,
+        virtual_display_id,
+        crate::display::synthetic::armed(),
+    );
 
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
@@ -1456,7 +1499,7 @@ mod tests {
         virtual_child.env("WAYLAND_DISPLAY", "wayland-0");
         virtual_child.env("XDG_RUNTIME_DIR", "/run/user/1000");
         virtual_child.env("XDG_SESSION_TYPE", "wayland");
-        apply_virtual_display_env(&mut virtual_child, Some(137));
+        apply_virtual_display_env(&mut virtual_child, Some(137), false);
         let env: std::collections::HashMap<_, _> = virtual_child.as_std().get_envs().collect();
         let display = env
             .get(std::ffi::OsStr::new("DISPLAY"))
@@ -1486,7 +1529,7 @@ mod tests {
         ordinary_child.env("WAYLAND_DISPLAY", "wayland-owner");
         ordinary_child.env("XDG_RUNTIME_DIR", "/run/user/owner");
         ordinary_child.env("XDG_SESSION_TYPE", "wayland");
-        apply_virtual_display_env(&mut ordinary_child, None);
+        apply_virtual_display_env(&mut ordinary_child, None, false);
         let ordinary_env: std::collections::HashMap<_, _> =
             ordinary_child.as_std().get_envs().collect();
         assert_eq!(
@@ -1516,6 +1559,63 @@ mod tests {
                 .and_then(|value| *value)
                 .and_then(std::ffi::OsStr::to_str),
             Some("wayland")
+        );
+
+        let mut synthetic_child = Command::new("true");
+        for (key, value) in [
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-owner"),
+            ("XAUTHORITY", "/run/user/owner/xauthority"),
+            ("XDG_RUNTIME_DIR", "/run/user/owner"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/owner/bus"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "GNOME"),
+            ("DESKTOP_SESSION", "gnome"),
+            ("INTENDANT_USER_DISPLAY", ":0"),
+            (USER_DISPLAY_GRANTED_ENV, "1"),
+        ] {
+            synthetic_child.env(key, value);
+        }
+        // Even a simultaneously supplied virtual id cannot weaken the
+        // synthetic backend's stronger OS-free boundary.
+        apply_virtual_display_env(&mut synthetic_child, Some(137), true);
+        let synthetic_env: std::collections::HashMap<_, _> =
+            synthetic_child.as_std().get_envs().collect();
+        for key in DISPLAY_SESSION_ENV_VARS {
+            assert_eq!(
+                synthetic_env.get(std::ffi::OsStr::new(key)),
+                Some(&None),
+                "synthetic child retained {key}"
+            );
+        }
+        assert_eq!(
+            synthetic_env
+                .get(std::ffi::OsStr::new(
+                    crate::display::synthetic::RUNTIME_MARKER_ENV,
+                ))
+                .and_then(|value| *value),
+            Some(std::ffi::OsStr::new(
+                crate::display::synthetic::RUNTIME_MARKER_VALUE,
+            )),
+            "synthetic child must carry the runtime fail-closed marker"
+        );
+
+        let mut ordinary_with_ambient_marker = Command::new("true");
+        ordinary_with_ambient_marker.env(
+            crate::display::synthetic::RUNTIME_MARKER_ENV,
+            crate::display::synthetic::RUNTIME_MARKER_VALUE,
+        );
+        apply_virtual_display_env(&mut ordinary_with_ambient_marker, None, false);
+        assert_eq!(
+            ordinary_with_ambient_marker
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| {
+                    *key == std::ffi::OsStr::new(crate::display::synthetic::RUNTIME_MARKER_ENV)
+                })
+                .and_then(|(_, value)| value),
+            None,
+            "ordinary children must not accept an ambient synthetic marker"
         );
     }
 

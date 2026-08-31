@@ -236,6 +236,24 @@ where
         .collect()
 }
 
+/// Desktop-session variables that must remain absent from commands spawned by
+/// a runtime constrained to the synthetic display rig. The controller already
+/// removes them at the runtime boundary; repeating the removal here prevents a
+/// future runtime-side environment mutation from reconnecting a descendant to
+/// the host desktop.
+const SYNTHETIC_DISPLAY_ENV_VARS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    "INTENDANT_USER_DISPLAY",
+    "INTENDANT_USER_DISPLAY_GRANTED",
+];
+
 #[derive(Clone)]
 pub struct Agent {
     process_state: Arc<RwLock<HashMap<u64, ProcessInfo>>>,
@@ -243,6 +261,10 @@ pub struct Agent {
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
     available_displays: Vec<i32>,
     session_xauthority: Option<PathBuf>,
+    /// Restriction-only mode minted by the controller for the OS-free mock
+    /// display rig. It disables every runtime path that can discover, select,
+    /// authenticate to, or capture a native display.
+    synthetic_display_runtime: bool,
     /// See [`crate::models::AgentInput::human_response_token`].
     human_response_token: Option<String>,
     /// See [`crate::models::AgentInput::runtime_protocol_token`].
@@ -263,6 +285,7 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays: vec![],
             session_xauthority: None,
+            synthetic_display_runtime: false,
             human_response_token: None,
             runtime_protocol_token: None,
         })
@@ -274,9 +297,13 @@ impl Agent {
         // Resolve log directory (reuse existing session or create new)
         let log_dir = Self::resolve_log_dir()?;
 
-        // Discover X displays and merge xauth cookies
-        let available_displays = Self::discover_displays();
-        let session_xauthority = Self::setup_merged_xauthority(&available_displays, &log_dir);
+        let synthetic_display_runtime = intendant_display::synthetic::runtime_marker_armed();
+        let (available_displays, session_xauthority) = Self::initialize_display_state_with(
+            synthetic_display_runtime,
+            &log_dir,
+            Self::discover_displays,
+            Self::setup_merged_xauthority,
+        );
 
         Ok(Self {
             process_state,
@@ -284,9 +311,32 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays,
             session_xauthority,
+            synthetic_display_runtime,
             human_response_token: None,
             runtime_protocol_token: None,
         })
+    }
+
+    /// Resolve the native display state through injectable hooks. The
+    /// synthetic branch returns before invoking either hook: tests use
+    /// panicking hooks to prove that runtime construction cannot even consult
+    /// host-global X locks or xauth when the marker is present.
+    fn initialize_display_state_with<Discover, Xauthority>(
+        synthetic_display_runtime: bool,
+        log_dir: &Path,
+        discover: Discover,
+        xauthority: Xauthority,
+    ) -> (Vec<i32>, Option<PathBuf>)
+    where
+        Discover: FnOnce() -> Vec<i32>,
+        Xauthority: FnOnce(&[i32], &Path) -> Option<PathBuf>,
+    {
+        if synthetic_display_runtime {
+            return (Vec::new(), None);
+        }
+        let displays = discover();
+        let merged = xauthority(&displays, log_dir);
+        (displays, merged)
     }
 
     /// Adopt the batch's controller-minted askHuman answer token (see
@@ -686,20 +736,25 @@ impl Agent {
         let mut stderr_reader = stderr_file.try_clone()?;
 
         // Execute command
-        let display_id = cmd.display.unwrap_or_else(|| {
-            std::env::var("DISPLAY")
-                .ok()
-                .and_then(|d| d.trim_start_matches(':').parse().ok())
-                .unwrap_or_else(|| self.default_display())
-        });
-        // Gate user session display access
-        if display_id <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
-            return Err(AgentError::Process(
-                "Access to the user's session display (display :0) requires explicit grant. \
-                 Use a virtual display or request display access first."
-                    .to_string(),
-            ));
-        }
+        let display_id = if self.synthetic_display_runtime {
+            None
+        } else {
+            let display_id = cmd.display.unwrap_or_else(|| {
+                std::env::var("DISPLAY")
+                    .ok()
+                    .and_then(|d| d.trim_start_matches(':').parse().ok())
+                    .unwrap_or_else(|| self.default_display())
+            });
+            // Gate user session display access
+            if display_id <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
+                return Err(AgentError::Process(
+                    "Access to the user's session display (display :0) requires explicit grant. \
+                     Use a virtual display or request display access first."
+                        .to_string(),
+                ));
+            }
+            Some(display_id)
+        };
         // Platform shell: `bash -c <command>` on Unix (unchanged), `cmd.exe
         // /C <command>` on Windows where bash is not on PATH. The whole
         // command string is passed as one argument so the shell does the
@@ -709,7 +764,6 @@ impl Agent {
         let mut cmd_builder = Command::new(shell);
         cmd_builder
             .args(&shell_args)
-            .env("DISPLAY", format!(":{}", display_id))
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("GEMINI_API_KEY")
@@ -718,14 +772,24 @@ impl Agent {
             .env_remove("ANTHROPIC")
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
+        if let Some(display_id) = display_id {
+            cmd_builder.env("DISPLAY", format!(":{}", display_id));
+        } else {
+            for key in SYNTHETIC_DISPLAY_ENV_VARS {
+                cmd_builder.env_remove(key);
+            }
+            cmd_builder.env_remove(intendant_display::synthetic::RUNTIME_MARKER_ENV);
+        }
         // Ambient host credentials (agent sockets, cloud/forge tokens,
         // credential-store pointers) must not ride into model-driven shells
         // either; `INTENDANT_*` control vars survive.
         for name in shell_env_scrub_list(std::env::vars_os().map(|(k, _)| k)) {
             cmd_builder.env_remove(&name);
         }
-        if let Some(ref xauth) = self.session_xauthority {
-            cmd_builder.env("XAUTHORITY", xauth);
+        if !self.synthetic_display_runtime {
+            if let Some(ref xauth) = self.session_xauthority {
+                cmd_builder.env("XAUTHORITY", xauth);
+            }
         }
         let mut child = cmd_builder.spawn()?;
 
@@ -775,6 +839,13 @@ impl Agent {
     }
 
     async fn capture_screen(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        if self.synthetic_display_runtime {
+            return Err(AgentError::Process(
+                "Legacy captureScreen is unavailable in synthetic display mode; use native \
+                 screenshot computer use."
+                    .to_string(),
+            ));
+        }
         let screenshot_path = self.log_dir.join(format!("screenshot_{}.png", cmd.nonce));
 
         // macOS: use native screencapture (no display number needed)
@@ -2050,6 +2121,83 @@ mod tests {
         let log_dir = TempDir::new().unwrap();
         let agent = Agent::new_with_paths(log_dir.path().to_path_buf()).unwrap();
         (agent, log_dir)
+    }
+
+    fn create_synthetic_test_agent() -> (Agent, TempDir) {
+        let log_dir = TempDir::new().unwrap();
+        let agent = Agent {
+            process_state: Arc::new(RwLock::new(HashMap::new())),
+            log_dir: log_dir.path().to_path_buf(),
+            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            available_displays: vec![],
+            session_xauthority: None,
+            synthetic_display_runtime: true,
+            human_response_token: None,
+            runtime_protocol_token: None,
+        };
+        (agent, log_dir)
+    }
+
+    #[test]
+    fn synthetic_runtime_skips_display_discovery_and_xauthority_hooks() {
+        let log_dir = TempDir::new().unwrap();
+        let (displays, xauthority) = Agent::initialize_display_state_with(
+            true,
+            log_dir.path(),
+            || panic!("synthetic runtime consulted host-global X locks"),
+            |_, _| panic!("synthetic runtime consulted host xauthority"),
+        );
+        assert!(displays.is_empty());
+        assert!(xauthority.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_runtime_shell_has_no_native_display_route() {
+        let (agent, _log) = create_synthetic_test_agent();
+        #[cfg(windows)]
+        let print_environment = "set";
+        #[cfg(not(windows))]
+        let print_environment = "env";
+        let cmd = AgentCommand {
+            function: "execAsAgent".to_string(),
+            nonce: 9101,
+            command: Some(print_environment.to_string()),
+            display: Some(0),
+            ..Default::default()
+        };
+        let result = agent.exec_as_agent(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let stdout = parsed["stdout_tail"].as_str().unwrap();
+        for key in SYNTHETIC_DISPLAY_ENV_VARS
+            .iter()
+            .copied()
+            .chain(std::iter::once(
+                intendant_display::synthetic::RUNTIME_MARKER_ENV,
+            ))
+        {
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{key}="))),
+                "synthetic shell retained {key}: {stdout}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_runtime_rejects_legacy_native_capture() {
+        let (agent, _log) = create_synthetic_test_agent();
+        let cmd = AgentCommand {
+            function: "captureScreen".to_string(),
+            nonce: 9102,
+            display: Some(99),
+            ..Default::default()
+        };
+        let err = agent.capture_screen(&cmd).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unavailable in synthetic display mode"),
+            "{err}"
+        );
     }
 
     fn command_log_paths(log_dir: &Path, nonce: u64, stream: &str) -> Vec<PathBuf> {
