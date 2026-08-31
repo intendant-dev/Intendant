@@ -179,11 +179,15 @@ fn requested_profile<'a>(params: &'a Value, endpoint_profile: Option<&'a str>) -
 fn profile_for_uri(uri: &str) -> Option<&'static str> {
     let prefix = "skill://intendant/intendant-skills";
     let suffix = uri.strip_prefix(prefix)?;
-    let package_path = suffix.strip_prefix('/').or_else(|| {
-        suffix
-            .strip_prefix('-')
-            .and_then(|rest| rest.split_once('/').map(|(_, path)| path))
-    })?;
+    let package_path = if let Some(path) = suffix.strip_prefix('/') {
+        path
+    } else {
+        let (ordinal, path) = suffix.strip_prefix('-')?.split_once('/')?;
+        if !matches!(ordinal, "2" | "3" | "4" | "5") {
+            return None;
+        }
+        path
+    };
     (package_path == "SKILL.md" || package_path.starts_with("references/"))
         .then_some("openai")
 }
