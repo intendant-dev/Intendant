@@ -1115,6 +1115,8 @@ impl IntendantServer {
         // cloning it.
         if let Some(result) = outcome.results.into_iter().next() {
             if let Some(screenshot) = result.screenshot {
+                let captured_at =
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 clear_wayland_user_session_activation_pending_after_capture(
                     &self.state,
                     target,
@@ -1126,6 +1128,7 @@ impl IntendantServer {
                     "screenshot_path": screenshot.path,
                     "width": screenshot.width,
                     "height": screenshot.height,
+                    "captured_at": captured_at,
                 });
                 if compact_output {
                     return Ok(compact_image_tool_result(metadata, "image/png"));

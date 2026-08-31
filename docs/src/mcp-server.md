@@ -284,6 +284,14 @@ context:
 "${INTENDANT:-intendant}" ctl display screenshot --target user_session --output screen.png
 ```
 
+Image-bearing ctl commands install `--output` atomically without overwriting an
+existing path or following an output symlink. On Unix the saved file is mode
+`0600`. Adding `--json` saves the image and prints a compact receipt containing
+its canonical path, SHA-256, media type, byte length, decoded dimensions, and
+save timestamp (plus the tool's capture timestamp when supplied); image bytes
+are never repeated in that receipt.
+`--raw` and `--output` are intentionally incompatible.
+
 Full MCP tool groups:
 
 ### Status & logs (observation)
