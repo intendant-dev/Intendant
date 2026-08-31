@@ -197,7 +197,17 @@ def spawn_daemon(name, home, script, cwd):
            if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
                         "MODEL_NAME", "PRESENCE_PROVIDER", "PRESENCE_MODEL",
                         "CU_PROVIDER", "CU_MODEL")}
-    env.update(HOME=home, PROVIDER="mock", INTENDANT_MOCK_SCRIPT=script_path)
+    # This protocol smoke never exercises a real desktop. Arm the mock
+    # provider's fail-closed synthetic display explicitly so its shell-only
+    # exec steps cannot allocate host-global Xvfb slots (or leak them when a
+    # CI job is cancelled). Keeping the declaration in the rig also makes the
+    # OS-free contract independent of runner-service environment variables.
+    env.update(
+        HOME=home,
+        PROVIDER="mock",
+        INTENDANT_MOCK_SCRIPT=script_path,
+        INTENDANT_MOCK_DISPLAY="synthetic",
+    )
     log_path = os.path.join(home, "daemon.log")
     out = open(log_path, "w")
     # `--web 0` asks the kernel for a free port (race-free — the daemon
