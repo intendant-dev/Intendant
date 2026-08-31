@@ -1099,6 +1099,67 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Live acceptance test for the real Xvfb authorization boundary. Run on
+    /// Linux capture hosts with both `Xvfb` and `xdpyinfo` installed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore]
+    async fn live_private_xvfb_rejects_unauthenticated_clients_and_tcp() {
+        let mut excluded = Vec::new();
+        let config = loop {
+            let config = virtual_display_config(640, 480, &excluded).expect("free display");
+            let DisplayTarget::Virtual { id } = config.target else {
+                panic!("virtual display allocator returned the user session");
+            };
+            let tcp = std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + id as u16));
+            if std::net::TcpStream::connect_timeout(&tcp, std::time::Duration::from_millis(50))
+                .is_err()
+            {
+                break config;
+            }
+            excluded.push(id);
+        };
+        let DisplayTarget::Virtual { id } = config.target else {
+            unreachable!();
+        };
+        let guard = launch_private_display(&config).await.expect("private Xvfb");
+        let authorization = virtual_display_x11_authorization(id).expect("live authorization");
+        let display = format!(":{id}");
+
+        let unauthorized = tokio::process::Command::new("xdpyinfo")
+            .args(["-display", &display])
+            .env_remove("XAUTHORITY")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .expect("unauthenticated xdpyinfo");
+        assert!(!unauthorized.success());
+
+        let authorized = tokio::process::Command::new("xdpyinfo")
+            .args(["-display", &display])
+            .env("XAUTHORITY", authorization.xauthority_path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .expect("authenticated xdpyinfo");
+        assert!(authorized.success());
+
+        let tcp = std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + id as u16));
+        assert!(
+            std::net::TcpStream::connect_timeout(&tcp, std::time::Duration::from_millis(100))
+                .is_err(),
+            "private Xvfb unexpectedly exposed TCP port {}",
+            tcp.port()
+        );
+
+        let credential_path = authorization.xauthority_path().to_path_buf();
+        guard.shutdown().await;
+        assert!(virtual_display_x11_authorization(id).is_none());
+        assert!(!credential_path.exists());
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn virtual_display_socket_probe_is_linux_only() {
