@@ -214,11 +214,15 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   **New virtual display** action and a first-class MCP tool
   (`intendant ctl display create [--width N] [--height N]`, federated via
   `ctl --peer`; it awaits the ready/failed outcome and returns the new
-  display's id) — the path that gives an authorized headless box a
-  display with no API key configured. Created displays register a
-  capture session immediately (streaming tile, CU-routable, announced to
-  dashboards and federated peers), are daemon-owned,
-  and are destroyed when their tile is closed (a hard daemon kill leaves the
+  display's id plus an opaque capture generation) — the path that gives an
+  authorized headless box a display with no API key configured. Created
+  displays register a capture session immediately (streaming tile,
+  CU-routable, announced to dashboards and federated peers) and are
+  daemon-owned. Automated callers tear
+  down exactly the generation they created with
+  `intendant ctl display destroy DISPLAY_ID CAPTURE_GENERATION`; stale
+  generations are refused and bound browsers are retired first. Displays are
+  also destroyed when their tile is closed (a hard daemon kill leaves the
   usual orphan for the next allocation to reclaim). Xvfb is Linux-only; other
   platforms answer the action with a clear error.
 - **`UserSession`** — the user's real desktop. On Linux X11 it resolves the

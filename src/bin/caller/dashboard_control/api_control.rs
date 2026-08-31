@@ -1888,6 +1888,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
         ControlMsg::ResolveDisplayRequest { .. } => "resolve_display_request",
         ControlMsg::CreateVirtualDisplay { .. } => "create_virtual_display",
+        ControlMsg::DestroyVirtualDisplay { .. } => "destroy_virtual_display",
         ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
         ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
         ControlMsg::AcquireBrowserWorkspace { .. } => "acquire_browser_workspace",

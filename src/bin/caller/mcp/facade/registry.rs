@@ -856,6 +856,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Create a virtual display",
     },
     CommandSpec {
+        path: &["display", "destroy"],
+        lane: RiskLane::Act,
+        tool: "destroy_virtual_display",
+        seed: "{}",
+        positionals: &[
+            p_u64("DISPLAY_ID", "display_id"),
+            p_str("CAPTURE_GENERATION", "capture_generation", false, false),
+        ],
+        flags: &[flag!("note", "note", Str, "why the display is destroyed")],
+        help: "Destroy the exact generation returned by display create",
+    },
+    CommandSpec {
         path: &["display", "frames"],
         lane: RiskLane::Inspect,
         tool: "list_frames",

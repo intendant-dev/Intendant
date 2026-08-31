@@ -419,7 +419,12 @@ impl XvfbGuard {
     /// runtime worker. Graceful waiting is bounded; the fallback hard-kills
     /// only the spawned child. X lock/socket residue is never removed because
     /// its ownership is ambiguous once the child has exited.
-    pub async fn shutdown(mut self) {
+    ///
+    /// Returns `true` only when the child exit was observed and, on Linux, its
+    /// exact X lock and socket are both absent. Receipt-bearing callers must
+    /// check this result instead of turning a diagnostic-only shutdown failure
+    /// into a successful teardown claim.
+    pub async fn shutdown(mut self) -> bool {
         #[cfg(target_os = "linux")]
         {
             // New browser launches must stop treating this display as owned
@@ -428,13 +433,14 @@ impl XvfbGuard {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     self.report_residual_state();
-                    return;
+                    return owned_xvfb_paths_are_cleared(
+                        std::path::Path::new("/tmp"),
+                        self.display_id,
+                    );
                 }
                 Ok(None) => {}
                 Err(err) => {
                     eprintln!("[vision] failed to inspect Xvfb child before shutdown: {err}");
-                    let _ = self.child.kill().await;
-                    return;
                 }
             }
 
@@ -444,7 +450,10 @@ impl XvfbGuard {
                 {
                     Ok(Ok(_)) => {
                         self.report_residual_state();
-                        return;
+                        return owned_xvfb_paths_are_cleared(
+                            std::path::Path::new("/tmp"),
+                            self.display_id,
+                        );
                     }
                     Ok(Err(err)) => {
                         eprintln!("[vision] failed to reap Xvfb child after SIGTERM: {err}");
@@ -457,7 +466,22 @@ impl XvfbGuard {
         // `Child::kill` targets this guard's exact spawned child and awaits
         // its exit. Drop remains the nonblocking fallback if this future is
         // cancelled before the await completes.
-        let _ = self.child.kill().await;
+        let killed = match self.child.kill().await {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("[vision] failed to kill and reap Xvfb child: {err}");
+                false
+            }
+        };
+        #[cfg(target_os = "linux")]
+        {
+            self.report_residual_state();
+            killed && owned_xvfb_paths_are_cleared(std::path::Path::new("/tmp"), self.display_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            killed
+        }
     }
 
     #[cfg(target_os = "linux")]

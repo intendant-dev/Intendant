@@ -649,6 +649,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::RevokeUserDisplay { .. }
         | ControlMsg::ResolveDisplayRequest { .. }
         | ControlMsg::CreateVirtualDisplay { .. }
+        | ControlMsg::DestroyVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. }
         | ControlMsg::PeerFileTransferSignal { .. }
         | ControlMsg::PeerDashboardControlSignal { .. }

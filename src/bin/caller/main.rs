@@ -3382,6 +3382,23 @@ pub fn spawn_user_display_listener(
                     )
                     .await;
                 }
+                AppEvent::ControlCommand(ControlMsg::DestroyVirtualDisplay {
+                    request_id,
+                    display_id,
+                    capture_generation,
+                    note,
+                }) => {
+                    virtual_display::destroy_virtual_display(
+                        &bus,
+                        &session_registry,
+                        &mut virtual_display_guards,
+                        &request_id,
+                        display_id,
+                        &capture_generation,
+                        note.as_deref(),
+                    )
+                    .await;
+                }
                 AppEvent::UserDisplayRevoked { display_id, .. } => {
                     virtual_display::fail_pending_virtual_display_create(
                         &bus,

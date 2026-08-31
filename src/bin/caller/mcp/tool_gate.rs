@@ -203,6 +203,7 @@ pub(crate) fn tool_allowed_for_profile(
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
                     | "create_virtual_display"
+                    | "destroy_virtual_display"
                     | "grant_user_display"
                     // The doorbell for the user's own display — exists
                     // precisely for these scoped supervised callers.
@@ -245,6 +246,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
                     | "create_virtual_display"
+                    | "destroy_virtual_display"
                     | "grant_user_display"
                     | "request_user_display"
                     | "revoke_user_display"
@@ -447,6 +449,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "take_display"
         | "release_display"
         | "create_virtual_display"
+        | "destroy_virtual_display"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -881,8 +884,16 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "create_virtual_display",
         manual_http_tool_definition!(
             "create_virtual_display",
-            "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
+            "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id, geometry, and opaque capture_generation required for exact teardown.",
             CreateVirtualDisplayParams
+        ),
+    );
+    push(
+        "destroy_virtual_display",
+        manual_http_tool_definition!(
+            "destroy_virtual_display",
+            "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes bound browser workspaces first, and refuses stale generations without touching the live display.",
+            DestroyVirtualDisplayParams
         ),
     );
     push(

@@ -995,6 +995,37 @@ async fn run_display(
                 call_tool(client, config, "create_virtual_display", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "destroy" => {
+            let args = parse_command_args(&raw[1..], &["--note"], &[])?;
+            let display_id = positional_u32(
+                &args,
+                0,
+                "display destroy requires DISPLAY_ID and CAPTURE_GENERATION",
+            )?;
+            let capture_generation = args.positional.get(1).ok_or_else(|| {
+                "display destroy requires DISPLAY_ID and CAPTURE_GENERATION".to_string()
+            })?;
+            if args.positional.len() > 2 {
+                return Err(
+                    "display destroy accepts exactly DISPLAY_ID and CAPTURE_GENERATION".to_string(),
+                );
+            }
+            let mut map = Map::new();
+            map.insert("display_id".to_string(), Value::from(display_id));
+            map.insert(
+                "capture_generation".to_string(),
+                Value::String(capture_generation.clone()),
+            );
+            insert_string(&mut map, "note", args.one("--note"));
+            let response = call_tool(
+                client,
+                config,
+                "destroy_virtual_display",
+                Value::Object(map),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
         "frames" => {
             let args = parse_command_args(&raw[1..], &["--stream", "--count"], &[])?;
             let mut map = Map::new();
@@ -5987,6 +6018,7 @@ fn help_display() {
         "Usage:\n\
   intendant ctl display list\n\
   intendant ctl display create [--width N] [--height N]\n\
+  intendant ctl display destroy DISPLAY_ID CAPTURE_GENERATION [--note TEXT]\n\
   intendant ctl display status [--target TARGET]\n\
   intendant ctl display frames [--stream NAME] [--count N]\n\
   intendant ctl display read-frame [latest|ID] [--stream NAME]\n\
