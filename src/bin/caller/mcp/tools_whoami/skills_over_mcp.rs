@@ -5,8 +5,8 @@
 //! daemon materializes—enabled builtins, active plugin payloads, and verified
 //! owner-added skills—is projected into `skills/list`, `skills/get`, and
 //! `resources/read`. The OpenAI adapter folds that unbounded logical catalog
-//! into one package so the provider's five-skill intake ceiling never becomes
-//! an Intendant catalog ceiling.
+//! into at most five tree-preserving packages so the provider's named-skill
+//! intake ceiling never becomes an Intendant catalog ceiling.
 
 use base64::Engine as _;
 use serde_json::{Map, Value};
@@ -48,6 +48,7 @@ impl ServedSkill {
                 .map(|resource| serde_json::json!({
                     "uri": resource.uri,
                     "digest": catalog::sha256_digest(&resource.bytes),
+                    "size": resource.bytes.len(),
                 }))
                 .collect::<Vec<_>>(),
         })
@@ -60,9 +61,9 @@ impl ServedSkill {
 
 impl IntendantServer {
     /// Paginated Skills Over MCP catalog. `profile=openai`—or the endpoint's
-    /// `skill_profile=openai` query—returns one aggregate package containing
-    /// every effective skill, avoiding OpenAI's current named-skill ceiling
-    /// without truncating the logical catalog.
+    /// `skill_profile=openai` query—returns at most five aggregate packages
+    /// containing every effective skill, using all of OpenAI's current named-
+    /// skill allowance without truncating the logical catalog.
     pub(crate) fn skills_over_mcp_list(
         &self,
         params: &Value,
@@ -79,6 +80,7 @@ impl IntendantServer {
         }
         let end = cursor.saturating_add(SKILLS_PAGE_SIZE).min(served.len());
         let mut out = serde_json::json!({
+            "resultType": "complete",
             "skills": served[cursor..end]
                 .iter()
                 .map(ServedSkill::catalog_json)
@@ -105,7 +107,10 @@ impl IntendantServer {
             .iter()
             .find(|skill| skill.uri == uri)
             .ok_or_else(|| format!("unknown skill URI {uri:?}"))?;
-        Ok(serde_json::json!({ "skill": skill.catalog_json() }))
+        Ok(serde_json::json!({
+            "resultType": "complete",
+            "skill": skill.catalog_json(),
+        }))
     }
 
     /// Read exactly one resource named by a listed skill manifest. Synthetic
@@ -143,7 +148,7 @@ impl IntendantServer {
     ) -> Result<Vec<ServedSkill>, String> {
         let effective = catalog::effective_skill_catalog(&self.skills_over_mcp_state_root())?;
         if openai_profile(skill_profile) {
-            Ok(vec![openai::aggregate_skill(&effective)?])
+            openai::aggregate_skills(&effective)
         } else {
             Ok(effective)
         }
@@ -172,11 +177,15 @@ fn requested_profile<'a>(params: &'a Value, endpoint_profile: Option<&'a str>) -
 }
 
 fn profile_for_uri(uri: &str) -> Option<&'static str> {
-    uri.starts_with(&format!(
-        "skill://intendant/{}/",
-        openai::AGGREGATE_NAME
-    ))
-    .then_some("openai")
+    let prefix = "skill://intendant/intendant-skills";
+    let suffix = uri.strip_prefix(prefix)?;
+    let package_path = suffix.strip_prefix('/').or_else(|| {
+        suffix
+            .strip_prefix('-')
+            .and_then(|rest| rest.split_once('/').map(|(_, path)| path))
+    })?;
+    (package_path == "SKILL.md" || package_path.starts_with("references/"))
+        .then_some("openai")
 }
 
 fn openai_profile(profile: Option<&str>) -> bool {
