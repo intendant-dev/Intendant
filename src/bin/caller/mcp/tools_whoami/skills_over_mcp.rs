@@ -90,14 +90,16 @@ impl IntendantServer {
         Ok(out)
     }
 
-    /// Return one complete skill entry by its catalog URI.
+    /// Return one complete skill entry by its catalog URI. Synthetic profile
+    /// URIs are self-identifying, so a follow-up need not repeat the profile
+    /// parameter used on `skills/list`.
     pub(crate) fn skills_over_mcp_get(
         &self,
         params: &Value,
         skill_profile: Option<&str>,
     ) -> Result<Value, String> {
         let uri = required_string(params, "uri")?;
-        let profile = requested_profile(params, skill_profile);
+        let profile = profile_for_uri(uri).or_else(|| requested_profile(params, skill_profile));
         let served = self.skills_over_mcp_catalog(profile)?;
         let skill = served
             .iter()
@@ -106,14 +108,15 @@ impl IntendantServer {
         Ok(serde_json::json!({ "skill": skill.catalog_json() }))
     }
 
-    /// Read exactly one resource named by a listed skill manifest.
+    /// Read exactly one resource named by a listed skill manifest. Synthetic
+    /// aggregate resource URIs likewise select their own profile.
     pub(crate) fn skills_over_mcp_read_resource(
         &self,
         params: &Value,
         skill_profile: Option<&str>,
     ) -> Result<Value, String> {
         let uri = required_string(params, "uri")?;
-        let profile = requested_profile(params, skill_profile);
+        let profile = profile_for_uri(uri).or_else(|| requested_profile(params, skill_profile));
         let served = self.skills_over_mcp_catalog(profile)?;
         let resource = served
             .iter()
@@ -166,6 +169,14 @@ fn requested_profile<'a>(params: &'a Value, endpoint_profile: Option<&'a str>) -
             .map(str::trim)
             .filter(|profile| !profile.is_empty())
     })
+}
+
+fn profile_for_uri(uri: &str) -> Option<&'static str> {
+    uri.starts_with(&format!(
+        "skill://intendant/{}/",
+        openai::AGGREGATE_NAME
+    ))
+    .then_some("openai")
 }
 
 fn openai_profile(profile: Option<&str>) -> bool {
