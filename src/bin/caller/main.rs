@@ -3383,6 +3383,12 @@ pub fn spawn_user_display_listener(
                     .await;
                 }
                 AppEvent::UserDisplayRevoked { display_id, .. } => {
+                    virtual_display::fail_pending_virtual_display_create(
+                        &bus,
+                        &mut virtual_display_guards,
+                        display_id,
+                        "virtual display create was revoked before completion",
+                    );
                     deactivate_user_display(&session_registry, display_id).await;
                     // Closing the tile of a dashboard-created display IS its
                     // destroy: nothing else owns it, and leaving the Xvfb
@@ -3396,6 +3402,7 @@ pub fn spawn_user_display_listener(
                 }
                 AppEvent::DisplayCaptureLost {
                     display_id,
+                    capture_generation: None,
                     ref reason,
                 } => {
                     // Capture backend stopped unexpectedly (portal session
@@ -3412,6 +3419,47 @@ pub fn spawn_user_display_listener(
                         &mut virtual_display_guards,
                         display_id,
                         "capture lost",
+                    )
+                    .await;
+                }
+                AppEvent::DisplayCaptureLost {
+                    capture_generation: Some(_),
+                    ..
+                } => {
+                    // Generation-bound public retirements are emitted only
+                    // after the virtual-display owner has already validated
+                    // and cleaned the exact generation. Their lossless-lane
+                    // copy must not touch a replacement that reused the id.
+                }
+                AppEvent::VirtualDisplayCaptureLost {
+                    display_id,
+                    ref capture_generation,
+                    ref reason,
+                } => {
+                    virtual_display::handle_virtual_display_capture_lost(
+                        &bus,
+                        &session_registry,
+                        &mut virtual_display_guards,
+                        display_id,
+                        capture_generation,
+                        reason,
+                    )
+                    .await;
+                }
+                AppEvent::VirtualDisplayCaptureReadiness {
+                    display_id,
+                    ref capture_generation,
+                    ready,
+                    ref reason,
+                } => {
+                    virtual_display::handle_virtual_display_capture_readiness(
+                        &bus,
+                        &session_registry,
+                        &mut virtual_display_guards,
+                        display_id,
+                        capture_generation,
+                        ready,
+                        reason.clone(),
                     )
                     .await;
                 }

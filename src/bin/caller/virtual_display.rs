@@ -19,7 +19,7 @@
 //! loss reaps it explicitly.
 
 use crate::display;
-use crate::display_glue::activate_user_display;
+use crate::display_glue::activate_user_display_with_capture_generation;
 use crate::event::{AppEvent, EventBus, VirtualDisplayCreateOutcome};
 use crate::frames;
 use crate::types::LogLevel;
@@ -34,7 +34,59 @@ use std::time::{Duration, Instant};
 /// single consumer, no locking. Async teardown asks the exact child to exit;
 /// Drop hard-kills that child without waiting. Ambiguous residual X state is
 /// preserved and skipped.
-pub(crate) type VirtualDisplayGuards = HashMap<u32, vision::XvfbGuard>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtualDisplayOwnership {
+    capture_generation: String,
+    request_id: Option<String>,
+    width: u32,
+    height: u32,
+}
+
+pub(crate) struct VirtualDisplayGuards {
+    processes: HashMap<u32, vision::XvfbGuard>,
+    ownership: HashMap<u32, VirtualDisplayOwnership>,
+}
+
+impl VirtualDisplayGuards {
+    pub(crate) fn new() -> Self {
+        Self {
+            processes: HashMap::new(),
+            ownership: HashMap::new(),
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &u32> {
+        self.ownership.keys()
+    }
+
+    fn get(&self, display_id: &u32) -> Option<&VirtualDisplayOwnership> {
+        self.ownership.get(display_id)
+    }
+
+    fn get_mut(&mut self, display_id: &u32) -> Option<&mut VirtualDisplayOwnership> {
+        self.ownership.get_mut(display_id)
+    }
+
+    fn insert(
+        &mut self,
+        display_id: u32,
+        guard: vision::XvfbGuard,
+        ownership: VirtualDisplayOwnership,
+    ) {
+        self.processes.insert(display_id, guard);
+        self.ownership.insert(display_id, ownership);
+    }
+
+    fn remove(&mut self, display_id: &u32) -> Option<vision::XvfbGuard> {
+        self.ownership.remove(display_id);
+        self.processes.remove(display_id)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.processes.is_empty() && self.ownership.is_empty()
+    }
+}
 
 /// Default resolution for a dashboard-created display. Human-facing desktop
 /// default — the token-optimized provider resolutions in
@@ -69,8 +121,9 @@ pub(crate) fn virtual_display_dimensions(
 
 /// Handle `ControlMsg::CreateVirtualDisplay`: launch an Xvfb at a free
 /// display number and register its capture session so every dashboard gets
-/// a streaming tile. All failure paths report through
-/// `VirtualDisplayCreateFailed` and never leave an unguarded Xvfb behind.
+/// a streaming tile. Pre-activation failures report through
+/// `VirtualDisplayCreateFailed`; post-publication failures emit an
+/// ID-bearing `DisplayCaptureLost`. No path leaves an unguarded Xvfb behind.
 pub(crate) async fn create_virtual_display(
     bus: &EventBus,
     session_registry: &display::SharedSessionRegistry,
@@ -140,7 +193,17 @@ pub(crate) async fn create_virtual_display(
 
     match vision::launch_display(&config).await {
         Ok(guard) => {
-            guards.insert(display_id, guard);
+            let capture_generation = format!("vdcg-{}", uuid::Uuid::new_v4().simple());
+            guards.insert(
+                display_id,
+                guard,
+                VirtualDisplayOwnership {
+                    capture_generation: capture_generation.clone(),
+                    request_id,
+                    width,
+                    height,
+                },
+            );
             bus.send(AppEvent::PresenceLog {
                 message: format!(
                     "[virtual_display] created :{display_id} ({width}x{height}) from the dashboard"
@@ -151,52 +214,46 @@ pub(crate) async fn create_virtual_display(
             // Dashboard-created virtual displays are agent workspaces:
             // always agent-visible.
             let capture_ready_after = Instant::now();
-            activate_user_display(bus, session_registry, frame_registry, display_id, true).await;
-            // A registry row alone is not capture readiness. The capture
-            // bridge can close immediately after `start_capture` returns and
-            // queue DisplayCaptureLost behind this create intent. Require a
-            // fresh frame and a still-live bridge before completing the
-            // correlated request as Created.
-            let session = session_registry.read().await.get_any(display_id);
-            let readiness = match session.as_ref() {
-                Some(session) => {
-                    await_capture_readiness(
-                        session,
+            activate_user_display_with_capture_generation(
+                bus,
+                session_registry,
+                frame_registry,
+                display_id,
+                true,
+                capture_generation.clone(),
+            )
+            .await;
+            if let Some(session) = session_registry.read().await.get_any(display_id) {
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    let readiness = await_capture_readiness(
+                        &session,
                         capture_ready_after,
                         CAPTURE_READY_TIMEOUT,
                         CAPTURE_STABILITY_WINDOW,
                     )
-                    .await
-                }
-                None => Err("display activation did not publish a capture session".to_string()),
-            };
-            if let Err(reason) = readiness {
-                if let Some(session) = session_registry.write().await.remove(display_id) {
-                    session.stop().await;
-                }
-                reap_virtual_display(guards, display_id, "activation failed").await;
-                report_virtual_display_create_failed(
-                    bus,
-                    request_id.as_deref(),
-                    format!("virtual display create failed: {reason}"),
-                );
-            } else if let Some(request_id) = request_id {
-                if !bus.complete_virtual_display_create(
-                    &request_id,
-                    VirtualDisplayCreateOutcome::Created {
+                    .await;
+                    let (ready, reason) = match readiness {
+                        Ok(()) => (true, None),
+                        Err(reason) => (false, Some(reason)),
+                    };
+                    bus.send(AppEvent::VirtualDisplayCaptureReadiness {
                         display_id,
-                        width,
-                        height,
-                    },
-                ) {
-                    eprintln!(
-                        "[virtual_display] create caller no longer waiting for request {request_id}; destroying its display"
-                    );
-                    if let Some(session) = session_registry.write().await.remove(display_id) {
-                        session.stop().await;
-                    }
-                    reap_virtual_display(guards, display_id, "create caller cancelled").await;
-                }
+                        capture_generation,
+                        ready,
+                        reason,
+                    });
+                });
+            } else {
+                // Activation normally emits its own generation-bound loss.
+                // Send a redundant correlated failure so a future backend
+                // cannot strand the Xvfb by returning without a registry row
+                // or lifecycle event. Duplicate generations are idempotent.
+                bus.send(AppEvent::VirtualDisplayCaptureLost {
+                    display_id,
+                    capture_generation,
+                    reason: "display activation did not publish a capture session".to_string(),
+                });
             }
         }
         Err(e) => {
@@ -206,6 +263,147 @@ pub(crate) async fn create_virtual_display(
                 create_failure_reason(&e),
             );
         }
+    }
+}
+
+pub(crate) async fn handle_virtual_display_capture_readiness(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    guards: &mut VirtualDisplayGuards,
+    display_id: u32,
+    capture_generation: &str,
+    ready: bool,
+    reason: Option<String>,
+) {
+    let Some(ownership) = guards.get(&display_id) else {
+        return;
+    };
+    if ownership.capture_generation != capture_generation {
+        eprintln!(
+            "[virtual_display] ignored stale readiness generation {capture_generation} for :{display_id}"
+        );
+        return;
+    }
+    if !ready {
+        retire_virtual_display_generation(
+            bus,
+            session_registry,
+            guards,
+            display_id,
+            capture_generation,
+            reason.as_deref().unwrap_or("capture readiness failed"),
+        )
+        .await;
+        return;
+    }
+
+    let request_id = ownership.request_id.clone();
+    let width = ownership.width;
+    let height = ownership.height;
+    let Some(request_id) = request_id else {
+        return;
+    };
+    if bus.complete_virtual_display_create(
+        &request_id,
+        VirtualDisplayCreateOutcome::Created {
+            display_id,
+            width,
+            height,
+        },
+    ) {
+        if let Some(ownership) = guards.get_mut(&display_id) {
+            if ownership.capture_generation == capture_generation {
+                ownership.request_id = None;
+            }
+        }
+    } else {
+        retire_virtual_display_generation(
+            bus,
+            session_registry,
+            guards,
+            display_id,
+            capture_generation,
+            "create caller cancelled before capture became ready",
+        )
+        .await;
+    }
+}
+
+pub(crate) async fn handle_virtual_display_capture_lost(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    guards: &mut VirtualDisplayGuards,
+    display_id: u32,
+    capture_generation: &str,
+    reason: &str,
+) {
+    retire_virtual_display_generation(
+        bus,
+        session_registry,
+        guards,
+        display_id,
+        capture_generation,
+        reason,
+    )
+    .await;
+}
+
+async fn retire_virtual_display_generation(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    guards: &mut VirtualDisplayGuards,
+    display_id: u32,
+    capture_generation: &str,
+    reason: &str,
+) {
+    let Some(ownership) = guards.get(&display_id) else {
+        return;
+    };
+    if ownership.capture_generation != capture_generation {
+        eprintln!(
+            "[virtual_display] ignored stale capture generation {capture_generation} for :{display_id}"
+        );
+        return;
+    }
+    let request_id = ownership.request_id.clone();
+
+    // Publish the ID-bearing retirement before freeing the id. Its intent-lane
+    // copy carries the old generation, so it cannot tear down a replacement.
+    bus.send(AppEvent::DisplayCaptureLost {
+        display_id,
+        capture_generation: Some(capture_generation.to_string()),
+        reason: reason.to_string(),
+    });
+    if let Some(session) = session_registry.write().await.remove(display_id) {
+        session.stop().await;
+    }
+    reap_virtual_display(guards, display_id, "capture unavailable").await;
+    if let Some(request_id) = request_id {
+        let _ = bus.complete_virtual_display_create(
+            &request_id,
+            VirtualDisplayCreateOutcome::Failed {
+                reason: format!("virtual display create failed: {reason}"),
+            },
+        );
+    }
+}
+
+pub(crate) fn fail_pending_virtual_display_create(
+    bus: &EventBus,
+    guards: &mut VirtualDisplayGuards,
+    display_id: u32,
+    reason: &str,
+) {
+    let request_id = guards
+        .get_mut(&display_id)
+        .and_then(|ownership| ownership.request_id.take());
+    if let Some(request_id) = request_id {
+        let _ = bus.complete_virtual_display_create(
+            &request_id,
+            VirtualDisplayCreateOutcome::Failed {
+                reason: reason.to_string(),
+            },
+        );
     }
 }
 
@@ -412,6 +610,139 @@ mod tests {
         .await
         .unwrap();
         healthy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_and_loss_are_scoped_to_one_capture_generation() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let waiter = bus
+            .register_virtual_display_create_waiter("vdc-generation-test".to_string())
+            .unwrap();
+        let session = Arc::new(started_test_session(true).await);
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(199, Arc::clone(&session));
+        let mut guards = VirtualDisplayGuards::new();
+        guards.ownership.insert(
+            199,
+            VirtualDisplayOwnership {
+                capture_generation: "generation-current".to_string(),
+                request_id: Some("vdc-generation-test".to_string()),
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        handle_virtual_display_capture_readiness(
+            &bus,
+            &registry,
+            &mut guards,
+            199,
+            "generation-current",
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            waiter.wait(Duration::from_millis(100)).await,
+            Ok(VirtualDisplayCreateOutcome::Created {
+                display_id: 199,
+                width: 1280,
+                height: 720,
+            })
+        );
+        assert_eq!(guards.get(&199).unwrap().request_id, None);
+
+        handle_virtual_display_capture_lost(
+            &bus,
+            &registry,
+            &mut guards,
+            199,
+            "generation-stale",
+            "stale capture stopped",
+        )
+        .await;
+        assert!(guards.get(&199).is_some());
+        assert!(registry.read().await.get_any(199).is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+
+        handle_virtual_display_capture_lost(
+            &bus,
+            &registry,
+            &mut guards,
+            199,
+            "generation-current",
+            "capture stopped",
+        )
+        .await;
+        assert!(guards.get(&199).is_none());
+        assert!(registry.read().await.get_any(199).is_none());
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            AppEvent::DisplayCaptureLost {
+                display_id: 199,
+                capture_generation: Some(ref generation),
+                ref reason,
+            } if generation == "generation-current" && reason == "capture stopped"
+        ));
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_publishes_retirement_and_fails_the_exact_waiter() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let waiter = bus
+            .register_virtual_display_create_waiter("vdc-readiness-failed".to_string())
+            .unwrap();
+        let session = Arc::new(started_test_session(true).await);
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(198, session);
+        let mut guards = VirtualDisplayGuards::new();
+        guards.ownership.insert(
+            198,
+            VirtualDisplayOwnership {
+                capture_generation: "generation-failed".to_string(),
+                request_id: Some("vdc-readiness-failed".to_string()),
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        handle_virtual_display_capture_readiness(
+            &bus,
+            &registry,
+            &mut guards,
+            198,
+            "generation-failed",
+            false,
+            Some("no fresh frame".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            waiter.wait(Duration::from_millis(100)).await,
+            Ok(VirtualDisplayCreateOutcome::Failed {
+                reason: "virtual display create failed: no fresh frame".to_string(),
+            })
+        );
+        assert!(registry.read().await.get_any(198).is_none());
+        assert!(guards.get(&198).is_none());
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            AppEvent::DisplayCaptureLost {
+                display_id: 198,
+                capture_generation: Some(ref generation),
+                ref reason,
+            } if generation == "generation-failed" && reason == "no fresh frame"
+        ));
     }
 
     #[tokio::test]
