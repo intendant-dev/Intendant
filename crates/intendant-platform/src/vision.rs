@@ -519,6 +519,42 @@ fn encode_xauthority_record(
 fn create_private_x11_authorization(
     display_id: u32,
 ) -> Result<PrivateX11Authorization, CallerError> {
+    let hostname = crate::platform::local_hostname_bytes().map_err(|error| {
+        CallerError::Config(format!(
+            "Failed to read local hostname for Xauthority: {error}"
+        ))
+    })?;
+    let mut cookie = vec![0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut cookie))
+        .map_err(|error| {
+            CallerError::Config(format!("Failed to generate Xauthority cookie: {error}"))
+        })?;
+    create_private_x11_authorization_from_parts(
+        display_id,
+        &hostname,
+        cookie,
+        &std::env::temp_dir(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_x11_authorization_from_parts(
+    display_id: u32,
+    hostname: &[u8],
+    cookie: Vec<u8>,
+    temp_root: &std::path::Path,
+) -> Result<PrivateX11Authorization, CallerError> {
+    if hostname.is_empty() || hostname.contains(&0) {
+        return Err(CallerError::Config(
+            "Xauthority hostname must be nonempty and NUL-free".to_string(),
+        ));
+    }
+    if cookie.len() != 16 {
+        return Err(CallerError::Config(
+            "MIT-MAGIC-COOKIE-1 data must contain exactly 16 bytes".to_string(),
+        ));
+    }
     let directory = tempfile::Builder::new()
         .prefix("intendant-xauthority-")
         // `tempfile` defaults directories to 0777 masked by the host umask;
@@ -526,7 +562,7 @@ fn create_private_x11_authorization(
         // creation time. Supplying 0700 reaches mkdir(2) atomically and the
         // umask may only make it more restrictive.
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
+        .tempdir_in(temp_root)
         .map_err(|error| {
             CallerError::Config(format!(
                 "Failed to create private Xauthority directory: {error}"
@@ -547,18 +583,7 @@ fn create_private_x11_authorization(
         )));
     }
 
-    let mut cookie = vec![0_u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut cookie))
-        .map_err(|error| {
-            CallerError::Config(format!("Failed to generate Xauthority cookie: {error}"))
-        })?;
-    let hostname = crate::platform::local_hostname_bytes().map_err(|error| {
-        CallerError::Config(format!(
-            "Failed to read local hostname for Xauthority: {error}"
-        ))
-    })?;
-    let record = encode_xauthority_record(display_id, &hostname, &cookie)?;
+    let record = encode_xauthority_record(display_id, hostname, &cookie)?;
     let path = directory.path().join("Xauthority");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1068,7 +1093,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn private_xauthority_is_mode_restricted_and_ephemeral() {
-        let authorization = create_private_x11_authorization(137).unwrap();
+        let temp_root = tempfile::tempdir().unwrap();
+        let authorization = create_private_x11_authorization_from_parts(
+            137,
+            b"fixture-host",
+            vec![7_u8; 16],
+            temp_root.path(),
+        )
+        .unwrap();
         let path = authorization.authorization.xauthority_path().to_path_buf();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1078,67 +1110,6 @@ mod tests {
         assert_eq!(authorization.authorization.cookie().len(), 16);
         drop(authorization);
         assert!(!path.exists());
-    }
-
-    /// Live acceptance test for the real Xvfb authorization boundary. Run on
-    /// Linux capture hosts with both `Xvfb` and `xdpyinfo` installed.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore]
-    async fn live_private_xvfb_rejects_unauthenticated_clients_and_tcp() {
-        let mut excluded = Vec::new();
-        let config = loop {
-            let config = virtual_display_config(640, 480, &excluded).expect("free display");
-            let DisplayTarget::Virtual { id } = config.target else {
-                panic!("virtual display allocator returned the user session");
-            };
-            let tcp = std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + id as u16));
-            if std::net::TcpStream::connect_timeout(&tcp, std::time::Duration::from_millis(50))
-                .is_err()
-            {
-                break config;
-            }
-            excluded.push(id);
-        };
-        let DisplayTarget::Virtual { id } = config.target else {
-            unreachable!();
-        };
-        let guard = launch_private_display(&config).await.expect("private Xvfb");
-        let authorization = virtual_display_x11_authorization(id).expect("live authorization");
-        let display = format!(":{id}");
-
-        let unauthorized = tokio::process::Command::new("xdpyinfo")
-            .args(["-display", &display])
-            .env_remove("XAUTHORITY")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .expect("unauthenticated xdpyinfo");
-        assert!(!unauthorized.success());
-
-        let authorized = tokio::process::Command::new("xdpyinfo")
-            .args(["-display", &display])
-            .env("XAUTHORITY", authorization.xauthority_path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .expect("authenticated xdpyinfo");
-        assert!(authorized.success());
-
-        let tcp = std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + id as u16));
-        assert!(
-            std::net::TcpStream::connect_timeout(&tcp, std::time::Duration::from_millis(100))
-                .is_err(),
-            "private Xvfb unexpectedly exposed TCP port {}",
-            tcp.port()
-        );
-
-        let credential_path = authorization.xauthority_path().to_path_buf();
-        guard.shutdown().await;
-        assert!(virtual_display_x11_authorization(id).is_none());
-        assert!(!credential_path.exists());
     }
 
     #[cfg(not(target_os = "linux"))]

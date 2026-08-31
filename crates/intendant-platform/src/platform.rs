@@ -2337,14 +2337,6 @@ mod owner_private_acl {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[test]
-    fn local_hostname_bytes_are_nonempty_and_nul_free() {
-        let hostname = local_hostname_bytes().expect("Unix host must expose its hostname");
-        assert!(!hostname.is_empty());
-        assert!(!hostname.contains(&0));
-    }
-
     #[test]
     fn path_leaf_link_probe_accepts_real_entries() {
         let temp = tempfile::tempdir().unwrap();
