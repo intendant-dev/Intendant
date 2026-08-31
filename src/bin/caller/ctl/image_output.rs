@@ -357,7 +357,7 @@ fn persist_private_noclobber(bytes: &[u8], requested_path: &Path) -> Result<Path
         .file_name()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "--output must name a file".to_string())?;
-    let requested_parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
+    let requested_parent = normalized_output_parent(requested_path);
     if intendant_platform::platform::path_leaf_is_symlink_or_reparse(requested_parent).map_err(
         |e| {
             format!(
@@ -454,6 +454,13 @@ fn persist_private_noclobber(bytes: &[u8], requested_path: &Path) -> Result<Path
     }
 
     Ok(output_path)
+}
+
+fn normalized_output_parent(requested_path: &Path) -> &Path {
+    requested_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn set_private_permissions(file: &File) -> Result<(), String> {
@@ -738,6 +745,14 @@ mod tests {
             .expect_err("excessive peer clock skew refused");
         assert!(error.contains("later than the local save clock"), "{error}");
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn bare_relative_output_uses_the_current_directory() {
+        assert_eq!(
+            normalized_output_parent(Path::new("screen.png")),
+            Path::new(".")
+        );
     }
 
     #[test]
