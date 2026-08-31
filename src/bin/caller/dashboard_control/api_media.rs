@@ -1347,7 +1347,11 @@ mod tests {
         assert_eq!(invalid_session["result"]["_httpStatus"], 400);
         assert_eq!(invalid_session["result"]["_httpOk"], false);
 
-        let workspace_snapshot = api_browser_workspace_snapshot_response("bw1".to_string()).await;
+        let workspace_snapshot = api_browser_workspace_snapshot_response(
+            "bw1".to_string(),
+            &crate::event::EventBus::new(),
+        )
+        .await;
         assert_eq!(workspace_snapshot["t"], "response");
         assert_eq!(workspace_snapshot["ok"], true);
         assert_eq!(

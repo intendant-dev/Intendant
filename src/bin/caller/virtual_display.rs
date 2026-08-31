@@ -25,8 +25,8 @@ use crate::frames;
 use crate::types::LogLevel;
 use crate::vision;
 use intendant_platform::DisplayTarget;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Xvfb guards for dashboard-created virtual displays, keyed by display
@@ -45,6 +45,33 @@ struct VirtualDisplayOwnership {
 pub(crate) struct VirtualDisplayGuards {
     processes: HashMap<u32, vision::XvfbGuard>,
     ownership: HashMap<u32, VirtualDisplayOwnership>,
+}
+
+fn browser_bindable_displays() -> &'static Mutex<HashSet<u32>> {
+    static DISPLAYS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    DISPLAYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether this exact daemon-owned display participates in the correlated
+/// create/reap lifecycle that also retires browser workspaces. Generic
+/// session-local Xvfb guards are intentionally excluded.
+pub(crate) fn process_owns_browser_bindable_display(display_id: u32) -> bool {
+    browser_bindable_displays()
+        .lock()
+        .is_ok_and(|displays| displays.contains(&display_id))
+        && vision::process_owns_virtual_display(display_id)
+}
+
+fn register_browser_bindable_display(display_id: u32) {
+    if let Ok(mut displays) = browser_bindable_displays().lock() {
+        displays.insert(display_id);
+    }
+}
+
+pub(crate) fn unregister_browser_bindable_display(display_id: u32) {
+    if let Ok(mut displays) = browser_bindable_displays().lock() {
+        displays.remove(&display_id);
+    }
 }
 
 impl VirtualDisplayGuards {
@@ -75,6 +102,7 @@ impl VirtualDisplayGuards {
     ) {
         self.processes.insert(display_id, guard);
         self.ownership.insert(display_id, ownership);
+        register_browser_bindable_display(display_id);
     }
 
     fn remove(&mut self, display_id: &u32) -> Option<vision::XvfbGuard> {
@@ -85,6 +113,14 @@ impl VirtualDisplayGuards {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.processes.is_empty() && self.ownership.is_empty()
+    }
+}
+
+impl Drop for VirtualDisplayGuards {
+    fn drop(&mut self) {
+        for display_id in self.ownership.keys().copied().collect::<Vec<_>>() {
+            unregister_browser_bindable_display(display_id);
+        }
     }
 }
 
@@ -377,7 +413,7 @@ async fn retire_virtual_display_generation(
     if let Some(session) = session_registry.write().await.remove(display_id) {
         session.stop().await;
     }
-    reap_virtual_display(guards, display_id, "capture unavailable").await;
+    reap_virtual_display(bus, guards, display_id, "capture unavailable").await;
     if let Some(request_id) = request_id {
         let _ = bus.complete_virtual_display_create(
             &request_id,
@@ -453,11 +489,19 @@ fn report_virtual_display_create_failed(
 /// Reaped on tile close (`UserDisplayRevoked`) and on capture loss (the
 /// Xvfb died, or activation never produced a session).
 pub(crate) async fn reap_virtual_display(
+    bus: &EventBus,
     guards: &mut VirtualDisplayGuards,
     display_id: u32,
     context: &str,
 ) -> bool {
-    if let Some(guard) = guards.remove(&display_id) {
+    let guard = guards.remove(&display_id);
+    // The browser registry lock serializes both sides of this transition:
+    // creation checks bindability and reserves Starting under the same lock,
+    // while teardown removes bindability before scanning every reservation.
+    // No creator can appear after the scan, and read-time reconciliation
+    // cannot consume the transition before its push events are collected.
+    crate::browser_workspace::close_display_binding(display_id, context, bus).await;
+    if let Some(guard) = guard {
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
         guard.shutdown().await;
         true
@@ -776,10 +820,11 @@ mod tests {
 
     #[tokio::test]
     async fn reap_is_scoped_to_created_displays() {
+        let bus = EventBus::new();
         let mut guards = VirtualDisplayGuards::new();
         // Nothing created from the dashboard: reap must refuse — agent
         // Xvfbs and user displays are not ours to kill.
-        assert!(!reap_virtual_display(&mut guards, 99, "test").await);
+        assert!(!reap_virtual_display(&bus, &mut guards, 99, "test").await);
     }
 
     #[test]

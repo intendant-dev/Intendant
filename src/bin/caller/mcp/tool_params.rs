@@ -813,6 +813,9 @@ pub struct CreateBrowserWorkspaceParams {
     /// Session or agent that owns this workspace.
     #[serde(default)]
     pub owner_session_id: Option<String>,
+    /// Explicit daemon-created virtual display (`display_99`, `:99`, or `99`). User-session, session-local, and foreign X servers are rejected.
+    #[serde(default)]
+    pub display_target: Option<String>,
     /// Explicit browser profile directory. If omitted, Intendant creates one under its data dir.
     #[serde(default)]
     pub profile_dir: Option<String>,

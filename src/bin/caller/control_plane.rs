@@ -803,6 +803,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             provider,
             peer_id,
             owner_session_id,
+            display_target,
             profile_dir,
         } => {
             let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
@@ -811,15 +812,11 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 provider: provider.clone(),
                 peer_id: peer_id.clone(),
                 owner_session_id: owner_session_id.clone(),
+                display_target: display_target.clone(),
                 profile_dir: profile_dir.clone(),
             };
-            match crate::browser_workspace::create_workspace(request).await {
-                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "created".to_string(),
-                    workspace: Some(workspace),
-                    workspace_id: None,
-                    message: None,
-                }),
+            match crate::browser_workspace::create_workspace(request, &state.bus).await {
+                Ok(_) => {}
                 Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "error".to_string(),
                     workspace: None,
@@ -859,13 +856,8 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 note: note.clone(),
                 force: *force,
             };
-            match crate::browser_workspace::acquire_workspace(request).await {
-                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_acquired".to_string(),
-                    workspace: Some(workspace),
-                    workspace_id: Some(workspace_id.clone()),
-                    message: None,
-                }),
+            match crate::browser_workspace::acquire_workspace(request, &state.bus).await {
+                Ok(_) => {}
                 Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "error".to_string(),
                     workspace: None,
@@ -884,13 +876,8 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 holder_id: holder_id.clone(),
                 note: note.clone(),
             };
-            match crate::browser_workspace::release_workspace(request).await {
-                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_released".to_string(),
-                    workspace: Some(workspace),
-                    workspace_id: Some(workspace_id.clone()),
-                    message: None,
-                }),
+            match crate::browser_workspace::release_workspace(request, &state.bus).await {
+                Ok(_) => {}
                 Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "error".to_string(),
                     workspace: None,

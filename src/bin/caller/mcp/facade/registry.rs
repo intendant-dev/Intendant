@@ -980,6 +980,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             flag!("peer", "peer_id", Str, "federation peer (ctl spelling)"),
             flag!("session", "owner_session_id", Str, "owning session (ctl spelling)"),
             flag!("owner-session", "owner_session_id", Str, "owning session"),
+            flag!(
+                "display-target",
+                "display_target",
+                Str,
+                "daemon-created virtual display"
+            ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
         ],
         help: "Create a browser workspace",

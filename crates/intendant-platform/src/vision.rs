@@ -1,10 +1,14 @@
 use intendant_core::error::CallerError;
 #[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::io::Read as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 use tokio::process::Child;
 
 use crate::DisplayTarget;
@@ -128,6 +132,77 @@ const PREFERRED_DISPLAY: u32 = 99;
 /// treated as user/session X servers, never as reclaimable Xvfb instances.
 #[cfg(target_os = "linux")]
 const VIRTUAL_DISPLAY_END: u32 = 200;
+
+#[cfg(target_os = "linux")]
+static OWNED_XVFB_PROCESSES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn owned_xvfb_processes() -> &'static Mutex<HashMap<u32, u32>> {
+    OWNED_XVFB_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether an id belongs to Intendant's reserved virtual-display range.
+pub fn managed_virtual_display_id(display_id: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        (PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END).contains(&display_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = display_id;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_owned_xvfb(display_id: u32, pid: u32) -> Result<(), CallerError> {
+    let mut owned = owned_xvfb_processes()
+        .lock()
+        .map_err(|_| CallerError::Config("owned Xvfb registry is unavailable".to_string()))?;
+    if let Some(existing_pid) = owned.insert(display_id, pid) {
+        if existing_pid != pid {
+            owned.insert(display_id, existing_pid);
+            return Err(CallerError::Config(format!(
+                "display :{display_id} is already owned by Xvfb process {existing_pid}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unregister_owned_xvfb(display_id: u32, pid: u32) {
+    if let Ok(mut owned) = owned_xvfb_processes().lock() {
+        if owned.get(&display_id) == Some(&pid) {
+            owned.remove(&display_id);
+        }
+    }
+}
+
+/// Whether this process owns the live Xvfb currently serving `display_id`.
+/// A socket alone is insufficient: another service on a shared host may own
+/// it. Browser workspaces use this proof before binding a child to a display.
+pub fn process_owns_virtual_display(display_id: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if !managed_virtual_display_id(display_id) {
+            return false;
+        }
+        let pid = owned_xvfb_processes()
+            .lock()
+            .ok()
+            .and_then(|owned| owned.get(&display_id).copied());
+        pid.is_some_and(|pid| {
+            crate::platform::process_alive(pid)
+                && xvfb_state_established(std::path::Path::new("/tmp"), display_id, pid)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = display_id;
+        false
+    }
+}
 
 /// Find a free X display number, preferring :99.
 ///
@@ -281,6 +356,9 @@ impl XvfbGuard {
     pub async fn shutdown(mut self) {
         #[cfg(target_os = "linux")]
         {
+            // New browser launches must stop treating this display as owned
+            // before shutdown starts, not after the child finally exits.
+            unregister_owned_xvfb(self.display_id, self.pid);
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     self.report_residual_state();
@@ -329,6 +407,8 @@ impl XvfbGuard {
 
 impl Drop for XvfbGuard {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unregister_owned_xvfb(self.display_id, self.pid);
         // Drop cannot wait: hard-kill this guard's exact spawned child and
         // leave reaping to Tokio. Normal async teardown calls `shutdown`.
         let _ = self.child.start_kill();
@@ -405,6 +485,7 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
             "Xvfb on display {display_arg} did not establish its expected lock and socket"
         )));
     }
+    register_owned_xvfb(display_id, pid)?;
 
     Ok(XvfbGuard {
         child,
@@ -700,6 +781,30 @@ mod tests {
         assert!(virtual_display_socket_exists_in(tmp.path(), 99));
         assert!(!virtual_display_socket_exists_in(tmp.path(), 250));
         assert!(!virtual_display_socket_exists_in(tmp.path(), 150));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_display_range_and_owner_registry_fail_closed() {
+        assert!(!managed_virtual_display_id(PREFERRED_DISPLAY - 1));
+        assert!(managed_virtual_display_id(PREFERRED_DISPLAY));
+        assert!(managed_virtual_display_id(VIRTUAL_DISPLAY_END - 1));
+        assert!(!managed_virtual_display_id(VIRTUAL_DISPLAY_END));
+
+        let display_id = VIRTUAL_DISPLAY_END - 1;
+        unregister_owned_xvfb(display_id, 41_001);
+        register_owned_xvfb(display_id, 41_001).unwrap();
+        assert!(register_owned_xvfb(display_id, 41_002).is_err());
+        unregister_owned_xvfb(display_id, 41_002);
+        assert_eq!(
+            owned_xvfb_processes().lock().unwrap().get(&display_id),
+            Some(&41_001)
+        );
+        unregister_owned_xvfb(display_id, 41_001);
+        assert!(!owned_xvfb_processes()
+            .lock()
+            .unwrap()
+            .contains_key(&display_id));
     }
 
     #[cfg(not(target_os = "linux"))]

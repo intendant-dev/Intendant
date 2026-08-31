@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::process::Child;
 use tokio::sync::RwLock;
 
+use crate::event::{AppEvent, EventBus};
+
 pub type SharedBrowserWorkspaceRegistry = Arc<RwLock<BrowserWorkspaceRegistry>>;
 
 static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = OnceLock::new();
@@ -139,6 +141,10 @@ pub struct BrowserWorkspace {
     pub preview_mode: BrowserWorkspacePreviewMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
+    /// Canonical Intendant virtual-display target (for example,
+    /// `display_99`) when this workspace is explicitly display-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +223,10 @@ pub struct CreateBrowserWorkspaceRequest {
     pub peer_id: Option<String>,
     #[serde(default)]
     pub owner_session_id: Option<String>,
+    /// Explicit daemon-created virtual display (`display_99`, `:99`, or
+    /// `99`). User-session, session-local, and foreign X servers are rejected.
+    #[serde(default)]
+    pub display_target: Option<String>,
     #[serde(default)]
     pub profile_dir: Option<String>,
 }
@@ -278,6 +288,58 @@ pub struct BrowserWorkspaceRegistry {
     children: HashMap<String, Child>,
 }
 
+struct RetiredBrowserWorkspace {
+    workspace: BrowserWorkspace,
+    process_id: Option<u32>,
+    child: Option<Child>,
+}
+
+struct StartingReservationGuard {
+    workspace_id: String,
+    bus: EventBus,
+    armed: bool,
+}
+
+impl StartingReservationGuard {
+    fn new(workspace_id: String, bus: EventBus) -> Self {
+        Self {
+            workspace_id,
+            bus,
+            armed: true,
+        }
+    }
+
+    async fn cleanup(&mut self, message: &str) {
+        remove_failed_reservation(&self.workspace_id, message, &self.bus).await;
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartingReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let bus = self.bus.clone();
+        runtime.spawn(async move {
+            remove_failed_reservation(
+                &workspace_id,
+                "browser workspace creation was cancelled before it became ready",
+                &bus,
+            )
+            .await;
+        });
+    }
+}
+
 impl BrowserWorkspaceRegistry {
     pub fn list(&self) -> Vec<BrowserWorkspace> {
         self.workspaces.values().cloned().collect()
@@ -296,6 +358,93 @@ impl BrowserWorkspaceRegistry {
         Some((workspace, child))
     }
 
+    fn reconcile_display_bindings(&mut self) -> Vec<RetiredBrowserWorkspace> {
+        self.reconcile_display_bindings_with(
+            crate::virtual_display::process_owns_browser_bindable_display,
+        )
+    }
+
+    fn reconcile_display_bindings_with(
+        &mut self,
+        display_is_live: impl Fn(u32) -> bool,
+    ) -> Vec<RetiredBrowserWorkspace> {
+        let stale: Vec<(String, String)> = self
+            .workspaces
+            .values()
+            .filter(|workspace| {
+                matches!(
+                    workspace.status,
+                    BrowserWorkspaceStatus::Starting | BrowserWorkspaceStatus::Ready
+                )
+            })
+            .filter_map(|workspace| {
+                let target = workspace.display_target.as_deref()?;
+                let binding = parse_browser_display_binding(target).ok()?;
+                (!display_is_live(binding.display_id))
+                    .then(|| (workspace.id.clone(), binding.canonical))
+            })
+            .collect();
+
+        self.retire_display_bindings(stale, |display_target| {
+            format!("bound virtual display {display_target} is no longer live; browser stopped")
+        })
+    }
+
+    fn retire_workspaces_for_display(
+        &mut self,
+        display_id: u32,
+        reason: &str,
+    ) -> Vec<RetiredBrowserWorkspace> {
+        let stale: Vec<(String, String)> = self
+            .workspaces
+            .values()
+            .filter(|workspace| {
+                matches!(
+                    workspace.status,
+                    BrowserWorkspaceStatus::Starting | BrowserWorkspaceStatus::Ready
+                )
+            })
+            .filter_map(|workspace| {
+                let binding =
+                    parse_browser_display_binding(workspace.display_target.as_deref()?).ok()?;
+                (binding.display_id == display_id)
+                    .then(|| (workspace.id.clone(), binding.canonical))
+            })
+            .collect();
+
+        self.retire_display_bindings(stale, |display_target| {
+            format!("bound virtual display {display_target} was retired: {reason}")
+        })
+    }
+
+    fn retire_display_bindings(
+        &mut self,
+        stale: Vec<(String, String)>,
+        message: impl Fn(&str) -> String,
+    ) -> Vec<RetiredBrowserWorkspace> {
+        stale
+            .into_iter()
+            .filter_map(|(workspace_id, display_target)| {
+                let workspace = self.workspaces.get_mut(&workspace_id)?;
+                workspace.status = BrowserWorkspaceStatus::Error;
+                workspace.lease = None;
+                workspace.message = Some(message(&display_target));
+                workspace.updated_at = now_string();
+                workspace.debugging_port = None;
+                workspace.cdp_http_url = None;
+                workspace.cdp_ws_url = None;
+                workspace.active_target_id = None;
+                let process_id = workspace.process_id.take();
+                let child = self.children.remove(&workspace_id);
+                Some(RetiredBrowserWorkspace {
+                    workspace: workspace.clone(),
+                    process_id,
+                    child,
+                })
+            })
+            .collect()
+    }
+
     fn acquire(
         &mut self,
         request: AcquireBrowserWorkspaceRequest,
@@ -304,6 +453,12 @@ impl BrowserWorkspaceRegistry {
             .workspaces
             .get_mut(&request.workspace_id)
             .ok_or_else(|| BrowserWorkspaceError::NotFound(request.workspace_id.clone()))?;
+        if workspace.status != BrowserWorkspaceStatus::Ready {
+            return Err(BrowserWorkspaceError::Unsupported(format!(
+                "browser workspace '{}' is not ready (status: {:?})",
+                request.workspace_id, workspace.status
+            )));
+        }
         if let Some(lease) = workspace.lease.as_ref() {
             if lease.holder_id != request.holder_id && !request.force {
                 return Err(BrowserWorkspaceError::LeaseHeld {
@@ -532,6 +687,7 @@ pub async fn ensure_managed_chromium(
 
 pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
+    bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     let requested_provider = BrowserWorkspaceProvider::parse(request.provider.as_deref());
     let placement = match request
@@ -576,18 +732,20 @@ pub async fn create_workspace(
 
     let id = format!("bw-{}", uuid::Uuid::new_v4().simple());
     let created_at = now_string();
+    let display_binding = request
+        .display_target
+        .as_deref()
+        .map(parse_browser_display_binding)
+        .transpose()?;
+    let bound_display_id = display_binding.as_ref().map(|binding| binding.display_id);
+    let bound_display_target = display_binding
+        .as_ref()
+        .map(|binding| binding.canonical.clone());
     let profile_dir = request
         .profile_dir
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_profile_dir(&id));
-    std::fs::create_dir_all(&profile_dir).map_err(|e| {
-        BrowserWorkspaceError::Io(format!(
-            "failed to create browser workspace profile {}: {e}",
-            profile_dir.display()
-        ))
-    })?;
-
     let mut workspace = BrowserWorkspace {
         label: request
             .label
@@ -613,6 +771,7 @@ pub async fn create_workspace(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        display_target: display_binding.map(|binding| binding.canonical),
         profile_dir: Some(profile_dir.display().to_string()),
         browser_executable: None,
         browser_executable_source: None,
@@ -628,7 +787,43 @@ pub async fn create_workspace(
         id,
     };
 
-    let (child, cdp) = launch_cdp_browser(&workspace, &profile_dir).await?;
+    // Publish the Starting reservation before filesystem work or browser
+    // launch. Display teardown can now retire this exact binding instead of
+    // racing past a workspace that exists only on this task's stack.
+    {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        if let Some(display_id) = bound_display_id {
+            if !crate::virtual_display::process_owns_browser_bindable_display(display_id) {
+                return Err(BrowserWorkspaceError::Unsupported(format!(
+                    "browser workspace display {} is not a live daemon-created virtual display",
+                    bound_display_target.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+        registry.insert(workspace.clone(), None);
+    }
+    // Async cancellation can happen at every await below. The guard removes
+    // the unpublished Starting row (and any child committed just before the
+    // cancellation) so request abortion cannot leave a ghost workspace.
+    let mut reservation = StartingReservationGuard::new(workspace.id.clone(), bus.clone());
+
+    if let Err(error) = std::fs::create_dir_all(&profile_dir) {
+        let message = format!(
+            "failed to create browser workspace profile {}: {error}",
+            profile_dir.display()
+        );
+        reservation.cleanup(&message).await;
+        return Err(BrowserWorkspaceError::Io(message));
+    }
+
+    let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir).await {
+        Ok(launched) => launched,
+        Err(error) => {
+            reservation.cleanup(&error.to_string()).await;
+            return Err(error);
+        }
+    };
     workspace.browser_executable = Some(cdp.executable.path.display().to_string());
     workspace.browser_executable_source = Some(cdp.executable.source);
     workspace.process_id = cdp.process_id;
@@ -640,22 +835,141 @@ pub async fn create_workspace(
     workspace.message = Some("ready".to_string());
     workspace.updated_at = now_string();
 
-    global_registry()
-        .write()
-        .await
-        .insert(workspace.clone(), Some(child));
-    Ok(workspace)
+    let mut child = Some(child);
+    let commit = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let display_is_live = bound_display_id.is_none_or(|display_id| {
+            crate::virtual_display::process_owns_browser_bindable_display(display_id)
+        });
+        let current = registry.workspaces.get_mut(&workspace.id);
+        match current {
+            None => Err("browser workspace was closed during launch".to_string()),
+            Some(current) if current.status != BrowserWorkspaceStatus::Starting => Err(current
+                .message
+                .clone()
+                .unwrap_or_else(|| "browser workspace was retired during launch".to_string())),
+            Some(current) if !display_is_live => {
+                let message = "bound virtual display was retired during browser launch".to_string();
+                current.status = BrowserWorkspaceStatus::Error;
+                current.lease = None;
+                current.message = Some(message.clone());
+                current.updated_at = now_string();
+                Err(message)
+            }
+            Some(current) => {
+                if let Some(launched_child) = child.take() {
+                    *current = workspace.clone();
+                    let committed = current.clone();
+                    registry
+                        .children
+                        .insert(workspace.id.clone(), launched_child);
+                    // Publish while the registry write guard still serializes
+                    // this Ready transition with display retirement. If the
+                    // display is reaped next, its Error event must follow this
+                    // creation event; it can never be overtaken by a stale
+                    // Ready clone returned to the caller.
+                    bus.send(AppEvent::BrowserWorkspaceChanged {
+                        kind: "created".to_string(),
+                        workspace_id: Some(committed.id.clone()),
+                        workspace: Some(committed.clone()),
+                        message: None,
+                    });
+                    Ok(committed)
+                } else {
+                    Err("browser workspace launch child was unavailable".to_string())
+                }
+            }
+        }
+    };
+    match commit {
+        Ok(committed) => {
+            reservation.disarm();
+            Ok(committed)
+        }
+        Err(message) => {
+            terminate_workspace_process(cdp.process_id, child);
+            reservation.cleanup(&message).await;
+            Err(BrowserWorkspaceError::Launch(message))
+        }
+    }
 }
 
-pub async fn list_workspaces() -> Vec<BrowserWorkspace> {
-    global_registry().read().await.list()
+pub async fn list_workspaces(bus: &EventBus) -> Vec<BrowserWorkspace> {
+    let (workspaces, retired) = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
+        (registry.list(), retired)
+    };
+    terminate_retired_processes(retired);
+    workspaces
+}
+
+pub async fn close_display_binding(
+    display_id: u32,
+    reason: &str,
+    bus: &EventBus,
+) -> Vec<BrowserWorkspace> {
+    let retired = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        // Creation reserves its Starting row under this same registry lock
+        // after checking the bindable set. Removing the display here before
+        // the scan therefore closes the post-scan insertion race.
+        crate::virtual_display::unregister_browser_bindable_display(display_id);
+        let retired = registry.retire_workspaces_for_display(display_id, reason);
+        // Publish each retirement before releasing the registry lock. A
+        // concurrent explicit close must therefore publish its newer Closed
+        // state after this event, never before a stale Error clone.
+        for retired in &retired {
+            publish_workspace_event(bus, "display_retired", &retired.workspace);
+        }
+        retired
+    };
+    retired
+        .into_iter()
+        .map(|retired| {
+            terminate_workspace_process(retired.process_id, retired.child);
+            retired.workspace
+        })
+        .collect()
+}
+
+async fn remove_failed_reservation(id: &str, message: &str, bus: &EventBus) {
+    let removed = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let removed = registry.remove(id);
+        if let Some((workspace, _)) = removed.as_ref() {
+            // A display teardown may already have published this reservation
+            // as Error. Serialize a terminal event with removal so the
+            // dashboard cannot retain that transient row as a ghost.
+            let mut closed = workspace.clone();
+            closed.status = BrowserWorkspaceStatus::Closed;
+            closed.lease = None;
+            closed.message = Some(message.to_string());
+            closed.updated_at = now_string();
+            bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "closed".to_string(),
+                workspace_id: Some(closed.id.clone()),
+                message: closed.message.clone(),
+                workspace: Some(closed),
+            });
+        }
+        removed
+    };
+    if let Some((workspace, child)) = removed {
+        terminate_workspace_process(workspace.process_id, child);
+    }
 }
 
 pub async fn close_workspace(
     id: &str,
     reason: Option<String>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    let (mut workspace, mut child) = global_registry()
+    let (mut workspace, child) = global_registry()
         .write()
         .await
         .remove(id)
@@ -664,7 +978,71 @@ pub async fn close_workspace(
     workspace.lease = None;
     workspace.message = reason.or_else(|| Some("closed".to_string()));
     workspace.updated_at = now_string();
-    if let Some(pid) = workspace.process_id {
+    terminate_workspace_process(workspace.process_id, child);
+    Ok(workspace)
+}
+
+pub async fn acquire_workspace(
+    request: AcquireBrowserWorkspaceRequest,
+    bus: &EventBus,
+) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let (result, retired) = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
+        let result = registry.acquire(request);
+        if let Ok(workspace) = result.as_ref() {
+            publish_workspace_event(bus, "lease_acquired", workspace);
+        }
+        (result, retired)
+    };
+    terminate_retired_processes(retired);
+    result
+}
+
+pub async fn release_workspace(
+    request: ReleaseBrowserWorkspaceRequest,
+    bus: &EventBus,
+) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let (result, retired) = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
+        let result = registry.release(request);
+        if let Ok(workspace) = result.as_ref() {
+            publish_workspace_event(bus, "lease_released", workspace);
+        }
+        (result, retired)
+    };
+    terminate_retired_processes(retired);
+    result
+}
+
+fn publish_retirements_locked(bus: &EventBus, retired: &[RetiredBrowserWorkspace]) {
+    for retired in retired {
+        publish_workspace_event(bus, "display_retired", &retired.workspace);
+    }
+}
+
+fn terminate_retired_processes(retired: Vec<RetiredBrowserWorkspace>) {
+    for retired in retired {
+        terminate_workspace_process(retired.process_id, retired.child);
+    }
+}
+
+fn publish_workspace_event(bus: &EventBus, kind: &str, workspace: &BrowserWorkspace) {
+    bus.send(AppEvent::BrowserWorkspaceChanged {
+        kind: kind.to_string(),
+        workspace_id: Some(workspace.id.clone()),
+        message: workspace.message.clone(),
+        workspace: Some(workspace.clone()),
+    });
+}
+
+fn terminate_workspace_process(process_id: Option<u32>, mut child: Option<Child>) {
+    if let Some(pid) = process_id {
         let targets = crate::platform::terminate_process_tree_now(pid);
         let still_alive: Vec<u32> = targets
             .into_iter()
@@ -680,19 +1058,6 @@ pub async fn close_workspace(
     if let Some(child) = child.as_mut() {
         let _ = child.start_kill();
     }
-    Ok(workspace)
-}
-
-pub async fn acquire_workspace(
-    request: AcquireBrowserWorkspaceRequest,
-) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    global_registry().write().await.acquire(request)
-}
-
-pub async fn release_workspace(
-    request: ReleaseBrowserWorkspaceRequest,
-) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    global_registry().write().await.release(request)
 }
 
 struct CdpLaunch {
@@ -711,8 +1076,36 @@ async fn launch_cdp_browser(
         workspace.provider,
         BrowserWorkspaceProvider::SystemCdp
     ))?;
+    let display_binding = workspace
+        .display_target
+        .as_deref()
+        .map(parse_browser_display_binding)
+        .transpose()?;
+    if let Some(binding) = display_binding.as_ref() {
+        if !crate::virtual_display::process_owns_browser_bindable_display(binding.display_id) {
+            return Err(BrowserWorkspaceError::Launch(format!(
+                "browser workspace display {} left the daemon-created lifecycle before browser launch",
+                binding.canonical
+            )));
+        }
+    }
     let port = reserve_local_port().await?;
     let mut command = tokio::process::Command::new(&executable.path);
+    // If the async create request is cancelled while CDP readiness is being
+    // awaited, dropping its future must also terminate the spawned browser.
+    command.kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    if let Some(binding) = display_binding.as_ref() {
+        // A bound workspace must use only its leased X11 display. Ambient
+        // Wayland/Xauthority state belongs to the daemon's login session and
+        // must not redirect or authorize this isolated browser child.
+        command
+            .env("DISPLAY", format!(":{}", binding.display_id))
+            .env("XDG_SESSION_TYPE", "x11")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("XAUTHORITY")
+            .arg("--ozone-platform=x11");
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1254,6 +1647,46 @@ fn default_profile_dir(id: &str) -> PathBuf {
     base.join(id).join("profile")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserDisplayBinding {
+    canonical: String,
+    display_id: u32,
+}
+
+fn parse_browser_display_binding(
+    raw: &str,
+) -> Result<BrowserDisplayBinding, BrowserWorkspaceError> {
+    let value = raw.trim();
+    let digits = value
+        .strip_prefix("display_")
+        .or_else(|| value.strip_prefix(':'))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "invalid browser workspace display target '{value}'; expected display_N, :N, or N"
+        )));
+    }
+    let display_id = digits.parse::<u32>().map_err(|_| {
+        BrowserWorkspaceError::Unsupported(format!(
+            "invalid browser workspace display target '{value}'"
+        ))
+    })?;
+    if display_id == 0 {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "browser workspaces cannot bind to the user's session display".to_string(),
+        ));
+    }
+    if !crate::vision::managed_virtual_display_id(display_id) {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "browser workspace display :{display_id} is outside Intendant's managed virtual-display range"
+        )));
+    }
+    Ok(BrowserDisplayBinding {
+        canonical: format!("display_{display_id}"),
+        display_id,
+    })
+}
+
 fn now_string() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -1273,6 +1706,7 @@ mod tests {
             status: BrowserWorkspaceStatus::Ready,
             preview_mode: BrowserWorkspacePreviewMode::Semantic,
             owner_session_id: Some("session-1".to_string()),
+            display_target: None,
             profile_dir: None,
             browser_executable: None,
             browser_executable_source: None,
@@ -1286,6 +1720,265 @@ mod tests {
             created_at: "2026-05-31T00:00:00.000Z".to_string(),
             updated_at: "2026-05-31T00:00:00.000Z".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_starting_reservation_is_removed_and_closed() {
+        let id = format!("bw-cancel-test-{}", uuid::Uuid::new_v4().simple());
+        let mut workspace = sample_workspace(&id);
+        workspace.status = BrowserWorkspaceStatus::Starting;
+        global_registry().write().await.insert(workspace, None);
+
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        drop(StartingReservationGuard::new(id.clone(), bus));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !global_registry().read().await.workspaces.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled reservation cleanup");
+
+        match events.recv().await.expect("closed cancellation event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                workspace: Some(workspace),
+                ..
+            } => {
+                assert_eq!(kind, "closed");
+                assert_eq!(workspace_id.as_deref(), Some(id.as_str()));
+                assert_eq!(workspace.status, BrowserWorkspaceStatus::Closed);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_publishes_serialized_lease_state() {
+        let id = format!("bw-lease-test-{}", uuid::Uuid::new_v4().simple());
+        global_registry()
+            .write()
+            .await
+            .insert(sample_workspace(&id), None);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+
+        let acquired = acquire_workspace(
+            AcquireBrowserWorkspaceRequest {
+                workspace_id: id.clone(),
+                holder_id: "audit-agent".to_string(),
+                holder_kind: Some("agent".to_string()),
+                note: None,
+                force: false,
+            },
+            &bus,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acquired
+                .lease
+                .as_ref()
+                .map(|lease| lease.holder_id.as_str()),
+            Some("audit-agent")
+        );
+        match events.recv().await.expect("lease event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                workspace: Some(workspace),
+                ..
+            } => {
+                assert_eq!(kind, "lease_acquired");
+                assert_eq!(workspace_id.as_deref(), Some(id.as_str()));
+                assert_eq!(workspace, acquired);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        global_registry().write().await.remove(&id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_browser_display_binding_is_strict_and_canonical() {
+        for raw in ["display_99", ":99", "99", " display_099 "] {
+            assert_eq!(
+                parse_browser_display_binding(raw).unwrap(),
+                BrowserDisplayBinding {
+                    canonical: "display_99".to_string(),
+                    display_id: 99,
+                }
+            );
+        }
+        for raw in [
+            "",
+            "user_session",
+            "display_0",
+            ":0",
+            "0",
+            "display_-1",
+            "display_98",
+            "display_200",
+            "display_99.0",
+        ] {
+            assert!(
+                parse_browser_display_binding(raw).is_err(),
+                "unsafe display target unexpectedly accepted: {raw}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dead_bound_display_marks_workspace_error_and_revokes_lease() {
+        let mut registry = BrowserWorkspaceRegistry::default();
+        let mut workspace = sample_workspace("bw-dead-display");
+        workspace.display_target = Some("display_99".to_string());
+        workspace.process_id = Some(42);
+        workspace.debugging_port = Some(9222);
+        workspace.cdp_http_url = Some("http://127.0.0.1:9222".to_string());
+        workspace.cdp_ws_url = Some("ws://127.0.0.1:9222/devtools/browser/test".to_string());
+        workspace.active_target_id = Some("page-1".to_string());
+        workspace.lease = Some(BrowserWorkspaceLease {
+            holder_id: "agent-a".to_string(),
+            holder_kind: "agent".to_string(),
+            acquired_at: "2026-05-31T00:00:00.000Z".to_string(),
+            note: None,
+        });
+        registry.insert(workspace, None);
+
+        let stale = registry.reconcile_display_bindings_with(|_| false);
+
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].process_id, Some(42));
+        let workspace = registry.workspaces.get("bw-dead-display").unwrap();
+        assert_eq!(workspace.status, BrowserWorkspaceStatus::Error);
+        assert!(workspace.lease.is_none());
+        assert!(workspace.process_id.is_none());
+        assert!(workspace.debugging_port.is_none());
+        assert!(workspace.cdp_http_url.is_none());
+        assert!(workspace.cdp_ws_url.is_none());
+        assert!(workspace.active_target_id.is_none());
+        assert!(workspace
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("display_99 is no longer live")));
+
+        let acquire = registry.acquire(AcquireBrowserWorkspaceRequest {
+            workspace_id: "bw-dead-display".to_string(),
+            holder_id: "agent-b".to_string(),
+            holder_kind: Some("agent".to_string()),
+            note: None,
+            force: false,
+        });
+        assert!(matches!(
+            acquire,
+            Err(BrowserWorkspaceError::Unsupported(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_bound_display_remains_ready_and_leasable() {
+        let mut registry = BrowserWorkspaceRegistry::default();
+        let mut workspace = sample_workspace("bw-live-display");
+        workspace.display_target = Some("display_99".to_string());
+        registry.insert(workspace, None);
+
+        let stale = registry.reconcile_display_bindings_with(|display_id| display_id == 99);
+
+        assert!(stale.is_empty());
+        assert_eq!(
+            registry.workspaces.get("bw-live-display").unwrap().status,
+            BrowserWorkspaceStatus::Ready
+        );
+        assert!(registry
+            .acquire(AcquireBrowserWorkspaceRequest {
+                workspace_id: "bw-live-display".to_string(),
+                holder_id: "agent-a".to_string(),
+                holder_kind: Some("agent".to_string()),
+                note: None,
+                force: false,
+            })
+            .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn display_retirement_targets_only_workspaces_bound_to_that_display() {
+        let mut registry = BrowserWorkspaceRegistry::default();
+        let mut retired = sample_workspace("bw-retired");
+        retired.status = BrowserWorkspaceStatus::Starting;
+        retired.display_target = Some("display_99".to_string());
+        retired.lease = Some(BrowserWorkspaceLease {
+            holder_id: "agent-a".to_string(),
+            holder_kind: "agent".to_string(),
+            acquired_at: "2026-05-31T00:00:00.000Z".to_string(),
+            note: None,
+        });
+        let mut survivor = sample_workspace("bw-survivor");
+        survivor.display_target = Some("display_100".to_string());
+        registry.insert(retired, None);
+        registry.insert(survivor, None);
+
+        let retired = registry.retire_workspaces_for_display(99, "tile closed");
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].workspace.id, "bw-retired");
+        assert_eq!(retired[0].workspace.status, BrowserWorkspaceStatus::Error);
+        assert!(retired[0].workspace.lease.is_none());
+        assert_eq!(
+            retired[0].workspace.message.as_deref(),
+            Some("bound virtual display display_99 was retired: tile closed")
+        );
+        assert_eq!(
+            registry.workspaces.get("bw-survivor").unwrap().status,
+            BrowserWorkspaceStatus::Ready
+        );
+    }
+
+    #[test]
+    fn reconciled_display_retirement_publishes_the_error_state() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let mut workspace = sample_workspace("bw-reconciled");
+        workspace.status = BrowserWorkspaceStatus::Error;
+        workspace.message = Some("bound display exited".to_string());
+
+        let retired = vec![RetiredBrowserWorkspace {
+            workspace: workspace.clone(),
+            process_id: None,
+            child: None,
+        }];
+        publish_retirements_locked(&bus, &retired);
+        terminate_retired_processes(retired);
+
+        match events.try_recv().expect("display retirement event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                message,
+                workspace: Some(published),
+            } => {
+                assert_eq!(kind, "display_retired");
+                assert_eq!(workspace_id.as_deref(), Some("bw-reconciled"));
+                assert_eq!(message.as_deref(), Some("bound display exited"));
+                assert_eq!(published, workspace);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn explicit_browser_display_binding_is_unavailable_without_managed_xvfb() {
+        assert!(parse_browser_display_binding("display_99").is_err());
     }
 
     #[test]

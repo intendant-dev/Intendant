@@ -1944,12 +1944,15 @@ mod tests {
                 "sess-2",
                 "--peer",
                 "peer-a",
+                "--display-target",
+                "display_99",
             ]),
         )
         .unwrap();
         assert_eq!(planned.args["url"], "https://example.com");
         assert_eq!(planned.args["owner_session_id"], "sess-2");
         assert_eq!(planned.args["peer_id"], "peer-a");
+        assert_eq!(planned.args["display_target"], "display_99");
         let planned = plan_for_meta(
             "authorize",
             &argv(&[

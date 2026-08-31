@@ -18,12 +18,12 @@ impl IntendantServer {
         description = "List active browser workspaces. Browser workspaces are addressable CDP/Playwright/Agent Browser surfaces with per-workspace leases."
     )]
     pub(crate) async fn list_browser_workspaces(&self) -> String {
-        let workspaces = crate::browser_workspace::list_workspaces().await;
+        let workspaces = crate::browser_workspace::list_workspaces(&self.bus).await;
         serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_string())
     }
 
     #[tool(
-        description = "Create a browser workspace. provider=cdp launches a managed local Chromium-family browser with an isolated profile and CDP endpoint; provider=system_cdp deliberately uses the installed system browser."
+        description = "Create a browser workspace. provider=cdp launches managed Chromium with an isolated profile and CDP endpoint. On Linux, display_target can bind it to an explicit daemon-created virtual display returned by create_virtual_display; user-session, session-local, and foreign displays are rejected. provider=system_cdp deliberately uses the installed system browser."
     )]
     pub(crate) async fn create_browser_workspace(
         &self,
@@ -35,16 +35,11 @@ impl IntendantServer {
             provider: params.provider,
             peer_id: params.peer_id,
             owner_session_id: params.owner_session_id,
+            display_target: params.display_target,
             profile_dir: params.profile_dir,
         };
-        match crate::browser_workspace::create_workspace(request).await {
+        match crate::browser_workspace::create_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "created".to_string(),
-                    workspace: Some(workspace.clone()),
-                    workspace_id: Some(workspace.id.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => {
@@ -104,14 +99,8 @@ impl IntendantServer {
             note: params.note,
             force: params.force,
         };
-        match crate::browser_workspace::acquire_workspace(request).await {
+        match crate::browser_workspace::acquire_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_acquired".to_string(),
-                    workspace_id: Some(workspace.id.clone()),
-                    workspace: Some(workspace.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
@@ -128,14 +117,8 @@ impl IntendantServer {
             holder_id: params.holder_id,
             note: params.note,
         };
-        match crate::browser_workspace::release_workspace(request).await {
+        match crate::browser_workspace::release_workspace(request, &self.bus).await {
             Ok(workspace) => {
-                self.bus.send(AppEvent::BrowserWorkspaceChanged {
-                    kind: "lease_released".to_string(),
-                    workspace_id: Some(workspace.id.clone()),
-                    workspace: Some(workspace.clone()),
-                    message: None,
-                });
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
             Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),

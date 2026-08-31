@@ -2773,6 +2773,8 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_dir: Option<String>,
     },
     CloseBrowserWorkspace {
@@ -5851,6 +5853,7 @@ mod tests {
                 provider: Some("cdp".to_string()),
                 peer_id: None,
                 owner_session_id: Some("session-1".to_string()),
+                display_target: None,
                 profile_dir: None,
             },
             ControlMsg::CloseBrowserWorkspace {
