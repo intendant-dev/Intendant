@@ -16,8 +16,7 @@ fn test_server(home: &Path) -> IntendantServer {
 }
 
 fn add_user_skill(state_root: &Path, name: &str, body: &str) {
-    let skill_md =
-        format!("---\nname: {name}\ndescription: Owner workflow {name}\n---\n{body}\n");
+    let skill_md = format!("---\nname: {name}\ndescription: Owner workflow {name}\n---\n{body}\n");
     crate::user_skills::add_user_skill_in(
         state_root,
         name,
@@ -92,11 +91,7 @@ fn get_and_read_return_the_same_manifest_bytes_and_digest() {
 fn openai_profile_folds_every_effective_skill_into_one_importable_package() {
     let home = tempfile::tempdir().unwrap();
     let state_root = crate::platform::intendant_home_in(home.path());
-    add_user_skill(
-        &state_root,
-        "owner-workflow",
-        "Unique owner body marker.",
-    );
+    add_user_skill(&state_root, "owner-workflow", "Unique owner body marker.");
     let server = test_server(home.path());
     let list = server
         .skills_over_mcp_list(&serde_json::json!({}), Some("openai"))
