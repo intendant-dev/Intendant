@@ -445,9 +445,29 @@ pub(crate) fn negotiated_mcp_protocol_version(requested: Option<&str>) -> &'stat
         .unwrap_or(SUPPORTED_MCP_PROTOCOL_VERSIONS[0])
 }
 
+/// Parse one wire body into its JSON-RPC request, or into the
+/// `-32700` response the wire expects for malformed JSON. The POST
+/// handler parses ONCE and shares the request between the SSE
+/// decision and dispatch — a second decode of a body near the route
+/// cap would double the heaviest per-POST cost for every client
+/// whose `Accept` admits an event stream.
+pub(crate) fn parse_mcp_http_request(body: &str) -> Result<McpHttpRequest, McpHttpOutcome> {
+    serde_json::from_str(body).map_err(|e| {
+        McpHttpOutcome::Response(McpHttpResponse {
+            jsonrpc: "2.0".into(),
+            id: None,
+            result: None,
+            error: Some(McpHttpError {
+                code: -32700,
+                message: format!("Parse error: {}", e),
+            }),
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_mcp_http_request(
-    body: &str,
+pub(crate) async fn handle_mcp_parsed_request(
+    request: McpHttpRequest,
     server: &crate::mcp::IntendantServer,
     session_id: Option<&str>,
     codex_managed_context: Option<bool>,
@@ -459,21 +479,6 @@ pub(crate) async fn handle_mcp_http_request(
     gate_session: Option<String>,
     bus: &EventBus,
 ) -> McpHttpOutcome {
-    let request: McpHttpRequest = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return McpHttpOutcome::Response(McpHttpResponse {
-                jsonrpc: "2.0".into(),
-                id: None,
-                result: None,
-                error: Some(McpHttpError {
-                    code: -32700,
-                    message: format!("Parse error: {}", e),
-                }),
-            });
-        }
-    };
-
     // JSON-RPC notifications have no `id` and expect no response body.
     // The MCP Streamable HTTP spec requires 202 Accepted for these.
     let is_notification = request.id.is_none();
@@ -638,9 +643,10 @@ fn accepts_event_stream(accept: &str) -> bool {
     })
 }
 
-/// The per-request SSE decision for one `POST /mcp` body (MCP
-/// Streamable HTTP, 2026-07-28 shape: the server may answer any POST
-/// as an event stream). Streams only when the client accepts
+/// The per-request SSE decision for one parsed `POST /mcp` request —
+/// the caller's single decode, shared with dispatch (MCP Streamable
+/// HTTP, 2026-07-28 shape: the server may answer any POST as an
+/// event stream). Streams only when the client accepts
 /// `text/event-stream`, the message is a `tools/call` REQUEST (an id —
 /// notifications take their 202), and the named (or facade-resolved)
 /// tool is a held-POST verb. Argument VALUES are never parsed here —
@@ -653,7 +659,7 @@ struct McpSsePlan {
     progress_token: Option<serde_json::Value>,
 }
 
-fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
+fn mcp_sse_plan(header_text: &str, request: &McpHttpRequest) -> Option<McpSsePlan> {
     // `Accept` is list-valued and may legally arrive split across
     // repeated field lines; fold every line (the parser is an ANY over
     // comma-separated ranges, so per-line ANY equals the joined list).
@@ -661,14 +667,13 @@ fn mcp_sse_plan(header_text: &str, body_text: &str) -> Option<McpSsePlan> {
     if !accepts_sse {
         return None;
     }
-    let msg: serde_json::Value = serde_json::from_str(body_text).ok()?;
-    if msg.get("id").is_none_or(serde_json::Value::is_null) {
+    if request.id.as_ref().is_none_or(|id| id.is_null()) {
         return None;
     }
-    if msg.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+    if request.method != "tools/call" {
         return None;
     }
-    let params = msg.get("params")?;
+    let params = request.params.as_ref()?;
     let name = params
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -816,105 +821,119 @@ pub(crate) async fn handle_mcp_post(
         // JSON-RPC response closes the stream. Everything else keeps
         // the plain-JSON leg below. Authorization is unchanged: the
         // per-tool decision still runs inside the dispatch, and a
-        // denial simply arrives as the stream's only message.
-        if let Some(plan) = mcp_sse_plan(header_text, &body_text) {
-            let call = handle_mcp_http_request(
-                &body_text,
-                mcp,
-                mcp_session_id.as_deref(),
-                codex_managed_context,
-                tool_profile.as_deref(),
-                &mcp_access,
-                mcp_gate_session(header_text),
-                &bus,
-            );
-            tokio::pin!(call);
-            // Establish the stream. Flushed, not just written: over TLS
-            // a completed write can leave ciphertext buffered, and the
-            // whole point of the stream is 15 s of guaranteed WIRE
-            // activity. If the head cannot be written — the client or a
-            // proxy reset between delivering the POST and reading the
-            // response — the accepted call still runs to its own
-            // completion below: plain-POST semantics never let a
-            // disconnect cancel a held verb, so only the writing is
-            // skipped.
-            let head = sse_response_head(&mcp_cors);
-            let mut client_gone =
-                stream.write_all(head.as_bytes()).await.is_err() || stream.flush().await.is_err();
-            let mut keepalive =
-                tokio::time::interval(std::time::Duration::from_secs(MCP_SSE_KEEPALIVE_SECS));
-            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            keepalive.tick().await; // consume the immediate first tick
-            let mut ticks = 0u64;
-            let outcome = loop {
-                tokio::select! {
-                    outcome = &mut call => break outcome,
-                    _ = keepalive.tick(), if !client_gone => {
-                        ticks += 1;
-                        let frame = match &plan.progress_token {
-                            Some(token) => sse_progress_frame(token, ticks),
-                            None => ": keepalive\n\n".to_string(),
-                        };
-                        // Flush each frame (wire activity, not buffer
-                        // activity), and bound the write: a client that
-                        // stopped reading must not park this loop on a
-                        // blocked write_all — that would stop polling
-                        // the call future itself (review).
-                        let wrote = tokio::time::timeout(
-                            std::time::Duration::from_secs(MCP_SSE_WRITE_TIMEOUT_SECS),
-                            async {
-                                stream.write_all(frame.as_bytes()).await?;
-                                stream.flush().await
-                            },
-                        )
-                        .await;
-                        if !matches!(wrote, Ok(Ok(()))) {
-                            // The client hung up (or stopped reading).
-                            // The verb still runs to completion —
-                            // plain-POST semantics, where a disconnect
-                            // is only ever noticed at the final write —
-                            // so an in-flight ask keeps its own
-                            // lifecycle; we just stop writing.
-                            client_gone = true;
+        // denial simply arrives as the stream's only message. The body
+        // is decoded exactly once — the SSE decision and dispatch
+        // share the parse.
+        let outcome = match parse_mcp_http_request(&body_text) {
+            Err(outcome) => outcome,
+            Ok(request) => {
+                if let Some(plan) = mcp_sse_plan(header_text, &request) {
+                    let call = handle_mcp_parsed_request(
+                        request,
+                        mcp,
+                        mcp_session_id.as_deref(),
+                        codex_managed_context,
+                        tool_profile.as_deref(),
+                        &mcp_access,
+                        mcp_gate_session(header_text),
+                        &bus,
+                    );
+                    tokio::pin!(call);
+                    // Establish the stream. Flushed, not just written:
+                    // over TLS a completed write can leave ciphertext
+                    // buffered, and the whole point of the stream is
+                    // 15 s of guaranteed WIRE activity. If the head
+                    // cannot be written — the client or a proxy reset
+                    // between delivering the POST and reading the
+                    // response — the accepted call still runs to its
+                    // own completion below: plain-POST semantics never
+                    // let a disconnect cancel a held verb, so only the
+                    // writing is skipped.
+                    let head = sse_response_head(&mcp_cors);
+                    let mut client_gone = stream.write_all(head.as_bytes()).await.is_err()
+                        || stream.flush().await.is_err();
+                    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(
+                        MCP_SSE_KEEPALIVE_SECS,
+                    ));
+                    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    keepalive.tick().await; // consume the immediate first tick
+                    let mut ticks = 0u64;
+                    let outcome = loop {
+                        tokio::select! {
+                            outcome = &mut call => break outcome,
+                            _ = keepalive.tick(), if !client_gone => {
+                                ticks += 1;
+                                let frame = match &plan.progress_token {
+                                    Some(token) => sse_progress_frame(token, ticks),
+                                    None => ": keepalive\n\n".to_string(),
+                                };
+                                // Flush each frame (wire activity, not
+                                // buffer activity), and bound the
+                                // write: a client that stopped reading
+                                // must not park this loop on a blocked
+                                // write_all — that would stop polling
+                                // the call future itself (review).
+                                let wrote = tokio::time::timeout(
+                                    std::time::Duration::from_secs(MCP_SSE_WRITE_TIMEOUT_SECS),
+                                    async {
+                                        stream.write_all(frame.as_bytes()).await?;
+                                        stream.flush().await
+                                    },
+                                )
+                                .await;
+                                if !matches!(wrote, Ok(Ok(()))) {
+                                    // The client hung up (or stopped
+                                    // reading). The verb still runs to
+                                    // completion — plain-POST
+                                    // semantics, where a disconnect is
+                                    // only ever noticed at the final
+                                    // write — so an in-flight ask
+                                    // keeps its own lifecycle; we just
+                                    // stop writing.
+                                    client_gone = true;
+                                }
+                            }
                         }
+                    };
+                    if client_gone {
+                        // The peer already failed a bounded write, so
+                        // the graceful finalizer must not run: its
+                        // unbounded flush + shutdown would push into
+                        // the same backpressure (rustls can still hold
+                        // ciphertext from the cancelled write) and
+                        // park this task long after the verb finished.
+                        // Dropping the stream closes the socket
+                        // without the courtesy flush the peer stopped
+                        // reading anyway.
+                        return;
                     }
+                    let final_frame = match outcome {
+                        McpHttpOutcome::Response(resp) => {
+                            sse_frame("message", &serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        // Unreachable for a planned tools/call request
+                        // (notifications never plan); close the stream
+                        // bare.
+                        McpHttpOutcome::Accepted => String::new(),
+                    };
+                    let _ = stream.write_all(final_frame.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
                 }
-            };
-            if client_gone {
-                // The peer already failed a bounded write, so the
-                // graceful finalizer must not run: its unbounded
-                // flush + shutdown would push into the same
-                // backpressure (rustls can still hold ciphertext from
-                // the cancelled write) and park this task long after
-                // the verb finished. Dropping the stream closes the
-                // socket without the courtesy flush the peer stopped
-                // reading anyway.
-                return;
+                handle_mcp_parsed_request(
+                    request,
+                    mcp,
+                    mcp_session_id.as_deref(),
+                    codex_managed_context,
+                    tool_profile.as_deref(),
+                    &mcp_access,
+                    mcp_gate_session(header_text),
+                    &bus,
+                )
+                .await
             }
-            let final_frame = match outcome {
-                McpHttpOutcome::Response(resp) => {
-                    sse_frame("message", &serde_json::to_string(&resp).unwrap_or_default())
-                }
-                // Unreachable for a planned tools/call request
-                // (notifications never plan); close the stream bare.
-                McpHttpOutcome::Accepted => String::new(),
-            };
-            let _ = stream.write_all(final_frame.as_bytes()).await;
-            let _ = stream.flush().await;
-            finalize_http_stream(&mut stream).await;
-            return;
-        }
-        let outcome = handle_mcp_http_request(
-            &body_text,
-            mcp,
-            mcp_session_id.as_deref(),
-            codex_managed_context,
-            tool_profile.as_deref(),
-            &mcp_access,
-            mcp_gate_session(header_text),
-            &bus,
-        )
-        .await;
+        };
         // Keep-alive opt-in (response leg): both shapes are self-framing
         // (Content-Length), and dispatch consumed the body under the /mcp
         // row's cap. Managed Codex/CC backends call /mcp once per tool
@@ -1201,6 +1220,45 @@ pub(crate) fn mcp_agent_session_context(
 mod tests {
     use super::*;
 
+    /// SSE-plan fixtures arrive pre-parsed, the way the production
+    /// path hands them over (one decode, shared with dispatch).
+    fn parse_req(value: serde_json::Value) -> McpHttpRequest {
+        serde_json::from_value(value).expect("test request parses")
+    }
+
+    /// Wire-shaped test entry: production parses once in
+    /// `handle_mcp_post` and hands the request to
+    /// `handle_mcp_parsed_request`; tests keep the str form so the
+    /// parse-error path is covered on the same seam the wire takes.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_mcp_http_request(
+        body: &str,
+        server: &crate::mcp::IntendantServer,
+        session_id: Option<&str>,
+        codex_managed_context: Option<bool>,
+        tool_profile: Option<&str>,
+        access: &HttpAccessContext,
+        gate_session: Option<String>,
+        bus: &EventBus,
+    ) -> McpHttpOutcome {
+        match parse_mcp_http_request(body) {
+            Ok(request) => {
+                handle_mcp_parsed_request(
+                    request,
+                    server,
+                    session_id,
+                    codex_managed_context,
+                    tool_profile,
+                    access,
+                    gate_session,
+                    bus,
+                )
+                .await
+            }
+            Err(outcome) => outcome,
+        }
+    }
+
     /// The per-request SSE plan fires only for the exact intersection:
     /// an event-stream-accepting client, a `tools/call` REQUEST, and a
     /// held-POST verb (typed name or facade-resolved) — and it lifts
@@ -1212,58 +1270,51 @@ mod tests {
         let sse_headers =
             "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json, text/event-stream\r\n\r\n";
         let json_headers = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\n\r\n";
-        let ask = serde_json::json!({
+        let ask = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "ask_user", "arguments": { "question": "go?" } },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &ask).is_some());
         assert!(
             mcp_sse_plan(json_headers, &ask).is_none(),
             "no event-stream accept, no stream"
         );
         // A short verb answers as plain JSON even when SSE is accepted.
-        let status = serde_json::json!({
+        let status = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": { "name": "get_status", "arguments": {} },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &status).is_none());
         // Notifications (no id) never stream; nor do non-call methods.
-        let notification = serde_json::json!({
+        let notification = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "method": "tools/call",
             "params": { "name": "ask_user", "arguments": {} },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &notification).is_none());
-        let list = serde_json::json!({
+        let list = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/list",
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &list).is_none());
         // Facade resolution is argv-only: `act ["ask", ...]` streams.
-        let facade_ask = serde_json::json!({
+        let facade_ask = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": { "name": "act", "arguments": { "argv": ["ask", "which one?"] } },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &facade_ask).is_some());
-        let facade_status = serde_json::json!({
+        let facade_status = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "inspect", "arguments": { "argv": ["status"] } },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &facade_status).is_none());
         // The progress token rides out of _meta when present.
-        let with_token = serde_json::json!({
+        let with_token = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 6, "method": "tools/call",
             "params": {
                 "name": "ask_user",
                 "arguments": { "question": "go?" },
                 "_meta": { "progressToken": "tok-1" },
             },
-        })
-        .to_string();
+        }));
         let plan = mcp_sse_plan(sse_headers, &with_token).unwrap();
         assert_eq!(plan.progress_token, Some(serde_json::json!("tok-1")));
         assert!(mcp_sse_plan(sse_headers, &ask)
@@ -1273,15 +1324,14 @@ mod tests {
         // A progress token is a bounded correlation handle, never a
         // payload: an oversized or non-scalar token downgrades to
         // comment keepalives instead of being reflected every 15 s.
-        let huge_token = serde_json::json!({
+        let huge_token = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": {
                 "name": "ask_user",
                 "arguments": { "question": "go?" },
                 "_meta": { "progressToken": "x".repeat(MCP_SSE_PROGRESS_TOKEN_MAX_BYTES + 1) },
             },
-        })
-        .to_string();
+        }));
         assert!(
             mcp_sse_plan(sse_headers, &huge_token)
                 .unwrap()
@@ -1289,28 +1339,26 @@ mod tests {
                 .is_none(),
             "oversized token downgrades"
         );
-        let object_token = serde_json::json!({
+        let object_token = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {
                 "name": "ask_user",
                 "arguments": { "question": "go?" },
                 "_meta": { "progressToken": { "not": "a scalar" } },
             },
-        })
-        .to_string();
+        }));
         assert!(mcp_sse_plan(sse_headers, &object_token)
             .unwrap()
             .progress_token
             .is_none());
-        let int_token = serde_json::json!({
+        let int_token = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 9, "method": "tools/call",
             "params": {
                 "name": "ask_user",
                 "arguments": { "question": "go?" },
                 "_meta": { "progressToken": 42 },
             },
-        })
-        .to_string();
+        }));
         assert_eq!(
             mcp_sse_plan(sse_headers, &int_token)
                 .unwrap()
@@ -1321,11 +1369,10 @@ mod tests {
         // consent-gated and long-poll tools ride the same
         // classification.
         for held in crate::mcp::MCP_HELD_POST_TOOLS {
-            let call = serde_json::json!({
+            let call = parse_req(serde_json::json!({
                 "jsonrpc": "2.0", "id": 10, "method": "tools/call",
                 "params": { "name": held, "arguments": {} },
-            })
-            .to_string();
+            }));
             assert!(
                 mcp_sse_plan(sse_headers, &call).is_some(),
                 "held verb `{held}` must stream"
@@ -1340,11 +1387,10 @@ mod tests {
     /// timeout.
     #[test]
     fn sse_selection_folds_repeated_accept_field_lines() {
-        let ask = serde_json::json!({
+        let ask = parse_req(serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "ask_user", "arguments": { "question": "go?" } },
-        })
-        .to_string();
+        }));
         let split = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\nAccept: text/event-stream\r\n\r\n";
         assert!(mcp_sse_plan(split, &ask).is_some());
         let rejected = "POST /mcp HTTP/1.1\r\nHost: h\r\nAccept: application/json\r\nAccept: text/event-stream;q=0\r\n\r\n";
