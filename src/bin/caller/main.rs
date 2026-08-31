@@ -1157,13 +1157,14 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 /// 1. Already launched (`xvfb_guard` is `Some`)? → skip
 /// 2. Current DISPLAY accessible? Yes → skip
 /// 3. Batch contains `captureScreen` or any `execAsAgent`? No → skip
-/// 4. Launch Xvfb, store guard, set DISPLAY
+/// 4. Launch Xvfb and retain its id in the session-owned guard
 /// 5. On failure → log warning, let commands fail naturally
 ///
 /// We launch on execAsAgent (not just captureScreen) because GUI applications
 /// started in early turns must share the same display that captureScreen will
-/// later capture. Launching only on captureScreen is too late — the app would
-/// already be running on a different (or no) display.
+/// later capture. The guard's display id is applied only to this session's
+/// runtime children; launching only on captureScreen is too late — the app
+/// would already be running on a different (or no) display.
 ///
 /// `facts` carries the batch's trigger booleans, derived once per batch —
 /// this function used to re-parse the full batch JSON (twice) to answer them.

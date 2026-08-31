@@ -3,6 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+fn user_session_display_env_from(mut read_env: impl FnMut(&str) -> Option<String>) -> String {
+    read_env("INTENDANT_USER_DISPLAY")
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_env("DISPLAY").filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| ":0".to_string())
+}
+
 /// Cross-platform display target. Replaces raw display numbers with a
 /// platform-agnostic enum that distinguishes between agent-managed virtual
 /// displays and the user's active session display.
@@ -29,10 +36,11 @@ impl DisplayTarget {
                     // macOS doesn't use DISPLAY for the primary display
                     String::new()
                 } else {
-                    // On Linux, try to find the login session's DISPLAY.
-                    // The caller may have overridden DISPLAY for Xvfb, so we
-                    // check INTENDANT_USER_DISPLAY first, then fall back to :0.
-                    std::env::var("INTENDANT_USER_DISPLAY").unwrap_or_else(|_| ":0".to_string())
+                    // Prefer the separately adopted login-session value. If
+                    // no adopter ran, preserve a valid ambient non-:0 X11
+                    // desktop rather than inventing :0. Xvfb launch itself
+                    // never mutates either process value.
+                    user_session_display_env_from(|key| std::env::var(key).ok())
                 }
             }
         }
@@ -71,6 +79,31 @@ impl DisplayTarget {
             Some(id) => Self::from_display_id(id),
             None => default,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn resolve(values: &[(&str, &str)]) -> String {
+        let values = values.iter().copied().collect::<BTreeMap<_, _>>();
+        user_session_display_env_from(|key| values.get(key).map(|value| (*value).to_string()))
+    }
+
+    #[test]
+    fn user_session_display_prefers_adopted_then_ambient_then_default() {
+        assert_eq!(
+            resolve(&[("INTENDANT_USER_DISPLAY", ":7"), ("DISPLAY", ":99")]),
+            ":7"
+        );
+        assert_eq!(resolve(&[("DISPLAY", ":7")]), ":7");
+        assert_eq!(resolve(&[]), ":0");
+        assert_eq!(
+            resolve(&[("INTENDANT_USER_DISPLAY", ""), ("DISPLAY", ":8")]),
+            ":8"
+        );
     }
 }
 

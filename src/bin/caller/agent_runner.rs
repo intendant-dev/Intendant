@@ -213,6 +213,15 @@ fn apply_user_display_grant_env(cmd: &mut Command, user_display_granted: bool) {
     }
 }
 
+/// Scope one runtime child to its session-owned Xvfb. `None` preserves the
+/// ordinary inherited/user-session display selected by the existing child
+/// environment policy.
+fn apply_virtual_display_env(cmd: &mut Command, virtual_display_id: Option<u32>) {
+    if let Some(display_id) = virtual_display_id {
+        cmd.env("DISPLAY", format!(":{display_id}"));
+    }
+}
+
 /// Provider-credential env names scrubbed from the runtime child beyond the
 /// authoritative `provider::PROVIDER_KEY_ENV_VARS` list: adjacent
 /// conventional spellings of the same secrets that a user `.env` (loaded
@@ -600,6 +609,9 @@ fn output_with_exit_status(
 /// `user_display_granted` is the autonomy guard's grant state, read by the
 /// caller at spawn time — the runtime child observes it as
 /// `INTENDANT_USER_DISPLAY_GRANTED` on its environment.
+/// `virtual_display_id`, when present, scopes this one runtime child and all
+/// of its GUI subprocesses to that session's Xvfb without mutating the
+/// controller process environment.
 ///
 /// `has_ask_human` selects the no-timeout path for batches containing
 /// `askHuman` (which polls indefinitely for the user). The caller derives it
@@ -610,6 +622,7 @@ pub async fn run_agent(
     log_dir: &std::path::Path,
     workdir: &std::path::Path,
     user_display_granted: bool,
+    virtual_display_id: Option<u32>,
     has_ask_human: bool,
     mcp_env: Option<&RuntimeMcpEnv>,
 ) -> Result<AgentOutput, CallerError> {
@@ -663,6 +676,7 @@ pub async fn run_agent(
                 Some(workdir),
                 Some(&sandbox),
                 user_display_granted,
+                virtual_display_id,
                 has_ask_human,
                 mcp_env,
                 None,
@@ -676,6 +690,7 @@ pub async fn run_agent(
         Some(workdir),
         None,
         user_display_granted,
+        virtual_display_id,
         has_ask_human,
         mcp_env,
         None,
@@ -698,6 +713,7 @@ pub async fn run_agent_sandboxed(
         None,
         Some(sandbox),
         user_display_granted,
+        None,
         has_ask_human,
         None,
         None,
@@ -729,6 +745,7 @@ pub async fn run_install_batch(
         Some(log_dir),
         None,
         false,
+        None,
         false,
         None,
         Some(hard_timeout),
@@ -743,6 +760,7 @@ async fn run_agent_inner(
     workdir: Option<&std::path::Path>,
     sandbox: Option<&crate::sandbox::SandboxConfig>,
     user_display_granted: bool,
+    virtual_display_id: Option<u32>,
     has_ask_human: bool,
     mcp_env: Option<&RuntimeMcpEnv>,
     hard_timeout_override: Option<std::time::Duration>,
@@ -849,6 +867,12 @@ async fn run_agent_inner(
 
     #[cfg(target_os = "linux")]
     crate::linux_display_env::apply_to_tokio_command(&mut cmd);
+
+    // A session-owned virtual display overrides only this runtime child.
+    // `launch_display` deliberately leaves the daemon-wide DISPLAY alone so
+    // concurrent sessions and browser workspaces cannot inherit each other's
+    // X servers.
+    apply_virtual_display_env(&mut cmd, virtual_display_id);
 
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
@@ -1414,6 +1438,27 @@ mod tests {
                 .all(|(k, _)| k != std::ffi::OsStr::new("INTENDANT_USER_DISPLAY_GRANTED")),
             "ungranted state must not set the grant var on the child"
         );
+    }
+
+    #[test]
+    fn virtual_display_env_is_child_scoped_and_optional() {
+        let mut virtual_child = Command::new("true");
+        virtual_child.env("DISPLAY", ":0");
+        apply_virtual_display_env(&mut virtual_child, Some(137));
+        let display = virtual_child
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("DISPLAY"))
+            .and_then(|(_, value)| value)
+            .and_then(std::ffi::OsStr::to_str);
+        assert_eq!(display, Some(":137"));
+
+        let mut ordinary_child = Command::new("true");
+        apply_virtual_display_env(&mut ordinary_child, None);
+        assert!(ordinary_child
+            .as_std()
+            .get_envs()
+            .all(|(key, _)| key != std::ffi::OsStr::new("DISPLAY")));
     }
 
     /// A small injected cap for the drain tests — never allocate the real

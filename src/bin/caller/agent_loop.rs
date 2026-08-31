@@ -2820,6 +2820,7 @@ pub(crate) async fn run_agent_loop(
                 log_dir,
                 &project.root,
                 user_display_granted,
+                xvfb_guard.as_ref().and_then(|guard| guard.display_id()),
                 batch_facts.has_ask_human,
                 runtime_mcp_env,
             )
@@ -3423,6 +3424,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 log_dir,
                 &project.root,
                 user_display_granted,
+                xvfb_guard.as_ref().and_then(|guard| guard.display_id()),
                 batch_facts.has_ask_human,
                 runtime_mcp_env,
             )

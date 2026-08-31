@@ -261,6 +261,19 @@ pub struct XvfbGuard {
 }
 
 impl XvfbGuard {
+    /// The virtual display owned by this guard. `None` is returned on
+    /// platforms where Xvfb launch is unsupported.
+    pub fn display_id(&self) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.display_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Ask this guard's exact child to exit and reap it without blocking a
     /// runtime worker. Graceful waiting is bounded; the fallback hard-kills
     /// only the spawned child. X lock/socket residue is never removed because
@@ -327,7 +340,10 @@ impl Drop for XvfbGuard {
 /// Launch Xvfb on the given display with the given resolution.
 /// The config's target must be `DisplayTarget::Virtual`; returns
 /// `CallerError::Config` otherwise.
-/// Returns a guard that kills the process on drop.
+/// Returns a guard that kills the process on drop. The launch is scoped to
+/// the returned display and never changes the daemon's process-wide `DISPLAY`;
+/// callers must pass the display target explicitly to capture, input, and
+/// browser subprocesses.
 #[cfg(target_os = "linux")]
 pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
     let display_id = match config.target {
@@ -389,17 +405,6 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
             "Xvfb on display {display_arg} did not establish its expected lock and socket"
         )));
     }
-
-    // Preserve the user's original DISPLAY before overriding with virtual display.
-    // This is used by DisplayTarget::UserSession to resolve the user's actual display.
-    if std::env::var("INTENDANT_USER_DISPLAY").is_err() {
-        if let Ok(original) = std::env::var("DISPLAY") {
-            std::env::set_var("INTENDANT_USER_DISPLAY", &original);
-        }
-    }
-
-    // Set DISPLAY env var so the runtime subprocess inherits it
-    std::env::set_var("DISPLAY", &display_arg);
 
     Ok(XvfbGuard {
         child,
