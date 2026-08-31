@@ -2383,11 +2383,16 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            if batch.agent_input_json.is_none() && !batch.precomputed_results.is_empty() {
+            if batch.agent_input_json.is_none()
+                && !batch.precomputed_results.is_empty()
+                && !has_cu_calls
+            {
                 continue;
             }
 
-            // If no runtime commands, just respond to tool calls with context update
+            // If no runtime commands, respond to tool calls locally. Native
+            // CU can coexist with controller-only calls, so prepare and run
+            // it here instead of dropping it at this early return.
             let Some(ref json_str) = batch.agent_input_json else {
                 empty_command_streak = 0;
                 // Respond to whatever no dedicated handler answered above
@@ -2399,6 +2404,44 @@ pub(crate) async fn run_agent_loop(
                         continue;
                     }
                     conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                }
+                if has_cu_calls {
+                    let user_display_granted = autonomy.read().await.user_display_granted;
+                    match maybe_auto_launch_xvfb(
+                        &BatchFacts::default(),
+                        xvfb_guard,
+                        provider.name(),
+                        &session_log,
+                        user_display_granted,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            execute_cu_calls(
+                                &response.cu_calls,
+                                conversation,
+                                provider.cu_display(),
+                                xvfb_guard.as_ref().and_then(|guard| guard.display_id()),
+                                log_dir,
+                                &mut cu_action_counter,
+                                &session_log,
+                                session_registry,
+                                user_display_granted,
+                                Some(&cu_observer),
+                            )
+                            .await;
+                        }
+                        Err(display_error) => {
+                            for cu_call in &response.cu_calls {
+                                conversation.add_cu_result(
+                                    &cu_call.call_id,
+                                    &display_error,
+                                    vec![],
+                                );
+                            }
+                        }
+                    }
                 }
                 continue;
             };
@@ -2792,7 +2835,30 @@ pub(crate) async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&batch_facts, xvfb_guard, provider.name(), &session_log).await;
+            // Read the grant before display preparation: an ambient user
+            // display is eligible only when this session owns that grant.
+            let user_display_granted = autonomy.read().await.user_display_granted;
+            if let Err(display_error) = maybe_auto_launch_xvfb(
+                &batch_facts,
+                xvfb_guard,
+                provider.name(),
+                &session_log,
+                user_display_granted,
+                has_cu_calls,
+            )
+            .await
+            {
+                for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
+                    conversation.add_tool_result(call_id, tool_name, &display_error);
+                }
+                for cu_call in &response.cu_calls {
+                    conversation.add_cu_result(&cu_call.call_id, &display_error, vec![]);
+                }
+                continue;
+            }
             let preview = batch_facts.commands_preview.clone();
             bus.send(AppEvent::AgentStarted {
                 session_id: local_session_id.clone(),
@@ -2812,9 +2878,6 @@ pub(crate) async fn run_agent_loop(
                 });
             }
 
-            // Read the grant fresh from the autonomy guard at every runtime
-            // spawn so a mid-session grant/revoke reaches the next child.
-            let user_display_granted = autonomy.read().await.user_display_granted;
             let output = agent_runner::run_agent(
                 &json_str,
                 log_dir,
@@ -2902,29 +2965,50 @@ pub(crate) async fn run_agent_loop(
                     &response.cu_calls,
                     conversation,
                     provider.cu_display(),
+                    xvfb_guard.as_ref().and_then(|guard| guard.display_id()),
                     log_dir,
                     &mut cu_action_counter,
                     &session_log,
                     session_registry,
-                    autonomy.read().await.user_display_granted,
+                    user_display_granted,
                     Some(&cu_observer),
                 )
                 .await;
             }
         } else if has_cu_calls {
             // CU-only turn (no function tool calls)
-            execute_cu_calls(
-                &response.cu_calls,
-                conversation,
-                provider.cu_display(),
-                log_dir,
-                &mut cu_action_counter,
+            let user_display_granted = autonomy.read().await.user_display_granted;
+            match maybe_auto_launch_xvfb(
+                &BatchFacts::default(),
+                xvfb_guard,
+                provider.name(),
                 &session_log,
-                session_registry,
-                autonomy.read().await.user_display_granted,
-                Some(&cu_observer),
+                user_display_granted,
+                true,
             )
-            .await;
+            .await
+            {
+                Ok(()) => {
+                    execute_cu_calls(
+                        &response.cu_calls,
+                        conversation,
+                        provider.cu_display(),
+                        xvfb_guard.as_ref().and_then(|guard| guard.display_id()),
+                        log_dir,
+                        &mut cu_action_counter,
+                        &session_log,
+                        session_registry,
+                        user_display_granted,
+                        Some(&cu_observer),
+                    )
+                    .await;
+                }
+                Err(display_error) => {
+                    for cu_call in &response.cu_calls {
+                        conversation.add_cu_result(&cu_call.call_id, &display_error, vec![]);
+                    }
+                }
+            }
         } else {
             // --- Legacy text extraction path ---
 
@@ -3395,7 +3479,25 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&batch_facts, xvfb_guard, provider.name(), &session_log).await;
+            // Read the grant before display preparation: an ambient user
+            // display is eligible only when this session owns that grant.
+            let user_display_granted = autonomy.read().await.user_display_granted;
+            if let Err(display_error) = maybe_auto_launch_xvfb(
+                &batch_facts,
+                xvfb_guard,
+                provider.name(),
+                &session_log,
+                user_display_granted,
+                false,
+            )
+            .await
+            {
+                conversation.add_user(
+                    MessageProvenance::SystemInjection,
+                    format!("Agent execution was not started: {display_error}"),
+                );
+                continue;
+            }
 
             let preview = batch_facts.commands_preview.clone();
             bus.send(AppEvent::AgentStarted {
@@ -3416,9 +3518,6 @@ Proceed with explicit assumptions and continue without additional questions."
                 });
             }
 
-            // Read the grant fresh from the autonomy guard at every runtime
-            // spawn so a mid-session grant/revoke reaches the next child.
-            let user_display_granted = autonomy.read().await.user_display_granted;
             let output = agent_runner::run_agent(
                 &json_str,
                 log_dir,
@@ -5023,8 +5122,10 @@ mod provenance_parity {
         let add_user_with_images = concat!(".add_", "user_with_images(");
         for (file, users, with_images) in [
             // agent_loop's 10th site is the coordination radar block
-            // (§2.1 seam, SystemInjection — consciously added, C2).
-            ("agent_loop.rs", 10usize, 2usize),
+            // (§2.1 seam, SystemInjection — consciously added, C2); the
+            // 11th reports fail-closed virtual-display preparation to the
+            // legacy text loop (SystemInjection).
+            ("agent_loop.rs", 11usize, 2usize),
             ("main.rs", 16, 1),
             ("run_modes.rs", 4, 3),
             ("display_glue.rs", 1, 2),

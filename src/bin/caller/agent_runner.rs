@@ -215,10 +215,18 @@ fn apply_user_display_grant_env(cmd: &mut Command, user_display_granted: bool) {
 
 /// Scope one runtime child to its session-owned Xvfb. `None` preserves the
 /// ordinary inherited/user-session display selected by the existing child
-/// environment policy.
+/// environment policy. A virtual child must not retain Wayland selection:
+/// otherwise GUI programs can ignore DISPLAY and connect to the owner's
+/// compositor through WAYLAND_DISPLAY/XDG_RUNTIME_DIR.
 fn apply_virtual_display_env(cmd: &mut Command, virtual_display_id: Option<u32>) {
     if let Some(display_id) = virtual_display_id {
         cmd.env("DISPLAY", format!(":{display_id}"));
+        #[cfg(target_os = "linux")]
+        {
+            cmd.env_remove("WAYLAND_DISPLAY");
+            cmd.env_remove("XDG_RUNTIME_DIR");
+            cmd.env("XDG_SESSION_TYPE", "x11");
+        }
     }
 }
 
@@ -868,10 +876,11 @@ async fn run_agent_inner(
     #[cfg(target_os = "linux")]
     crate::linux_display_env::apply_to_tokio_command(&mut cmd);
 
-    // A session-owned virtual display overrides only this runtime child.
-    // `launch_display` deliberately leaves the daemon-wide DISPLAY alone so
-    // concurrent sessions and browser workspaces cannot inherit each other's
-    // X servers.
+    // A session-owned virtual display overrides only this runtime child and,
+    // on Linux, removes the Wayland selection path so GUI programs cannot
+    // bypass DISPLAY. `launch_display` deliberately leaves the daemon-wide
+    // environment alone so concurrent sessions and browser workspaces cannot
+    // inherit each other's X servers.
     apply_virtual_display_env(&mut cmd, virtual_display_id);
 
     let mut child = cmd.spawn().map_err(|e| {
@@ -1444,21 +1453,70 @@ mod tests {
     fn virtual_display_env_is_child_scoped_and_optional() {
         let mut virtual_child = Command::new("true");
         virtual_child.env("DISPLAY", ":0");
+        virtual_child.env("WAYLAND_DISPLAY", "wayland-0");
+        virtual_child.env("XDG_RUNTIME_DIR", "/run/user/1000");
+        virtual_child.env("XDG_SESSION_TYPE", "wayland");
         apply_virtual_display_env(&mut virtual_child, Some(137));
-        let display = virtual_child
-            .as_std()
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("DISPLAY"))
-            .and_then(|(_, value)| value)
+        let env: std::collections::HashMap<_, _> = virtual_child.as_std().get_envs().collect();
+        let display = env
+            .get(std::ffi::OsStr::new("DISPLAY"))
+            .and_then(|value| *value)
             .and_then(std::ffi::OsStr::to_str);
         assert_eq!(display, Some(":137"));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("WAYLAND_DISPLAY")),
+                Some(&None)
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("XDG_RUNTIME_DIR")),
+                Some(&None)
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("XDG_SESSION_TYPE"))
+                    .and_then(|value| *value)
+                    .and_then(std::ffi::OsStr::to_str),
+                Some("x11")
+            );
+        }
 
         let mut ordinary_child = Command::new("true");
+        ordinary_child.env("DISPLAY", ":0");
+        ordinary_child.env("WAYLAND_DISPLAY", "wayland-owner");
+        ordinary_child.env("XDG_RUNTIME_DIR", "/run/user/owner");
+        ordinary_child.env("XDG_SESSION_TYPE", "wayland");
         apply_virtual_display_env(&mut ordinary_child, None);
-        assert!(ordinary_child
-            .as_std()
-            .get_envs()
-            .all(|(key, _)| key != std::ffi::OsStr::new("DISPLAY")));
+        let ordinary_env: std::collections::HashMap<_, _> =
+            ordinary_child.as_std().get_envs().collect();
+        assert_eq!(
+            ordinary_env
+                .get(std::ffi::OsStr::new("DISPLAY"))
+                .and_then(|value| *value)
+                .and_then(std::ffi::OsStr::to_str),
+            Some(":0")
+        );
+        assert_eq!(
+            ordinary_env
+                .get(std::ffi::OsStr::new("WAYLAND_DISPLAY"))
+                .and_then(|value| *value)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("wayland-owner")
+        );
+        assert_eq!(
+            ordinary_env
+                .get(std::ffi::OsStr::new("XDG_RUNTIME_DIR"))
+                .and_then(|value| *value)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/run/user/owner")
+        );
+        assert_eq!(
+            ordinary_env
+                .get(std::ffi::OsStr::new("XDG_SESSION_TYPE"))
+                .and_then(|value| *value)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("wayland")
+        );
     }
 
     /// A small injected cap for the drain tests — never allocate the real

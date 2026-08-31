@@ -1141,6 +1141,19 @@ pub(crate) fn resolve_cu_display_target(user_display_granted: bool) -> computer_
     }
 }
 
+/// Resolve native computer-use for one agent-loop session. A session-owned
+/// Xvfb is authoritative even when the daemon process still carries an
+/// ambient `DISPLAY` selected for a different session.
+fn resolve_cu_display_target_for_session(
+    user_display_granted: bool,
+    session_virtual_display_id: Option<u32>,
+) -> computer_use::DisplayTarget {
+    match session_virtual_display_id {
+        Some(id) => computer_use::DisplayTarget::Virtual { id },
+        None => resolve_cu_display_target(user_display_granted),
+    }
+}
+
 /// Maximum turns for an ephemeral CU task before giving up.
 pub(crate) const CU_TASK_MAX_TURNS: usize = 20;
 
@@ -1675,6 +1688,8 @@ pub(crate) async fn handle_shared_view_calls(
     }
 }
 
+/// `session_virtual_display_id`, when present, is the Xvfb owned by this
+/// agent-loop session and overrides daemon-wide display discovery.
 /// `user_display_granted` is the autonomy guard's grant state, read by the
 /// caller before dispatching the batch. `cu_observer` feeds the dashboard's
 /// live action-visualization lane (`None` disables emission).
@@ -1683,6 +1698,7 @@ pub(crate) async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
     conversation: &mut conversation::Conversation,
     cu_display: Option<(u32, u32)>,
+    session_virtual_display_id: Option<u32>,
     log_dir: &std::path::Path,
     counter: &mut u64,
     session_log: &SharedSessionLog,
@@ -1692,8 +1708,8 @@ pub(crate) async fn execute_cu_calls(
 ) {
     // Owned form for execute_actions, which wants `&Option<_>`.
     let session_registry = session_registry.cloned();
-    let display_target = if cu_display.is_some() {
-        resolve_cu_display_target(user_display_granted)
+    let display_target = if cu_display.is_some() || session_virtual_display_id.is_some() {
+        resolve_cu_display_target_for_session(user_display_granted, session_virtual_display_id)
     } else {
         // No CU display configured — resolve availability-aware, but
         // never auto-target the user's desktop from the model-driven
@@ -1822,6 +1838,24 @@ mod tests {
                 None => std::env::remove_var("DISPLAY"),
             }
         }
+    }
+
+    /// Hostile concurrency pin: daemon-wide DISPLAY may name another
+    /// session's Xvfb. The guard id threaded by the owning loop must win for
+    /// native CU regardless of ambient state or the user-display grant.
+    #[tokio::test]
+    async fn session_virtual_display_overrides_ambient_daemon_display() {
+        let _env_lock = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let _display = DisplayEnvGuard::set(":99");
+
+        assert_eq!(
+            resolve_cu_display_target_for_session(false, Some(137)),
+            computer_use::DisplayTarget::Virtual { id: 137 }
+        );
+        assert_eq!(
+            resolve_cu_display_target_for_session(true, Some(138)),
+            computer_use::DisplayTarget::Virtual { id: 138 }
+        );
     }
 
     #[tokio::test]

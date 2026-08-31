@@ -1155,10 +1155,11 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 ///
 /// Detection flow:
 /// 1. Already launched (`xvfb_guard` is `Some`)? → skip
-/// 2. Current DISPLAY accessible? Yes → skip
-/// 3. Batch contains `captureScreen` or any `execAsAgent`? No → skip
+/// 2. User display is granted and current DISPLAY is accessible? Yes → skip
+/// 3. Batch contains `captureScreen`, any `execAsAgent`, or native CU? No → skip
 /// 4. Launch Xvfb and retain its id in the session-owned guard
-/// 5. On failure → log warning, let commands fail naturally
+/// 5. On failure → reject this batch so the runtime cannot discover another
+///    session's Xvfb from host-global lock files
 ///
 /// We launch on execAsAgent (not just captureScreen) because GUI applications
 /// started in early turns must share the same display that captureScreen will
@@ -1173,12 +1174,54 @@ async fn maybe_auto_launch_xvfb(
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     provider_name: &str,
     session_log: &SharedSessionLog,
-) {
+    user_display_granted: bool,
+    has_cu_calls: bool,
+) -> Result<(), String> {
+    maybe_auto_launch_xvfb_with(
+        facts,
+        xvfb_guard,
+        provider_name,
+        session_log,
+        user_display_granted,
+        has_cu_calls,
+        vision::virtual_displays_supported(),
+        vision::display_config_for_provider,
+        |config| async move { vision::launch_display(&config).await },
+    )
+    .await
+}
+
+/// Injectable core of [`maybe_auto_launch_xvfb`]. The production wrapper
+/// supplies the platform allocator and launcher; tests inject hostile launch
+/// outcomes without depending on the host having (or not having) Xvfb.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_auto_launch_xvfb_with<ConfigFn, LaunchFn, LaunchFuture>(
+    facts: &BatchFacts,
+    xvfb_guard: &mut Option<vision::XvfbGuard>,
+    provider_name: &str,
+    session_log: &SharedSessionLog,
+    user_display_granted: bool,
+    has_cu_calls: bool,
+    virtual_displays_supported: bool,
+    display_config_for_provider: ConfigFn,
+    launch_display: LaunchFn,
+) -> Result<(), String>
+where
+    ConfigFn: FnOnce(&str) -> Option<vision::DisplayConfig>,
+    LaunchFn: FnOnce(vision::DisplayConfig) -> LaunchFuture,
+    LaunchFuture: std::future::Future<Output = Result<vision::XvfbGuard, CallerError>>,
+{
     if xvfb_guard.is_some() {
-        return;
+        return Ok(());
     }
-    if !facts.has_capture_screen && !facts.has_exec {
-        return;
+    if !facts.has_capture_screen && !facts.has_exec && !has_cu_calls {
+        return Ok(());
+    }
+    // Xvfb is a Linux-only isolation backend. Native-display platforms keep
+    // their existing runtime-side permission handling and never treat the
+    // absence of Xvfb as a batch failure.
+    if !virtual_displays_supported {
+        return Ok(());
     }
     // Memoized accessible-display verdict: this function runs on every
     // exec/captureScreen batch, `is_display_accessible()` forks `xdpyinfo`
@@ -1193,11 +1236,11 @@ async fn maybe_auto_launch_xvfb(
     // a dead display and auto-launch could never self-heal.
     static EXISTING_DISPLAY: std::sync::Mutex<Option<(u32, u32, u32)>> =
         std::sync::Mutex::new(None);
-    {
+    if user_display_granted {
         let mut memo = EXISTING_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
         if memo.is_some() {
             if existing_display_memo_still_valid() {
-                return;
+                return Ok(());
             }
             // The memoized display died — clear and fall through to the
             // full probe so Xvfb auto-launch can recover.
@@ -1209,7 +1252,7 @@ async fn maybe_auto_launch_xvfb(
     // Don't emit DisplayReady — no DisplaySession exists, so the web dashboard
     // can't connect via WebRTC. Recording uses the legacy platform ffmpeg path
     // directly (x11grab on Linux, screencapture/image2pipe on macOS).
-    if vision::is_display_accessible() {
+    if user_display_granted && vision::is_display_accessible() {
         let default_display = if cfg!(target_os = "macos") { 0 } else { 99 };
         let display_id = std::env::var("DISPLAY")
             .ok()
@@ -1224,22 +1267,23 @@ async fn maybe_auto_launch_xvfb(
                 display_id, width, height
             ))
         });
-        return;
+        return Ok(());
     }
-    let Some(config) = vision::display_config_for_provider(provider_name) else {
-        slog(session_log, |l| {
-            l.warn("No unoccupied virtual display is available; skipping Xvfb auto-launch")
-        });
-        return;
+    let Some(config) = display_config_for_provider(provider_name) else {
+        let message = "No unoccupied virtual display is available; the batch was not executed.";
+        slog(session_log, |l| l.warn(message));
+        return Err(message.to_string());
     };
     let trigger = if facts.has_capture_screen {
         "captureScreen"
-    } else {
+    } else if facts.has_exec {
         "execAsAgent (display needed)"
+    } else {
+        "native computer use"
     };
     let virtual_id = match config.target {
         computer_use::DisplayTarget::Virtual { id } => id,
-        _ => return,
+        _ => return Err("Virtual-display allocation returned a non-virtual target.".to_string()),
     };
     slog(session_log, |l| {
         l.info(&format!(
@@ -1247,7 +1291,7 @@ async fn maybe_auto_launch_xvfb(
             virtual_id, config.width, config.height, trigger
         ))
     });
-    match vision::launch_display(&config).await {
+    match launch_display(config).await {
         Ok(guard) => {
             // Phase 1: no DisplayReady for virtual displays — no DisplaySession means no web slot.
             // The agent uses this display for CU via X11 tools directly.
@@ -1258,11 +1302,14 @@ async fn maybe_auto_launch_xvfb(
                 ))
             });
             *xvfb_guard = Some(guard);
+            Ok(())
         }
         Err(e) => {
-            slog(session_log, |l| {
-                l.warn(&format!("Failed to auto-launch Xvfb: {}", e))
-            });
+            let message = format!(
+                "Virtual display launch failed; the batch was not executed and may be retried: {e}"
+            );
+            slog(session_log, |l| l.warn(&message));
+            Err(message)
         }
     }
 }
@@ -1586,6 +1633,138 @@ mod tests {
         assert!(sock.exists());
         std::fs::remove_file(&sock).unwrap();
         assert!(!sock.exists());
+    }
+
+    /// A native-CU-only response has no runtime command batch, but it still
+    /// needs the same session-owned display. If Xvfb cannot start, fail the
+    /// preparation step and leave the guard empty rather than letting native
+    /// CU fall through to an ambient/foreign display.
+    #[tokio::test]
+    async fn cu_only_turn_rejects_hostile_xvfb_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let launch_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launch_attempted_in_hook = std::sync::Arc::clone(&launch_attempted);
+        let mut guard = None;
+
+        let result = maybe_auto_launch_xvfb_with(
+            &BatchFacts::default(),
+            &mut guard,
+            "openai",
+            &session_log,
+            false,
+            true,
+            true,
+            |_| {
+                Some(vision::DisplayConfig {
+                    target: computer_use::DisplayTarget::Virtual { id: 137 },
+                    width: 1024,
+                    height: 768,
+                })
+            },
+            move |_| {
+                launch_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<vision::XvfbGuard, _>(CallerError::Config(
+                        "hostile test: Xvfb executable unavailable".to_string(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        let error = result.expect_err("failed Xvfb launch must reject native CU");
+        assert!(launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains("batch was not executed"), "{error}");
+        assert!(error.contains("Xvfb executable unavailable"), "{error}");
+        assert!(guard.is_none(), "a failed launch must not publish a guard");
+    }
+
+    /// macOS and Windows have no Xvfb runtime. Their native-display path must
+    /// remain available without calling the Linux allocator or launcher.
+    #[tokio::test]
+    async fn absent_virtual_display_runtime_skips_xvfb_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let allocation_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launch_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allocation_attempted_in_hook = std::sync::Arc::clone(&allocation_attempted);
+        let launch_attempted_in_hook = std::sync::Arc::clone(&launch_attempted);
+        let mut guard = None;
+        let facts = BatchFacts {
+            has_exec: true,
+            ..BatchFacts::default()
+        };
+
+        let result = maybe_auto_launch_xvfb_with(
+            &facts,
+            &mut guard,
+            "openai",
+            &session_log,
+            false,
+            false,
+            false,
+            move |_| {
+                allocation_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            move |_| {
+                launch_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<vision::XvfbGuard, _>(CallerError::Config(
+                        "launcher must not run".to_string(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(!allocation_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(guard.is_none());
+    }
+
+    /// Exhausted allocation is another fail-closed no-runtime path. The
+    /// launcher must not be called with an invented/reused display id.
+    #[tokio::test]
+    async fn cu_only_turn_rejects_exhausted_virtual_display_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let launch_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launch_attempted_in_hook = std::sync::Arc::clone(&launch_attempted);
+        let mut guard = None;
+
+        let result = maybe_auto_launch_xvfb_with(
+            &BatchFacts::default(),
+            &mut guard,
+            "openai",
+            &session_log,
+            false,
+            true,
+            true,
+            |_| None,
+            move |_| {
+                launch_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<vision::XvfbGuard, _>(CallerError::Config(
+                        "launcher must not run".to_string(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        let error = result.expect_err("exhausted allocation must reject native CU");
+        assert!(error.contains("No unoccupied virtual display"), "{error}");
+        assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(guard.is_none());
     }
 
     /// The idle queued-steer flush synthesizes an EMPTY task envelope per
