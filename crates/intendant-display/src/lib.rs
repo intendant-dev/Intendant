@@ -2898,6 +2898,20 @@ impl DisplaySession {
         self.frame_tx.subscribe()
     }
 
+    /// Whether the capture bridge is still live.
+    ///
+    /// This is a narrow lifecycle probe for callers that must not publish a
+    /// newly created display until capture has produced a frame and remained
+    /// alive through the readiness check. It is deliberately observational:
+    /// normal capture loss is still reported by the display event stream.
+    pub async fn capture_bridge_running(&self) -> bool {
+        self.capture_handle
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
     /// Get the most recently captured frame, or `None` if no frame yet.
     ///
     /// Marks external frame demand: repeated polls (the recording

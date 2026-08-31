@@ -27,6 +27,7 @@ use crate::vision;
 use intendant_platform::DisplayTarget;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Xvfb guards for dashboard-created virtual displays, keyed by display
 /// number. Owned as plain task-local state by the user-display listener —
@@ -46,6 +47,8 @@ const MIN_WIDTH: u32 = 320;
 const MIN_HEIGHT: u32 = 240;
 const MAX_WIDTH: u32 = 3840;
 const MAX_HEIGHT: u32 = 2160;
+const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 
 /// Resolve requested dimensions: defaults for omitted axes, bounds-checked,
 /// rounded down to even (VP8 rejects odd frame dimensions).
@@ -137,17 +140,35 @@ pub(crate) async fn create_virtual_display(
             });
             // Dashboard-created virtual displays are agent workspaces:
             // always agent-visible.
+            let capture_ready_after = Instant::now();
             activate_user_display(bus, session_registry, frame_registry, display_id, true).await;
-            // Activation failure already reported its reason; don't leave a
-            // guarded Xvfb running with no tile and no way to destroy it.
-            // (`get_any` for symmetry — this is lifecycle bookkeeping, not
-            // an agent lookup, though virtual displays are never hidden.)
-            if session_registry.read().await.get_any(display_id).is_none() {
+            // A registry row alone is not capture readiness. The capture
+            // bridge can close immediately after `start_capture` returns and
+            // queue DisplayCaptureLost behind this create intent. Require a
+            // fresh frame and a still-live bridge before completing the
+            // correlated request as Created.
+            let session = session_registry.read().await.get_any(display_id);
+            let readiness = match session.as_ref() {
+                Some(session) => {
+                    await_capture_readiness(
+                        session,
+                        capture_ready_after,
+                        CAPTURE_READY_TIMEOUT,
+                        CAPTURE_STABILITY_WINDOW,
+                    )
+                    .await
+                }
+                None => Err("display activation did not publish a capture session".to_string()),
+            };
+            if let Err(reason) = readiness {
+                if let Some(session) = session_registry.write().await.remove(display_id) {
+                    session.stop().await;
+                }
                 reap_virtual_display(guards, display_id, "activation failed").await;
                 report_virtual_display_create_failed(
                     bus,
                     request_id.as_deref(),
-                    "virtual display create failed: display activation did not publish a capture session",
+                    format!("virtual display create failed: {reason}"),
                 );
             } else if let Some(request_id) = request_id {
                 if !bus.complete_virtual_display_create(
@@ -172,6 +193,26 @@ pub(crate) async fn create_virtual_display(
             );
         }
     }
+}
+
+async fn await_capture_readiness(
+    session: &display::DisplaySession,
+    capture_ready_after: Instant,
+    timeout: Duration,
+    stability_window: Duration,
+) -> Result<(), String> {
+    session
+        .fresh_frame(capture_ready_after, timeout)
+        .await
+        .map_err(|error| format!("capture did not produce a fresh frame: {error}"))?;
+    // Give an immediately closed producer a bounded window to drive the
+    // bridge to completion before the liveness observation. A source that
+    // produced one terminal frame and then died is not a ready display.
+    tokio::time::sleep(stability_window).await;
+    if !session.capture_bridge_running().await {
+        return Err("capture bridge stopped during activation".to_string());
+    }
+    Ok(())
 }
 
 fn report_virtual_display_create_failed(
@@ -240,6 +281,66 @@ fn create_failure_reason(e: &crate::error::CallerError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::{DisplayBackend, Frame, FrameFormat};
+    use intendant_core::error::CallerError;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    struct TestCaptureBackend {
+        keep_sender_alive: bool,
+        sender: Mutex<Option<mpsc::Sender<Frame>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DisplayBackend for TestCaptureBackend {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send(Frame {
+                data: vec![0; 640 * 480 * 4],
+                format: FrameFormat::Bgra,
+                width: 640,
+                height: 480,
+                stride: 640 * 4,
+                timestamp: Instant::now(),
+                dirty_rects: None,
+            })
+            .unwrap();
+            if self.keep_sender_alive {
+                *self.sender.lock().unwrap() = Some(tx);
+            }
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {
+            self.sender.lock().unwrap().take();
+        }
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (640, 480)
+        }
+
+        fn kind(&self) -> &'static str {
+            "virtual-display-readiness-test"
+        }
+    }
+
+    async fn started_test_session(keep_sender_alive: bool) -> display::DisplaySession {
+        let backend = Arc::new(TestCaptureBackend {
+            keep_sender_alive,
+            sender: Mutex::new(None),
+        });
+        let session = display::DisplaySession::new(199, backend);
+        session.disable_video_bank();
+        session.start(30, None, None).await.unwrap();
+        session
+    }
 
     #[test]
     fn dimensions_default_to_full_hd() {
@@ -269,6 +370,34 @@ mod tests {
         assert!(virtual_display_dimensions(None, Some(10_000)).is_err());
         let err = virtual_display_dimensions(Some(8000), Some(600)).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn capture_readiness_requires_a_fresh_frame_and_live_bridge() {
+        let capture_ready_after = Instant::now();
+        let failed = started_test_session(false).await;
+        let error = await_capture_readiness(
+            &failed,
+            capture_ready_after,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("capture bridge stopped"), "{error}");
+        failed.stop().await;
+
+        let capture_ready_after = Instant::now();
+        let healthy = started_test_session(true).await;
+        await_capture_readiness(
+            &healthy,
+            capture_ready_after,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        healthy.stop().await;
     }
 
     #[tokio::test]
