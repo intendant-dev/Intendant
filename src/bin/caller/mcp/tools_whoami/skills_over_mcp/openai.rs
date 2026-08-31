@@ -138,9 +138,8 @@ fn partition(prepared: Vec<PreparedSkill>) -> Result<Vec<Vec<PreparedSkill>>, St
             ));
         }
 
-        let needs_new_group = !groups.last().expect("one group exists").is_empty()
-            && (resources_in_group.saturating_add(skill_resources) > RESOURCE_LIMIT
-                || bytes_in_group.saturating_add(skill_bytes) > SKILL_TOTAL_LIMIT);
+        let needs_new_group = resources_in_group.saturating_add(skill_resources) > RESOURCE_LIMIT
+            || bytes_in_group.saturating_add(skill_bytes) > SKILL_TOTAL_LIMIT;
         if needs_new_group {
             if groups.len() == MAX_PACKAGES {
                 return Err(format!(
@@ -257,6 +256,13 @@ fn package_name(index: usize) -> String {
 }
 
 fn package_description(index: usize, total: usize, group: &[PreparedSkill]) -> String {
+    if group.is_empty() {
+        return format!(
+            "Use for any Intendant daemon task. Live owner-approved skill catalog router \
+             for {total} imported packages; load it to locate and follow the matching \
+             workflow."
+        );
+    }
     let names = group
         .iter()
         .map(|skill| skill.name.as_str())
@@ -326,11 +332,15 @@ fn package_body(
         ));
     }
     body.push_str("\n## Workflows in this package\n\n");
-    for skill in group {
-        body.push_str(&format!(
-            "- **{}** — read `{}`\n",
-            skill.name, skill.instruction_relative_path
-        ));
+    if group.is_empty() {
+        body.push_str("This package is the router; its catalog points to the payload packages.\n");
+    } else {
+        for skill in group {
+            body.push_str(&format!(
+                "- **{}** — read `{}`\n",
+                skill.name, skill.instruction_relative_path
+            ));
+        }
     }
     body
 }
