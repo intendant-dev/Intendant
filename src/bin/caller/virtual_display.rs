@@ -473,7 +473,18 @@ pub(crate) async fn destroy_virtual_display(
         // tasks alive; a subsequent create may reuse the numeric id.
         session.stop().await;
     }
-    guard.shutdown().await;
+    if !guard.shutdown().await {
+        let reason = format!(
+            "display :{display_id} generation {capture_generation} shutdown could not be confirmed"
+        );
+        bus.send(AppEvent::PresenceLog {
+            message: format!("[virtual_display] {reason}"),
+            level: Some(LogLevel::Error),
+            turn: None,
+        });
+        refuse_virtual_display_destroy(bus, request_id, reason);
+        return;
+    }
 
     bus.send(AppEvent::PresenceLog {
         message: format!(
