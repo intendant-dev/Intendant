@@ -434,11 +434,6 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
             ))
         }
     };
-    if !managed_virtual_display_id(display_id) {
-        return Err(CallerError::Config(format!(
-            "virtual display :{display_id} is outside Intendant's managed range"
-        )));
-    }
     let display_arg = format!(":{}", display_id);
     let screen_arg = format!("{}x{}x24", config.width, config.height);
 
