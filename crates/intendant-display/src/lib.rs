@@ -1337,16 +1337,24 @@ pub trait DisplayBackend: Send + Sync + 'static {
     /// Human-readable backend name (e.g. "wayland", "x11").
     fn kind(&self) -> &'static str;
 
-    /// The X11 display string this backend actually captures (e.g.
-    /// `":99"`), for consumers that must open their own connection to
-    /// the same server — the XDamage tile-damage backend in particular.
-    /// `None` for non-X11 backends; the damage layer then falls back to
-    /// the process `DISPLAY`. Without this hint a session created via
-    /// `X11Backend::with_display` while `DISPLAY` points elsewhere would
-    /// attach XDamage to the wrong X server.
-    fn x11_display_hint(&self) -> Option<String> {
+    /// The exact X11 connection this backend captures, for consumers that
+    /// must open an independent authenticated connection to the same server
+    /// (the XDamage tile-damage backend in particular). `None` for non-X11
+    /// backends; the damage layer then falls back to the process `DISPLAY`.
+    fn x11_damage_hint(&self) -> Option<X11DamageHint> {
         None
     }
+}
+
+/// In-process X11 damage-tracker connection material. This deliberately has
+/// no serialization or debug representation: private-display authorization
+/// must not enter logs, events, or portable receipts.
+#[derive(Clone)]
+pub struct X11DamageHint {
+    #[cfg(target_os = "linux")]
+    display: String,
+    #[cfg(target_os = "linux")]
+    connection: x11_input::X11Connection,
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,22 +1892,28 @@ fn make_damage_backend(
     width: u32,
     height: u32,
     backend_kind: &'static str,
-    x11_display_hint: Option<&str>,
+    x11_damage_hint: Option<&X11DamageHint>,
 ) -> Box<dyn capture::damage::DamageBackend> {
     #[cfg(not(target_os = "linux"))]
-    let _ = (backend_kind, x11_display_hint);
+    let _ = (backend_kind, x11_damage_hint);
 
     #[cfg(target_os = "linux")]
     {
         if should_try_xdamage_for_tile_stream(backend_kind) {
-            // The capturing backend's own display string wins: a session
-            // on `:99` must not damage-track whatever the process-wide
-            // DISPLAY happens to name.
-            let display = x11_display_hint
-                .map(str::to_string)
-                .or_else(|| std::env::var("DISPLAY").ok())
-                .unwrap_or_else(|| ":0".to_string());
-            match capture::x11_damage::X11DamageBackend::new(&display) {
+            // The capturing backend's exact authenticated connection wins: a
+            // private session on :99 must neither attach to process DISPLAY
+            // nor rely on ambient Xauthority discovery.
+            let fallback_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+            let display = x11_damage_hint
+                .map(|hint| hint.display.as_str())
+                .unwrap_or(fallback_display.as_str());
+            let result = match x11_damage_hint {
+                Some(hint) => {
+                    capture::x11_damage::X11DamageBackend::with_connection(&hint.connection)
+                }
+                None => capture::x11_damage::X11DamageBackend::new(display),
+            };
+            match result {
                 Ok(backend) => {
                     eprintln!("[display/tile] XDamage backend enabled on DISPLAY={display}");
                     return Box::new(backend);
@@ -3643,7 +3657,7 @@ impl DisplaySession {
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
         let backend_kind = self.backend.kind();
-        let x11_display_hint = self.backend.x11_display_hint();
+        let x11_damage_hint = self.backend.x11_damage_hint();
         // Tile-standby plumbing (per-peer RTP standby under tile mode):
         // the bridge owns every standby transition, mirrors the mode
         // into `tile_video_active` for the Subscribe handler, kicks the
@@ -3660,12 +3674,8 @@ impl DisplaySession {
         let pool_feed_kf_tx = self.pool_feed_keyframe_tx.lock().await.clone();
 
         let task = tokio::spawn(async move {
-            let mut damage = make_damage_backend(
-                initial_w,
-                initial_h,
-                backend_kind,
-                x11_display_hint.as_deref(),
-            );
+            let mut damage =
+                make_damage_backend(initial_w, initial_h, backend_kind, x11_damage_hint.as_ref());
             // `Option` so the tracker can round-trip through the
             // spawn_blocking diff below (moved in, moved back out).
             let mut frame_diff: Option<capture::frame_diff::FrameDiffDamageTracker> = Some(

@@ -64,8 +64,16 @@ impl X11DamageBackend {
     /// unavailable on the X server — caller should fall back to a
     /// [`super::damage::NullDamageBackend`] in that case.
     pub fn new(display_str: &str) -> Result<Self, DamageError> {
-        let (conn, screen_num) =
-            x11rb::connect(Some(display_str)).map_err(|e| DamageError::Connect(e.to_string()))?;
+        let connection = crate::x11_input::X11Connection::unauthenticated(display_str);
+        Self::with_connection(&connection)
+    }
+
+    /// Set up XDamage over the exact connection identity used by the capture
+    /// backend, including its private per-display authorization when present.
+    pub fn with_connection(
+        connection: &crate::x11_input::X11Connection,
+    ) -> Result<Self, DamageError> {
+        let (conn, screen_num) = connection.connect().map_err(DamageError::Connect)?;
 
         // Verify both required extensions are present BEFORE making any
         // protocol-specific calls. This is the explicit-degradation

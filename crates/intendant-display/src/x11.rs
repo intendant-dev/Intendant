@@ -424,8 +424,11 @@ impl DisplayBackend for X11Backend {
         "x11"
     }
 
-    fn x11_display_hint(&self) -> Option<String> {
-        Some(self.display.clone())
+    fn x11_damage_hint(&self) -> Option<super::X11DamageHint> {
+        Some(super::X11DamageHint {
+            display: self.display.clone(),
+            connection: self.connection.clone(),
+        })
     }
 }
 
