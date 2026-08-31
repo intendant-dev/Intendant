@@ -1,0 +1,22 @@
+name: Agent source export
+
+on:
+  push:
+    branches:
+      - agent/skills-over-mcp-live-catalog
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/intendant-source.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intendant-source
+          path: ${{ runner.temp }}/intendant-source.tar.gz
+          retention-days: 1
