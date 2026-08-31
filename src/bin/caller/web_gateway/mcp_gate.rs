@@ -39,7 +39,7 @@ fn skills_initialize_result(requested: Option<&str>) -> serde_json::Value {
             "tools": {},
             "resources": {},
             "extensions": {
-                (SKILLS_EXTENSION): {}
+                "io.modelcontextprotocol/skills": {}
             }
         },
         "serverInfo": {
@@ -74,12 +74,7 @@ fn json_rpc_response(
     }
 }
 
-async fn write_skills_response(
-    mut stream: DemuxStream,
-    status: &str,
-    body: String,
-    cors: &str,
-) {
+async fn write_skills_response(mut stream: DemuxStream, status: &str, body: String, cors: &str) {
     use tokio::io::AsyncWriteExt;
 
     let reuse = stream.exchange_reusable();
@@ -169,17 +164,8 @@ pub(crate) async fn handle_mcp_post(
                 403 => "Forbidden",
                 _ => "Error",
             };
-            let body = json_rpc_response(
-                serde_json::Value::Null,
-                Err((-32600, message)),
-            );
-            return write_skills_response(
-                stream,
-                &format!("{status} {reason}"),
-                body,
-                &cors,
-            )
-            .await;
+            let body = json_rpc_response(serde_json::Value::Null, Err((-32600, message)));
+            return write_skills_response(stream, &format!("{status} {reason}"), body, &cors).await;
         }
     };
 
@@ -241,9 +227,7 @@ pub(crate) async fn handle_mcp_post(
             let call = match method {
                 "skills/list" => mcp.skills_over_mcp_list(&params, profile.as_deref()),
                 "skills/get" => mcp.skills_over_mcp_get(&params, profile.as_deref()),
-                "resources/read" => {
-                    mcp.skills_over_mcp_read_resource(&params, profile.as_deref())
-                }
+                "resources/read" => mcp.skills_over_mcp_read_resource(&params, profile.as_deref()),
                 _ => unreachable!("selector and dispatch must match"),
             };
             call.map_err(|message| (-32602, message))
@@ -260,8 +244,8 @@ mod skills_extension_tests {
     #[test]
     fn selector_intercepts_only_the_extension_surface_and_initialize() {
         for method in ["initialize", "skills/list", "skills/get", "resources/read"] {
-            let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method })
-                .to_string();
+            let body =
+                serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method }).to_string();
             assert_eq!(skills_extension_method(&body), Some(method));
         }
         let tools = serde_json::json!({
