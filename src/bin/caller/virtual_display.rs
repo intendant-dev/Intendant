@@ -377,7 +377,7 @@ async fn retire_virtual_display_generation(
     if let Some(session) = session_registry.write().await.remove(display_id) {
         session.stop().await;
     }
-    reap_virtual_display(guards, display_id, "capture unavailable").await;
+    reap_virtual_display(bus, guards, display_id, "capture unavailable").await;
     if let Some(request_id) = request_id {
         let _ = bus.complete_virtual_display_create(
             &request_id,
@@ -453,11 +453,22 @@ fn report_virtual_display_create_failed(
 /// Reaped on tile close (`UserDisplayRevoked`) and on capture loss (the
 /// Xvfb died, or activation never produced a session).
 pub(crate) async fn reap_virtual_display(
+    bus: &EventBus,
     guards: &mut VirtualDisplayGuards,
     display_id: u32,
     context: &str,
 ) -> bool {
     if let Some(guard) = guards.remove(&display_id) {
+        for workspace in
+            crate::browser_workspace::retire_workspaces_for_display(display_id, context).await
+        {
+            bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "display_retired".to_string(),
+                workspace_id: Some(workspace.id.clone()),
+                message: workspace.message.clone(),
+                workspace: Some(workspace),
+            });
+        }
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
         guard.shutdown().await;
         true
@@ -776,10 +787,11 @@ mod tests {
 
     #[tokio::test]
     async fn reap_is_scoped_to_created_displays() {
+        let bus = EventBus::new();
         let mut guards = VirtualDisplayGuards::new();
         // Nothing created from the dashboard: reap must refuse — agent
         // Xvfbs and user displays are not ours to kill.
-        assert!(!reap_virtual_display(&mut guards, 99, "test").await);
+        assert!(!reap_virtual_display(&bus, &mut guards, 99, "test").await);
     }
 
     #[test]

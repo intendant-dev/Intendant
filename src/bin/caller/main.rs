@@ -3394,6 +3394,7 @@ pub fn spawn_user_display_listener(
                     // destroy: nothing else owns it, and leaving the Xvfb
                     // running would leak displays with no way to kill them.
                     virtual_display::reap_virtual_display(
+                        &bus,
                         &mut virtual_display_guards,
                         display_id,
                         "tile closed",
@@ -3416,6 +3417,7 @@ pub fn spawn_user_display_listener(
                         session.stop().await;
                     }
                     virtual_display::reap_virtual_display(
+                        &bus,
                         &mut virtual_display_guards,
                         display_id,
                         "capture lost",

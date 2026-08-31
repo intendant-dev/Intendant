@@ -286,6 +286,12 @@ pub struct BrowserWorkspaceRegistry {
     children: HashMap<String, Child>,
 }
 
+struct RetiredBrowserWorkspace {
+    workspace: BrowserWorkspace,
+    process_id: Option<u32>,
+    child: Option<Child>,
+}
+
 impl BrowserWorkspaceRegistry {
     pub fn list(&self) -> Vec<BrowserWorkspace> {
         self.workspaces.values().cloned().collect()
@@ -304,14 +310,14 @@ impl BrowserWorkspaceRegistry {
         Some((workspace, child))
     }
 
-    fn reconcile_display_bindings(&mut self) -> Vec<(Option<u32>, Option<Child>)> {
+    fn reconcile_display_bindings(&mut self) -> Vec<RetiredBrowserWorkspace> {
         self.reconcile_display_bindings_with(crate::vision::process_owns_virtual_display)
     }
 
     fn reconcile_display_bindings_with(
         &mut self,
         display_is_live: impl Fn(u32) -> bool,
-    ) -> Vec<(Option<u32>, Option<Child>)> {
+    ) -> Vec<RetiredBrowserWorkspace> {
         let stale: Vec<(String, String)> = self
             .workspaces
             .values()
@@ -329,15 +335,50 @@ impl BrowserWorkspaceRegistry {
             })
             .collect();
 
+        self.retire_display_bindings(stale, |display_target| {
+            format!("bound virtual display {display_target} is no longer live; browser stopped")
+        })
+    }
+
+    fn retire_workspaces_for_display(
+        &mut self,
+        display_id: u32,
+        reason: &str,
+    ) -> Vec<RetiredBrowserWorkspace> {
+        let stale: Vec<(String, String)> = self
+            .workspaces
+            .values()
+            .filter(|workspace| {
+                matches!(
+                    workspace.status,
+                    BrowserWorkspaceStatus::Starting | BrowserWorkspaceStatus::Ready
+                )
+            })
+            .filter_map(|workspace| {
+                let binding =
+                    parse_browser_display_binding(workspace.display_target.as_deref()?).ok()?;
+                (binding.display_id == display_id)
+                    .then(|| (workspace.id.clone(), binding.canonical))
+            })
+            .collect();
+
+        self.retire_display_bindings(stale, |display_target| {
+            format!("bound virtual display {display_target} was retired: {reason}")
+        })
+    }
+
+    fn retire_display_bindings(
+        &mut self,
+        stale: Vec<(String, String)>,
+        message: impl Fn(&str) -> String,
+    ) -> Vec<RetiredBrowserWorkspace> {
         stale
             .into_iter()
             .filter_map(|(workspace_id, display_target)| {
                 let workspace = self.workspaces.get_mut(&workspace_id)?;
                 workspace.status = BrowserWorkspaceStatus::Error;
                 workspace.lease = None;
-                workspace.message = Some(format!(
-                    "bound virtual display {display_target} is no longer live; browser stopped"
-                ));
+                workspace.message = Some(message(&display_target));
                 workspace.updated_at = now_string();
                 workspace.debugging_port = None;
                 workspace.cdp_http_url = None;
@@ -345,7 +386,11 @@ impl BrowserWorkspaceRegistry {
                 workspace.active_target_id = None;
                 let process_id = workspace.process_id.take();
                 let child = self.children.remove(&workspace_id);
-                Some((process_id, child))
+                Some(RetiredBrowserWorkspace {
+                    workspace: workspace.clone(),
+                    process_id,
+                    child,
+                })
             })
             .collect()
     }
@@ -722,16 +767,30 @@ pub async fn create_workspace(
 }
 
 pub async fn list_workspaces() -> Vec<BrowserWorkspace> {
-    let (workspaces, stale_processes) = {
+    let (workspaces, retired) = {
         let registry = global_registry();
         let mut registry = registry.write().await;
-        let stale_processes = registry.reconcile_display_bindings();
-        (registry.list(), stale_processes)
+        let retired = registry.reconcile_display_bindings();
+        (registry.list(), retired)
     };
-    for (process_id, child) in stale_processes {
-        terminate_workspace_process(process_id, child);
+    for retired in retired {
+        terminate_workspace_process(retired.process_id, retired.child);
     }
     workspaces
+}
+
+pub async fn retire_workspaces_for_display(display_id: u32, reason: &str) -> Vec<BrowserWorkspace> {
+    let retired = global_registry()
+        .write()
+        .await
+        .retire_workspaces_for_display(display_id, reason);
+    retired
+        .into_iter()
+        .map(|retired| {
+            terminate_workspace_process(retired.process_id, retired.child);
+            retired.workspace
+        })
+        .collect()
 }
 
 pub async fn close_workspace(
@@ -754,14 +813,14 @@ pub async fn close_workspace(
 pub async fn acquire_workspace(
     request: AcquireBrowserWorkspaceRequest,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    let (result, stale_processes) = {
+    let (result, retired) = {
         let registry = global_registry();
         let mut registry = registry.write().await;
-        let stale_processes = registry.reconcile_display_bindings();
-        (registry.acquire(request), stale_processes)
+        let retired = registry.reconcile_display_bindings();
+        (registry.acquire(request), retired)
     };
-    for (process_id, child) in stale_processes {
-        terminate_workspace_process(process_id, child);
+    for retired in retired {
+        terminate_workspace_process(retired.process_id, retired.child);
     }
     result
 }
@@ -769,7 +828,16 @@ pub async fn acquire_workspace(
 pub async fn release_workspace(
     request: ReleaseBrowserWorkspaceRequest,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    global_registry().write().await.release(request)
+    let (result, retired) = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let retired = registry.reconcile_display_bindings();
+        (registry.release(request), retired)
+    };
+    for retired in retired {
+        terminate_workspace_process(retired.process_id, retired.child);
+    }
+    result
 }
 
 fn terminate_workspace_process(process_id: Option<u32>, mut child: Option<Child>) {
@@ -1502,7 +1570,7 @@ mod tests {
         let stale = registry.reconcile_display_bindings_with(|_| false);
 
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].0, Some(42));
+        assert_eq!(stale[0].process_id, Some(42));
         let workspace = registry.workspaces.get("bw-dead-display").unwrap();
         assert_eq!(workspace.status, BrowserWorkspaceStatus::Error);
         assert!(workspace.lease.is_none());
@@ -1553,6 +1621,39 @@ mod tests {
                 force: false,
             })
             .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn display_retirement_targets_only_workspaces_bound_to_that_display() {
+        let mut registry = BrowserWorkspaceRegistry::default();
+        let mut retired = sample_workspace("bw-retired");
+        retired.display_target = Some("display_99".to_string());
+        retired.lease = Some(BrowserWorkspaceLease {
+            holder_id: "agent-a".to_string(),
+            holder_kind: "agent".to_string(),
+            acquired_at: "2026-05-31T00:00:00.000Z".to_string(),
+            note: None,
+        });
+        let mut survivor = sample_workspace("bw-survivor");
+        survivor.display_target = Some("display_100".to_string());
+        registry.insert(retired, None);
+        registry.insert(survivor, None);
+
+        let retired = registry.retire_workspaces_for_display(99, "tile closed");
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].workspace.id, "bw-retired");
+        assert_eq!(retired[0].workspace.status, BrowserWorkspaceStatus::Error);
+        assert!(retired[0].workspace.lease.is_none());
+        assert_eq!(
+            retired[0].workspace.message.as_deref(),
+            Some("bound virtual display display_99 was retired: tile closed")
+        );
+        assert_eq!(
+            registry.workspaces.get("bw-survivor").unwrap().status,
+            BrowserWorkspaceStatus::Ready
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
