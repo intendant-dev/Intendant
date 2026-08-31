@@ -19,12 +19,31 @@ use crate::*;
 /// this forwarder is where its lifecycle/telemetry events become
 /// `AppEvent`s.
 pub(crate) fn display_event_forwarder(bus: EventBus) -> display::DisplayEventSender {
+    display_event_forwarder_with_generation(bus, None)
+}
+
+fn display_event_forwarder_with_generation(
+    bus: EventBus,
+    capture_generation: Option<String>,
+) -> display::DisplayEventSender {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             bus.send(match ev {
                 display::DisplayEvent::CaptureLost { display_id, reason } => {
-                    AppEvent::DisplayCaptureLost { display_id, reason }
+                    if let Some(capture_generation) = capture_generation.clone() {
+                        AppEvent::VirtualDisplayCaptureLost {
+                            display_id,
+                            capture_generation,
+                            reason,
+                        }
+                    } else {
+                        AppEvent::DisplayCaptureLost {
+                            display_id,
+                            capture_generation: None,
+                            reason,
+                        }
+                    }
                 }
                 display::DisplayEvent::Metrics { snapshot } => AppEvent::DisplayMetrics {
                     snapshot: *snapshot,
@@ -491,9 +510,30 @@ pub(crate) fn report_user_display_capture_unavailable(
     display_id: u32,
     reason: impl Into<String>,
 ) {
+    report_user_display_capture_unavailable_with_generation(bus, display_id, None, reason);
+}
+
+fn report_user_display_capture_unavailable_with_generation(
+    bus: &EventBus,
+    display_id: u32,
+    capture_generation: Option<String>,
+    reason: impl Into<String>,
+) {
     let reason = reason.into();
     eprintln!("[user_display] {reason}");
-    bus.send(AppEvent::DisplayCaptureLost { display_id, reason });
+    if let Some(capture_generation) = capture_generation {
+        bus.send(AppEvent::VirtualDisplayCaptureLost {
+            display_id,
+            capture_generation,
+            reason,
+        });
+    } else {
+        bus.send(AppEvent::DisplayCaptureLost {
+            display_id,
+            capture_generation: None,
+            reason,
+        });
+    }
 }
 
 /// Arm the synthetic display backend when — and only when — the headless
@@ -565,6 +605,44 @@ pub(crate) async fn activate_user_display(
     target_display_id: u32,
     agent_visible: bool,
 ) {
+    activate_user_display_inner(
+        bus,
+        session_registry,
+        frame_registry,
+        target_display_id,
+        agent_visible,
+        None,
+    )
+    .await;
+}
+
+pub(crate) async fn activate_user_display_with_capture_generation(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    target_display_id: u32,
+    agent_visible: bool,
+    capture_generation: String,
+) {
+    activate_user_display_inner(
+        bus,
+        session_registry,
+        frame_registry,
+        target_display_id,
+        agent_visible,
+        Some(capture_generation),
+    )
+    .await;
+}
+
+async fn activate_user_display_inner(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    target_display_id: u32,
+    agent_visible: bool,
+    capture_generation: Option<String>,
+) {
     let display_id: u32 = target_display_id;
 
     // Dedupe against ANY live session — a private view is still a live
@@ -605,20 +683,27 @@ pub(crate) async fn activate_user_display(
             .start(
                 30,
                 frame_registry,
-                Some(display_event_forwarder(bus.clone())),
+                Some(display_event_forwarder_with_generation(
+                    bus.clone(),
+                    capture_generation.clone(),
+                )),
             )
             .await
         {
-            report_user_display_capture_unavailable(
+            report_user_display_capture_unavailable_with_generation(
                 bus,
                 display_id,
+                capture_generation.clone(),
                 format!("synthetic display session failed: {e}"),
             );
             return;
         }
         let (width, height) = session.resolution();
         let session = Arc::new(session);
-        session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
+        session.spawn_metrics_logger(Some(display_event_forwarder_with_generation(
+            bus.clone(),
+            capture_generation.clone(),
+        )));
         session_registry.write().await.insert(display_id, session);
         bus.send(AppEvent::DisplayReady {
             display_id,
@@ -645,9 +730,10 @@ pub(crate) async fn activate_user_display(
         let backend = match display::x11::X11Backend::with_display(&display_str) {
             Ok(backend) => backend,
             Err(e) => {
-                report_user_display_capture_unavailable(
+                report_user_display_capture_unavailable_with_generation(
                     bus,
                     display_id,
+                    capture_generation.clone(),
                     format!("virtual display {display_str} connect failed: {e}"),
                 );
                 return;
@@ -659,20 +745,27 @@ pub(crate) async fn activate_user_display(
             .start(
                 30,
                 frame_registry.clone(),
-                Some(display_event_forwarder(bus.clone())),
+                Some(display_event_forwarder_with_generation(
+                    bus.clone(),
+                    capture_generation.clone(),
+                )),
             )
             .await
         {
-            report_user_display_capture_unavailable(
+            report_user_display_capture_unavailable_with_generation(
                 bus,
                 display_id,
+                capture_generation.clone(),
                 format!("virtual display {display_str} session failed: {e}"),
             );
             return;
         }
         let (width, height) = session.resolution();
         let session = Arc::new(session);
-        session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
+        session.spawn_metrics_logger(Some(display_event_forwarder_with_generation(
+            bus.clone(),
+            capture_generation.clone(),
+        )));
         session_registry.write().await.insert(display_id, session);
         bus.send(AppEvent::DisplayReady {
             display_id,

@@ -792,7 +792,30 @@ pub enum AppEvent {
     // Display capture lost (backend crashed or portal session ended)
     DisplayCaptureLost {
         display_id: u32,
+        /// Generation of a daemon-owned virtual display when this public
+        /// retirement was validated against one. `None` for ordinary user or
+        /// agent-owned display sessions. Internal lifecycle consumers use it
+        /// to ignore a delayed retirement after an id has been reused.
+        capture_generation: Option<String>,
         reason: String,
+    },
+
+    /// Capture loss raised by a generation-bound daemon-owned virtual display.
+    /// This is internal lifecycle input: the serial display owner validates
+    /// the generation before emitting the public `DisplayCaptureLost` event.
+    VirtualDisplayCaptureLost {
+        display_id: u32,
+        capture_generation: String,
+        reason: String,
+    },
+
+    /// Asynchronous first-frame readiness result for one daemon-owned virtual
+    /// display. The slow wait never runs on the serial display-intent owner.
+    VirtualDisplayCaptureReadiness {
+        display_id: u32,
+        capture_generation: String,
+        ready: bool,
+        reason: Option<String>,
     },
 
     /// A virtual-display create request failed before any display lifecycle
@@ -3150,6 +3173,8 @@ pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
             | AppEvent::UserDisplayGranted { .. }
             | AppEvent::UserDisplayRevoked { .. }
             | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureReadiness { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::TaskComplete { .. }
@@ -3985,12 +4010,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             tile_snapshot_frames: snapshot.tile_snapshot_frames,
             tile_snapshot_kbps: snapshot.tile_snapshot_kbps,
         }),
-        AppEvent::DisplayCaptureLost { display_id, reason } => {
-            Some(OutboundEvent::DisplayCaptureLost {
-                display_id: *display_id,
-                reason: reason.clone(),
-            })
-        }
+        AppEvent::DisplayCaptureLost {
+            display_id, reason, ..
+        } => Some(OutboundEvent::DisplayCaptureLost {
+            display_id: *display_id,
+            reason: reason.clone(),
+        }),
         AppEvent::VirtualDisplayCreateFailed { reason } => Some(OutboundEvent::LogEntry {
             level: "error".to_string(),
             source: "display".to_string(),
@@ -4133,7 +4158,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::VoiceModelRerouted { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
-        | AppEvent::LiveAudioCompleted { .. } => None,
+        | AppEvent::LiveAudioCompleted { .. }
+        | AppEvent::VirtualDisplayCaptureLost { .. }
+        | AppEvent::VirtualDisplayCaptureReadiness { .. } => None,
     }
 }
 
@@ -4391,6 +4418,8 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::DisplayTaken { .. }
             | AppEvent::DisplayReleased { .. }
             | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureReadiness { .. }
             | AppEvent::VirtualDisplayCreateFailed { .. }
             | AppEvent::DisplayApprovalPending { .. }
             | AppEvent::SharedView { .. }
@@ -4640,7 +4669,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         AppEvent::DisplayReleased { display_id, note } => {
             log.display_released(*display_id, note.as_deref());
         }
-        AppEvent::DisplayCaptureLost { display_id, reason } => {
+        AppEvent::DisplayCaptureLost {
+            display_id, reason, ..
+        } => {
             log.warn(&format!("Display :{} capture lost: {}", display_id, reason));
         }
         AppEvent::VirtualDisplayCreateFailed { reason } => {
@@ -5163,7 +5194,14 @@ mod tests {
         }));
         bus.send(AppEvent::DisplayCaptureLost {
             display_id: 99,
+            capture_generation: None,
             reason: "test loss".to_string(),
+        });
+        bus.send(AppEvent::VirtualDisplayCaptureReadiness {
+            display_id: 100,
+            capture_generation: "generation-1".to_string(),
+            ready: true,
+            reason: None,
         });
 
         assert!(matches!(
@@ -5181,6 +5219,15 @@ mod tests {
         assert!(matches!(
             intents.recv().await,
             Some(AppEvent::DisplayCaptureLost { display_id: 99, .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::VirtualDisplayCaptureReadiness {
+                display_id: 100,
+                capture_generation,
+                ready: true,
+                reason: None,
+            }) if capture_generation == "generation-1"
         ));
         assert!(intents.try_recv().is_err());
         assert!(matches!(
