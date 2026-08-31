@@ -54,6 +54,23 @@ use tokio::sync::{mpsc, Mutex};
 /// session spins up encoders only if a peer ever subscribes on demand.
 pub const KIND: &str = "synthetic";
 
+/// Controller-minted marker passed only to an `intendant-runtime` child when
+/// the fail-closed synthetic display rig is armed. The runtime is a separate
+/// process, so the process-local [`armed`] bit cannot cross that boundary.
+///
+/// This is deliberately distinct from the user-facing
+/// `INTENDANT_MOCK_DISPLAY` request. The caller validates that request against
+/// the mock provider before minting this marker; the runtime treats its
+/// presence only as a restriction (never as authority to access anything).
+pub const RUNTIME_MARKER_ENV: &str = "INTENDANT_SYNTHETIC_DISPLAY_RUNTIME";
+pub const RUNTIME_MARKER_VALUE: &str = "1";
+
+/// Whether this runtime child was constrained to the OS-free synthetic rig.
+pub fn runtime_marker_armed() -> bool {
+    std::env::var_os(RUNTIME_MARKER_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(RUNTIME_MARKER_VALUE))
+}
+
 /// Synthetic source dimensions. Even on both axes (the encoder chain
 /// normalizes to even dims) and comfortably above
 /// `encode::pool::MIN_LAYER_DIM`.

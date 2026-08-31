@@ -245,8 +245,19 @@ fn apply_virtual_display_env(
         for key in DISPLAY_SESSION_ENV_VARS {
             cmd.env_remove(key);
         }
+        // The runtime is a separate process and cannot observe the caller's
+        // process-local synthetic `armed` bit. Mint a restriction-only marker
+        // so it also skips host-global X discovery and never injects DISPLAY
+        // into model-driven descendants.
+        cmd.env(
+            crate::display::synthetic::RUNTIME_MARKER_ENV,
+            crate::display::synthetic::RUNTIME_MARKER_VALUE,
+        );
         return;
     }
+    // Never honor an ambient copy: only the validated synthetic branch above
+    // may mint the marker for a runtime child.
+    cmd.env_remove(crate::display::synthetic::RUNTIME_MARKER_ENV);
     if let Some(display_id) = virtual_display_id {
         cmd.env("DISPLAY", format!(":{display_id}"));
         #[cfg(target_os = "linux")]
@@ -1577,6 +1588,35 @@ mod tests {
                 "synthetic child retained {key}"
             );
         }
+        assert_eq!(
+            synthetic_env
+                .get(std::ffi::OsStr::new(
+                    crate::display::synthetic::RUNTIME_MARKER_ENV,
+                ))
+                .and_then(|value| *value),
+            Some(std::ffi::OsStr::new(
+                crate::display::synthetic::RUNTIME_MARKER_VALUE,
+            )),
+            "synthetic child must carry the runtime fail-closed marker"
+        );
+
+        let mut ordinary_with_ambient_marker = Command::new("true");
+        ordinary_with_ambient_marker.env(
+            crate::display::synthetic::RUNTIME_MARKER_ENV,
+            crate::display::synthetic::RUNTIME_MARKER_VALUE,
+        );
+        apply_virtual_display_env(&mut ordinary_with_ambient_marker, None, false);
+        assert_eq!(
+            ordinary_with_ambient_marker
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| {
+                    *key == std::ffi::OsStr::new(crate::display::synthetic::RUNTIME_MARKER_ENV)
+                })
+                .and_then(|(_, value)| value),
+            None,
+            "ordinary children must not accept an ambient synthetic marker"
+        );
     }
 
     /// A small injected cap for the drain tests — never allocate the real
