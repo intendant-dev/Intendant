@@ -480,15 +480,6 @@ pub(crate) fn create_pending_request(
     let now = unix_timestamp();
     let expires_at_unix = now + effective_ttl_secs(config);
     let path = request_path(cert_dir, &request_id);
-    let existing = read_request_path(&path)?;
-    if let Some(existing) = &existing {
-        if !matches!(effective_status(existing), AccessRequestStatus::Pending) {
-            return Err(CallerError::Config(format!(
-                "pairing request {} is already {:?}",
-                existing.code, existing.status
-            )));
-        }
-    }
 
     let stored = StoredAccessRequest {
         version: 1,
@@ -525,21 +516,36 @@ pub(crate) fn create_pending_request(
     // surface — a replay that flips any decision input (the CLASS above
     // all: peer↔agent changes what the approval mints) would race the
     // stale view into approving something the owner never evaluated.
-    if let Some(existing) = &existing {
-        let changed = existing.class != stored.class
-            || existing.requested_profile != stored.requested_profile
-            || existing.requester_label != stored.requester_label
-            || existing.requester_card_url != stored.requester_card_url
-            || existing.requester_daemon_id != stored.requester_daemon_id
-            || existing.requester_tier != stored.requester_tier;
-        if changed {
-            return Err(CallerError::Config(format!(
-                "pairing request {} is already pending with different parameters; deny it first, then re-request",
-                existing.code
-            )));
+    // The read → compare → write span holds the authority-store lock so
+    // two concurrent first knocks cannot both read None and let the
+    // LAST writer pick the stored class.
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let existing = read_request_path(&path)
+            .map_err(|error| crate::access::AccessError(error.to_string()))?;
+        if let Some(existing) = &existing {
+            if !matches!(effective_status(existing), AccessRequestStatus::Pending) {
+                return Err(crate::access::AccessError(format!(
+                    "pairing request {} is already {:?}",
+                    existing.code, existing.status
+                )));
+            }
+            let changed = existing.class != stored.class
+                || existing.requested_profile != stored.requested_profile
+                || existing.requester_label != stored.requester_label
+                || existing.requester_card_url != stored.requester_card_url
+                || existing.requester_daemon_id != stored.requester_daemon_id
+                || existing.requester_tier != stored.requester_tier;
+            if changed {
+                return Err(crate::access::AccessError(format!(
+                    "pairing request {} is already pending with different parameters; deny it first, then re-request",
+                    existing.code
+                )));
+            }
         }
-    }
-    write_request(cert_dir, &stored)?;
+        write_request(cert_dir, &stored)
+            .map_err(|error| crate::access::AccessError(error.to_string()))
+    })
+    .map_err(|error| CallerError::Config(error.to_string()))?;
     eprintln!(
         "intendant: {} access request {} from {}{}; approve with `intendant peer approve {}`",
         match stored.class {
@@ -2064,6 +2070,125 @@ mod tests {
             stored.class,
             crate::access::access_policy::IdentityClass::Agent
         ));
+    }
+
+    /// Two concurrent FIRST knocks with the same key+nonce but
+    /// divergent classes cannot split the store: the read→compare→write
+    /// span holds the authority-store lock, so exactly one lands and
+    /// the loser refuses — never a last-writer-wins class the owner
+    /// did not see.
+    #[test]
+    fn concurrent_first_knocks_cannot_split_the_class() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        for round in 0..4u32 {
+            let key = access::certs::generate_client_key_material().unwrap();
+            let nonce = format!("racenonce{round:08}");
+            let build =
+                |class: Option<crate::access::access_policy::IdentityClass>| AccessRequestCreate {
+                    version: 1,
+                    requester_label: "racer".into(),
+                    public_key_pem: key.public_key_pem.clone(),
+                    nonce: nonce.clone(),
+                    requested_profile: None,
+                    requester_card_url: None,
+                    requester_daemon_id: None,
+                    requester_daemon_sig: None,
+                    requester_daemon_sig_ts: None,
+                    dialed_origin: None,
+                    requester_tier: None,
+                    requested_class: class,
+                };
+            let card = "https://target/.well-known/agent-card.json";
+            let config = PeerAccessRequestConfig::default();
+            let barrier = std::sync::Barrier::new(2);
+            let (agent_side, peer_side) = std::thread::scope(|scope| {
+                let agent = scope.spawn(|| {
+                    barrier.wait();
+                    create_pending_request(
+                        certs.path(),
+                        build(Some(crate::access::access_policy::IdentityClass::Agent)),
+                        card.into(),
+                        Some(format!("10.0.0.{round}")),
+                        &config,
+                        None,
+                    )
+                });
+                let peer = scope.spawn(|| {
+                    barrier.wait();
+                    create_pending_request(
+                        certs.path(),
+                        build(None),
+                        card.into(),
+                        Some(format!("10.0.1.{round}")),
+                        &config,
+                        None,
+                    )
+                });
+                (agent.join().unwrap(), peer.join().unwrap())
+            });
+            let winners = usize::from(agent_side.is_ok()) + usize::from(peer_side.is_ok());
+            assert_eq!(
+                winners, 1,
+                "exactly one racing knock may land (round {round}): {agent_side:?} / {peer_side:?}"
+            );
+            let (created, expect_agent) = match (&agent_side, &peer_side) {
+                (Ok(created), Err(_)) => (created, true),
+                (Err(_), Ok(created)) => (created, false),
+                _ => unreachable!("winner count pinned above"),
+            };
+            let stored = find_request(certs.path(), &created.code).unwrap();
+            assert_eq!(
+                matches!(
+                    stored.class,
+                    crate::access::access_policy::IdentityClass::Agent
+                ),
+                expect_agent,
+                "the stored class must be the WINNER's (round {round})"
+            );
+            // Keep the store small so per-source pending limits never
+            // shape later rounds.
+            deny_request(certs.path(), &created.code).unwrap();
+        }
+    }
+
+    /// A peer-class knock that ASKS for the agent vocabulary cannot be
+    /// approved into it: the store's raw-writer invariant refuses the
+    /// wrong-lane profile even when no override is given, instead of
+    /// the wire-lenient path storing a recognized ceiling name.
+    #[test]
+    fn peer_approval_refuses_requested_agent_vocabulary() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "sneaky-peer".into(),
+            public_key_pem: key.public_key_pem,
+            nonce: "peeragentnonce001".into(),
+            requested_profile: Some("agent-operator".into()),
+            requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
+            requester_tier: None,
+            requested_class: None,
+        };
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+            None,
+        )
+        .unwrap();
+        let err = approve_request(certs.path(), &created.code, None).unwrap_err();
+        assert!(
+            err.to_string().contains("agent-lane vocabulary"),
+            "peer approval must refuse the agent profile: {err}"
+        );
     }
 
     /// An agent-class knock mints the agent lane end-to-end: the

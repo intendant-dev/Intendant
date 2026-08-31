@@ -1720,6 +1720,21 @@ pub fn write_identity_record(
     cert_dir: &Path,
     record: &PeerIdentityRecord,
 ) -> Result<(), CallerError> {
+    // Store invariant, enforced at the single raw writer so EVERY lane
+    // hits it (doorbell approval, org materialization, profile changes,
+    // future writers): the agent vocabulary never lands on a peer-class
+    // record. `profile_class` recognizes `agent-operator`, so a peer
+    // record carrying it would evaluate at the agent ceiling's
+    // operation set — a recognized wrong-lane name is not an "unknown
+    // wire profile" and gets no lenient presence-only degrade.
+    let normalized = record.profile.trim().to_ascii_lowercase();
+    if matches!(record.class, IdentityClass::Peer)
+        && AGENT_PROFILES.iter().any(|(name, _)| *name == normalized)
+    {
+        return Err(CallerError::Config(format!(
+            "profile {normalized:?} is agent-lane vocabulary and cannot be stored on a peer identity"
+        )));
+    }
     with_identity_store_lock(cert_dir, || {
         let path = identity_path(cert_dir, &record.fingerprint);
         let mut body = serde_json::to_vec_pretty(record)?;
@@ -2382,6 +2397,22 @@ mod tests {
             set_identity_profile(dir.path(), &peer_fp, AGENT_OPERATOR_PROFILE).is_err(),
             "the peer lane never accepts the agent vocabulary"
         );
+
+        // The store invariant holds at the RAW writer — the choke point
+        // every lane crosses (doorbell, org materialization, future
+        // writers): a peer-class record can never carry the agent
+        // vocabulary, however it was assembled.
+        let mut smuggled = lookup_identity(dir.path(), &peer_fp).unwrap().unwrap();
+        smuggled.profile = AGENT_OPERATOR_PROFILE.to_string();
+        assert!(
+            write_identity_record(dir.path(), &smuggled).is_err(),
+            "the raw writer must refuse agent vocabulary on a peer record"
+        );
+        // Unknown wire profiles keep their lenient contract (stored
+        // as-is, presence-only degrade) — only the RECOGNIZED
+        // wrong-lane names refuse.
+        smuggled.profile = "future-profile-from-a-newer-build".to_string();
+        assert!(write_identity_record(dir.path(), &smuggled).is_ok());
     }
 
     #[test]
