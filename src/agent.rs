@@ -3569,11 +3569,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_displays_no_lock_files() {
-        // This test just verifies the function doesn't panic
+    async fn discover_displays_are_sorted() {
+        // The host may legitimately have any number of display locks while
+        // this parallel test suite creates and tears down Xvfb instances.
+        // Assert the deterministic property promised by the helper instead
+        // of imposing an environment-dependent cardinality ceiling.
         let displays = Agent::discover_displays();
-        // Can't assert specific values since it depends on environment
-        assert!(displays.len() < 100); // sanity check
+        assert!(displays.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[tokio::test]
