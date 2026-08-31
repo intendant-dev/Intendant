@@ -294,6 +294,52 @@ struct RetiredBrowserWorkspace {
     child: Option<Child>,
 }
 
+struct StartingReservationGuard {
+    workspace_id: String,
+    bus: EventBus,
+    armed: bool,
+}
+
+impl StartingReservationGuard {
+    fn new(workspace_id: String, bus: EventBus) -> Self {
+        Self {
+            workspace_id,
+            bus,
+            armed: true,
+        }
+    }
+
+    async fn cleanup(&mut self, message: &str) {
+        remove_failed_reservation(&self.workspace_id, message, &self.bus).await;
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartingReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let bus = self.bus.clone();
+        runtime.spawn(async move {
+            remove_failed_reservation(
+                &workspace_id,
+                "browser workspace creation was cancelled before it became ready",
+                &bus,
+            )
+            .await;
+        });
+    }
+}
+
 impl BrowserWorkspaceRegistry {
     pub fn list(&self) -> Vec<BrowserWorkspace> {
         self.workspaces.values().cloned().collect()
@@ -757,20 +803,24 @@ pub async fn create_workspace(
         }
         registry.insert(workspace.clone(), None);
     }
+    // Async cancellation can happen at every await below. The guard removes
+    // the unpublished Starting row (and any child committed just before the
+    // cancellation) so request abortion cannot leave a ghost workspace.
+    let mut reservation = StartingReservationGuard::new(workspace.id.clone(), bus.clone());
 
     if let Err(error) = std::fs::create_dir_all(&profile_dir) {
         let message = format!(
             "failed to create browser workspace profile {}: {error}",
             profile_dir.display()
         );
-        remove_failed_reservation(&workspace.id, &message, bus).await;
+        reservation.cleanup(&message).await;
         return Err(BrowserWorkspaceError::Io(message));
     }
 
     let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir).await {
         Ok(launched) => launched,
         Err(error) => {
-            remove_failed_reservation(&workspace.id, &error.to_string(), bus).await;
+            reservation.cleanup(&error.to_string()).await;
             return Err(error);
         }
     };
@@ -833,10 +883,13 @@ pub async fn create_workspace(
         }
     };
     match commit {
-        Ok(committed) => Ok(committed),
+        Ok(committed) => {
+            reservation.disarm();
+            Ok(committed)
+        }
         Err(message) => {
             terminate_workspace_process(cdp.process_id, child);
-            remove_failed_reservation(&workspace.id, &message, bus).await;
+            reservation.cleanup(&message).await;
             Err(BrowserWorkspaceError::Launch(message))
         }
     }
@@ -938,7 +991,11 @@ pub async fn acquire_workspace(
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
         publish_retirements_locked(bus, &retired);
-        (registry.acquire(request), retired)
+        let result = registry.acquire(request);
+        if let Ok(workspace) = result.as_ref() {
+            publish_workspace_event(bus, "lease_acquired", workspace);
+        }
+        (result, retired)
     };
     terminate_retired_processes(retired);
     result
@@ -953,7 +1010,11 @@ pub async fn release_workspace(
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
         publish_retirements_locked(bus, &retired);
-        (registry.release(request), retired)
+        let result = registry.release(request);
+        if let Ok(workspace) = result.as_ref() {
+            publish_workspace_event(bus, "lease_released", workspace);
+        }
+        (result, retired)
     };
     terminate_retired_processes(retired);
     result
@@ -1030,6 +1091,9 @@ async fn launch_cdp_browser(
     }
     let port = reserve_local_port().await?;
     let mut command = tokio::process::Command::new(&executable.path);
+    // If the async create request is cancelled while CDP readiness is being
+    // awaited, dropping its future must also terminate the spawned browser.
+    command.kill_on_drop(true);
     #[cfg(target_os = "linux")]
     if let Some(binding) = display_binding.as_ref() {
         // A bound workspace must use only its leased X11 display. Ambient
