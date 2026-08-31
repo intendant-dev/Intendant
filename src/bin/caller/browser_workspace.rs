@@ -139,6 +139,10 @@ pub struct BrowserWorkspace {
     pub preview_mode: BrowserWorkspacePreviewMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
+    /// Canonical Intendant virtual-display target (for example,
+    /// `display_99`) when this workspace is explicitly display-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +221,10 @@ pub struct CreateBrowserWorkspaceRequest {
     pub peer_id: Option<String>,
     #[serde(default)]
     pub owner_session_id: Option<String>,
+    /// Explicit Intendant-owned virtual display (`display_99`, `:99`, or
+    /// `99`). User-session and foreign X servers are rejected.
+    #[serde(default)]
+    pub display_target: Option<String>,
     #[serde(default)]
     pub profile_dir: Option<String>,
 }
@@ -576,6 +584,19 @@ pub async fn create_workspace(
 
     let id = format!("bw-{}", uuid::Uuid::new_v4().simple());
     let created_at = now_string();
+    let display_binding = request
+        .display_target
+        .as_deref()
+        .map(parse_browser_display_binding)
+        .transpose()?;
+    if let Some(binding) = display_binding.as_ref() {
+        if !crate::vision::process_owns_virtual_display(binding.display_id) {
+            return Err(BrowserWorkspaceError::Unsupported(format!(
+                "browser workspace display {} is not a live virtual display owned by this Intendant process",
+                binding.canonical
+            )));
+        }
+    }
     let profile_dir = request
         .profile_dir
         .as_deref()
@@ -613,6 +634,7 @@ pub async fn create_workspace(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        display_target: display_binding.map(|binding| binding.canonical),
         profile_dir: Some(profile_dir.display().to_string()),
         browser_executable: None,
         browser_executable_source: None,
@@ -711,8 +733,33 @@ async fn launch_cdp_browser(
         workspace.provider,
         BrowserWorkspaceProvider::SystemCdp
     ))?;
+    let display_binding = workspace
+        .display_target
+        .as_deref()
+        .map(parse_browser_display_binding)
+        .transpose()?;
+    if let Some(binding) = display_binding.as_ref() {
+        if !crate::vision::process_owns_virtual_display(binding.display_id) {
+            return Err(BrowserWorkspaceError::Launch(format!(
+                "browser workspace display {} stopped being owned before browser launch",
+                binding.canonical
+            )));
+        }
+    }
     let port = reserve_local_port().await?;
     let mut command = tokio::process::Command::new(&executable.path);
+    #[cfg(target_os = "linux")]
+    if let Some(binding) = display_binding.as_ref() {
+        // A bound workspace must use only its leased X11 display. Ambient
+        // Wayland/Xauthority state belongs to the daemon's login session and
+        // must not redirect or authorize this isolated browser child.
+        command
+            .env("DISPLAY", format!(":{}", binding.display_id))
+            .env("XDG_SESSION_TYPE", "x11")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("XAUTHORITY")
+            .arg("--ozone-platform=x11");
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1254,6 +1301,46 @@ fn default_profile_dir(id: &str) -> PathBuf {
     base.join(id).join("profile")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserDisplayBinding {
+    canonical: String,
+    display_id: u32,
+}
+
+fn parse_browser_display_binding(
+    raw: &str,
+) -> Result<BrowserDisplayBinding, BrowserWorkspaceError> {
+    let value = raw.trim();
+    let digits = value
+        .strip_prefix("display_")
+        .or_else(|| value.strip_prefix(':'))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "invalid browser workspace display target '{value}'; expected display_N, :N, or N"
+        )));
+    }
+    let display_id = digits.parse::<u32>().map_err(|_| {
+        BrowserWorkspaceError::Unsupported(format!(
+            "invalid browser workspace display target '{value}'"
+        ))
+    })?;
+    if display_id == 0 {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "browser workspaces cannot bind to the user's session display".to_string(),
+        ));
+    }
+    if !crate::vision::managed_virtual_display_id(display_id) {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "browser workspace display :{display_id} is outside Intendant's managed virtual-display range"
+        )));
+    }
+    Ok(BrowserDisplayBinding {
+        canonical: format!("display_{display_id}"),
+        display_id,
+    })
+}
+
 fn now_string() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -1273,6 +1360,7 @@ mod tests {
             status: BrowserWorkspaceStatus::Ready,
             preview_mode: BrowserWorkspacePreviewMode::Semantic,
             owner_session_id: Some("session-1".to_string()),
+            display_target: None,
             profile_dir: None,
             browser_executable: None,
             browser_executable_source: None,
@@ -1286,6 +1374,42 @@ mod tests {
             created_at: "2026-05-31T00:00:00.000Z".to_string(),
             updated_at: "2026-05-31T00:00:00.000Z".to_string(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_browser_display_binding_is_strict_and_canonical() {
+        for raw in ["display_99", ":99", "99", " display_099 "] {
+            assert_eq!(
+                parse_browser_display_binding(raw).unwrap(),
+                BrowserDisplayBinding {
+                    canonical: "display_99".to_string(),
+                    display_id: 99,
+                }
+            );
+        }
+        for raw in [
+            "",
+            "user_session",
+            "display_0",
+            ":0",
+            "0",
+            "display_-1",
+            "display_98",
+            "display_200",
+            "display_99.0",
+        ] {
+            assert!(
+                parse_browser_display_binding(raw).is_err(),
+                "unsafe display target unexpectedly accepted: {raw}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn explicit_browser_display_binding_is_unavailable_without_managed_xvfb() {
+        assert!(parse_browser_display_binding("display_99").is_err());
     }
 
     #[test]

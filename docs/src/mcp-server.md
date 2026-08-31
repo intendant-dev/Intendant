@@ -408,13 +408,17 @@ Testing into Intendant's managed cache. The wire contract already carries
 `provider` and `peer_id` fields so Playwright/Agent Browser adapters and
 federated peer-hosted browsers can slot in later. Each workspace has a lease,
 so concurrent agents must explicitly acquire it and use `force` to take over an
-active holder.
+active holder. On Linux, `display_target` can bind a local CDP workspace to a
+virtual display previously created by this same Intendant daemon (for example,
+`display_99`). Intendant rejects user-session displays, out-of-range targets,
+and X servers it does not own, and rechecks ownership immediately before
+launching the browser.
 
 | Tool                          | Description | Params |
 |-------------------------------|-------------|--------|
 | `browser_workspace_providers` | Report available workspace providers. | — |
 | `list_browser_workspaces`     | List active browser workspaces and leases. | — |
-| `create_browser_workspace`    | Launch/register a workspace. | `url?`, `label?`, `provider?`, `peer_id?`, `owner_session_id?`, `profile_dir?` |
+| `create_browser_workspace`    | Launch/register a workspace. | `url?`, `label?`, `provider?`, `peer_id?`, `owner_session_id?`, `display_target?`, `profile_dir?` |
 | `acquire_browser_workspace`   | Acquire a workspace lease. | `workspace_id`, `holder_id`, `holder_kind?`, `note?`, `force?` |
 | `release_browser_workspace`   | Release a workspace lease. | `workspace_id`, `holder_id?`, `note?` |
 | `close_browser_workspace`     | Close a workspace and terminate its local browser process when owned here. | `workspace_id`, `reason?` |

@@ -803,6 +803,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             provider,
             peer_id,
             owner_session_id,
+            display_target,
             profile_dir,
         } => {
             let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
@@ -811,6 +812,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 provider: provider.clone(),
                 peer_id: peer_id.clone(),
                 owner_session_id: owner_session_id.clone(),
+                display_target: display_target.clone(),
                 profile_dir: profile_dir.clone(),
             };
             match crate::browser_workspace::create_workspace(request).await {

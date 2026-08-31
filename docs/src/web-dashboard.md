@@ -1403,7 +1403,9 @@ browser workspaces and their leases.
 CDP workspaces prefer managed Chromium/Chrome-for-Testing executables; on macOS
 system Chrome/Chromium apps require choosing `system_cdp` or setting
 `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1`. Run
-`intendant setup browsers` to install or repair the managed browser cache.
+`intendant setup browsers` to install or repair the managed browser cache. On
+Linux, callers can explicitly bind a workspace to a virtual display created by
+the same daemon; Intendant refuses user-session and foreign X servers.
 
 ### Settings
 

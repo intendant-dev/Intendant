@@ -1152,6 +1152,7 @@ async fn run_browser(
                     "--provider",
                     "--peer",
                     "--session",
+                    "--display-target",
                     "--profile-dir",
                 ],
                 &[],
@@ -1165,6 +1166,7 @@ async fn run_browser(
             insert_string(&mut map, "provider", args.one("--provider"));
             insert_string(&mut map, "peer_id", args.one("--peer"));
             insert_string(&mut map, "owner_session_id", args.one("--session"));
+            insert_string(&mut map, "display_target", args.one("--display-target"));
             insert_string(&mut map, "profile_dir", args.one("--profile-dir"));
             let response = call_tool(
                 client,
@@ -6037,7 +6039,7 @@ fn help_browser() {
         "Usage:\n\
   intendant ctl browser providers\n\
   intendant ctl browser list\n\
-  intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|system_cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--profile-dir PATH]\n\
+  intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|system_cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--display-target display_N] [--profile-dir PATH]\n\
   intendant ctl browser acquire WORKSPACE_ID [--holder ID] [--holder-kind agent|human] [--note TEXT] [--force]\n\
   intendant ctl browser release WORKSPACE_ID [--holder ID] [--note TEXT]\n\
   intendant ctl browser close WORKSPACE_ID [--reason TEXT]\n\
