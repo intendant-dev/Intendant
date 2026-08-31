@@ -467,9 +467,11 @@ pub(crate) async fn destroy_virtual_display(
     });
 
     if let Some(session) = session_registry.write().await.remove(display_id) {
-        tokio::spawn(async move {
-            session.stop().await;
-        });
+        // Exact destroy is a receipt-bearing automation primitive, unlike
+        // the latency-sensitive dashboard revoke path. Do not report success
+        // while the old generation still has capture, input, tile, or peer
+        // tasks alive; a subsequent create may reuse the numeric id.
+        session.stop().await;
     }
     guard.shutdown().await;
 
