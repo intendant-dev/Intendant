@@ -484,9 +484,15 @@ fn cmd_requests() -> Result<(), CallerError> {
             None => "caller=unverified".to_string(),
         };
         println!(
-            "{}  {:?}  {}  profile={}  {}  expires={}",
+            "{}  {:?}  {}  {}  profile={}  {}  expires={}",
             request.code,
             request.status,
+            // The lane an approval mints — an owner scanning the list
+            // must see which requests are AGENT enrollments.
+            match request.class {
+                crate::access::access_policy::IdentityClass::Peer => "peer",
+                crate::access::access_policy::IdentityClass::Agent => "AGENT",
+            },
             request.requester_label,
             request
                 .requested_profile
@@ -507,8 +513,13 @@ fn cmd_approve(args: PeerArgs) -> Result<(), CallerError> {
     let request =
         crate::peer::access_request::approve_request(&cert_dir, &code, args.profile.as_deref())?;
     println!(
-        ":: approved peer access request {} for {}",
-        request.code, request.requester_label
+        ":: approved {} access request {} for {}",
+        match request.class {
+            crate::access::access_policy::IdentityClass::Peer => "peer",
+            crate::access::access_policy::IdentityClass::Agent => "AGENT",
+        },
+        request.code,
+        request.requester_label
     );
     println!(
         ":: approved profile: {}",

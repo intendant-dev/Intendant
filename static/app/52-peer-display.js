@@ -2477,6 +2477,17 @@ function setDaemonPairingStatus(id, msg, kind) {
   el.className = 'daemon-pairing-status' + (kind ? ' ' + kind : '');
 }
 
+// Agent-lane profiles (mirrors the daemon's AGENT_PROFILES — pinned by
+// the same parity test that pins PEER_PROFILE_OPTIONS): offered ONLY on
+// agent-class enrollment requests, never in the peer picker.
+const AGENT_PROFILE_OPTIONS = [
+  {
+    profile: 'agent-operator',
+    label: 'Agent operator (ceiling)',
+    summary: 'Everything a machine principal may hold — approvals, sessions, terminal, displays — except access administration and credential custody. Grant a narrower peer profile below to cap further.',
+  },
+];
+
 const PEER_PROFILE_OPTIONS = [
   {
     profile: 'read-only-display',
@@ -2558,19 +2569,27 @@ function peerProfileMeta(profile) {
     'peer-daemon': 'peer-root',
   };
   const canonical = aliases[value] || value;
-  return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical) || {
-    profile: canonical,
-    label: canonical || 'Presence only',
-    summary: 'Unknown profiles are treated as presence-only by this build.',
-  };
+  return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical)
+    || AGENT_PROFILE_OPTIONS.find(item => item.profile === canonical)
+    || {
+      profile: canonical,
+      label: canonical || 'Presence only',
+      summary: 'Unknown profiles are treated as presence-only by this build.',
+    };
 }
 
-function renderPeerProfileOptions(selected) {
+function renderPeerProfileOptions(selected, requestClass) {
   // Mirrors the daemon's DEFAULT_PROFILE (access_policy.rs): an approval
-  // with no stated profile yields read-only-display.
+  // with no stated profile yields read-only-display. Agent-class
+  // requests additionally offer the agent ceiling — without it, a
+  // requested agent-operator would silently fall back to the first
+  // peer option and the approval would post that narrower override.
   const value = String(selected || 'read-only-display').toLowerCase();
   const selectedMeta = peerProfileMeta(value);
-  return PEER_PROFILE_OPTIONS.map(({ profile, label, summary }) => (
+  const options = requestClass === 'agent'
+    ? AGENT_PROFILE_OPTIONS.concat(PEER_PROFILE_OPTIONS)
+    : PEER_PROFILE_OPTIONS;
+  return options.map(({ profile, label, summary }) => (
     `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
   )).join('');
 }
@@ -2835,7 +2854,15 @@ function renderPeerAccessRequests(requests) {
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
     const requestedProfile = req.approved_profile || req.requested_profile || 'read-only-display';
-    const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
+    // Which lane approving MINTS (the daemon's stored request class):
+    // an agent client is not a peer daemon, and the owner must see the
+    // difference before deciding. Absent = a pre-agent daemon = peer.
+    const requestClass = String(req.class || 'peer').toLowerCase();
+    const isAgentRequest = requestClass === 'agent';
+    const laneWord = isAgentRequest ? 'agent' : 'peer';
+    const roleLabel = req.approved_profile
+      ? `Approved ${laneWord} profile`
+      : `Requested ${laneWord} profile`;
     // Cross-owner tier claim (docs/src/trust-tiers.md § Where fleet
     // metadata rides): the daemon stores requester_tier only when the
     // claim was signed inside a verified caller-ID, so presence here
@@ -2871,8 +2898,11 @@ function renderPeerAccessRequests(requests) {
         ${upwardAlarm
           ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. Approving would hand a disposable box authority on this integrated one — the tier bridge the doctrine warns about.">⚠ Upward grant: this is a disposable machine asking for authority on an integrated one. Approving bridges your tiers.</div>'
           : (pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : '')}
+        ${isAgentRequest
+          ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="This enrollment mints an agent-client identity — a machine principal that drives this daemon over MCP at whatever profile you grant. It is not a federated peer daemon.">🤖 AGENT enrollment: approving lets this machine operate the daemon at the granted profile.</div>'
+          : ''}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
-        ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
+        ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile, requestClass)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
           <button class="approve" type="button" data-access-request-action="approve" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Approve</button>
           <button class="deny" type="button" data-access-request-action="deny" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Deny</button>

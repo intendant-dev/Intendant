@@ -2282,6 +2282,27 @@ mod tests {
             "peer aliases resolve on the agent path too"
         );
         assert!(require_known_agent_profile("made-up").is_err());
+
+        // The dashboard's agent picker mirrors AGENT_PROFILES the way
+        // the peer picker mirrors PROFILES — same drift protection,
+        // same mechanism.
+        let app = include_str!("../../../../static/app.html");
+        let from = app
+            .find("const AGENT_PROFILE_OPTIONS = [")
+            .expect("AGENT_PROFILE_OPTIONS missing from app.html");
+        let block = &app[from..];
+        let block = &block[..block.find("\n];").expect("options block unterminated")];
+        let picker: std::collections::BTreeSet<&str> = regex::Regex::new(r"profile: '([a-z-]+)'")
+            .unwrap()
+            .captures_iter(block)
+            .map(|caps| caps.get(1).unwrap().as_str())
+            .collect();
+        let canonical: std::collections::BTreeSet<&str> =
+            AGENT_PROFILES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            picker, canonical,
+            "AGENT_PROFILE_OPTIONS (static/app.html) drifted from AGENT_PROFILES"
+        );
     }
 
     /// Identity records written before the agent lane existed carry no

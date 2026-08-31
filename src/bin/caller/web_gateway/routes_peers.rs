@@ -905,6 +905,9 @@ pub(crate) fn access_request_summary_json(
         "code": request.code,
         "status": request.status,
         "requester_label": request.requester_label,
+        // Which lane an approval will mint — the owner must SEE what
+        // they are approving: an agent client is not a peer daemon.
+        "class": request.class,
         "requested_profile": request.requested_profile,
         "approved_profile": request.approved_profile,
         // Present only when the claim was signed inside a verified
