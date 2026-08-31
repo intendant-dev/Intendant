@@ -3008,6 +3008,15 @@ impl EventBus {
         sender.is_some_and(|sender| sender.send(outcome).is_ok())
     }
 
+    /// Whether an exact correlated virtual-display caller is still waiting.
+    /// A poisoned registry fails closed so queued work cannot launch an
+    /// unowned display when cancellation state is ambiguous.
+    pub fn virtual_display_create_is_pending(&self, request_id: &str) -> bool {
+        self.virtual_display_create_waiters
+            .lock()
+            .is_ok_and(|waiters| waiters.contains_key(request_id))
+    }
+
     pub fn send(&self, event: AppEvent) {
         // Every approval resolution — session registries, daemon-scoped gate
         // waiters, MCP/agenda resolvers — announces through this event, so

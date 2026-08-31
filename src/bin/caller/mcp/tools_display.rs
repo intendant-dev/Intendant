@@ -1898,10 +1898,12 @@ mod tests {
         let timeout_waiter = bus
             .register_virtual_display_create_waiter("vdc-timeout".to_string())
             .unwrap();
+        assert!(bus.virtual_display_create_is_pending("vdc-timeout"));
         assert_eq!(
             timeout_waiter.wait(Duration::from_millis(10)).await,
             Err(crate::event::VirtualDisplayCreateWaitError::TimedOut)
         );
+        assert!(!bus.virtual_display_create_is_pending("vdc-timeout"));
         assert!(!bus.complete_virtual_display_create(
             "vdc-timeout",
             crate::event::VirtualDisplayCreateOutcome::Failed {
@@ -1912,10 +1914,12 @@ mod tests {
         let cancelled = bus
             .register_virtual_display_create_waiter("vdc-cancelled".to_string())
             .unwrap();
+        assert!(bus.virtual_display_create_is_pending("vdc-cancelled"));
         assert!(bus
             .register_virtual_display_create_waiter("vdc-cancelled".to_string())
             .is_err());
         drop(cancelled);
+        assert!(!bus.virtual_display_create_is_pending("vdc-cancelled"));
         assert!(!bus.complete_virtual_display_create(
             "vdc-cancelled",
             crate::event::VirtualDisplayCreateOutcome::Failed {

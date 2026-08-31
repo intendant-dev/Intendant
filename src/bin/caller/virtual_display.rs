@@ -80,6 +80,16 @@ pub(crate) async fn create_virtual_display(
     height: Option<u32>,
     request_id: Option<String>,
 ) {
+    // The lossless intent lane can outlive its synchronous caller. Refuse an
+    // already-cancelled correlated request before allocating an X display;
+    // uncorrelated dashboard creates keep their legacy lifecycle behavior.
+    if let Some(request_id) = request_id.as_deref() {
+        if !bus.virtual_display_create_is_pending(request_id) {
+            eprintln!("[virtual_display] skipped cancelled create request {request_id}");
+            return;
+        }
+    }
+
     // Unsupported platforms bail before any display lifecycle exists.
     if !vision::virtual_displays_supported() {
         report_virtual_display_create_failed(
@@ -180,8 +190,12 @@ pub(crate) async fn create_virtual_display(
                     },
                 ) {
                     eprintln!(
-                        "[virtual_display] create caller no longer waiting for request {request_id}"
+                        "[virtual_display] create caller no longer waiting for request {request_id}; destroying its display"
                     );
+                    if let Some(session) = session_registry.write().await.remove(display_id) {
+                        session.stop().await;
+                    }
+                    reap_virtual_display(guards, display_id, "create caller cancelled").await;
                 }
             }
         }
@@ -398,6 +412,35 @@ mod tests {
         .await
         .unwrap();
         healthy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_correlated_request_is_skipped_before_display_lifecycle() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let mut guards = VirtualDisplayGuards::new();
+
+        create_virtual_display(
+            &bus,
+            &registry,
+            None,
+            &mut guards,
+            Some(1280),
+            Some(720),
+            Some("vdc-no-longer-pending".to_string()),
+        )
+        .await;
+
+        assert!(guards.is_empty());
+        assert!(registry.read().await.all_display_ids().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
