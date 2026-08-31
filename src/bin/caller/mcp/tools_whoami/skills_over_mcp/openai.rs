@@ -36,7 +36,10 @@ pub(super) fn aggregate_skill(effective: &[ServedSkill]) -> Result<ServedSkill, 
     );
 
     let frontmatter = Map::from_iter([
-        ("name".to_string(), Value::String(AGGREGATE_NAME.to_string())),
+        (
+            "name".to_string(),
+            Value::String(AGGREGATE_NAME.to_string()),
+        ),
         ("description".to_string(), Value::String(description)),
     ]);
     let root_md = document_from_frontmatter(&frontmatter, &root_body)?;
@@ -134,9 +137,8 @@ fn skill_section(skill: &ServedSkill) -> Result<String, String> {
             Ok(text) => section.push_str(text),
             Err(_) => {
                 section.push_str("Binary resource, base64 encoded:\n\n");
-                section.push_str(
-                    &base64::engine::general_purpose::STANDARD.encode(&resource.bytes),
-                );
+                section
+                    .push_str(&base64::engine::general_purpose::STANDARD.encode(&resource.bytes));
             }
         }
         if !section.ends_with('\n') {
