@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
-use image::{ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader, Limits};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENCODED_IMAGE_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+const MAX_DECODED_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 32_768;
+const MAX_CAPTURE_CLOCK_SKEW_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,11 +126,15 @@ pub(super) fn save_image_output(
                 .map_err(|e| format!("invalid captured_at timestamp {captured_at:?}: {e}"))
         })
         .transpose()?;
+    let latest_permitted_capture =
+        Utc::now().fixed_offset() + chrono::Duration::seconds(MAX_CAPTURE_CLOCK_SKEW_SECONDS);
     if captured_at_parsed
         .as_ref()
-        .is_some_and(|captured_at| captured_at > &Utc::now().fixed_offset())
+        .is_some_and(|captured_at| captured_at > &latest_permitted_capture)
     {
-        return Err("captured_at is later than the local save clock".to_string());
+        return Err(format!(
+            "captured_at is more than {MAX_CAPTURE_CLOCK_SKEW_SECONDS}s later than the local save clock"
+        ));
     }
 
     let artifact_path = persist_private_noclobber(&bytes, requested_path)?;
@@ -315,6 +322,33 @@ fn inspect_image(bytes: &[u8]) -> Result<(&'static str, u32, u32), String> {
     if width == 0 || height == 0 {
         return Err("saved image dimensions must be non-zero".to_string());
     }
+    let decoded_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(8))
+        .ok_or_else(|| "saved image decoded-size estimate overflowed".to_string())?;
+    if width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || decoded_bytes > MAX_DECODED_IMAGE_BYTES
+    {
+        return Err(format!(
+            "saved image exceeds the {MAX_IMAGE_DIMENSION}px dimension or {MAX_DECODED_IMAGE_BYTES}-byte decoded limit"
+        ));
+    }
+
+    let mut decoder = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("failed to identify saved image format for decoding: {e}"))?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_BYTES);
+    decoder.limits(limits);
+    let decoded = decoder
+        .decode()
+        .map_err(|e| format!("failed to fully decode saved image pixels: {e}"))?;
+    if decoded.width() != width || decoded.height() != height {
+        return Err("saved image dimensions changed during full decoding".to_string());
+    }
     Ok((media_type, width, height))
 }
 
@@ -470,7 +504,7 @@ mod tests {
         bytes
     }
 
-    fn inline_result(bytes: &[u8], width: u32, height: u32) -> Value {
+    fn inline_result_at(bytes: &[u8], width: u32, height: u32, captured_at: &str) -> Value {
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         serde_json::json!({
             "content": [
@@ -480,12 +514,16 @@ mod tests {
                         "status": "screenshot captured",
                         "width": width,
                         "height": height,
-                        "captured_at": "2026-08-31T20:00:00.000Z"
+                        "captured_at": captured_at
                     }).to_string()
                 },
                 {"type": "image", "data": encoded, "mimeType": "image/png"}
             ]
         })
+    }
+
+    fn inline_result(bytes: &[u8], width: u32, height: u32) -> Value {
+        inline_result_at(bytes, width, height, "2026-08-31T20:00:00.000Z")
     }
 
     #[test]
@@ -652,6 +690,53 @@ mod tests {
         let error = save_image_output(&inline_result(&bytes, 3, 2), &output)
             .expect_err("dimension mismatch refused");
         assert!(error.contains("dimensions"), "{error}");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn truncated_pixel_stream_is_refused_before_output_creation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("proof.png");
+        let mut bytes = png_bytes(8, 8);
+        bytes.truncate(45);
+        let dimensions = ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .expect("identify truncated PNG")
+            .into_dimensions()
+            .expect("header still carries dimensions");
+        assert_eq!(dimensions, (8, 8));
+
+        let error = save_image_output(&inline_result(&bytes, 8, 8), &output)
+            .expect_err("truncated pixels refused");
+        assert!(error.contains("fully decode"), "{error}");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn bounded_future_capture_clock_skew_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("proof.png");
+        let bytes = png_bytes(1, 1);
+        let captured_at = (Utc::now() + chrono::Duration::seconds(60))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+
+        save_image_output(&inline_result_at(&bytes, 1, 1, &captured_at), &output)
+            .expect("bounded peer clock skew accepted");
+        assert!(output.exists());
+    }
+
+    #[test]
+    fn excessive_future_capture_clock_skew_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("proof.png");
+        let bytes = png_bytes(1, 1);
+        let captured_at = (Utc::now()
+            + chrono::Duration::seconds(MAX_CAPTURE_CLOCK_SKEW_SECONDS + 60))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+
+        let error = save_image_output(&inline_result_at(&bytes, 1, 1, &captured_at), &output)
+            .expect_err("excessive peer clock skew refused");
+        assert!(error.contains("later than the local save clock"), "{error}");
         assert!(!output.exists());
     }
 
