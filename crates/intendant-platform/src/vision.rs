@@ -145,7 +145,7 @@ fn owned_xvfb_processes() -> &'static Mutex<HashMap<u32, u32>> {
 pub fn managed_virtual_display_id(display_id: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return (PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END).contains(&display_id);
+        (PREFERRED_DISPLAY..VIRTUAL_DISPLAY_END).contains(&display_id)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -192,10 +192,10 @@ pub fn process_owns_virtual_display(display_id: u32) -> bool {
             .lock()
             .ok()
             .and_then(|owned| owned.get(&display_id).copied());
-        return pid.is_some_and(|pid| {
+        pid.is_some_and(|pid| {
             crate::platform::process_alive(pid)
                 && xvfb_state_established(std::path::Path::new("/tmp"), display_id, pid)
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
