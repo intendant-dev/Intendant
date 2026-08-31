@@ -1831,6 +1831,7 @@ mod tests {
             &bus,
             &Some(control_tx),
             ControlMsg::CreateVirtualDisplay {
+                request_id: None,
                 width: Some(1280),
                 height: Some(800),
             },

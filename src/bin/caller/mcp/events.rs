@@ -1040,6 +1040,7 @@ pub fn spawn_event_listener(
                     AppEvent::DisplayCaptureLost {
                         display_id,
                         ref reason,
+                        ..
                     } => {
                         s.note_display_capture_lost(display_id);
                         s.push_log(
@@ -1049,6 +1050,12 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::VirtualDisplayCreateFailed { ref reason } => {
                         s.push_log(LogLevel::Warn, reason.clone());
+                    }
+                    AppEvent::VirtualDisplayCaptureLost { .. }
+                    | AppEvent::VirtualDisplayCaptureReadiness { .. } => {
+                        // Internal generation-bound lifecycle input. The
+                        // display owner emits the public retirement only
+                        // after validating the active generation.
                     }
                     AppEvent::DisplayApprovalPending {
                         display_id,

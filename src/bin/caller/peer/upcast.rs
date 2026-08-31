@@ -1199,9 +1199,14 @@ impl AppEventUpcaster {
                 reason: note.clone(),
             }],
 
-            AppEvent::DisplayCaptureLost { display_id, reason } => self
+            AppEvent::DisplayCaptureLost {
+                display_id, reason, ..
+            } => self
                 .displays
                 .lost(*display_id, Some(format!("capture_lost: {reason}"))),
+
+            AppEvent::VirtualDisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureReadiness { .. } => Vec::new(),
 
             AppEvent::VirtualDisplayCreateFailed { reason } => vec![log_event(
                 LogLevel::Error,
@@ -3608,6 +3613,7 @@ mod tests {
         // Losing capture retires availability.
         let lost = u.upcast(&AppEvent::DisplayCaptureLost {
             display_id: 1,
+            capture_generation: None,
             reason: "backend_crashed".into(),
         });
         assert_eq!(lost.len(), 1);
@@ -4448,6 +4454,7 @@ mod tests {
     fn parity_display_capture_lost() {
         assert_parity(AppEvent::DisplayCaptureLost {
             display_id: 1,
+            capture_generation: None,
             reason: "backend_crashed".into(),
         });
     }

@@ -241,6 +241,62 @@ pub enum CredentialReloadProgress {
     Failed { error: String },
 }
 
+/// Request-scoped terminal result for one daemon-owned virtual-display
+/// creation. This stays on the internal event bus: public display lifecycle
+/// remains `DisplayReady` / `VirtualDisplayCreateFailed`, while synchronous
+/// callers use this value to avoid consuming another concurrent request's
+/// outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualDisplayCreateOutcome {
+    Created {
+        display_id: u32,
+        width: u32,
+        height: u32,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualDisplayCreateWaitError {
+    TimedOut,
+    Closed,
+}
+
+type VirtualDisplayCreateWaiters =
+    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<VirtualDisplayCreateOutcome>>>>;
+
+/// RAII owner for one request-scoped terminal result. Dropping a cancelled or
+/// timed-out call removes its sender so abandoned MCP calls cannot accumulate
+/// in the daemon.
+pub struct VirtualDisplayCreateWaiter {
+    request_id: String,
+    waiters: VirtualDisplayCreateWaiters,
+    receiver: tokio::sync::oneshot::Receiver<VirtualDisplayCreateOutcome>,
+}
+
+impl VirtualDisplayCreateWaiter {
+    pub async fn wait(
+        mut self,
+        timeout_after: Duration,
+    ) -> Result<VirtualDisplayCreateOutcome, VirtualDisplayCreateWaitError> {
+        match tokio::time::timeout(timeout_after, &mut self.receiver).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_closed)) => Err(VirtualDisplayCreateWaitError::Closed),
+            Err(_elapsed) => Err(VirtualDisplayCreateWaitError::TimedOut),
+        }
+    }
+}
+
+impl Drop for VirtualDisplayCreateWaiter {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.remove(&self.request_id);
+        }
+    }
+}
+
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -736,7 +792,30 @@ pub enum AppEvent {
     // Display capture lost (backend crashed or portal session ended)
     DisplayCaptureLost {
         display_id: u32,
+        /// Generation of a daemon-owned virtual display when this public
+        /// retirement was validated against one. `None` for ordinary user or
+        /// agent-owned display sessions. Internal lifecycle consumers use it
+        /// to ignore a delayed retirement after an id has been reused.
+        capture_generation: Option<String>,
         reason: String,
+    },
+
+    /// Capture loss raised by a generation-bound daemon-owned virtual display.
+    /// This is internal lifecycle input: the serial display owner validates
+    /// the generation before emitting the public `DisplayCaptureLost` event.
+    VirtualDisplayCaptureLost {
+        display_id: u32,
+        capture_generation: String,
+        reason: String,
+    },
+
+    /// Asynchronous first-frame readiness result for one daemon-owned virtual
+    /// display. The slow wait never runs on the serial display-intent owner.
+    VirtualDisplayCaptureReadiness {
+        display_id: u32,
+        capture_generation: String,
+        ready: bool,
+        reason: Option<String>,
     },
 
     /// A virtual-display create request failed before any display lifecycle
@@ -2609,6 +2688,10 @@ pub enum ControlMsg {
     /// Linux-only mechanism — other
     /// platforms report a clear error.
     CreateVirtualDisplay {
+        /// Opaque per-call correlation id. Older/dashboard callers may omit
+        /// it and continue to observe only the public display lifecycle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         /// Optional resolution; defaults to 1920x1080. Values are clamped
         /// to sane bounds and rounded down to even (VP8 requirement).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2895,6 +2978,7 @@ pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
     session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SessionLogLaneItem>>>>,
     intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    virtual_display_create_waiters: VirtualDisplayCreateWaiters,
 }
 
 impl EventBus {
@@ -2904,7 +2988,56 @@ impl EventBus {
             tx,
             session_log_sinks: Arc::new(Mutex::new(Vec::new())),
             intent_sinks: Arc::new(Mutex::new(Vec::new())),
+            virtual_display_create_waiters: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register one lossless terminal-result channel before emitting its
+    /// corresponding create intent. Generated MCP request ids are unique; an
+    /// occupied id is rejected instead of replacing another caller's sender.
+    pub fn register_virtual_display_create_waiter(
+        &self,
+        request_id: String,
+    ) -> Result<VirtualDisplayCreateWaiter, String> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut waiters = self
+            .virtual_display_create_waiters
+            .lock()
+            .map_err(|_| "virtual display result registry is unavailable".to_string())?;
+        if waiters.contains_key(&request_id) {
+            return Err("virtual display request id is already pending".to_string());
+        }
+        waiters.insert(request_id.clone(), sender);
+        drop(waiters);
+        Ok(VirtualDisplayCreateWaiter {
+            request_id,
+            waiters: Arc::clone(&self.virtual_display_create_waiters),
+            receiver,
+        })
+    }
+
+    /// Complete one registered request over its request-scoped lossless
+    /// channel. Returns false when the caller already timed out or cancelled.
+    pub fn complete_virtual_display_create(
+        &self,
+        request_id: &str,
+        outcome: VirtualDisplayCreateOutcome,
+    ) -> bool {
+        let sender = self
+            .virtual_display_create_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(request_id));
+        sender.is_some_and(|sender| sender.send(outcome).is_ok())
+    }
+
+    /// Whether an exact correlated virtual-display caller is still waiting.
+    /// A poisoned registry fails closed so queued work cannot launch an
+    /// unowned display when cancellation state is ambiguous.
+    pub fn virtual_display_create_is_pending(&self, request_id: &str) -> bool {
+        self.virtual_display_create_waiters
+            .lock()
+            .is_ok_and(|waiters| waiters.contains_key(request_id))
     }
 
     pub fn send(&self, event: AppEvent) {
@@ -3035,7 +3168,11 @@ pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
             | AppEvent::SessionIdentity { .. }
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionEnded { .. }
+            | AppEvent::UserDisplayGranted { .. }
             | AppEvent::UserDisplayRevoked { .. }
+            | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureReadiness { .. }
             | AppEvent::SharedView { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::TaskComplete { .. }
@@ -3871,12 +4008,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             tile_snapshot_frames: snapshot.tile_snapshot_frames,
             tile_snapshot_kbps: snapshot.tile_snapshot_kbps,
         }),
-        AppEvent::DisplayCaptureLost { display_id, reason } => {
-            Some(OutboundEvent::DisplayCaptureLost {
-                display_id: *display_id,
-                reason: reason.clone(),
-            })
-        }
+        AppEvent::DisplayCaptureLost {
+            display_id, reason, ..
+        } => Some(OutboundEvent::DisplayCaptureLost {
+            display_id: *display_id,
+            reason: reason.clone(),
+        }),
         AppEvent::VirtualDisplayCreateFailed { reason } => Some(OutboundEvent::LogEntry {
             level: "error".to_string(),
             source: "display".to_string(),
@@ -4019,7 +4156,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::VoiceModelRerouted { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
-        | AppEvent::LiveAudioCompleted { .. } => None,
+        | AppEvent::LiveAudioCompleted { .. }
+        | AppEvent::VirtualDisplayCaptureLost { .. }
+        | AppEvent::VirtualDisplayCaptureReadiness { .. } => None,
     }
 }
 
@@ -4277,6 +4416,8 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::DisplayTaken { .. }
             | AppEvent::DisplayReleased { .. }
             | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureLost { .. }
+            | AppEvent::VirtualDisplayCaptureReadiness { .. }
             | AppEvent::VirtualDisplayCreateFailed { .. }
             | AppEvent::DisplayApprovalPending { .. }
             | AppEvent::SharedView { .. }
@@ -4526,7 +4667,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         AppEvent::DisplayReleased { display_id, note } => {
             log.display_released(*display_id, note.as_deref());
         }
-        AppEvent::DisplayCaptureLost { display_id, reason } => {
+        AppEvent::DisplayCaptureLost {
+            display_id, reason, ..
+        } => {
             log.warn(&format!("Display :{} capture lost: {}", display_id, reason));
         }
         AppEvent::VirtualDisplayCreateFailed { reason } => {
@@ -5027,6 +5170,68 @@ mod tests {
             Some(AppEvent::TaskComplete { .. })
         ));
         assert!(intents.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn intent_lane_keeps_display_lifecycle_lossless_under_broadcast_flood() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        let mut lossy = bus.subscribe();
+
+        bus.send(AppEvent::UserDisplayGranted {
+            display_id: 99,
+            agent_visible: true,
+        });
+        for _ in 0..5_000 {
+            bus.send(AppEvent::Tick);
+        }
+        bus.send(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+            request_id: Some("vdc-lossless".to_string()),
+            width: Some(1280),
+            height: Some(720),
+        }));
+        bus.send(AppEvent::DisplayCaptureLost {
+            display_id: 99,
+            capture_generation: None,
+            reason: "test loss".to_string(),
+        });
+        bus.send(AppEvent::VirtualDisplayCaptureReadiness {
+            display_id: 100,
+            capture_generation: "generation-1".to_string(),
+            ready: true,
+            reason: None,
+        });
+
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::UserDisplayGranted { display_id: 99, .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                request_id: Some(request_id),
+                width: Some(1280),
+                height: Some(720),
+            })) if request_id == "vdc-lossless"
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::DisplayCaptureLost { display_id: 99, .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::VirtualDisplayCaptureReadiness {
+                display_id: 100,
+                capture_generation,
+                ready: true,
+                reason: None,
+            }) if capture_generation == "generation-1"
+        ));
+        assert!(intents.try_recv().is_err());
+        assert!(matches!(
+            lossy.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
     }
 
     /// B5, deterministic core: the coalesce buffer concatenates per
@@ -6635,6 +6840,7 @@ mod tests {
         assert!(matches!(
             msg,
             ControlMsg::CreateVirtualDisplay {
+                request_id: None,
                 width: None,
                 height: None
             }
@@ -6645,10 +6851,24 @@ mod tests {
         assert!(matches!(
             msg,
             ControlMsg::CreateVirtualDisplay {
+                request_id: None,
                 width: Some(1280),
                 height: Some(800)
             }
         ));
+
+        let json = r#"{"action":"create_virtual_display","request_id":"vdc-abc","width":1024,"height":768}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMsg::CreateVirtualDisplay {
+                request_id: Some(ref request_id),
+                width: Some(1024),
+                height: Some(768)
+            } if request_id == "vdc-abc"
+        ));
+        let serialized = serde_json::to_value(&msg).unwrap();
+        assert_eq!(serialized["request_id"], "vdc-abc");
     }
 
     #[test]
