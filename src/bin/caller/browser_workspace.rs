@@ -847,9 +847,10 @@ pub async fn list_workspaces(bus: &EventBus) -> Vec<BrowserWorkspace> {
         let registry = global_registry();
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
         (registry.list(), retired)
     };
-    publish_reconciled_retirements(bus, retired);
+    terminate_retired_processes(retired);
     workspaces
 }
 
@@ -936,9 +937,10 @@ pub async fn acquire_workspace(
         let registry = global_registry();
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
         (registry.acquire(request), retired)
     };
-    publish_reconciled_retirements(bus, retired);
+    terminate_retired_processes(retired);
     result
 }
 
@@ -950,16 +952,22 @@ pub async fn release_workspace(
         let registry = global_registry();
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
+        publish_retirements_locked(bus, &retired);
         (registry.release(request), retired)
     };
-    publish_reconciled_retirements(bus, retired);
+    terminate_retired_processes(retired);
     result
 }
 
-fn publish_reconciled_retirements(bus: &EventBus, retired: Vec<RetiredBrowserWorkspace>) {
+fn publish_retirements_locked(bus: &EventBus, retired: &[RetiredBrowserWorkspace]) {
+    for retired in retired {
+        publish_workspace_event(bus, "display_retired", &retired.workspace);
+    }
+}
+
+fn terminate_retired_processes(retired: Vec<RetiredBrowserWorkspace>) {
     for retired in retired {
         terminate_workspace_process(retired.process_id, retired.child);
-        publish_workspace_event(bus, "display_retired", &retired.workspace);
     }
 }
 
@@ -1797,14 +1805,13 @@ mod tests {
         workspace.status = BrowserWorkspaceStatus::Error;
         workspace.message = Some("bound display exited".to_string());
 
-        publish_reconciled_retirements(
-            &bus,
-            vec![RetiredBrowserWorkspace {
-                workspace: workspace.clone(),
-                process_id: None,
-                child: None,
-            }],
-        );
+        let retired = vec![RetiredBrowserWorkspace {
+            workspace: workspace.clone(),
+            process_id: None,
+            child: None,
+        }];
+        publish_retirements_locked(&bus, &retired);
+        terminate_retired_processes(retired);
 
         match events.try_recv().expect("display retirement event") {
             AppEvent::BrowserWorkspaceChanged {
