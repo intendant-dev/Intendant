@@ -4,6 +4,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const SKILL_URI_AUTHORITY: &str = "intendant";
+const MAX_RESOURCES_PER_SKILL: usize = 512;
+const MAX_TOTAL_BYTES_PER_SKILL: usize = 16 * 1024 * 1024;
+const MAX_DESCRIPTION_CHARS: usize = 1024;
+const MAX_COMPATIBILITY_CHARS: usize = 500;
 
 pub(super) fn effective_skill_catalog(state_root: &Path) -> Result<Vec<ServedSkill>, String> {
     let disabled = crate::skill_state::disabled_skill_names_in(state_root);
@@ -50,6 +54,7 @@ pub(super) fn effective_skill_catalog(state_root: &Path) -> Result<Vec<ServedSki
         out.push(served_skill(&skill.name, &skill.skill_md, Vec::new())?);
     }
 
+    out.sort_by(|left, right| left.uri.cmp(&right.uri));
     Ok(out)
 }
 
@@ -81,6 +86,20 @@ fn served_skill(
             relative_path,
             bytes,
         });
+    }
+    if resources.len() > MAX_RESOURCES_PER_SKILL {
+        return Err(format!(
+            "skill {expected_name:?} contains {} resources, above the Skills Over MCP \
+             limit of {MAX_RESOURCES_PER_SKILL}",
+            resources.len()
+        ));
+    }
+    let total_bytes: usize = resources.iter().map(|resource| resource.bytes.len()).sum();
+    if total_bytes > MAX_TOTAL_BYTES_PER_SKILL {
+        return Err(format!(
+            "skill {expected_name:?} contains {total_bytes} bytes, above the Skills Over MCP \
+             limit of {MAX_TOTAL_BYTES_PER_SKILL}"
+        ));
     }
     Ok(ServedSkill {
         name: expected_name.to_string(),
@@ -131,16 +150,33 @@ fn normalized_skill_document(
             source.display()
         ));
     }
-    if frontmatter
+    let description = frontmatter
         .get("description")
         .and_then(Value::as_str)
         .map(str::trim)
-        .is_none_or(|description| description.is_empty())
-    {
+        .filter(|description| !description.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{}: frontmatter description must be a non-empty string",
+                source.display()
+            )
+        })?;
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
         return Err(format!(
-            "{}: frontmatter description must be a non-empty string",
+            "{}: frontmatter description exceeds the Agent Skills limit of \
+             {MAX_DESCRIPTION_CHARS} characters",
             source.display()
         ));
+    }
+    if let Some(compatibility) = frontmatter.get("compatibility").and_then(Value::as_str) {
+        let chars = compatibility.chars().count();
+        if chars == 0 || chars > MAX_COMPATIBILITY_CHARS {
+            return Err(format!(
+                "{}: frontmatter compatibility must contain 1..={MAX_COMPATIBILITY_CHARS} \
+                 characters",
+                source.display()
+            ));
+        }
     }
 
     let mut normalized = String::from("---\n");
@@ -208,12 +244,11 @@ pub(super) fn write_yaml_entry(out: &mut String, key: &str, value: &Value) -> Re
 }
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(format!("unsafe skill name {name:?}"));
+    if !crate::agenda::valid_slug(name) {
+        return Err(format!(
+            "skill name {name:?} violates the Agent Skills grammar (1..=64 lowercase \
+             alphanumerics with single interior hyphens)"
+        ));
     }
     Ok(())
 }
