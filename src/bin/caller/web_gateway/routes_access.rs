@@ -11,6 +11,12 @@ pub(crate) struct PeerConnectionIdentity {
     pub(crate) fingerprint: String,
     pub(crate) label: String,
     pub(crate) profile: String,
+    /// The identity record's lane (`Peer` = federated daemon, `Agent`
+    /// = enrolled R1 agent client). Every consumer that treats the two
+    /// differently BRANCHES on this — the principal binding, the relay
+    /// admission scope — so an agent credential can never ride a
+    /// peer-shaped code path by omission, and vice versa.
+    pub(crate) class: crate::peer::access_policy::IdentityClass,
     pub(crate) filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
     pub(crate) record: Option<crate::peer::access_policy::PeerIdentityRecord>,
 }
@@ -1440,13 +1446,31 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
             crate::peer::access_policy::PeerIdentityStatus::Approved => "expired",
             crate::peer::access_policy::PeerIdentityStatus::Revoked => "revoked",
         };
-        let principal_id = format!("principal:inbound-peer-daemon:{fingerprint}");
-        let grant_id = format!("grant:inbound-peer:{fingerprint}:{}", identity.profile);
-        let transport_id = format!("transport:inbound-peer-mtls:{fingerprint}");
+        // The overview projects the record's class faithfully — an
+        // enrolled agent client must never read as a federated daemon
+        // on the IAM topology the owner audits (it would contradict the
+        // identity listing and misstate what the grant admits).
+        let is_agent = matches!(
+            identity.class,
+            crate::peer::access_policy::IdentityClass::Agent
+        );
+        let (principal_id, grant_id, transport_id) = if is_agent {
+            (
+                format!("principal:agent-client:{fingerprint}"),
+                format!("grant:agent-client:{fingerprint}:{}", identity.profile),
+                format!("transport:agent-client-mtls:{fingerprint}"),
+            )
+        } else {
+            (
+                format!("principal:inbound-peer-daemon:{fingerprint}"),
+                format!("grant:inbound-peer:{fingerprint}:{}", identity.profile),
+                format!("transport:inbound-peer-mtls:{fingerprint}"),
+            )
+        };
         principals.push(serde_json::json!({
             "id": principal_id.clone(),
-            "kind": "peer_daemon",
-            "kind_label": "Peer daemon",
+            "kind": if is_agent { "agent_client" } else { "peer_daemon" },
+            "kind_label": if is_agent { "Agent client" } else { "Peer daemon" },
             "label": identity.label.clone(),
             "source": "peer_access_identity",
             "target_id": local_target_id.clone(),
@@ -1458,18 +1482,18 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
             "organization": serde_json::Value::Null,
             "authn": [{
                 "kind": "daemon_mutual_tls",
-                "label": "Daemon mTLS identity"
+                "label": if is_agent { "Agent mTLS identity" } else { "Daemon mTLS identity" }
             }]
         }));
         grants.push(serde_json::json!({
             "id": grant_id,
             "principal_id": principal_id,
             "target_id": local_target_id.clone(),
-            "kind": "inbound_daemon_peer_profile",
-            "kind_label": "Inbound daemon peer profile",
-            "policy_id": "policy:peer-profile",
-            "role": "peer_profile",
-            "role_label": "Peer profile",
+            "kind": if is_agent { "agent_client_profile" } else { "inbound_daemon_peer_profile" },
+            "kind_label": if is_agent { "Agent client profile" } else { "Inbound daemon peer profile" },
+            "policy_id": if is_agent { "policy:agent-profile" } else { "policy:peer-profile" },
+            "role": if is_agent { "agent_profile" } else { "peer_profile" },
+            "role_label": if is_agent { "Agent profile" } else { "Peer profile" },
             "profile": identity.profile.clone(),
             "transport_id": transport_id.clone(),
             "source": "peer_access_identity",
@@ -1483,8 +1507,8 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
         }));
         transports.push(serde_json::json!({
             "id": transport_id,
-            "kind": "inbound_peer_mtls",
-            "kind_label": "Inbound peer mTLS",
+            "kind": if is_agent { "agent_client_mtls" } else { "inbound_peer_mtls" },
+            "kind_label": if is_agent { "Agent client mTLS" } else { "Inbound peer mTLS" },
             "label": identity.label.clone(),
             "status": status,
             "implementation": "daemon_mutual_tls_inbound",
@@ -3003,6 +3027,21 @@ pub(crate) fn dashboard_control_grant_for_client(
     trusted_local_admitted: bool,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     if let Some(identity) = identity {
+        // The agent lane has NO dashboard-control surface in its first
+        // cut: the R1 charter is `/mcp` alone, and this grant's Peer
+        // arm hardcodes the peer principal — admitting an agent here
+        // would walk it into peer-only tenant edges (memory propose)
+        // under the wrong actor class. Refused by name until an owner
+        // ruling gives agents their own grant class.
+        if matches!(
+            identity.class,
+            crate::peer::access_policy::IdentityClass::Agent
+        ) {
+            return Err(
+                "agent identities have no dashboard-control surface; the agent lane is /mcp only"
+                    .to_string(),
+            );
+        }
         return Ok(crate::dashboard_control::DashboardControlGrant::Peer {
             fingerprint: identity.fingerprint.clone(),
             label: identity.label.clone(),
@@ -3054,12 +3093,27 @@ pub(crate) fn peer_identity_access_principal(
     identity: &PeerConnectionIdentity,
     transport: &str,
 ) -> crate::access::iam::AccessPrincipal {
-    crate::access::iam::AccessPrincipal::peer_daemon(
-        identity.fingerprint.clone(),
-        identity.label.clone(),
-        identity.profile.clone(),
-        transport,
-    )
+    // The one place a resolved connection identity becomes a principal:
+    // the record class picks the principal kind, so an agent identity
+    // can never mint `peer_daemon` authority or vice versa.
+    match identity.class {
+        crate::peer::access_policy::IdentityClass::Peer => {
+            crate::access::iam::AccessPrincipal::peer_daemon(
+                identity.fingerprint.clone(),
+                identity.label.clone(),
+                identity.profile.clone(),
+                transport,
+            )
+        }
+        crate::peer::access_policy::IdentityClass::Agent => {
+            crate::access::iam::AccessPrincipal::agent_client(
+                identity.fingerprint.clone(),
+                identity.label.clone(),
+                identity.profile.clone(),
+                transport,
+            )
+        }
+    }
 }
 
 pub(crate) fn authorize_http_filesystem_access(
@@ -3153,12 +3207,27 @@ pub(crate) fn audit_peer_filesystem_access(
 }
 
 pub(crate) fn peer_client_header_present(header_text: &str) -> bool {
+    lane_header_present(
+        header_text,
+        crate::peer::transport::intendant::PEER_CLIENT_HEADER,
+        crate::peer::transport::intendant::PEER_CLIENT_HEADER_VALUE,
+    )
+}
+
+pub(crate) fn agent_client_header_present(header_text: &str) -> bool {
+    lane_header_present(
+        header_text,
+        crate::peer::transport::intendant::AGENT_CLIENT_HEADER,
+        crate::peer::transport::intendant::AGENT_CLIENT_HEADER_VALUE,
+    )
+}
+
+fn lane_header_present(header_text: &str, header: &str, expected: &str) -> bool {
     header_text.lines().any(|line| {
         let Some((name, value)) = line.split_once(':') else {
             return false;
         };
-        name.eq_ignore_ascii_case(crate::peer::transport::intendant::PEER_CLIENT_HEADER)
-            && value.trim() == crate::peer::transport::intendant::PEER_CLIENT_HEADER_VALUE
+        name.eq_ignore_ascii_case(header) && value.trim() == expected
     })
 }
 
@@ -3183,38 +3252,71 @@ pub(crate) fn resolve_peer_connection_identity_from_cert_dir(
         return Ok(None);
     };
     let peer_mode = peer_client_header_present(header_text);
+    let agent_mode = agent_client_header_present(header_text);
 
     let record = crate::peer::access_policy::lookup_identity(cert_dir, fingerprint)
         .map_err(|e| (500, serde_json::json!({"error": e.to_string()}).to_string()))?;
     let now_unix = crate::access::client_key::now_unix_ms() / 1000;
     match record {
-        Some(record) if record.is_active(now_unix) => Ok(Some(PeerConnectionIdentity {
-            fingerprint: record.fingerprint.clone(),
-            label: record.label.clone(),
-            profile: record.profile.clone(),
-            filesystem: record.filesystem.clone(),
-            record: Some(record),
-        })),
+        Some(record) if record.is_active(now_unix) => {
+            // Lane-declaration discipline: a client that DECLARES one
+            // lane while holding the other class's identity is refused
+            // outright — misconfiguration or replay, never something to
+            // silently reinterpret. (Header-less requests resolve by
+            // the record class alone, matching the peer transport's
+            // long-standing contract that the header is an opt-in.)
+            let is_agent = matches!(
+                record.class,
+                crate::peer::access_policy::IdentityClass::Agent
+            );
+            if (peer_mode && is_agent) || (agent_mode && !is_agent) {
+                return Err((
+                    403,
+                    serde_json::json!({
+                        "error": "identity class does not match the declared lane",
+                        "fingerprint": record.fingerprint,
+                        "label": record.label,
+                    })
+                    .to_string(),
+                ));
+            }
+            Ok(Some(PeerConnectionIdentity {
+                fingerprint: record.fingerprint.clone(),
+                label: record.label.clone(),
+                profile: record.profile.clone(),
+                class: record.class,
+                filesystem: record.filesystem.clone(),
+                record: Some(record),
+            }))
+        }
         Some(record) => Err((
             403,
             serde_json::json!({
-                "error": if matches!(
-                    record.status,
-                    crate::peer::access_policy::PeerIdentityStatus::Approved
+                "error": match (
+                    matches!(
+                        record.status,
+                        crate::peer::access_policy::PeerIdentityStatus::Approved
+                    ),
+                    matches!(record.class, crate::peer::access_policy::IdentityClass::Agent),
                 ) {
-                    "peer identity expired"
-                } else {
-                    "peer identity revoked"
+                    (true, false) => "peer identity expired",
+                    (false, false) => "peer identity revoked",
+                    (true, true) => "agent identity expired",
+                    (false, true) => "agent identity revoked",
                 },
                 "fingerprint": record.fingerprint,
                 "label": record.label,
             })
             .to_string(),
         )),
-        None if peer_mode => Err((
+        None if peer_mode || agent_mode => Err((
             403,
             serde_json::json!({
-                "error": "unknown peer client certificate",
+                "error": if agent_mode {
+                    "unknown agent client certificate"
+                } else {
+                    "unknown peer client certificate"
+                },
                 "fingerprint": fingerprint,
             })
             .to_string(),
@@ -3253,6 +3355,7 @@ mod tests {
         let bus = EventBus::new();
         let mut events = bus.subscribe();
         let identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peer-fingerprint".to_string(),
             label: "Peer label".to_string(),
             profile: "file-reader".to_string(),
@@ -3842,6 +3945,81 @@ mod tests {
         );
     }
 
+    /// The IAM overview projects the record's class faithfully: an
+    /// enrolled agent client reads as `agent_client` with an
+    /// agent-profile grant and its own transport kind — never as a
+    /// federated daemon — while peer records keep their exact
+    /// historical projection beside it.
+    #[test]
+    fn access_overview_projects_agent_identities_as_agent_clients() {
+        let cert_dir = tempfile::TempDir::new().unwrap();
+        let agent_fp = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        crate::peer::access_policy::write_approved_agent_identity(
+            cert_dir.path(),
+            agent_fp,
+            "sidecar",
+            "agent-operator",
+            Some("req-agent"),
+            None,
+        )
+        .unwrap();
+        let peer_fp = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            peer_fp,
+            "peer-e",
+            "stats",
+            None,
+            None,
+        )
+        .unwrap();
+        let identities = crate::peer::access_policy::list_identities(cert_dir.path()).unwrap();
+        let agent_card = serde_json::json!({
+            "id": "local-daemon",
+            "label": "Local daemon",
+            "capabilities": [],
+        });
+        let payload =
+            access_overview_response_value_with_identities(&agent_card, None, &identities);
+
+        let principals = payload["principals"].as_array().expect("principals");
+        assert!(
+            principals.iter().any(|principal| {
+                principal["id"].as_str()
+                    == Some(format!("principal:agent-client:{agent_fp}").as_str())
+                    && principal["kind"].as_str() == Some("agent_client")
+                    && principal["kind_label"].as_str() == Some("Agent client")
+            }),
+            "agent identity must project as an agent_client principal"
+        );
+        assert!(
+            principals.iter().any(|principal| {
+                principal["id"].as_str()
+                    == Some(format!("principal:inbound-peer-daemon:{peer_fp}").as_str())
+                    && principal["kind"].as_str() == Some("peer_daemon")
+            }),
+            "peer identities keep their historical projection"
+        );
+        let grants = payload["grants"].as_array().expect("grants");
+        assert!(
+            grants.iter().any(|grant| {
+                grant["kind"].as_str() == Some("agent_client_profile")
+                    && grant["role"].as_str() == Some("agent_profile")
+                    && grant["profile"].as_str() == Some("agent-operator")
+                    && grant["status"].as_str() == Some("active")
+            }),
+            "the agent grant must carry the agent role vocabulary"
+        );
+        let transports = payload["transports"].as_array().expect("transports");
+        assert!(
+            transports.iter().any(|transport| {
+                transport["kind"].as_str() == Some("agent_client_mtls")
+                    && transport["fingerprint"].as_str() == Some(agent_fp)
+            }),
+            "the agent transport must carry its own kind"
+        );
+    }
+
     #[test]
     fn test_access_overview_merges_local_iam_state_as_unenforced() {
         let agent_card = serde_json::json!({
@@ -4056,6 +4234,133 @@ mod tests {
         assert!(err.1.contains("peer identity revoked"));
     }
 
+    /// The class matrix at resolution: an agent record resolves with
+    /// its class; a lane-declaration mismatch in either direction is a
+    /// 403, never a silent reinterpretation; an unknown certificate
+    /// that declares the agent lane is refused like the peer twin.
+    #[test]
+    fn connection_identity_classes_never_cross_lanes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_fp = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let peer_fp = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let bare = "GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n";
+        let peer_header = "GET /mcp HTTP/1.1\r\nHost: x\r\nx-intendant-peer: 1\r\n\r\n";
+        let agent_header = "GET /mcp HTTP/1.1\r\nHost: x\r\nx-intendant-agent: 1\r\n\r\n";
+
+        // Unknown cert declaring the agent lane: refused by name.
+        let err = resolve_peer_connection_identity_from_cert_dir(
+            tmp.path(),
+            agent_header,
+            Some(agent_fp),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("unknown agent client certificate"));
+
+        crate::peer::access_policy::write_approved_agent_identity(
+            tmp.path(),
+            agent_fp,
+            "sidecar",
+            "agent-operator",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            peer_fp,
+            "peer-b",
+            "read-only-display",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The agent record resolves — headerless and with its own
+        // declaration — carrying its class.
+        for header in [bare, agent_header] {
+            let identity =
+                resolve_peer_connection_identity_from_cert_dir(tmp.path(), header, Some(agent_fp))
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                identity.class,
+                crate::peer::access_policy::IdentityClass::Agent
+            ));
+            assert_eq!(identity.profile, "agent-operator");
+        }
+
+        // Lane mismatches refuse in both directions.
+        let err =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), peer_header, Some(agent_fp))
+                .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("does not match the declared lane"));
+        let err =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), agent_header, Some(peer_fp))
+                .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("does not match the declared lane"));
+
+        // The classed identities bind classed principals at the one
+        // choke point.
+        let agent_identity =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(agent_fp))
+                .unwrap()
+                .unwrap();
+        let principal = peer_identity_access_principal(&agent_identity, "https");
+        assert_eq!(principal.kind, "agent_client");
+        let peer_identity =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(peer_fp))
+                .unwrap()
+                .unwrap();
+        let principal = peer_identity_access_principal(&peer_identity, "https");
+        assert_eq!(principal.kind, "peer_daemon");
+
+        // Revoked agent records name their lane in the refusal.
+        crate::peer::access_policy::revoke_identity(tmp.path(), agent_fp).unwrap();
+        let err = resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(agent_fp))
+            .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("agent identity revoked"));
+    }
+
+    /// The dashboard-control entrance is peer/user-lane only: an
+    /// agent-class identity is refused by name — the grant's Peer arm
+    /// hardcodes the peer principal, and walking an agent in would
+    /// reach peer-only tenant edges (memory propose) under the wrong
+    /// actor class. The agent lane is `/mcp` alone.
+    #[test]
+    fn dashboard_control_grant_refuses_the_agent_lane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent = PeerConnectionIdentity {
+            fingerprint: "dd".repeat(32),
+            label: "sidecar".into(),
+            profile: "agent-operator".into(),
+            class: crate::peer::access_policy::IdentityClass::Agent,
+            filesystem: Default::default(),
+            record: None,
+        };
+        let err = dashboard_control_grant_for_client(tmp.path(), Some(&agent), None, true, false)
+            .unwrap_err();
+        assert!(
+            err.contains("agent identities have no dashboard-control surface"),
+            "{err}"
+        );
+        let peer = PeerConnectionIdentity {
+            fingerprint: "ee".repeat(32),
+            label: "peer".into(),
+            profile: "read-only-display".into(),
+            class: crate::peer::access_policy::IdentityClass::Peer,
+            filesystem: Default::default(),
+            record: None,
+        };
+        assert!(matches!(
+            dashboard_control_grant_for_client(tmp.path(), Some(&peer), None, true, false),
+            Ok(crate::dashboard_control::DashboardControlGrant::Peer { .. })
+        ));
+    }
+
     /// Connections without a TLS client certificate resolve as anonymous,
     /// even when the peer transport's `x-intendant-peer` header is present.
     /// Certless federation modes (`AuthRequirements::none()` on trusted
@@ -4147,6 +4452,7 @@ mod tests {
     fn http_access_context_carries_the_peer_identity_filesystem() {
         let tmp = tempfile::TempDir::new().unwrap();
         let identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peerfp01".to_string(),
             label: "peer-a".to_string(),
             profile: "terminal-operator".to_string(),
@@ -4404,6 +4710,7 @@ mod tests {
             iam_cert_dir: None,
         };
         let peer_identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "fp".to_string(),
             label: "peer".to_string(),
             profile: "peer-root".to_string(),
@@ -4678,6 +4985,7 @@ mod tests {
             iam_cert_dir: None,
         };
         let peer_identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "fp".to_string(),
             label: "peer".to_string(),
             profile: "viewer".to_string(),

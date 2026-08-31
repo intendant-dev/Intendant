@@ -128,6 +128,10 @@ pub(crate) fn identity_summary_json(
         "fingerprint": record.fingerprint,
         "label": record.label,
         "profile": record.profile,
+        // The identity's lane — the durable management surface must
+        // keep saying whether this grant is a peer daemon or an
+        // enrolled agent client long after approval.
+        "class": record.class,
         "status": record.status,
         "active": record.is_active(now_unix),
         "card_url": record.card_url,

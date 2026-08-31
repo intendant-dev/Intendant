@@ -2967,6 +2967,7 @@ mod tests {
         let bus = crate::event::EventBus::new();
         let rt = peer_runtime(&rig);
         let identity = crate::web_gateway::PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "fp".into(),
             label: "scoped-peer".into(),
             profile: "file-operator".into(),

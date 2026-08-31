@@ -309,6 +309,33 @@ pub fn issue_client_certificate_for_public_key(
     Ok(cert.pem())
 }
 
+/// [`issue_client_certificate_for_public_key`]'s agent-lane sibling —
+/// the R1 enrollment ceremony's cert mint. Same never-sees-the-private-key
+/// contract; the CN says `Intendant Agent`.
+pub fn issue_agent_certificate_for_public_key(
+    cert_dir: &Path,
+    label: &str,
+    public_key_pem: &str,
+) -> AccessResult<String> {
+    let ca_path = cert_dir.join(CA_CRT);
+    let key_path = cert_dir.join(CA_KEY);
+    if !ca_path.exists() || !key_path.exists() {
+        return Err(AccessError(format!(
+            "no access CA found in {} — run `intendant access setup` first",
+            cert_dir.display()
+        )));
+    }
+    let ca_pem = std::fs::read_to_string(ca_path)?;
+    let ca_key_pem = read_ca_key_pem(&key_path)?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+    let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
+    let public_key = SubjectPublicKeyInfo::from_pem(public_key_pem)
+        .map_err(|e| AccessError(format!("parse requester public key: {e}")))?;
+    let params = agent_cert_params(label)?;
+    let cert = params.signed_by(&public_key, &ca_issuer)?;
+    Ok(cert.pem())
+}
+
 fn regenerate_server_cert(cert_dir: &Path, server_names: &ServerNames) -> AccessResult<()> {
     let ca_pem = std::fs::read_to_string(cert_dir.join(CA_CRT))?;
     let ca_key_pem = read_ca_key_pem(&cert_dir.join(CA_KEY))?;
@@ -507,11 +534,24 @@ fn generate_client_cert(
 }
 
 fn client_cert_params(label: &str) -> AccessResult<CertificateParams> {
+    client_params_with_cn(format!("Intendant Client ({label})"))
+}
+
+/// The agent-lane credential shape (R1): identical CA, key usages, and
+/// validity — only the CN names the lane, for humans reading cert
+/// dumps and store listings. Enforcement never reads the CN: which
+/// lane a certificate authenticates into is decided solely by its
+/// identity record's class.
+fn agent_cert_params(label: &str) -> AccessResult<CertificateParams> {
+    client_params_with_cn(format!("Intendant Agent ({label})"))
+}
+
+fn client_params_with_cn(common_name: String) -> AccessResult<CertificateParams> {
     let mut params =
         CertificateParams::new(vec![]).map_err(|e| AccessError(format!("client params: {e}")))?;
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("Intendant Client ({label})"));
+        .push(DnType::CommonName, common_name);
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,

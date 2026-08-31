@@ -974,6 +974,9 @@ fn plan_org_peer_grant(
         label,
         profile,
         status: pol::PeerIdentityStatus::Approved,
+        // Org grant documents materialize federated daemons only — the
+        // agent lane enrolls exclusively through its own ceremony.
+        class: pol::IdentityClass::Peer,
         card_url: existing.as_ref().and_then(|r| r.card_url.clone()),
         request_id: existing.as_ref().and_then(|r| r.request_id.clone()),
         filesystem: existing
@@ -2812,6 +2815,7 @@ mod tests {
             label: "peer".to_string(),
             profile: "session-reader".to_string(),
             status: crate::access::access_policy::PeerIdentityStatus::Approved,
+            class: crate::access::access_policy::IdentityClass::Peer,
             card_url: None,
             request_id: None,
             filesystem: Default::default(),

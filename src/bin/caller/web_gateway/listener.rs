@@ -2312,10 +2312,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // Browser-enrolled certificates resolve no record and
                     // are refused byte-identically; the owner-name
                     // (custom-domain) lane stays lease-only.
+                    // Peer daemons only: the agent class (R1 sidecar)
+                    // has no relay WS admission at all — its scoped
+                    // lane is `POST /mcp`, and nothing the sidecar
+                    // does needs a socket.
                     let admitted_relay_peer_ws = config.connect.relay_peer_admission
                         && base_discovery_only_ws
                         && !custom_domain_selected
-                        && peer_connection_identity.is_some();
+                        && peer_connection_identity.as_ref().is_some_and(|identity| {
+                            matches!(
+                                identity.class,
+                                crate::peer::access_policy::IdentityClass::Peer
+                            )
+                        });
                     let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
@@ -4805,6 +4814,93 @@ mod tests {
         assert_eq!(
             ws_with_identity, ws_anonymous,
             "key off: the WS refusal must be byte-identical to the anonymous one"
+        );
+    }
+
+    /// Agent-class identities under the same admission key are scoped
+    /// to `/mcp` on the relay (the amendment that created the class):
+    /// the sidecar's endpoint is admitted, every other path keeps the
+    /// discovery-only refusal, the `/ws` upgrade is refused outright —
+    /// agents have no relay socket at all — and the direct mTLS lane
+    /// stays ordinarily profile-gated, not path-scoped.
+    #[tokio::test]
+    async fn relay_agent_admission_is_scoped_to_mcp() {
+        let mut config = WebGatewayConfig::default();
+        config.connect.relay_peer_admission = true;
+        let gw = spawn_relay_ingress_test_gateway_with_peer_auth(config).await;
+
+        let agent =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "sidecar").unwrap();
+        let agent_fp = crate::peer::access_policy::fingerprint_pem(&agent.cert_pem).unwrap();
+        crate::peer::access_policy::write_approved_agent_identity(
+            gw.access_dir(),
+            &agent_fp,
+            "sidecar",
+            "agent-operator",
+            None,
+            None,
+        )
+        .unwrap();
+
+        const MCP_POST: &str = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let via_relay_mcp = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &agent,
+            false,
+            MCP_POST,
+        )
+        .await;
+        assert!(
+            !via_relay_mcp.contains(DISCOVERY_ONLY_REFUSAL),
+            "the agent lane must be admitted to /mcp through the relay: {via_relay_mcp}"
+        );
+        // This rig attaches no MCP server, so the gate's own ladder
+        // answers with ITS unavailability shape — proof the request
+        // cleared transport admission and reached the endpoint.
+        assert!(
+            via_relay_mcp.contains("MCP server not available"),
+            "the admitted call lands in the MCP gate's own ladder: {via_relay_mcp}"
+        );
+        let via_relay_config = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &agent,
+            false,
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            via_relay_config.contains(DISCOVERY_ONLY_REFUSAL),
+            "everything but /mcp keeps the discovery-only refusal for agents: {via_relay_config}"
+        );
+        let via_relay_ws = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &agent,
+            false,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        assert!(
+            via_relay_ws.contains(DISCOVERY_ONLY_REFUSAL),
+            "agents have no relay WS admission: {via_relay_ws}"
+        );
+        let via_direct_config = identity_request(
+            gw.gateway.direct_addr,
+            false,
+            gw.ca_der.clone(),
+            &agent,
+            false,
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            via_direct_config.starts_with("HTTP/1.1 200"),
+            "direct mTLS stays profile-gated, not path-scoped: {via_direct_config}"
         );
     }
 

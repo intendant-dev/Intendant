@@ -3525,6 +3525,7 @@ mod peer_approval_attribution_tests {
 
     fn identity(label: &str) -> PeerConnectionIdentity {
         PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "aabbccddeeff00112233".to_string(),
             label: label.to_string(),
             profile: "peer-root".to_string(),

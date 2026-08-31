@@ -364,10 +364,20 @@ pub(crate) async fn serve_http_request(
     // custom-domain (owner-name) browser lane is deliberately outside the
     // exemption: peers dial the fleet name, and the owner-name lane stays
     // lease-only in both key states.
+    // Agent-class identities (the R1 sidecar lane) ride the same knob
+    // but are admitted to `/mcp` ALONE on the relay: the sidecar needs
+    // exactly that endpoint, and the amendment that created the class
+    // scopes its relay admission to it — a peer daemon's whole-gateway
+    // admission stays exactly as it was.
     let admitted_relay_peer = relay_peer_admission
         && base_discovery_only_ingress
         && !custom_domain_selected
-        && peer_connection_identity.is_some();
+        && peer_connection_identity
+            .as_ref()
+            .is_some_and(|identity| match identity.class {
+                crate::peer::access_policy::IdentityClass::Peer => true,
+                crate::peer::access_policy::IdentityClass::Agent => req_path == "/mcp",
+            });
     // A custom-domain TLS name is itself a live authority decision even
     // before a passkey endpoint mints a lease. Retain that decision at the
     // transport edge now, so body reads, authority-worker awaits, and

@@ -39429,7 +39429,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '04ddfd99177d54b9';
+const INTENDANT_APP_BUILD = '821cdd1c6b3f2d3d';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -81796,8 +81796,8 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'agent_client', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, enrolled agent clients, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
       },
       role_ceilings: {
         connect_account: 'role:none',
@@ -123904,6 +123904,17 @@ function setDaemonPairingStatus(id, msg, kind) {
   el.className = 'daemon-pairing-status' + (kind ? ' ' + kind : '');
 }
 
+// Agent-lane profiles (mirrors the daemon's AGENT_PROFILES — pinned by
+// the same parity test that pins PEER_PROFILE_OPTIONS): offered ONLY on
+// agent-class enrollment requests, never in the peer picker.
+const AGENT_PROFILE_OPTIONS = [
+  {
+    profile: 'agent-operator',
+    label: 'Agent operator (ceiling)',
+    summary: 'Everything a machine principal may hold — approvals, sessions, terminal, displays — except access administration and credential custody. Grant a narrower peer profile below to cap further.',
+  },
+];
+
 const PEER_PROFILE_OPTIONS = [
   {
     profile: 'read-only-display',
@@ -123985,20 +123996,35 @@ function peerProfileMeta(profile) {
     'peer-daemon': 'peer-root',
   };
   const canonical = aliases[value] || value;
-  return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical) || {
-    profile: canonical,
-    label: canonical || 'Presence only',
-    summary: 'Unknown profiles are treated as presence-only by this build.',
-  };
+  return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical)
+    || AGENT_PROFILE_OPTIONS.find(item => item.profile === canonical)
+    || {
+      profile: canonical,
+      label: canonical || 'Presence only',
+      summary: 'Unknown profiles are treated as presence-only by this build.',
+    };
 }
 
-function renderPeerProfileOptions(selected) {
+function renderPeerProfileOptions(selected, requestClass) {
   // Mirrors the daemon's DEFAULT_PROFILE (access_policy.rs): an approval
-  // with no stated profile yields read-only-display.
+  // with no stated profile yields read-only-display. Agent-class
+  // requests additionally offer the agent ceiling — without it, a
+  // requested agent-operator would silently fall back to the first
+  // peer option and the approval would post that narrower override.
   const value = String(selected || 'read-only-display').toLowerCase();
   const selectedMeta = peerProfileMeta(value);
-  return PEER_PROFILE_OPTIONS.map(({ profile, label, summary }) => (
-    `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
+  // The ceiling rides LAST, and an unknown or mistyped requested
+  // profile preselects the cautious default — never whatever happens
+  // to sit first. A fail-closed request must not become the maximum
+  // grant through a typo plus the browser's first-option fallback.
+  const options = requestClass === 'agent'
+    ? PEER_PROFILE_OPTIONS.concat(AGENT_PROFILE_OPTIONS)
+    : PEER_PROFILE_OPTIONS;
+  const effective = options.some(item => item.profile === selectedMeta.profile)
+    ? selectedMeta.profile
+    : 'read-only-display';
+  return options.map(({ profile, label, summary }) => (
+    `<option value="${escapeHtml(profile)}" ${profile === effective ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
   )).join('');
 }
 
@@ -124262,7 +124288,15 @@ function renderPeerAccessRequests(requests) {
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
     const requestedProfile = req.approved_profile || req.requested_profile || 'read-only-display';
-    const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
+    // Which lane approving MINTS (the daemon's stored request class):
+    // an agent client is not a peer daemon, and the owner must see the
+    // difference before deciding. Absent = a pre-agent daemon = peer.
+    const requestClass = String(req.class || 'peer').toLowerCase();
+    const isAgentRequest = requestClass === 'agent';
+    const laneWord = isAgentRequest ? 'agent' : 'peer';
+    const roleLabel = req.approved_profile
+      ? `Approved ${laneWord} profile`
+      : `Requested ${laneWord} profile`;
     // Cross-owner tier claim (docs/src/trust-tiers.md § Where fleet
     // metadata rides): the daemon stores requester_tier only when the
     // claim was signed inside a verified caller-ID, so presence here
@@ -124298,8 +124332,11 @@ function renderPeerAccessRequests(requests) {
         ${upwardAlarm
           ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. Approving would hand a disposable box authority on this integrated one — the tier bridge the doctrine warns about.">⚠ Upward grant: this is a disposable machine asking for authority on an integrated one. Approving bridges your tiers.</div>'
           : (pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : '')}
+        ${isAgentRequest
+          ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="This enrollment mints an agent-client identity — a machine principal that drives this daemon over MCP at whatever profile you grant. It is not a federated peer daemon.">🤖 AGENT enrollment: approving lets this machine operate the daemon at the granted profile.</div>'
+          : ''}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
-        ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
+        ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile, requestClass)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
           <button class="approve" type="button" data-access-request-action="approve" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Approve</button>
           <button class="deny" type="button" data-access-request-action="deny" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Deny</button>
@@ -124382,19 +124419,26 @@ function renderPeerIdentities(identities) {
 
   list.innerHTML = identities.map(identity => {
     const fingerprint = String(identity.fingerprint || '');
-    const label = escapeHtml(identity.label || 'Unnamed daemon');
+    // The lane the daemon stored for this grant (absent = a record
+    // from before the agent lane = peer): the durable management
+    // surface must keep the peer/agent distinction visible.
+    const identityClass = String(identity.class || 'peer').toLowerCase();
+    const isAgent = identityClass === 'agent';
+    const label = escapeHtml(identity.label || (isAgent ? 'Unnamed agent' : 'Unnamed daemon'));
     const status = String(identity.status || 'unknown').toLowerCase();
     const role = peerProfileMeta(identity.profile || 'presence-only');
     const request = identity.request_id ? `Request ${escapeHtml(identity.request_id)}` : '';
     const card = identity.card_url ? escapeHtml(identity.card_url) : '';
     const active = status === 'approved';
+    const laneLabel = isAgent ? 'Agent profile' : 'Peer profile';
     return `
       <div class="daemon-identity-card ${escapeHtml(status)}">
         <div class="daemon-identity-head">
-          <span>${label}</span>
+          <span>${isAgent ? '🤖 ' : ''}${label}</span>
           <span class="daemon-identity-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
         </div>
-        <div class="daemon-identity-role" title="Peer profile ${escapeHtml(identity.profile || 'presence-only')}">Peer profile ${escapeHtml(role.label)}</div>
+        ${isAgent ? '<div class="daemon-access-request-meta" title="An enrolled agent client: a machine principal that drives this daemon over MCP at the granted profile. Not a federated peer daemon.">agent client (MCP lane)</div>' : ''}
+        <div class="daemon-identity-role" title="${laneLabel} ${escapeHtml(identity.profile || 'presence-only')}">${laneLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-identity-profile">${escapeHtml(role.summary)}${request ? ` - ${request}` : ''}</div>
         ${card ? `<div class="daemon-identity-profile">${card}</div>` : ''}
         <div class="daemon-identity-fingerprint" title="${escapeHtml(fingerprint)}">${escapeHtml(fingerprint)}</div>

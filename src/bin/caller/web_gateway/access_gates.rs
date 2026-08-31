@@ -966,6 +966,7 @@ mod tests {
         let bus = EventBus::new();
         assert!(!peer_identity_allows_ws_control(None, &control, &bus));
         let peer = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peer-fingerprint".to_string(),
             label: "observer".to_string(),
             profile: "observer".to_string(),
@@ -1131,6 +1132,7 @@ mod tests {
         ));
 
         let peer = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peer-fingerprint".to_string(),
             label: "trusted peer".to_string(),
             profile: "observer".to_string(),
