@@ -480,8 +480,9 @@ pub(crate) fn create_pending_request(
     let now = unix_timestamp();
     let expires_at_unix = now + effective_ttl_secs(config);
     let path = request_path(cert_dir, &request_id);
-    if let Some(existing) = read_request_path(&path)? {
-        if !matches!(effective_status(&existing), AccessRequestStatus::Pending) {
+    let existing = read_request_path(&path)?;
+    if let Some(existing) = &existing {
+        if !matches!(effective_status(existing), AccessRequestStatus::Pending) {
             return Err(CallerError::Config(format!(
                 "pairing request {} is already {:?}",
                 existing.code, existing.status
@@ -518,6 +519,26 @@ pub(crate) fn create_pending_request(
         client_cert_pem: None,
         target_daemon_identity_public_key: target_identity_public_key,
     };
+    // A pending record may be re-posted idempotently (a retry), never
+    // REWRITTEN: the same key+nonce yields the same request id, and the
+    // owner may already be looking at this request on an approval
+    // surface — a replay that flips any decision input (the CLASS above
+    // all: peer↔agent changes what the approval mints) would race the
+    // stale view into approving something the owner never evaluated.
+    if let Some(existing) = &existing {
+        let changed = existing.class != stored.class
+            || existing.requested_profile != stored.requested_profile
+            || existing.requester_label != stored.requester_label
+            || existing.requester_card_url != stored.requester_card_url
+            || existing.requester_daemon_id != stored.requester_daemon_id
+            || existing.requester_tier != stored.requester_tier;
+        if changed {
+            return Err(CallerError::Config(format!(
+                "pairing request {} is already pending with different parameters; deny it first, then re-request",
+                existing.code
+            )));
+        }
+    }
     write_request(cert_dir, &stored)?;
     eprintln!(
         "intendant: {} access request {} from {}{}; approve with `intendant peer approve {}`",
@@ -1955,6 +1976,94 @@ mod tests {
             .unwrap()
             .client_cert_pem
             .contains("BEGIN CERTIFICATE"));
+    }
+
+    /// A pending record is idempotent under byte-equivalent retries
+    /// and REFUSES a replay that changes any decision input — above
+    /// all the class: the same key+nonce yields the same request id,
+    /// and a peer↔agent flip under the owner's stale approval view
+    /// would mint a lane the owner never evaluated.
+    #[test]
+    fn pending_request_replays_cannot_change_decision_inputs() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let build = |class: Option<crate::access::access_policy::IdentityClass>,
+                     profile: Option<&str>| AccessRequestCreate {
+            version: 1,
+            requester_label: "replayer".into(),
+            public_key_pem: key.public_key_pem.clone(),
+            nonce: "replaynonce000001".into(),
+            requested_profile: profile.map(str::to_string),
+            requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
+            requester_tier: None,
+            requested_class: class,
+        };
+        let card = "https://target/.well-known/agent-card.json".to_string();
+        let config = PeerAccessRequestConfig::default();
+        let created = create_pending_request(
+            certs.path(),
+            build(
+                Some(crate::access::access_policy::IdentityClass::Agent),
+                None,
+            ),
+            card.clone(),
+            Some("127.0.0.1".into()),
+            &config,
+            None,
+        )
+        .unwrap();
+        // Byte-equivalent retry: idempotent, same id.
+        let retried = create_pending_request(
+            certs.path(),
+            build(
+                Some(crate::access::access_policy::IdentityClass::Agent),
+                None,
+            ),
+            card.clone(),
+            Some("127.0.0.1".into()),
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(retried.request_id, created.request_id);
+        // A class flip refuses; so does a profile flip.
+        let err = create_pending_request(
+            certs.path(),
+            build(None, None),
+            card.clone(),
+            Some("127.0.0.1".into()),
+            &config,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("different parameters"),
+            "class flip must refuse: {err}"
+        );
+        let err = create_pending_request(
+            certs.path(),
+            build(
+                Some(crate::access::access_policy::IdentityClass::Agent),
+                Some("peer-operator"),
+            ),
+            card,
+            Some("127.0.0.1".into()),
+            &config,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different parameters"));
+        // The stored record still carries the ORIGINAL class.
+        let stored = find_request(certs.path(), &created.code).unwrap();
+        assert!(matches!(
+            stored.class,
+            crate::access::access_policy::IdentityClass::Agent
+        ));
     }
 
     /// An agent-class knock mints the agent lane end-to-end: the

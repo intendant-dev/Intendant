@@ -2586,11 +2586,18 @@ function renderPeerProfileOptions(selected, requestClass) {
   // peer option and the approval would post that narrower override.
   const value = String(selected || 'read-only-display').toLowerCase();
   const selectedMeta = peerProfileMeta(value);
+  // The ceiling rides LAST, and an unknown or mistyped requested
+  // profile preselects the cautious default — never whatever happens
+  // to sit first. A fail-closed request must not become the maximum
+  // grant through a typo plus the browser's first-option fallback.
   const options = requestClass === 'agent'
-    ? AGENT_PROFILE_OPTIONS.concat(PEER_PROFILE_OPTIONS)
+    ? PEER_PROFILE_OPTIONS.concat(AGENT_PROFILE_OPTIONS)
     : PEER_PROFILE_OPTIONS;
+  const effective = options.some(item => item.profile === selectedMeta.profile)
+    ? selectedMeta.profile
+    : 'read-only-display';
   return options.map(({ profile, label, summary }) => (
-    `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
+    `<option value="${escapeHtml(profile)}" ${profile === effective ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
   )).join('');
 }
 
