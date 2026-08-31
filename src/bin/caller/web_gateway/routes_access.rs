@@ -1446,13 +1446,31 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
             crate::peer::access_policy::PeerIdentityStatus::Approved => "expired",
             crate::peer::access_policy::PeerIdentityStatus::Revoked => "revoked",
         };
-        let principal_id = format!("principal:inbound-peer-daemon:{fingerprint}");
-        let grant_id = format!("grant:inbound-peer:{fingerprint}:{}", identity.profile);
-        let transport_id = format!("transport:inbound-peer-mtls:{fingerprint}");
+        // The overview projects the record's class faithfully — an
+        // enrolled agent client must never read as a federated daemon
+        // on the IAM topology the owner audits (it would contradict the
+        // identity listing and misstate what the grant admits).
+        let is_agent = matches!(
+            identity.class,
+            crate::peer::access_policy::IdentityClass::Agent
+        );
+        let (principal_id, grant_id, transport_id) = if is_agent {
+            (
+                format!("principal:agent-client:{fingerprint}"),
+                format!("grant:agent-client:{fingerprint}:{}", identity.profile),
+                format!("transport:agent-client-mtls:{fingerprint}"),
+            )
+        } else {
+            (
+                format!("principal:inbound-peer-daemon:{fingerprint}"),
+                format!("grant:inbound-peer:{fingerprint}:{}", identity.profile),
+                format!("transport:inbound-peer-mtls:{fingerprint}"),
+            )
+        };
         principals.push(serde_json::json!({
             "id": principal_id.clone(),
-            "kind": "peer_daemon",
-            "kind_label": "Peer daemon",
+            "kind": if is_agent { "agent_client" } else { "peer_daemon" },
+            "kind_label": if is_agent { "Agent client" } else { "Peer daemon" },
             "label": identity.label.clone(),
             "source": "peer_access_identity",
             "target_id": local_target_id.clone(),
@@ -1464,18 +1482,18 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
             "organization": serde_json::Value::Null,
             "authn": [{
                 "kind": "daemon_mutual_tls",
-                "label": "Daemon mTLS identity"
+                "label": if is_agent { "Agent mTLS identity" } else { "Daemon mTLS identity" }
             }]
         }));
         grants.push(serde_json::json!({
             "id": grant_id,
             "principal_id": principal_id,
             "target_id": local_target_id.clone(),
-            "kind": "inbound_daemon_peer_profile",
-            "kind_label": "Inbound daemon peer profile",
-            "policy_id": "policy:peer-profile",
-            "role": "peer_profile",
-            "role_label": "Peer profile",
+            "kind": if is_agent { "agent_client_profile" } else { "inbound_daemon_peer_profile" },
+            "kind_label": if is_agent { "Agent client profile" } else { "Inbound daemon peer profile" },
+            "policy_id": if is_agent { "policy:agent-profile" } else { "policy:peer-profile" },
+            "role": if is_agent { "agent_profile" } else { "peer_profile" },
+            "role_label": if is_agent { "Agent profile" } else { "Peer profile" },
             "profile": identity.profile.clone(),
             "transport_id": transport_id.clone(),
             "source": "peer_access_identity",
@@ -1489,8 +1507,8 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
         }));
         transports.push(serde_json::json!({
             "id": transport_id,
-            "kind": "inbound_peer_mtls",
-            "kind_label": "Inbound peer mTLS",
+            "kind": if is_agent { "agent_client_mtls" } else { "inbound_peer_mtls" },
+            "kind_label": if is_agent { "Agent client mTLS" } else { "Inbound peer mTLS" },
             "label": identity.label.clone(),
             "status": status,
             "implementation": "daemon_mutual_tls_inbound",
@@ -3924,6 +3942,81 @@ mod tests {
                 && transport["fingerprint"].as_str() == Some(fp)
                 && transport["status"].as_str() == Some("active")),
             "inbound peer mTLS transport should be visible"
+        );
+    }
+
+    /// The IAM overview projects the record's class faithfully: an
+    /// enrolled agent client reads as `agent_client` with an
+    /// agent-profile grant and its own transport kind — never as a
+    /// federated daemon — while peer records keep their exact
+    /// historical projection beside it.
+    #[test]
+    fn access_overview_projects_agent_identities_as_agent_clients() {
+        let cert_dir = tempfile::TempDir::new().unwrap();
+        let agent_fp = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        crate::peer::access_policy::write_approved_agent_identity(
+            cert_dir.path(),
+            agent_fp,
+            "sidecar",
+            "agent-operator",
+            Some("req-agent"),
+            None,
+        )
+        .unwrap();
+        let peer_fp = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            peer_fp,
+            "peer-e",
+            "stats",
+            None,
+            None,
+        )
+        .unwrap();
+        let identities = crate::peer::access_policy::list_identities(cert_dir.path()).unwrap();
+        let agent_card = serde_json::json!({
+            "id": "local-daemon",
+            "label": "Local daemon",
+            "capabilities": [],
+        });
+        let payload =
+            access_overview_response_value_with_identities(&agent_card, None, &identities);
+
+        let principals = payload["principals"].as_array().expect("principals");
+        assert!(
+            principals.iter().any(|principal| {
+                principal["id"].as_str()
+                    == Some(format!("principal:agent-client:{agent_fp}").as_str())
+                    && principal["kind"].as_str() == Some("agent_client")
+                    && principal["kind_label"].as_str() == Some("Agent client")
+            }),
+            "agent identity must project as an agent_client principal"
+        );
+        assert!(
+            principals.iter().any(|principal| {
+                principal["id"].as_str()
+                    == Some(format!("principal:inbound-peer-daemon:{peer_fp}").as_str())
+                    && principal["kind"].as_str() == Some("peer_daemon")
+            }),
+            "peer identities keep their historical projection"
+        );
+        let grants = payload["grants"].as_array().expect("grants");
+        assert!(
+            grants.iter().any(|grant| {
+                grant["kind"].as_str() == Some("agent_client_profile")
+                    && grant["role"].as_str() == Some("agent_profile")
+                    && grant["profile"].as_str() == Some("agent-operator")
+                    && grant["status"].as_str() == Some("active")
+            }),
+            "the agent grant must carry the agent role vocabulary"
+        );
+        let transports = payload["transports"].as_array().expect("transports");
+        assert!(
+            transports.iter().any(|transport| {
+                transport["kind"].as_str() == Some("agent_client_mtls")
+                    && transport["fingerprint"].as_str() == Some(agent_fp)
+            }),
+            "the agent transport must carry its own kind"
         );
     }
 
