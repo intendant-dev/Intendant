@@ -135,7 +135,7 @@ fn normalized_skill_document(
         .get("description")
         .and_then(Value::as_str)
         .map(str::trim)
-        .is_none_or(str::is_empty)
+        .is_none_or(|description| description.is_empty())
     {
         return Err(format!(
             "{}: frontmatter description must be a non-empty string",
@@ -157,22 +157,16 @@ fn normalized_skill_document(
 
 fn scalar_frontmatter_value(key: &str, value: String) -> Result<Value, String> {
     match key {
-        "disable-auto-invocation" | "disable_auto_invocation" | "sandbox" => {
-            match value.as_str() {
-                "true" => Ok(Value::Bool(true)),
-                "false" => Ok(Value::Bool(false)),
-                other => Err(format!("{key}: expected true or false, got {other:?}")),
-            }
-        }
+        "disable-auto-invocation" | "disable_auto_invocation" | "sandbox" => match value.as_str() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            other => Err(format!("{key}: expected true or false, got {other:?}")),
+        },
         _ => Ok(Value::String(value)),
     }
 }
 
-pub(super) fn write_yaml_entry(
-    out: &mut String,
-    key: &str,
-    value: &Value,
-) -> Result<(), String> {
+pub(super) fn write_yaml_entry(out: &mut String, key: &str, value: &Value) -> Result<(), String> {
     match value {
         Value::String(value) => {
             out.push_str(key);
@@ -215,9 +209,9 @@ pub(super) fn write_yaml_entry(
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty()
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(format!("unsafe skill name {name:?}"));
     }
@@ -231,9 +225,9 @@ pub(super) fn validate_resource_path(path: &str) -> Result<(), String> {
         || path.split('/').any(|component| {
             component.is_empty()
                 || matches!(component, "." | "..")
-                || !component.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                })
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         })
     {
         return Err(format!("unsafe skill resource path {path:?}"));
