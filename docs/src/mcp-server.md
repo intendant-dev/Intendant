@@ -60,7 +60,7 @@ agent-to-user collaboration primitives (`post_session_note`, `ask_user`,
 `notify_user`); the Agenda tools (`agenda_list`, `agenda_item`, `agenda_op`)
 and the Memory retrieval/propose tools; the shared-view
 tools; and the minimal display/CU set (`list_displays`,
-`create_virtual_display`, `grant_user_display`, `request_user_display`,
+`create_virtual_display`, `destroy_virtual_display`, `grant_user_display`, `request_user_display`,
 `revoke_user_display`, `take_screenshot`, `read_screen`, `execute_cu_actions`,
 `display_readiness`) — managed and vanilla alike. Managed context additionally
 advertises rewind/backout and fission tools. The other profile names
@@ -347,7 +347,8 @@ claim instead.
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
-| `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer. On Linux, each dashboard-created display has a fresh daemon-held Xauthority cookie and no X11 TCP listener; capture, input, and its bound browser authenticate explicitly. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
+| `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer and returns its id plus an opaque `capture_generation`. On Linux, each dashboard-created display has a fresh daemon-held Xauthority cookie and no X11 TCP listener; capture, input, and its bound browser authenticate explicitly. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
+| `destroy_virtual_display` | Destroy exactly the daemon-owned virtual-display generation returned by `create_virtual_display`. Bound browser workspaces are retired before capture and Xvfb; a stale generation is refused without touching the live display. | `display_id`, `capture_generation`, `note?` |
 | `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
 | `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |

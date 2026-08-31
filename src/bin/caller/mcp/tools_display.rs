@@ -126,7 +126,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for this exact request's correlated terminal result and returns JSON with request_id plus the new display id/geometry or error."
+        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for this exact request's correlated terminal result and returns JSON with request_id, display id/geometry, and the opaque capture_generation required for exact teardown."
     )]
     pub(crate) async fn create_virtual_display(
         &self,
@@ -161,13 +161,15 @@ impl IntendantServer {
                 display_id,
                 width,
                 height,
+                capture_generation,
             }) => serde_json::json!({
                 "ok": true,
                 "request_id": request_id,
                 "display_id": display_id,
                 "display_target": format!("display_{display_id}"),
                 "width": width,
-                "height": height
+                "height": height,
+                "capture_generation": capture_generation
             })
             .to_string(),
             Ok(crate::event::VirtualDisplayCreateOutcome::Failed { reason }) => serde_json::json!({
@@ -186,6 +188,81 @@ impl IntendantServer {
                 "ok": false,
                 "request_id": request_id,
                 "error": "virtual display event bus closed before the correlated result arrived"
+            })
+            .to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes every browser bound to that display first, and waits for correlated teardown. A stale generation is refused without touching the live display."
+    )]
+    pub(crate) async fn destroy_virtual_display(
+        &self,
+        Parameters(params): Parameters<DestroyVirtualDisplayParams>,
+    ) -> String {
+        let request_id = format!("vdd-{}", uuid::Uuid::new_v4().simple());
+        let waiter = match self
+            .bus
+            .register_virtual_display_destroy_waiter(request_id.clone())
+        {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "display_id": params.display_id,
+                    "capture_generation": params.capture_generation,
+                    "error": error
+                })
+                .to_string();
+            }
+        };
+        self.bus.send(AppEvent::ControlCommand(
+            ControlMsg::DestroyVirtualDisplay {
+                request_id: request_id.clone(),
+                display_id: params.display_id,
+                capture_generation: params.capture_generation.clone(),
+                note: params.note,
+            },
+        ));
+        match waiter.wait(std::time::Duration::from_secs(20)).await {
+            Ok(crate::event::VirtualDisplayDestroyOutcome::Destroyed {
+                display_id,
+                capture_generation,
+                closed_browser_workspace_ids,
+            }) => serde_json::json!({
+                "ok": true,
+                "request_id": request_id,
+                "display_id": display_id,
+                "display_target": format!("display_{display_id}"),
+                "capture_generation": capture_generation,
+                "closed_browser_workspace_ids": closed_browser_workspace_ids
+            })
+            .to_string(),
+            Ok(crate::event::VirtualDisplayDestroyOutcome::Refused { reason }) => {
+                serde_json::json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "display_id": params.display_id,
+                    "capture_generation": params.capture_generation,
+                    "error": reason
+                })
+                .to_string()
+            }
+            Err(crate::event::VirtualDisplayDestroyWaitError::TimedOut) => serde_json::json!({
+                "ok": false,
+                "request_id": request_id,
+                "display_id": params.display_id,
+                "capture_generation": params.capture_generation,
+                "error": "virtual display destruction did not return its correlated result within 20s"
+            })
+            .to_string(),
+            Err(crate::event::VirtualDisplayDestroyWaitError::Closed) => serde_json::json!({
+                "ok": false,
+                "request_id": request_id,
+                "display_id": params.display_id,
+                "capture_generation": params.capture_generation,
+                "error": "virtual display event bus closed before the correlated destroy result arrived"
             })
             .to_string(),
         }
@@ -1822,6 +1899,7 @@ mod tests {
                 display_id: 89,
                 width: 640,
                 height: 480,
+                capture_generation: "generation-unrelated".to_string(),
             },
         ));
         // Overflow the best-effort broadcast ring. Terminal delivery uses a
@@ -1842,6 +1920,7 @@ mod tests {
                 display_id: 102,
                 width: 1000,
                 height: 700,
+                capture_generation: "generation-second".to_string(),
             },
         ));
         let second_json: serde_json::Value = serde_json::from_str(
@@ -1855,6 +1934,7 @@ mod tests {
         assert_eq!(second_json["request_id"], second_id);
         assert_eq!(second_json["display_id"], 102);
         assert_eq!(second_json["display_target"], "display_102");
+        assert_eq!(second_json["capture_generation"], "generation-second");
         assert!(!first.is_finished());
 
         assert!(bus.complete_virtual_display_create(
@@ -1906,6 +1986,80 @@ mod tests {
         assert!(!bus.complete_virtual_display_create(
             "vdc-cancelled",
             crate::event::VirtualDisplayCreateOutcome::Failed {
+                reason: "cancelled".to_string(),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_virtual_display_destroy_returns_its_correlated_receipt() {
+        let bus = EventBus::new();
+        let mut command_rx = bus.subscribe();
+        let server = IntendantServer::new(test_state(), bus.clone());
+        let destroy = tokio::spawn(async move {
+            server
+                .destroy_virtual_display(Parameters(DestroyVirtualDisplayParams {
+                    display_id: 99,
+                    capture_generation: "vdcg-live".to_string(),
+                    note: Some("capture complete".to_string()),
+                }))
+                .await
+        });
+
+        let request_id = loop {
+            match timeout(Duration::from_secs(1), command_rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::DestroyVirtualDisplay {
+                    request_id,
+                    display_id: 99,
+                    capture_generation,
+                    note,
+                }))) => {
+                    assert_eq!(capture_generation, "vdcg-live");
+                    assert_eq!(note.as_deref(), Some("capture complete"));
+                    break request_id;
+                }
+                Ok(Ok(_)) => continue,
+                other => panic!("expected correlated destroy command, got {other:?}"),
+            }
+        };
+        assert!(bus.complete_virtual_display_destroy(
+            &request_id,
+            crate::event::VirtualDisplayDestroyOutcome::Destroyed {
+                display_id: 99,
+                capture_generation: "vdcg-live".to_string(),
+                closed_browser_workspace_ids: vec!["bw-1".to_string()],
+            },
+        ));
+
+        let result: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(1), destroy)
+                .await
+                .expect("destroy should complete")
+                .expect("destroy task should not panic"),
+        )
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["request_id"], request_id);
+        assert_eq!(result["display_id"], 99);
+        assert_eq!(result["capture_generation"], "vdcg-live");
+        assert_eq!(result["closed_browser_workspace_ids"][0], "bw-1");
+    }
+
+    #[tokio::test]
+    async fn virtual_display_destroy_wait_cancellation_fails_closed() {
+        let bus = EventBus::new();
+        let waiter = bus
+            .register_virtual_display_destroy_waiter("vdd-cancelled".to_string())
+            .unwrap();
+        assert!(bus.virtual_display_destroy_is_pending("vdd-cancelled"));
+        assert!(bus
+            .register_virtual_display_destroy_waiter("vdd-cancelled".to_string())
+            .is_err());
+        drop(waiter);
+        assert!(!bus.virtual_display_destroy_is_pending("vdd-cancelled"));
+        assert!(!bus.complete_virtual_display_destroy(
+            "vdd-cancelled",
+            crate::event::VirtualDisplayDestroyOutcome::Refused {
                 reason: "cancelled".to_string(),
             }
         ));

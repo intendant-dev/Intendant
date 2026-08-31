@@ -1488,6 +1488,20 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOGS_URI)
         }
+        ControlMsg::DestroyVirtualDisplay { .. } => {
+            // The serial user-display listener owns generation validation,
+            // browser retirement, capture removal, and Xvfb shutdown. This
+            // surface acknowledges only that the correlated intent arrived.
+            emit_control_result(
+                control_tx,
+                "destroy_virtual_display",
+                true,
+                "generation-bound virtual display destruction requested; the correlated tool result reports success or refusal"
+                    .to_string(),
+                None,
+            );
+            Some(RESOURCE_LOGS_URI)
+        }
         ControlMsg::ListDisplays => {
             let session_registry = state.read().await.session_registry.clone();
             let displays =

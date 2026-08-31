@@ -252,8 +252,25 @@ pub enum VirtualDisplayCreateOutcome {
         display_id: u32,
         width: u32,
         height: u32,
+        capture_generation: String,
     },
     Failed {
+        reason: String,
+    },
+}
+
+/// Request-scoped terminal result for destroying one exact daemon-owned
+/// virtual-display generation. A refused result is deliberately distinct
+/// from a successful no-op: callers must not treat an absent or stale
+/// generation as proof that the display they created was torn down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualDisplayDestroyOutcome {
+    Destroyed {
+        display_id: u32,
+        capture_generation: String,
+        closed_browser_workspace_ids: Vec<String>,
+    },
+    Refused {
         reason: String,
     },
 }
@@ -264,8 +281,16 @@ pub enum VirtualDisplayCreateWaitError {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualDisplayDestroyWaitError {
+    TimedOut,
+    Closed,
+}
+
 type VirtualDisplayCreateWaiters =
     Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<VirtualDisplayCreateOutcome>>>>;
+type VirtualDisplayDestroyWaiters =
+    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<VirtualDisplayDestroyOutcome>>>>;
 
 /// RAII owner for one request-scoped terminal result. Dropping a cancelled or
 /// timed-out call removes its sender so abandoned MCP calls cannot accumulate
@@ -290,6 +315,36 @@ impl VirtualDisplayCreateWaiter {
 }
 
 impl Drop for VirtualDisplayCreateWaiter {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.remove(&self.request_id);
+        }
+    }
+}
+
+/// RAII owner for one generation-bound destroy result. Cancellation removes
+/// the sender, and the serial display owner checks that liveness before it
+/// performs any destructive work.
+pub struct VirtualDisplayDestroyWaiter {
+    request_id: String,
+    waiters: VirtualDisplayDestroyWaiters,
+    receiver: tokio::sync::oneshot::Receiver<VirtualDisplayDestroyOutcome>,
+}
+
+impl VirtualDisplayDestroyWaiter {
+    pub async fn wait(
+        mut self,
+        timeout_after: Duration,
+    ) -> Result<VirtualDisplayDestroyOutcome, VirtualDisplayDestroyWaitError> {
+        match tokio::time::timeout(timeout_after, &mut self.receiver).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_closed)) => Err(VirtualDisplayDestroyWaitError::Closed),
+            Err(_elapsed) => Err(VirtualDisplayDestroyWaitError::TimedOut),
+        }
+    }
+}
+
+impl Drop for VirtualDisplayDestroyWaiter {
     fn drop(&mut self) {
         if let Ok(mut waiters) = self.waiters.lock() {
             waiters.remove(&self.request_id);
@@ -2699,6 +2754,18 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         height: Option<u32>,
     },
+    /// Destroy one exact daemon-owned virtual-display generation. Numeric
+    /// X11 display ids can be reused, so both the id and the opaque
+    /// generation returned by `create_virtual_display` are mandatory. The
+    /// request id belongs to an in-process waiter; unregistered/cancelled
+    /// requests are ignored before any teardown begins.
+    DestroyVirtualDisplay {
+        request_id: String,
+        display_id: u32,
+        capture_generation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// **Phase 0 visual-freshness diagnostic** (task #83). Toggle the
     /// per-display marker overlay that the pool-feed bridge stamps into
     /// the I420 Y plane. Off by default; operator flips it on for a
@@ -2981,6 +3048,7 @@ pub struct EventBus {
     session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SessionLogLaneItem>>>>,
     intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
     virtual_display_create_waiters: VirtualDisplayCreateWaiters,
+    virtual_display_destroy_waiters: VirtualDisplayDestroyWaiters,
 }
 
 impl EventBus {
@@ -2991,6 +3059,7 @@ impl EventBus {
             session_log_sinks: Arc::new(Mutex::new(Vec::new())),
             intent_sinks: Arc::new(Mutex::new(Vec::new())),
             virtual_display_create_waiters: Arc::new(Mutex::new(HashMap::new())),
+            virtual_display_destroy_waiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3038,6 +3107,50 @@ impl EventBus {
     /// unowned display when cancellation state is ambiguous.
     pub fn virtual_display_create_is_pending(&self, request_id: &str) -> bool {
         self.virtual_display_create_waiters
+            .lock()
+            .is_ok_and(|waiters| waiters.contains_key(request_id))
+    }
+
+    /// Register a generation-bound destroy result before publishing its
+    /// intent. Occupied ids are refused instead of replacing another caller.
+    pub fn register_virtual_display_destroy_waiter(
+        &self,
+        request_id: String,
+    ) -> Result<VirtualDisplayDestroyWaiter, String> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut waiters = self
+            .virtual_display_destroy_waiters
+            .lock()
+            .map_err(|_| "virtual display destroy result registry is unavailable".to_string())?;
+        if waiters.contains_key(&request_id) {
+            return Err("virtual display destroy request id is already pending".to_string());
+        }
+        waiters.insert(request_id.clone(), sender);
+        drop(waiters);
+        Ok(VirtualDisplayDestroyWaiter {
+            request_id,
+            waiters: Arc::clone(&self.virtual_display_destroy_waiters),
+            receiver,
+        })
+    }
+
+    pub fn complete_virtual_display_destroy(
+        &self,
+        request_id: &str,
+        outcome: VirtualDisplayDestroyOutcome,
+    ) -> bool {
+        let sender = self
+            .virtual_display_destroy_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(request_id));
+        sender.is_some_and(|sender| sender.send(outcome).is_ok())
+    }
+
+    /// Whether the exact destroy caller is still waiting. Poisoning fails
+    /// closed, as does cancellation: neither may initiate teardown.
+    pub fn virtual_display_destroy_is_pending(&self, request_id: &str) -> bool {
+        self.virtual_display_destroy_waiters
             .lock()
             .is_ok_and(|waiters| waiters.contains_key(request_id))
     }
@@ -6872,6 +6985,27 @@ mod tests {
         ));
         let serialized = serde_json::to_value(&msg).unwrap();
         assert_eq!(serialized["request_id"], "vdc-abc");
+    }
+
+    #[test]
+    fn control_msg_destroy_virtual_display_requires_exact_generation() {
+        let json = r#"{"action":"destroy_virtual_display","request_id":"vdd-abc","display_id":99,"capture_generation":"vdcg-abc","note":"capture complete"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMsg::DestroyVirtualDisplay {
+                ref request_id,
+                display_id: 99,
+                ref capture_generation,
+                note: Some(ref note),
+            } if request_id == "vdd-abc"
+                && capture_generation == "vdcg-abc"
+                && note == "capture complete"
+        ));
+
+        let missing_generation =
+            r#"{"action":"destroy_virtual_display","request_id":"vdd-abc","display_id":99}"#;
+        assert!(serde_json::from_str::<ControlMsg>(missing_generation).is_err());
     }
 
     #[test]

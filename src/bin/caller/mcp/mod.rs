@@ -1043,6 +1043,12 @@ impl IntendantServer {
                     self.create_virtual_display(Parameters(params)).await,
                 ))
             }
+            "destroy_virtual_display" => {
+                let Parameters(params) = parse_params::<DestroyVirtualDisplayParams>(args)?;
+                Ok(text_tool_result(
+                    self.destroy_virtual_display(Parameters(params)).await,
+                ))
+            }
             "take_display" => {
                 let params = parse_params::<TakeDisplayParams>(args)?;
                 Ok(text_tool_result(self.take_display(params).await))

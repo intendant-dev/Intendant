@@ -632,6 +632,18 @@ pub struct CreateVirtualDisplayParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DestroyVirtualDisplayParams {
+    /// Numeric display id returned by `create_virtual_display`.
+    pub display_id: u32,
+    /// Opaque generation returned by the same create call. Both values are
+    /// required so a stale cleanup cannot destroy a replacement display.
+    pub capture_generation: String,
+    /// Optional short lifecycle note included in retirement events.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RevokeUserDisplayParams {
     /// User session display ID to revoke. Omit for the primary display (0).
     #[serde(default)]

@@ -20,7 +20,7 @@
 
 use crate::display;
 use crate::display_glue::activate_user_display_with_capture_generation;
-use crate::event::{AppEvent, EventBus, VirtualDisplayCreateOutcome};
+use crate::event::{AppEvent, EventBus, VirtualDisplayCreateOutcome, VirtualDisplayDestroyOutcome};
 use crate::frames;
 use crate::types::LogLevel;
 use crate::vision;
@@ -101,6 +101,14 @@ impl VirtualDisplayGuards {
 
     fn get_mut(&mut self, display_id: &u32) -> Option<&mut VirtualDisplayOwnership> {
         self.ownership.get_mut(display_id)
+    }
+
+    fn owns_generation(&self, display_id: u32, capture_generation: &str) -> bool {
+        self.processes.contains_key(&display_id)
+            && self
+                .ownership
+                .get(&display_id)
+                .is_some_and(|ownership| ownership.capture_generation == capture_generation)
     }
 
     fn insert(
@@ -358,6 +366,7 @@ pub(crate) async fn handle_virtual_display_capture_readiness(
             display_id,
             width,
             height,
+            capture_generation: capture_generation.to_string(),
         },
     ) {
         if let Some(ownership) = guards.get_mut(&display_id) {
@@ -376,6 +385,116 @@ pub(crate) async fn handle_virtual_display_capture_readiness(
         )
         .await;
     }
+}
+
+/// Destroy one exact daemon-owned virtual-display generation. The serial
+/// display owner calls this only after the MCP surface registered a waiter.
+/// Both facts matter: a cancelled caller must not leave a delayed destructive
+/// intent behind, and a reused numeric X display id must never let an old job
+/// tear down a replacement.
+pub(crate) async fn destroy_virtual_display(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    guards: &mut VirtualDisplayGuards,
+    request_id: &str,
+    display_id: u32,
+    capture_generation: &str,
+    note: Option<&str>,
+) {
+    if !bus.virtual_display_destroy_is_pending(request_id) {
+        eprintln!("[virtual_display] skipped cancelled destroy request {request_id}");
+        return;
+    }
+
+    let Some(ownership) = guards.get(&display_id) else {
+        refuse_virtual_display_destroy(
+            bus,
+            request_id,
+            format!("display :{display_id} is not a daemon-owned virtual display"),
+        );
+        return;
+    };
+    if ownership.capture_generation != capture_generation {
+        refuse_virtual_display_destroy(
+            bus,
+            request_id,
+            format!(
+                "capture generation does not match the live daemon-owned display :{display_id}"
+            ),
+        );
+        return;
+    }
+    if !guards.owns_generation(display_id, capture_generation) {
+        refuse_virtual_display_destroy(
+            bus,
+            request_id,
+            format!("display :{display_id} has incomplete daemon ownership state"),
+        );
+        return;
+    }
+    let Some(guard) = guards.remove(&display_id) else {
+        refuse_virtual_display_destroy(
+            bus,
+            request_id,
+            format!("display :{display_id} ownership changed before teardown"),
+        );
+        return;
+    };
+
+    let context = note
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .unwrap_or("generation-bound destroy requested");
+    let context = crate::types::truncate_str(context, 280);
+
+    // Retire every browser binding before touching capture or Xvfb. The
+    // registry lock also removes bindability, so a new workspace cannot race
+    // into this display after the scan.
+    let closed_browser_workspace_ids =
+        crate::browser_workspace::close_display_binding(display_id, context, bus)
+            .await
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+
+    // Publish the old generation's terminal lifecycle before freeing the id.
+    // Its later intent-lane copy carries the generation and is therefore
+    // barred from touching any replacement that reuses the number.
+    bus.send(AppEvent::DisplayCaptureLost {
+        display_id,
+        capture_generation: Some(capture_generation.to_string()),
+        reason: context.to_string(),
+    });
+
+    if let Some(session) = session_registry.write().await.remove(display_id) {
+        tokio::spawn(async move {
+            session.stop().await;
+        });
+    }
+    guard.shutdown().await;
+
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[virtual_display] destroyed :{display_id} generation {capture_generation} ({context})"
+        ),
+        level: Some(LogLevel::Info),
+        turn: None,
+    });
+    let _ = bus.complete_virtual_display_destroy(
+        request_id,
+        VirtualDisplayDestroyOutcome::Destroyed {
+            display_id,
+            capture_generation: capture_generation.to_string(),
+            closed_browser_workspace_ids,
+        },
+    );
+}
+
+fn refuse_virtual_display_destroy(bus: &EventBus, request_id: &str, reason: String) {
+    let _ = bus.complete_virtual_display_destroy(
+        request_id,
+        VirtualDisplayDestroyOutcome::Refused { reason },
+    );
 }
 
 pub(crate) async fn handle_virtual_display_capture_lost(
@@ -708,6 +827,7 @@ mod tests {
                 display_id: 199,
                 width: 1280,
                 height: 720,
+                capture_generation: "generation-current".to_string(),
             })
         );
         assert_eq!(guards.get(&199).unwrap().request_id, None);
@@ -829,6 +949,83 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_destroy_generation_is_refused_without_touching_live_ownership() {
+        let bus = EventBus::new();
+        let waiter = bus
+            .register_virtual_display_destroy_waiter("vdd-stale".to_string())
+            .unwrap();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let mut guards = VirtualDisplayGuards::new();
+        guards.ownership.insert(
+            199,
+            VirtualDisplayOwnership {
+                capture_generation: "generation-live".to_string(),
+                request_id: None,
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        destroy_virtual_display(
+            &bus,
+            &registry,
+            &mut guards,
+            "vdd-stale",
+            199,
+            "generation-old",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            waiter.wait(Duration::from_millis(100)).await,
+            Ok(VirtualDisplayDestroyOutcome::Refused {
+                reason: "capture generation does not match the live daemon-owned display :199"
+                    .to_string(),
+            })
+        );
+        assert_eq!(
+            guards
+                .get(&199)
+                .map(|ownership| ownership.capture_generation.as_str()),
+            Some("generation-live")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_destroy_request_performs_no_teardown() {
+        let bus = EventBus::new();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let mut guards = VirtualDisplayGuards::new();
+        guards.ownership.insert(
+            199,
+            VirtualDisplayOwnership {
+                capture_generation: "generation-live".to_string(),
+                request_id: None,
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        destroy_virtual_display(
+            &bus,
+            &registry,
+            &mut guards,
+            "vdd-cancelled",
+            199,
+            "generation-live",
+            None,
+        )
+        .await;
+
+        assert!(guards.get(&199).is_some());
     }
 
     #[tokio::test]

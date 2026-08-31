@@ -1802,6 +1802,7 @@ pub(crate) const DASHBOARD_ACTION_MSG_ACTIONS: &[&str] = &[
     "revoke_user_display",
     "resolve_display_request",
     "create_virtual_display",
+    "destroy_virtual_display",
     "create_browser_workspace",
     "close_browser_workspace",
     "acquire_browser_workspace",
@@ -1888,6 +1889,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
         ControlMsg::ResolveDisplayRequest { .. } => "resolve_display_request",
         ControlMsg::CreateVirtualDisplay { .. } => "create_virtual_display",
+        ControlMsg::DestroyVirtualDisplay { .. } => "destroy_virtual_display",
         ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
         ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
         ControlMsg::AcquireBrowserWorkspace { .. } => "acquire_browser_workspace",
@@ -4328,6 +4330,14 @@ mod tests {
             "create_virtual_display",
             || serde_json::json!({"action": "create_virtual_display", "width": 1280, "height": 800}),
         ),
+        ("destroy_virtual_display", || {
+            serde_json::json!({
+                "action": "destroy_virtual_display",
+                "request_id": "vdd-test",
+                "display_id": 99,
+                "capture_generation": "vdcg-test"
+            })
+        }),
         (
             "close_browser_workspace",
             || serde_json::json!({"action": "close_browser_workspace", "workspace_id": "w"}),

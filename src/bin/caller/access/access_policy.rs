@@ -1096,6 +1096,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::RevokeUserDisplay { .. }
         | ControlMsg::ResolveDisplayRequest { .. }
         | ControlMsg::CreateVirtualDisplay { .. }
+        | ControlMsg::DestroyVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. } => PeerOperation::DisplayInput,
         ControlMsg::Input { .. }
         | ControlMsg::FollowUp { .. }
