@@ -858,16 +858,14 @@ pub async fn create_workspace(
     }
 }
 
-pub async fn list_workspaces() -> Vec<BrowserWorkspace> {
+pub async fn list_workspaces(bus: &EventBus) -> Vec<BrowserWorkspace> {
     let (workspaces, retired) = {
         let registry = global_registry();
         let mut registry = registry.write().await;
         let retired = registry.reconcile_display_bindings();
         (registry.list(), retired)
     };
-    for retired in retired {
-        terminate_workspace_process(retired.process_id, retired.child);
-    }
+    publish_reconciled_retirements(bus, retired);
     workspaces
 }
 
@@ -909,6 +907,7 @@ pub async fn close_workspace(
 
 pub async fn acquire_workspace(
     request: AcquireBrowserWorkspaceRequest,
+    bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     let (result, retired) = {
         let registry = global_registry();
@@ -916,14 +915,13 @@ pub async fn acquire_workspace(
         let retired = registry.reconcile_display_bindings();
         (registry.acquire(request), retired)
     };
-    for retired in retired {
-        terminate_workspace_process(retired.process_id, retired.child);
-    }
+    publish_reconciled_retirements(bus, retired);
     result
 }
 
 pub async fn release_workspace(
     request: ReleaseBrowserWorkspaceRequest,
+    bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     let (result, retired) = {
         let registry = global_registry();
@@ -931,10 +929,21 @@ pub async fn release_workspace(
         let retired = registry.reconcile_display_bindings();
         (registry.release(request), retired)
     };
+    publish_reconciled_retirements(bus, retired);
+    result
+}
+
+fn publish_reconciled_retirements(bus: &EventBus, retired: Vec<RetiredBrowserWorkspace>) {
     for retired in retired {
         terminate_workspace_process(retired.process_id, retired.child);
+        let workspace = retired.workspace;
+        bus.send(AppEvent::BrowserWorkspaceChanged {
+            kind: "display_retired".to_string(),
+            workspace_id: Some(workspace.id.clone()),
+            message: workspace.message.clone(),
+            workspace: Some(workspace),
+        });
     }
-    result
 }
 
 fn terminate_workspace_process(process_id: Option<u32>, mut child: Option<Child>) {
@@ -1752,6 +1761,39 @@ mod tests {
             registry.workspaces.get("bw-survivor").unwrap().status,
             BrowserWorkspaceStatus::Ready
         );
+    }
+
+    #[test]
+    fn reconciled_display_retirement_publishes_the_error_state() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let mut workspace = sample_workspace("bw-reconciled");
+        workspace.status = BrowserWorkspaceStatus::Error;
+        workspace.message = Some("bound display exited".to_string());
+
+        publish_reconciled_retirements(
+            &bus,
+            vec![RetiredBrowserWorkspace {
+                workspace: workspace.clone(),
+                process_id: None,
+                child: None,
+            }],
+        );
+
+        match events.try_recv().expect("display retirement event") {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace_id,
+                message,
+                workspace: Some(published),
+            } => {
+                assert_eq!(kind, "display_retired");
+                assert_eq!(workspace_id.as_deref(), Some("bw-reconciled"));
+                assert_eq!(message.as_deref(), Some("bound display exited"));
+                assert_eq!(published, workspace);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]

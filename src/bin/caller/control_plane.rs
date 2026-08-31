@@ -856,7 +856,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 note: note.clone(),
                 force: *force,
             };
-            match crate::browser_workspace::acquire_workspace(request).await {
+            match crate::browser_workspace::acquire_workspace(request, &state.bus).await {
                 Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "lease_acquired".to_string(),
                     workspace: Some(workspace),
@@ -881,7 +881,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 holder_id: holder_id.clone(),
                 note: note.clone(),
             };
-            match crate::browser_workspace::release_workspace(request).await {
+            match crate::browser_workspace::release_workspace(request, &state.bus).await {
                 Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "lease_released".to_string(),
                     workspace: Some(workspace),

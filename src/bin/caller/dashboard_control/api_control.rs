@@ -69,8 +69,11 @@ pub(crate) async fn api_voice_session_response(
     }
 }
 
-pub(crate) async fn api_browser_workspace_snapshot_response(id: String) -> serde_json::Value {
-    let workspaces = crate::browser_workspace::list_workspaces().await;
+pub(crate) async fn api_browser_workspace_snapshot_response(
+    id: String,
+    bus: &crate::event::EventBus,
+) -> serde_json::Value {
+    let workspaces = crate::browser_workspace::list_workspaces(bus).await;
     serde_json::json!({
         "t": "response",
         "id": id,
@@ -208,7 +211,7 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     }
     if !runtime.grant.is_hosted_lease() {
         if let Some(frame) = response_result(
-            api_browser_workspace_snapshot_response("bootstrap-browser".into()).await,
+            api_browser_workspace_snapshot_response("bootstrap-browser".into(), &runtime.bus).await,
         ) {
             frames.push(frame);
         }

@@ -18,7 +18,7 @@ impl IntendantServer {
         description = "List active browser workspaces. Browser workspaces are addressable CDP/Playwright/Agent Browser surfaces with per-workspace leases."
     )]
     pub(crate) async fn list_browser_workspaces(&self) -> String {
-        let workspaces = crate::browser_workspace::list_workspaces().await;
+        let workspaces = crate::browser_workspace::list_workspaces(&self.bus).await;
         serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_string())
     }
 
@@ -99,7 +99,7 @@ impl IntendantServer {
             note: params.note,
             force: params.force,
         };
-        match crate::browser_workspace::acquire_workspace(request).await {
+        match crate::browser_workspace::acquire_workspace(request, &self.bus).await {
             Ok(workspace) => {
                 self.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "lease_acquired".to_string(),
@@ -123,7 +123,7 @@ impl IntendantServer {
             holder_id: params.holder_id,
             note: params.note,
         };
-        match crate::browser_workspace::release_workspace(request).await {
+        match crate::browser_workspace::release_workspace(request, &self.bus).await {
             Ok(workspace) => {
                 self.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "lease_released".to_string(),
