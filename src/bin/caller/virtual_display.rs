@@ -20,7 +20,7 @@
 
 use crate::display;
 use crate::display_glue::activate_user_display;
-use crate::event::{AppEvent, EventBus};
+use crate::event::{AppEvent, EventBus, VirtualDisplayCreateOutcome};
 use crate::frames;
 use crate::types::LogLevel;
 use crate::vision;
@@ -75,11 +75,13 @@ pub(crate) async fn create_virtual_display(
     guards: &mut VirtualDisplayGuards,
     width: Option<u32>,
     height: Option<u32>,
+    request_id: Option<String>,
 ) {
     // Unsupported platforms bail before any display lifecycle exists.
     if !vision::virtual_displays_supported() {
         report_virtual_display_create_failed(
             bus,
+            request_id.as_deref(),
             "virtual display create failed: virtual displays are Xvfb-based and Linux-only; \
              use \"Your display\" to stream this machine's desktop instead",
         );
@@ -101,7 +103,7 @@ pub(crate) async fn create_virtual_display(
     let (width, height) = match virtual_display_dimensions(width, height) {
         Ok(dims) => dims,
         Err(reason) => {
-            report_virtual_display_create_failed(bus, reason);
+            report_virtual_display_create_failed(bus, request_id.as_deref(), reason);
             return;
         }
     };
@@ -109,6 +111,7 @@ pub(crate) async fn create_virtual_display(
     let Some(config) = vision::virtual_display_config(width, height, &exclude) else {
         report_virtual_display_create_failed(
             bus,
+            request_id.as_deref(),
             "virtual display create failed: no unoccupied X display is available",
         );
         return;
@@ -116,6 +119,7 @@ pub(crate) async fn create_virtual_display(
     let Some(display_id) = virtual_target_id(&config) else {
         report_virtual_display_create_failed(
             bus,
+            request_id.as_deref(),
             "virtual display create failed: allocator returned a non-virtual target",
         );
         return;
@@ -140,18 +144,54 @@ pub(crate) async fn create_virtual_display(
             // an agent lookup, though virtual displays are never hidden.)
             if session_registry.read().await.get_any(display_id).is_none() {
                 reap_virtual_display(guards, display_id, "activation failed").await;
+                report_virtual_display_create_failed(
+                    bus,
+                    request_id.as_deref(),
+                    "virtual display create failed: display activation did not publish a capture session",
+                );
+            } else if let Some(request_id) = request_id {
+                if !bus.complete_virtual_display_create(
+                    &request_id,
+                    VirtualDisplayCreateOutcome::Created {
+                        display_id,
+                        width,
+                        height,
+                    },
+                ) {
+                    eprintln!(
+                        "[virtual_display] create caller no longer waiting for request {request_id}"
+                    );
+                }
             }
         }
         Err(e) => {
-            report_virtual_display_create_failed(bus, create_failure_reason(&e));
+            report_virtual_display_create_failed(
+                bus,
+                request_id.as_deref(),
+                create_failure_reason(&e),
+            );
         }
     }
 }
 
-fn report_virtual_display_create_failed(bus: &EventBus, reason: impl Into<String>) {
+fn report_virtual_display_create_failed(
+    bus: &EventBus,
+    request_id: Option<&str>,
+    reason: impl Into<String>,
+) {
     let reason = reason.into();
     eprintln!("[virtual_display] {reason}");
-    bus.send(AppEvent::VirtualDisplayCreateFailed { reason });
+    bus.send(AppEvent::VirtualDisplayCreateFailed {
+        reason: reason.clone(),
+    });
+    if let Some(request_id) = request_id {
+        if !bus.complete_virtual_display_create(
+            request_id,
+            VirtualDisplayCreateOutcome::Failed { reason },
+        ) {
+            eprintln!("[virtual_display] create caller no longer waiting for request {request_id}");
+        }
+    }
 }
 
 /// Drop the guard for a dashboard-created display, stopping its exact Xvfb
@@ -263,12 +303,44 @@ mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
 
-        report_virtual_display_create_failed(&bus, "virtual display create failed: exhausted");
+        report_virtual_display_create_failed(
+            &bus,
+            None,
+            "virtual display create failed: exhausted",
+        );
 
         assert!(matches!(
             rx.recv().await.unwrap(),
             AppEvent::VirtualDisplayCreateFailed { .. }
         ));
         assert!(registry.read().await.get_any(u32::MAX).is_some());
+    }
+
+    #[tokio::test]
+    async fn create_failure_emits_public_lifecycle_and_exact_correlated_result() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let reason = "virtual display create failed: exhausted";
+        let waiter = bus
+            .register_virtual_display_create_waiter("vdc-request-a".to_string())
+            .unwrap();
+
+        report_virtual_display_create_failed(&bus, Some("vdc-request-a"), reason);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AppEvent::VirtualDisplayCreateFailed { reason: emitted } if emitted == reason
+        ));
+        assert_eq!(
+            waiter.wait(std::time::Duration::from_secs(1)).await,
+            Ok(VirtualDisplayCreateOutcome::Failed {
+                reason: reason.to_string()
+            })
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
     }
 }

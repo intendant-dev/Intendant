@@ -3334,7 +3334,7 @@ fn setup_fresh_conversation_with_attachments(
 /// On revoke: stop the session and remove it from the registry.
 ///
 /// Also the owner of dashboard-created virtual displays: it consumes
-/// `ControlMsg::CreateVirtualDisplay` off the bus (this task is the one
+/// `ControlMsg::CreateVirtualDisplay` off the lossless intent lane (this task is the one
 /// place with the session/frame registries the create needs), and holds
 /// their `XvfbGuard`s as task-local state — created displays die with the
 /// daemon, on tile close (revoke of their id), or on capture loss.
@@ -3344,14 +3344,19 @@ pub fn spawn_user_display_listener(
     frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut rx = bus.subscribe();
+        // Every event this task acts on rides the lossless intent lane. A
+        // virtual-display create can take long enough for the best-effort
+        // broadcast ring to lap; dropping either a create request or a
+        // grant/revoke/capture-loss transition would leave the caller and
+        // display registry out of sync.
+        let mut rx = bus.subscribe_intents();
         let mut virtual_display_guards = virtual_display::VirtualDisplayGuards::new();
-        loop {
-            match rx.recv().await {
-                Ok(AppEvent::UserDisplayGranted {
+        while let Some(event) = rx.recv().await {
+            match event {
+                AppEvent::UserDisplayGranted {
                     display_id,
                     agent_visible,
-                }) => {
+                } => {
                     activate_user_display(
                         &bus,
                         &session_registry,
@@ -3361,10 +3366,11 @@ pub fn spawn_user_display_listener(
                     )
                     .await;
                 }
-                Ok(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                    request_id,
                     width,
                     height,
-                })) => {
+                }) => {
                     virtual_display::create_virtual_display(
                         &bus,
                         &session_registry,
@@ -3372,10 +3378,11 @@ pub fn spawn_user_display_listener(
                         &mut virtual_display_guards,
                         width,
                         height,
+                        request_id,
                     )
                     .await;
                 }
-                Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
+                AppEvent::UserDisplayRevoked { display_id, .. } => {
                     deactivate_user_display(&session_registry, display_id).await;
                     // Closing the tile of a dashboard-created display IS its
                     // destroy: nothing else owns it, and leaving the Xvfb
@@ -3387,10 +3394,10 @@ pub fn spawn_user_display_listener(
                     )
                     .await;
                 }
-                Ok(AppEvent::DisplayCaptureLost {
+                AppEvent::DisplayCaptureLost {
                     display_id,
                     ref reason,
-                }) => {
+                } => {
                     // Capture backend stopped unexpectedly (portal session
                     // ended, backend crashed, etc.).  Remove the session from
                     // the registry so a re-grant creates a fresh one.
@@ -3408,31 +3415,6 @@ pub fn spawn_user_display_listener(
                     )
                     .await;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // A missed grant/revoke/capture-loss leaves no trustworthy
-                    // lifecycle state. Fail closed: registry drain invokes the
-                    // synchronous input-authority observer before any stale
-                    // session can be looked up again; stop captures and Xvfb
-                    // guards outside the registry lock. The user can explicitly
-                    // re-open the displays after the event stream recovers.
-                    eprintln!(
-                        "[user_display] lifecycle listener lagged by {skipped} events; \
-                         closing all display sessions fail-closed"
-                    );
-                    let sessions = session_registry.write().await.drain();
-                    // Gracefully reap guards concurrently. Serially awaiting
-                    // each bounded shutdown here would compound the timeout
-                    // and make lag recovery itself keep falling behind.
-                    for (_, guard) in std::mem::take(&mut virtual_display_guards) {
-                        tokio::spawn(guard.shutdown());
-                    }
-                    for session in sessions {
-                        tokio::spawn(async move {
-                            session.stop().await;
-                        });
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
             }
         }

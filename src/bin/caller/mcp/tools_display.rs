@@ -143,74 +143,68 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
+        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for this exact request's correlated terminal result and returns JSON with request_id plus the new display id/geometry or error."
     )]
     pub(crate) async fn create_virtual_display(
         &self,
         Parameters(params): Parameters<CreateVirtualDisplayParams>,
     ) -> String {
-        // Ready events carry the allocated display id; pre-lifecycle failures
-        // have their own id-free event and therefore cannot collide with or
-        // retire any registered display session.
-        let session_registry = self.state.read().await.session_registry.clone();
-        let known: std::collections::HashSet<u32> =
-            crate::display::enumerate_displays_with_sessions(&session_registry)
-                .await
-                .into_iter()
-                .map(|d| d.id)
-                .collect();
-        let mut rx = self.bus.subscribe();
+        // Every caller receives a distinct internal terminal result. Public
+        // DisplayReady/failure events remain broadcast lifecycle signals and
+        // are deliberately not used for synchronous attribution.
+        let request_id = format!("vdc-{}", uuid::Uuid::new_v4().simple());
+        let waiter = match self
+            .bus
+            .register_virtual_display_create_waiter(request_id.clone())
+        {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "error": error
+                })
+                .to_string();
+            }
+        };
         self.bus
             .send(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                request_id: Some(request_id.clone()),
                 width: params.width,
                 height: params.height,
             }));
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return "virtual display creation requested, but no display_ready arrived \
-                        within 20s — check the daemon log (is Xvfb installed on the host?)"
-                    .to_string();
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(AppEvent::DisplayReady {
-                    display_id,
-                    width,
-                    height,
-                    ..
-                })) if !known.contains(&display_id) => {
-                    return format!(
-                        "virtual display created: display_id {display_id} ({width}x{height}). \
-                         Target it as display_target \"display_{display_id}\" for screenshots \
-                         and CU actions; it is streaming to dashboards and announced to \
-                         federated peers now."
-                    );
-                }
-                Ok(Ok(AppEvent::VirtualDisplayCreateFailed { reason })) => {
-                    if reason.starts_with("virtual display create failed") {
-                        return reason;
-                    }
-                    return format!("virtual display create failed: {reason}");
-                }
-                Ok(Ok(AppEvent::DisplayCaptureLost { display_id, reason }))
-                    if !known.contains(&display_id) =>
-                {
-                    return format!("virtual display create failed: {reason}");
-                }
-                Ok(Ok(_)) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return "virtual display create: the event bus closed before an outcome \
-                            arrived"
-                        .to_string();
-                }
-                Err(_elapsed) => {
-                    return "virtual display creation requested, but no display_ready arrived \
-                            within 20s — check the daemon log (is Xvfb installed on the host?)"
-                        .to_string();
-                }
-            }
+        match waiter.wait(std::time::Duration::from_secs(20)).await {
+            Ok(crate::event::VirtualDisplayCreateOutcome::Created {
+                display_id,
+                width,
+                height,
+            }) => serde_json::json!({
+                "ok": true,
+                "request_id": request_id,
+                "display_id": display_id,
+                "display_target": format!("display_{display_id}"),
+                "width": width,
+                "height": height
+            })
+            .to_string(),
+            Ok(crate::event::VirtualDisplayCreateOutcome::Failed { reason }) => serde_json::json!({
+                "ok": false,
+                "request_id": request_id,
+                "error": reason
+            })
+            .to_string(),
+            Err(crate::event::VirtualDisplayCreateWaitError::TimedOut) => serde_json::json!({
+                "ok": false,
+                "request_id": request_id,
+                "error": "virtual display creation did not return its correlated result within 20s"
+            })
+            .to_string(),
+            Err(crate::event::VirtualDisplayCreateWaitError::Closed) => serde_json::json!({
+                "ok": false,
+                "request_id": request_id,
+                "error": "virtual display event bus closed before the correlated result arrived"
+            })
+            .to_string(),
         }
     }
 
@@ -1771,6 +1765,164 @@ mod tests {
         test_session_registry_with_display, test_state, test_state_with_log_dir,
     };
     use tokio::time::{timeout, Duration};
+
+    async fn next_virtual_display_create_command(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    ) -> (String, Option<u32>, Option<u32>) {
+        loop {
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                    request_id: Some(request_id),
+                    width,
+                    height,
+                }))) => return (request_id, width, height),
+                Ok(Ok(_)) => continue,
+                other => panic!("expected correlated create command, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_virtual_display_creates_receive_only_their_own_reversed_results() {
+        let bus = EventBus::new();
+        let mut command_rx = bus.subscribe();
+        let server = IntendantServer::new(test_state(), bus.clone());
+
+        let first_server = server.clone();
+        let first = tokio::spawn(async move {
+            first_server
+                .create_virtual_display(Parameters(CreateVirtualDisplayParams {
+                    width: Some(800),
+                    height: Some(600),
+                }))
+                .await
+        });
+        let second_server = server.clone();
+        let second = tokio::spawn(async move {
+            second_server
+                .create_virtual_display(Parameters(CreateVirtualDisplayParams {
+                    width: Some(1000),
+                    height: Some(700),
+                }))
+                .await
+        });
+
+        let mut first_id = None;
+        let mut second_id = None;
+        for _ in 0..2 {
+            let (request_id, width, height) =
+                next_virtual_display_create_command(&mut command_rx).await;
+            match (width, height) {
+                (Some(800), Some(600)) => first_id = Some(request_id),
+                (Some(1000), Some(700)) => second_id = Some(request_id),
+                other => panic!("unexpected create dimensions: {other:?}"),
+            }
+        }
+        let first_id = first_id.expect("first request id");
+        let second_id = second_id.expect("second request id");
+        assert_ne!(first_id, second_id);
+
+        // Public lifecycle traffic and an unrelated internal result are all
+        // stale for these callers and must not complete either future.
+        bus.send(AppEvent::DisplayReady {
+            display_id: 88,
+            width: 640,
+            height: 480,
+            agent_visible: true,
+        });
+        bus.send(AppEvent::VirtualDisplayCreateFailed {
+            reason: "stale public failure".to_string(),
+        });
+        assert!(!bus.complete_virtual_display_create(
+            "vdc-unrelated",
+            crate::event::VirtualDisplayCreateOutcome::Created {
+                display_id: 89,
+                width: 640,
+                height: 480,
+            },
+        ));
+        // Overflow the best-effort broadcast ring. Terminal delivery uses a
+        // separate one-shot registry and therefore cannot be displaced by
+        // high-rate unrelated daemon traffic.
+        for _ in 0..5_000 {
+            bus.send(AppEvent::Tick);
+        }
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        // Complete the second request first. The first waiter must remain
+        // pending even though it observes the same broadcast event.
+        assert!(bus.complete_virtual_display_create(
+            &second_id,
+            crate::event::VirtualDisplayCreateOutcome::Created {
+                display_id: 102,
+                width: 1000,
+                height: 700,
+            },
+        ));
+        let second_json: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(1), second)
+                .await
+                .expect("second request should complete")
+                .expect("second task should not panic"),
+        )
+        .unwrap();
+        assert_eq!(second_json["ok"], true);
+        assert_eq!(second_json["request_id"], second_id);
+        assert_eq!(second_json["display_id"], 102);
+        assert_eq!(second_json["display_target"], "display_102");
+        assert!(!first.is_finished());
+
+        assert!(bus.complete_virtual_display_create(
+            &first_id,
+            crate::event::VirtualDisplayCreateOutcome::Failed {
+                reason: "first request failed".to_string(),
+            },
+        ));
+        let first_json: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(1), first)
+                .await
+                .expect("first request should complete")
+                .expect("first task should not panic"),
+        )
+        .unwrap();
+        assert_eq!(first_json["ok"], false);
+        assert_eq!(first_json["request_id"], first_id);
+        assert_eq!(first_json["error"], "first request failed");
+    }
+
+    #[tokio::test]
+    async fn virtual_display_result_wait_is_lossless_bounded_and_cancellation_safe() {
+        let bus = EventBus::new();
+        let timeout_waiter = bus
+            .register_virtual_display_create_waiter("vdc-timeout".to_string())
+            .unwrap();
+        assert_eq!(
+            timeout_waiter.wait(Duration::from_millis(10)).await,
+            Err(crate::event::VirtualDisplayCreateWaitError::TimedOut)
+        );
+        assert!(!bus.complete_virtual_display_create(
+            "vdc-timeout",
+            crate::event::VirtualDisplayCreateOutcome::Failed {
+                reason: "too late".to_string(),
+            }
+        ));
+
+        let cancelled = bus
+            .register_virtual_display_create_waiter("vdc-cancelled".to_string())
+            .unwrap();
+        assert!(bus
+            .register_virtual_display_create_waiter("vdc-cancelled".to_string())
+            .is_err());
+        drop(cancelled);
+        assert!(!bus.complete_virtual_display_create(
+            "vdc-cancelled",
+            crate::event::VirtualDisplayCreateOutcome::Failed {
+                reason: "cancelled".to_string(),
+            }
+        ));
+    }
 
     /// A fragment unique to the user-session opt-in refusal
     /// (`computer_use::user_session_denied_message`, which both gated MCP
