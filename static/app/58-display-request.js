@@ -191,7 +191,6 @@ window.sendDisplayRequestDecision = function (decision) {
     msg.duration = (select && select.value) || 'until_revoked';
   }
   if (pendingDisplayRequest.sessionId) msg.session_id = pendingDisplayRequest.sessionId;
-  removeLiveDisplayRequest(pendingDisplayRequest.sessionId, pendingDisplayRequest.id);
   dispatchDashboardActionMsg(msg);
   clearPendingDisplayRequest();
   hidePanel('display-request-panel');
