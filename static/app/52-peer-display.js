@@ -2985,19 +2985,26 @@ function renderPeerIdentities(identities) {
 
   list.innerHTML = identities.map(identity => {
     const fingerprint = String(identity.fingerprint || '');
-    const label = escapeHtml(identity.label || 'Unnamed daemon');
+    // The lane the daemon stored for this grant (absent = a record
+    // from before the agent lane = peer): the durable management
+    // surface must keep the peer/agent distinction visible.
+    const identityClass = String(identity.class || 'peer').toLowerCase();
+    const isAgent = identityClass === 'agent';
+    const label = escapeHtml(identity.label || (isAgent ? 'Unnamed agent' : 'Unnamed daemon'));
     const status = String(identity.status || 'unknown').toLowerCase();
     const role = peerProfileMeta(identity.profile || 'presence-only');
     const request = identity.request_id ? `Request ${escapeHtml(identity.request_id)}` : '';
     const card = identity.card_url ? escapeHtml(identity.card_url) : '';
     const active = status === 'approved';
+    const laneLabel = isAgent ? 'Agent profile' : 'Peer profile';
     return `
       <div class="daemon-identity-card ${escapeHtml(status)}">
         <div class="daemon-identity-head">
-          <span>${label}</span>
+          <span>${isAgent ? '🤖 ' : ''}${label}</span>
           <span class="daemon-identity-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
         </div>
-        <div class="daemon-identity-role" title="Peer profile ${escapeHtml(identity.profile || 'presence-only')}">Peer profile ${escapeHtml(role.label)}</div>
+        ${isAgent ? '<div class="daemon-access-request-meta" title="An enrolled agent client: a machine principal that drives this daemon over MCP at the granted profile. Not a federated peer daemon.">agent client (MCP lane)</div>' : ''}
+        <div class="daemon-identity-role" title="${laneLabel} ${escapeHtml(identity.profile || 'presence-only')}">${laneLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-identity-profile">${escapeHtml(role.summary)}${request ? ` - ${request}` : ''}</div>
         ${card ? `<div class="daemon-identity-profile">${card}</div>` : ''}
         <div class="daemon-identity-fingerprint" title="${escapeHtml(fingerprint)}">${escapeHtml(fingerprint)}</div>

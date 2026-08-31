@@ -1628,8 +1628,15 @@ pub fn set_identity_profile(
     profile: &str,
 ) -> Result<ProfileChange, CallerError> {
     with_identity_store_lock(cert_dir, || {
-        let profile = require_known_profile(profile)?;
         let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
+        // The record's class picks the vocabulary: an agent identity
+        // may be widened back to `agent-operator` (or any peer
+        // profile), while a peer identity keeps rejecting the agent
+        // vocabulary outright.
+        let profile = match record.class {
+            IdentityClass::Peer => require_known_profile(profile)?,
+            IdentityClass::Agent => require_known_agent_profile(profile)?,
+        };
         if !matches!(record.status, PeerIdentityStatus::Approved) {
             return Err(CallerError::Config(format!(
                 "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
@@ -2344,6 +2351,37 @@ mod tests {
         assert!(matches!(read.class, IdentityClass::Agent));
         assert_eq!(read.profile, AGENT_OPERATOR_PROFILE);
         assert!(serde_json::to_string(&read).unwrap().contains("\"agent\""));
+    }
+
+    /// Profile changes route through the record's class: an agent
+    /// narrowed to a peer profile can be widened back to
+    /// `agent-operator`, while a peer identity keeps rejecting the
+    /// agent vocabulary outright.
+    #[test]
+    fn set_identity_profile_routes_the_vocabulary_by_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_fp = "cd".repeat(32);
+        write_approved_agent_identity(
+            dir.path(),
+            &agent_fp,
+            "sidecar",
+            AGENT_OPERATOR_PROFILE,
+            None,
+            None,
+        )
+        .unwrap();
+        let narrowed = set_identity_profile(dir.path(), &agent_fp, "read-only-display").unwrap();
+        assert_eq!(narrowed.record.profile, "read-only-display");
+        assert!(matches!(narrowed.record.class, IdentityClass::Agent));
+        let widened = set_identity_profile(dir.path(), &agent_fp, AGENT_OPERATOR_PROFILE).unwrap();
+        assert_eq!(widened.record.profile, AGENT_OPERATOR_PROFILE);
+
+        let peer_fp = "ef".repeat(32);
+        write_approved_identity(dir.path(), &peer_fp, "peer", "stats", None, None).unwrap();
+        assert!(
+            set_identity_profile(dir.path(), &peer_fp, AGENT_OPERATOR_PROFILE).is_err(),
+            "the peer lane never accepts the agent vocabulary"
+        );
     }
 
     #[test]

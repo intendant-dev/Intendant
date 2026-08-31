@@ -3009,6 +3009,21 @@ pub(crate) fn dashboard_control_grant_for_client(
     trusted_local_admitted: bool,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     if let Some(identity) = identity {
+        // The agent lane has NO dashboard-control surface in its first
+        // cut: the R1 charter is `/mcp` alone, and this grant's Peer
+        // arm hardcodes the peer principal — admitting an agent here
+        // would walk it into peer-only tenant edges (memory propose)
+        // under the wrong actor class. Refused by name until an owner
+        // ruling gives agents their own grant class.
+        if matches!(
+            identity.class,
+            crate::peer::access_policy::IdentityClass::Agent
+        ) {
+            return Err(
+                "agent identities have no dashboard-control surface; the agent lane is /mcp only"
+                    .to_string(),
+            );
+        }
         return Ok(crate::dashboard_control::DashboardControlGrant::Peer {
             fingerprint: identity.fingerprint.clone(),
             label: identity.label.clone(),
@@ -4215,6 +4230,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, 403);
         assert!(err.1.contains("agent identity revoked"));
+    }
+
+    /// The dashboard-control entrance is peer/user-lane only: an
+    /// agent-class identity is refused by name — the grant's Peer arm
+    /// hardcodes the peer principal, and walking an agent in would
+    /// reach peer-only tenant edges (memory propose) under the wrong
+    /// actor class. The agent lane is `/mcp` alone.
+    #[test]
+    fn dashboard_control_grant_refuses_the_agent_lane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent = PeerConnectionIdentity {
+            fingerprint: "dd".repeat(32),
+            label: "sidecar".into(),
+            profile: "agent-operator".into(),
+            class: crate::peer::access_policy::IdentityClass::Agent,
+            filesystem: Default::default(),
+            record: None,
+        };
+        let err = dashboard_control_grant_for_client(tmp.path(), Some(&agent), None, true, false)
+            .unwrap_err();
+        assert!(
+            err.contains("agent identities have no dashboard-control surface"),
+            "{err}"
+        );
+        let peer = PeerConnectionIdentity {
+            fingerprint: "ee".repeat(32),
+            label: "peer".into(),
+            profile: "read-only-display".into(),
+            class: crate::peer::access_policy::IdentityClass::Peer,
+            filesystem: Default::default(),
+            record: None,
+        };
+        assert!(matches!(
+            dashboard_control_grant_for_client(tmp.path(), Some(&peer), None, true, false),
+            Ok(crate::dashboard_control::DashboardControlGrant::Peer { .. })
+        ));
     }
 
     /// Connections without a TLS client certificate resolve as anonymous,

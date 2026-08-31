@@ -589,9 +589,13 @@ fn cmd_identities() -> Result<(), CallerError> {
     }
     for identity in identities {
         println!(
-            "{}  {:?}  profile={}  label={}{}{}",
+            "{}  {:?}  {}  profile={}  label={}{}{}",
             identity.fingerprint,
             identity.status,
+            match identity.class {
+                crate::access::access_policy::IdentityClass::Peer => "peer",
+                crate::access::access_policy::IdentityClass::Agent => "AGENT",
+            },
             identity.profile,
             identity.label,
             identity
