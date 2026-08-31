@@ -545,6 +545,11 @@ fn create_private_x11_authorization(
 ) -> Result<PrivateX11Authorization, CallerError> {
     let directory = tempfile::Builder::new()
         .prefix("intendant-xauthority-")
+        // `tempfile` defaults directories to 0777 masked by the host umask;
+        // a group-friendly umask can therefore expose the pathname at
+        // creation time. Supplying 0700 reaches mkdir(2) atomically and the
+        // umask may only make it more restrictive.
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|error| {
             CallerError::Config(format!(
