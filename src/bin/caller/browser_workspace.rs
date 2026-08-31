@@ -702,15 +702,10 @@ pub async fn create_workspace(
         .as_deref()
         .map(parse_browser_display_binding)
         .transpose()?;
-    if let Some(binding) = display_binding.as_ref() {
-        if !crate::virtual_display::process_owns_browser_bindable_display(binding.display_id) {
-            return Err(BrowserWorkspaceError::Unsupported(format!(
-                "browser workspace display {} is not a live daemon-created virtual display",
-                binding.canonical
-            )));
-        }
-    }
     let bound_display_id = display_binding.as_ref().map(|binding| binding.display_id);
+    let bound_display_target = display_binding
+        .as_ref()
+        .map(|binding| binding.canonical.clone());
     let profile_dir = request
         .profile_dir
         .as_deref()
@@ -760,10 +755,19 @@ pub async fn create_workspace(
     // Publish the Starting reservation before filesystem work or browser
     // launch. Display teardown can now retire this exact binding instead of
     // racing past a workspace that exists only on this task's stack.
-    global_registry()
-        .write()
-        .await
-        .insert(workspace.clone(), None);
+    {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        if let Some(display_id) = bound_display_id {
+            if !crate::virtual_display::process_owns_browser_bindable_display(display_id) {
+                return Err(BrowserWorkspaceError::Unsupported(format!(
+                    "browser workspace display {} is not a live daemon-created virtual display",
+                    bound_display_target.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+        registry.insert(workspace.clone(), None);
+    }
 
     if let Err(error) = std::fs::create_dir_all(&profile_dir) {
         let message = format!(
@@ -867,11 +871,16 @@ pub async fn list_workspaces() -> Vec<BrowserWorkspace> {
     workspaces
 }
 
-pub async fn retire_workspaces_for_display(display_id: u32, reason: &str) -> Vec<BrowserWorkspace> {
-    let retired = global_registry()
-        .write()
-        .await
-        .retire_workspaces_for_display(display_id, reason);
+pub async fn close_display_binding(display_id: u32, reason: &str) -> Vec<BrowserWorkspace> {
+    let retired = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        // Creation reserves its Starting row under this same registry lock
+        // after checking the bindable set. Removing the display here before
+        // the scan therefore closes the post-scan insertion race.
+        crate::virtual_display::unregister_browser_bindable_display(display_id);
+        registry.retire_workspaces_for_display(display_id, reason)
+    };
     retired
         .into_iter()
         .map(|retired| {

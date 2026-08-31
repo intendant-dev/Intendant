@@ -68,7 +68,7 @@ fn register_browser_bindable_display(display_id: u32) {
     }
 }
 
-fn unregister_browser_bindable_display(display_id: u32) {
+pub(crate) fn unregister_browser_bindable_display(display_id: u32) {
     if let Ok(mut displays) = browser_bindable_displays().lock() {
         displays.remove(&display_id);
     }
@@ -494,26 +494,25 @@ pub(crate) async fn reap_virtual_display(
     display_id: u32,
     context: &str,
 ) -> bool {
-    if let Some(guard) = guards.remove(&display_id) {
-        for workspace in
-            crate::browser_workspace::retire_workspaces_for_display(display_id, context).await
-        {
-            bus.send(AppEvent::BrowserWorkspaceChanged {
-                kind: "display_retired".to_string(),
-                workspace_id: Some(workspace.id.clone()),
-                message: workspace.message.clone(),
-                workspace: Some(workspace),
-            });
-        }
-        // Keep the display browser-bindable until every dependent workspace
-        // has been atomically retired. This prevents read-time reconciliation
-        // from winning the race and suppressing the push lifecycle event.
-        unregister_browser_bindable_display(display_id);
+    let guard = guards.remove(&display_id);
+    // The browser registry lock serializes both sides of this transition:
+    // creation checks bindability and reserves Starting under the same lock,
+    // while teardown removes bindability before scanning every reservation.
+    // No creator can appear after the scan, and read-time reconciliation
+    // cannot consume the transition before its push events are collected.
+    for workspace in crate::browser_workspace::close_display_binding(display_id, context).await {
+        bus.send(AppEvent::BrowserWorkspaceChanged {
+            kind: "display_retired".to_string(),
+            workspace_id: Some(workspace.id.clone()),
+            message: workspace.message.clone(),
+            workspace: Some(workspace),
+        });
+    }
+    if let Some(guard) = guard {
         eprintln!("[virtual_display] destroyed :{display_id} ({context})");
         guard.shutdown().await;
         true
     } else {
-        unregister_browser_bindable_display(display_id);
         false
     }
 }
