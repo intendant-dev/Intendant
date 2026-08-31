@@ -218,6 +218,11 @@ one. `replace_lines` errors if `end_line < line_number`.
   The controller derives that variable onto the runtime child's environment at
   spawn time from the autonomy guard's `user_display_granted` (the grant's
   single source of truth) — it is never set on the controller's own process.
+  For a daemon-owned private Xvfb, the controller also resolves that exact
+  display's live Xauthority path and injects a display-scoped internal record
+  over the runtime's one-shot stdin. Any model-supplied record is discarded;
+  `execAsAgent` and `captureScreen` select only the credential matching their
+  chosen display, while ordinary displays retain the merged session credential.
 - **Exit codes**: real exit code on completion; `-3` on timeout (process killed),
   `-2` on `wait_for_port` timeout, `-1` on spawn/wait failure.
 
