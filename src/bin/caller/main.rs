@@ -1184,6 +1184,7 @@ async fn maybe_auto_launch_xvfb(
         session_log,
         user_display_granted,
         has_cu_calls,
+        display::synthetic::armed(),
         vision::virtual_displays_supported(),
         vision::display_config_for_provider,
         |config| async move { vision::launch_display(&config).await },
@@ -1202,6 +1203,7 @@ async fn maybe_auto_launch_xvfb_with<ConfigFn, LaunchFn, LaunchFuture>(
     session_log: &SharedSessionLog,
     user_display_granted: bool,
     has_cu_calls: bool,
+    synthetic_display_armed: bool,
     virtual_displays_supported: bool,
     display_config_for_provider: ConfigFn,
     launch_display: LaunchFn,
@@ -1215,6 +1217,14 @@ where
         return Ok(());
     }
     if !facts.has_capture_screen && !facts.has_exec && !has_cu_calls {
+        return Ok(());
+    }
+    // The fail-closed mock rig's synthetic backend is explicitly OS-free.
+    // Allocating Xvfb here contradicts that contract, consumes the shared
+    // host display range, and can leave stale sockets when CI cancels a job.
+    // Native CU and capture continue through the already-armed synthetic
+    // backend; ordinary shell commands need no display at all.
+    if synthetic_display_armed {
         return Ok(());
     }
     // Xvfb is a Linux-only isolation backend. Native-display platforms keep
@@ -1656,6 +1666,7 @@ mod tests {
             &session_log,
             false,
             true,
+            false,
             true,
             |_| {
                 Some(vision::DisplayConfig {
@@ -1708,6 +1719,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             move |_| {
                 allocation_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
                 None
@@ -1748,6 +1760,7 @@ mod tests {
             &session_log,
             false,
             true,
+            false,
             true,
             |_| None,
             move |_| {
@@ -1763,6 +1776,56 @@ mod tests {
 
         let error = result.expect_err("exhausted allocation must reject native CU");
         assert!(error.contains("No unoccupied virtual display"), "{error}");
+        assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(guard.is_none());
+    }
+
+    /// The mock-provider synthetic display is an OS-free test seam. Even an
+    /// exec/CU batch must not consult the allocator or launch Xvfb while it is
+    /// armed; cancelled test processes could otherwise leak host-global X11
+    /// sockets and eventually exhaust the complete virtual-display range.
+    #[tokio::test]
+    async fn synthetic_display_skips_xvfb_allocation_and_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let allocation_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launch_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allocation_attempted_in_hook = std::sync::Arc::clone(&allocation_attempted);
+        let launch_attempted_in_hook = std::sync::Arc::clone(&launch_attempted);
+        let mut guard = None;
+        let facts = BatchFacts {
+            has_exec: true,
+            ..BatchFacts::default()
+        };
+
+        let result = maybe_auto_launch_xvfb_with(
+            &facts,
+            &mut guard,
+            "mock",
+            &session_log,
+            false,
+            true,
+            true,
+            true,
+            move |_| {
+                allocation_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            move |_| {
+                launch_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<vision::XvfbGuard, _>(CallerError::Config(
+                        "launcher must not run".to_string(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(!allocation_attempted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(guard.is_none());
     }
