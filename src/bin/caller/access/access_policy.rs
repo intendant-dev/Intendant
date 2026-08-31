@@ -162,6 +162,31 @@ pub enum PeerIdentityStatus {
     Revoked,
 }
 
+/// Which lane an identity record authenticates into. The classes never
+/// cross: a `Peer` record resolves only through the peer-daemon lane
+/// and an `Agent` record only through the agent-client lane (the R1
+/// MCP sidecar), each resolver refusing the other class fail-closed —
+/// the record class, not the certificate, is this store's
+/// discriminator, so a credential approved for one lane can never be
+/// replayed into the other.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityClass {
+    /// A federated daemon (every record written before the agent lane
+    /// existed deserializes here — the serde default).
+    #[default]
+    Peer,
+    /// An enrolled agent-operator client: a machine principal driving
+    /// this daemon over `/mcp` under an owner-granted profile ceiling.
+    Agent,
+}
+
+impl IdentityClass {
+    pub fn is_peer(&self) -> bool {
+        matches!(self, IdentityClass::Peer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerIdentityRecord {
     pub version: u8,
@@ -169,6 +194,8 @@ pub struct PeerIdentityRecord {
     pub label: String,
     pub profile: String,
     pub status: PeerIdentityStatus,
+    #[serde(default, skip_serializing_if = "IdentityClass::is_peer")]
+    pub class: IdentityClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,6 +269,13 @@ pub enum ProfileClass {
     /// and route it to the attachment lane; authority over the worker
     /// flows the other way (home drives the worker), never inbound.
     CloudWorker,
+    /// The R1 agent-client ceiling (the MCP sidecar lane): everything a
+    /// machine principal may hold — approvals included — short of
+    /// access administration and credential custody, the same lane rule
+    /// that caps `AdminPeer`. An enrolled agent's granted profile is
+    /// either this class or any peer-vocabulary profile (each fits
+    /// under it), chosen by the owner at approval.
+    AgentOperator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +437,18 @@ pub(crate) const CLOUD_WORKER_PROFILE: &str = "cloud-worker";
 pub(crate) const SYSTEM_PROFILES: &[(&str, ProfileClass)] =
     &[(CLOUD_WORKER_PROFILE, ProfileClass::CloudWorker)];
 
+/// The R1 agent-operator profile name — the ceiling class for enrolled
+/// agent clients (the MCP sidecar lane).
+pub(crate) const AGENT_OPERATOR_PROFILE: &str = "agent-operator";
+
+/// Agent-lane profiles: recognized by every enforcement path, assignable
+/// only through the AGENT enrollment ceremony — the peer paths'
+/// [`require_known_profile`] keeps rejecting them, and the dashboard
+/// picker's parity pin mirrors [`PROFILES`] alone, so nothing peer-shaped
+/// can be granted an agent class by typo.
+pub(crate) const AGENT_PROFILES: &[(&str, ProfileClass)] =
+    &[(AGENT_OPERATOR_PROFILE, ProfileClass::AgentOperator)];
+
 /// Accepted alternate spellings, each canonicalizing to a [`PROFILES`] name.
 pub(crate) const PROFILE_ALIASES: &[(&str, &str)] = &[
     ("presence", "presence-only"),
@@ -447,6 +493,7 @@ pub fn profile_class(profile: &str) -> ProfileClass {
         .or_else(|| {
             SYSTEM_PROFILES
                 .iter()
+                .chain(AGENT_PROFILES)
                 .find(|(name, _)| *name == normalized)
                 .map(|(_, class)| *class)
         })
@@ -486,6 +533,31 @@ pub fn require_known_profile(raw: &str) -> Result<String, CallerError> {
     Err(CallerError::Config(format!(
         "unknown peer profile '{normalized}'; known profiles: {known}; accepted aliases: {aliases}"
     )))
+}
+
+/// Operator-facing validation for the AGENT approval path: an enrolled
+/// agent's granted profile may be any peer-vocabulary profile (each
+/// fits under the agent-operator operation set) or `agent-operator`
+/// itself. Same loud-typo contract as [`require_known_profile`]; the
+/// peer paths never accept the agent vocabulary and vice-versa is
+/// deliberately one-way (a peer profile on an agent identity is a
+/// narrower ceiling, which is always allowed).
+pub fn require_known_agent_profile(raw: &str) -> Result<String, CallerError> {
+    let normalized = normalize_profile(raw)?;
+    if let Some((name, _)) = AGENT_PROFILES.iter().find(|(name, _)| *name == normalized) {
+        return Ok(name.to_string());
+    }
+    require_known_profile(&normalized).map_err(|_| {
+        let known = AGENT_PROFILES
+            .iter()
+            .chain(PROFILES)
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        CallerError::Config(format!(
+            "unknown agent profile '{normalized}'; known profiles: {known}"
+        ))
+    })
 }
 
 pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
@@ -536,6 +608,13 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
         // key-writing route gated at Settings would hand AdminPeer
         // custody through the side door.
         AdminPeer => !matches!(op, AccessManage | CredentialsManage),
+        // The agent lane inherits the same rule for the same reason: an
+        // agent client's principal is a machine, and access
+        // administration and credential custody must stay attributable
+        // to an identified person on a user-lane surface. This is the
+        // R1 charter's ceiling — approvals and operation up to
+        // everything short of IAM/credential administration.
+        AgentOperator => !matches!(op, AccessManage | CredentialsManage),
     }
 }
 
@@ -1340,6 +1419,54 @@ pub fn write_approved_identity_expiring(
     request_id: Option<&str>,
     expires_at_unix: Option<i64>,
 ) -> Result<PeerIdentityRecord, CallerError> {
+    write_approved_identity_record(
+        cert_dir,
+        fingerprint,
+        label,
+        profile,
+        IdentityClass::Peer,
+        card_url,
+        request_id,
+        expires_at_unix,
+    )
+}
+
+/// The agent-lane writer: identical store, [`IdentityClass::Agent`]
+/// stamped, no card URL (an agent client has no daemon card). Only the
+/// agent enrollment ceremony calls this; the peer approval paths stay
+/// on the peer writers above, so the class an identity authenticates
+/// into is decided by which ceremony approved it, never by the wire.
+pub fn write_approved_agent_identity(
+    cert_dir: &Path,
+    fingerprint: &str,
+    label: &str,
+    profile: &str,
+    request_id: Option<&str>,
+    expires_at_unix: Option<i64>,
+) -> Result<PeerIdentityRecord, CallerError> {
+    write_approved_identity_record(
+        cert_dir,
+        fingerprint,
+        label,
+        profile,
+        IdentityClass::Agent,
+        None,
+        request_id,
+        expires_at_unix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_approved_identity_record(
+    cert_dir: &Path,
+    fingerprint: &str,
+    label: &str,
+    profile: &str,
+    class: IdentityClass,
+    card_url: Option<&str>,
+    request_id: Option<&str>,
+    expires_at_unix: Option<i64>,
+) -> Result<PeerIdentityRecord, CallerError> {
     with_identity_store_lock(cert_dir, || {
         let fingerprint = normalize_fingerprint(fingerprint)?;
         let profile = normalize_profile(profile)?;
@@ -1349,6 +1476,7 @@ pub fn write_approved_identity_expiring(
             label: label.trim().to_string(),
             profile,
             status: PeerIdentityStatus::Approved,
+            class,
             card_url: card_url.map(str::to_string),
             request_id: request_id.map(str::to_string),
             filesystem: FilesystemAccessPolicy::default(),

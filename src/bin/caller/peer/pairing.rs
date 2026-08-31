@@ -440,6 +440,7 @@ async fn cmd_request(args: PeerArgs) -> Result<(), CallerError> {
             requester_label: args.label,
             requested_profile: args.profile,
             requester_card_url: args.requester_card_url,
+            requested_class: None,
         },
     )
     .await?;

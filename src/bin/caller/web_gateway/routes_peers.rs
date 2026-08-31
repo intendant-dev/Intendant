@@ -648,6 +648,7 @@ pub(crate) async fn peers_pairing_request_access(
             requester_label: req.label,
             requested_profile: req.profile,
             requester_card_url: req.requester_card_url,
+            requested_class: None,
         },
     )
     .await

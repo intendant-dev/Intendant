@@ -54,7 +54,8 @@ pub(crate) struct AccessRequestCreate {
     /// target, key, or ceremony. All-absent = a legacy requester
     /// (admitted, shown as an unverified caller). A target that predates
     /// these fields rejects them (`deny_unknown_fields`); the requester
-    /// retries once without and notes the downgrade.
+    /// surfaces that as a hard error — never a silent downgrade an
+    /// on-path 400 could force (see the send path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_daemon_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +72,15 @@ pub(crate) struct AccessRequestCreate {
     /// request — it is never admitted as a bare assertion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_tier: Option<String>,
+    /// The lane this enrollment asks for: absent = a federated peer
+    /// daemon (every pre-agent requester); `agent` = an R1 agent-client
+    /// enrollment. Requester-declared by design — the class changes
+    /// what an APPROVAL mints, never what the knock may do — and a
+    /// target that predates the field rejects the request outright
+    /// (`deny_unknown_fields`), so an agent enrollment can never be
+    /// silently approved as a peer by an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_class: Option<crate::access::access_policy::IdentityClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +166,14 @@ pub(crate) struct StoredAccessRequest {
     pub requester_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hint: Option<String>,
+    /// The lane the requester asked to enroll into; approval mints a
+    /// certificate and identity record of exactly this class, and the
+    /// owner-facing listings say which they are approving.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::access::access_policy::IdentityClass::is_peer"
+    )]
+    pub class: crate::access::access_policy::IdentityClass,
     pub target_label: String,
     pub target_card_url: String,
     pub server_cert_fingerprint: String,
@@ -199,6 +217,10 @@ pub(crate) struct InitiateAccessRequestOptions {
     pub requester_label: Option<String>,
     pub requested_profile: Option<String>,
     pub requester_card_url: Option<String>,
+    /// `Some(Agent)` = an R1 agent-client enrollment (`intendant mcp
+    /// enroll`); `None` keeps the wire field absent so peer requests
+    /// stay byte-identical to pre-agent builds.
+    pub requested_class: Option<crate::access::access_policy::IdentityClass>,
 }
 
 #[derive(Debug)]
@@ -485,6 +507,7 @@ pub(crate) fn create_pending_request(
         requester_daemon_id: verified_requester_daemon_id,
         requester_tier: verified_requester_tier,
         source_hint,
+        class: request.requested_class.unwrap_or_default(),
         target_label: target_label.clone(),
         target_card_url: target_card_url.clone(),
         server_cert_fingerprint: server_cert_fingerprint.clone(),
@@ -497,7 +520,11 @@ pub(crate) fn create_pending_request(
     };
     write_request(cert_dir, &stored)?;
     eprintln!(
-        "intendant: peer access request {} from {}{}; approve with `intendant peer approve {}`",
+        "intendant: {} access request {} from {}{}; approve with `intendant peer approve {}`",
+        match stored.class {
+            crate::access::access_policy::IdentityClass::Peer => "peer",
+            crate::access::access_policy::IdentityClass::Agent => "AGENT",
+        },
         stored.code,
         stored.requester_label,
         stored
@@ -560,21 +587,62 @@ pub(crate) fn approve_request(
         .transpose()?
         .or_else(|| stored.requested_profile.clone())
         .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
-    let cert_pem = access::certs::issue_client_certificate_for_public_key(
-        cert_dir,
-        &stored.requester_label,
-        &stored.public_key_pem,
-    )
+    // Strict at the core for the new lane: an agent grant must be in
+    // the agent vocabulary (agent-operator or any peer profile, each
+    // of which fits under it) — a typo fails the approval loudly
+    // instead of storing a presence-only degrade the owner never
+    // chose. Validated BEFORE minting so the recorded approved_profile
+    // is exactly what the identity record holds.
+    let profile = match stored.class {
+        super::access_policy::IdentityClass::Peer => profile,
+        super::access_policy::IdentityClass::Agent => {
+            super::access_policy::require_known_agent_profile(&profile)?
+        }
+    };
+    // The stored class decides which lane this approval mints into —
+    // cert shape, profile vocabulary, and identity writer all switch
+    // together, so a peer request can never produce an agent identity
+    // or vice versa.
+    let cert_pem = match stored.class {
+        super::access_policy::IdentityClass::Peer => {
+            access::certs::issue_client_certificate_for_public_key(
+                cert_dir,
+                &stored.requester_label,
+                &stored.public_key_pem,
+            )
+        }
+        super::access_policy::IdentityClass::Agent => {
+            access::certs::issue_agent_certificate_for_public_key(
+                cert_dir,
+                &stored.requester_label,
+                &stored.public_key_pem,
+            )
+        }
+    }
     .map_err(|e| CallerError::Config(e.to_string()))?;
     let client_fingerprint = super::access_policy::fingerprint_pem(&cert_pem)?;
-    super::access_policy::write_approved_identity(
-        cert_dir,
-        &client_fingerprint,
-        &stored.requester_label,
-        &profile,
-        stored.requester_card_url.as_deref(),
-        Some(&stored.request_id),
-    )?;
+    match stored.class {
+        super::access_policy::IdentityClass::Peer => {
+            super::access_policy::write_approved_identity(
+                cert_dir,
+                &client_fingerprint,
+                &stored.requester_label,
+                &profile,
+                stored.requester_card_url.as_deref(),
+                Some(&stored.request_id),
+            )?;
+        }
+        super::access_policy::IdentityClass::Agent => {
+            super::access_policy::write_approved_agent_identity(
+                cert_dir,
+                &client_fingerprint,
+                &stored.requester_label,
+                &profile,
+                Some(&stored.request_id),
+                None,
+            )?;
+        }
+    }
     stored.status = AccessRequestStatus::Approved;
     stored.approved_profile = Some(profile);
     stored.approved_at_unix = Some(unix_timestamp());
@@ -631,6 +699,7 @@ pub(crate) async fn initiate_access_request(
         requester_daemon_sig_ts: None,
         dialed_origin: None,
         requester_tier: None,
+        requested_class: options.requested_class,
     };
     // Caller-ID: prove this daemon's identity over the doorbell. Best
     // effort — a box without a loadable identity still rings the bell,
