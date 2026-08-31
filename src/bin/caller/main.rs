@@ -1223,8 +1223,17 @@ where
     // Allocating Xvfb here contradicts that contract, consumes the shared
     // host display range, and can leave stale sockets when CI cancels a job.
     // Native CU and capture continue through the already-armed synthetic
-    // backend; ordinary shell commands need no display at all.
+    // backend; ordinary shell commands need no display at all. The legacy
+    // runtime captureScreen command cannot reach that backend, so reject it
+    // before the runtime can invoke an OS capture tool against inherited X11.
     if synthetic_display_armed {
+        if facts.has_capture_screen {
+            return Err(
+                "Legacy captureScreen is unavailable in synthetic display mode; the batch was \
+                 not executed and no OS display was touched. Use native screenshot computer use."
+                    .to_string(),
+            );
+        }
         return Ok(());
     }
     // Xvfb is a Linux-only isolation backend. Native-display platforms keep
@@ -1825,6 +1834,58 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(()));
+        assert!(!allocation_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(guard.is_none());
+    }
+
+    /// Legacy captureScreen executes inside the sandbox runtime and cannot
+    /// consume SyntheticBackend frames. Reject it before allocator, launcher,
+    /// or runtime dispatch rather than letting ImageMagick touch inherited
+    /// X11. The native Screenshot CU action uses the synthetic backend.
+    #[tokio::test]
+    async fn synthetic_display_rejects_legacy_capture_without_os_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let allocation_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launch_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allocation_attempted_in_hook = std::sync::Arc::clone(&allocation_attempted);
+        let launch_attempted_in_hook = std::sync::Arc::clone(&launch_attempted);
+        let mut guard = None;
+        let facts = BatchFacts {
+            has_capture_screen: true,
+            ..BatchFacts::default()
+        };
+
+        let result = maybe_auto_launch_xvfb_with(
+            &facts,
+            &mut guard,
+            "mock",
+            &session_log,
+            false,
+            false,
+            true,
+            true,
+            move |_| {
+                allocation_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            move |_| {
+                launch_attempted_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<vision::XvfbGuard, _>(CallerError::Config(
+                        "launcher must not run".to_string(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        let error = result.expect_err("legacy capture must fail before OS access");
+        assert!(error.contains("no OS display was touched"), "{error}");
+        assert!(error.contains("native screenshot"), "{error}");
         assert!(!allocation_attempted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!launch_attempted.load(std::sync::atomic::Ordering::SeqCst));
         assert!(guard.is_none());
