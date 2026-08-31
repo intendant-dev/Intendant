@@ -14,6 +14,25 @@
 // { id, sessionId, access } while the panel is up.
 let pendingDisplayRequest = null;
 let displayRequestExpireTimer = null;
+// Keep the full live wire payloads independently of the one visible panel.
+// Other bottom panels may temporarily displace the display-request card; the
+// Attention inbox must still be able to restore the actionable request.
+const liveDisplayRequests = new Map();
+
+function displayRequestKey(sessionId, id) {
+  return `${String(sessionId || '')}::${String(id)}`;
+}
+
+function removeLiveDisplayRequest(sessionId, id) {
+  const sid = String(sessionId || '');
+  if (sid) {
+    liveDisplayRequests.delete(displayRequestKey(sid, id));
+    return;
+  }
+  for (const [key, request] of liveDisplayRequests) {
+    if (String(request && request.id) === String(id)) liveDisplayRequests.delete(key);
+  }
+}
 
 function clearPendingDisplayRequest() {
   pendingDisplayRequest = null;
@@ -53,8 +72,19 @@ function showDisplayRequest(d) {
   if (id === undefined || id === null) return;
   const access = d.access === 'view_and_control' ? 'view_and_control' : 'view';
   const expiresAt = Number(d.expires_unix_ms || 0);
-  if (expiresAt && expiresAt <= Date.now()) return; // stale bootstrap replay
+  if (expiresAt && expiresAt <= Date.now()) return false; // stale bootstrap replay
 
+  // A display request is a doorbell, not just an attention badge: bring its
+  // handling surface into view even when the owner is elsewhere in the app.
+  // Route refusal preserves live annotation/callout work on Displays; in that
+  // case leave the request cached/attended instead of claiming a hidden panel.
+  if (typeof routeTo === 'function') {
+    try {
+      if (routeTo('activity', 'log') === false) return false;
+    } catch (_) {
+      return false;
+    }
+  }
   hideAllPanels();
   pendingDisplayRequest = { id, sessionId: d.session_id || '', access };
   if (pendingDisplayRequest.sessionId) {
@@ -153,6 +183,7 @@ function showDisplayRequest(d) {
   revealActivityLogPanel();
   document.getElementById('display-request-panel').classList.add('visible');
   setApprovalIndicator(true);
+  return true;
 }
 
 window.sendDisplayRequestDecision = function (decision) {
@@ -172,11 +203,27 @@ window.sendDisplayRequestDecision = function (decision) {
   hidePanel('display-request-panel');
 };
 
+function restoreDisplayRequestPanel(sessionId, id) {
+  const key = displayRequestKey(sessionId, id);
+  const request = liveDisplayRequests.get(key);
+  if (!request) return false;
+  const expiresAt = Number(request.expires_unix_ms || 0);
+  if (expiresAt && expiresAt <= Date.now()) {
+    liveDisplayRequests.delete(key);
+    return false;
+  }
+  return showDisplayRequest(request) === true;
+}
+
 function handleDisplayRequestRaised(d) {
+  const id = d && d.id;
+  if (id === undefined || id === null) return;
+  liveDisplayRequests.set(displayRequestKey(d.session_id, id), { ...d });
   showDisplayRequest(d);
 }
 
 function handleDisplayRequestResolved(d) {
+  removeLiveDisplayRequest(d && d.session_id, d && d.id);
   // Another dashboard (or the timeout / session end) resolved it.
   if (
     pendingDisplayRequest &&

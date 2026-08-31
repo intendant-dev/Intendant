@@ -427,6 +427,25 @@ function attentionNavigate(item) {
     // where the cause lives.
     attentionRetire(item, 'clicked');
   }
+  if (item.kind === 'display') {
+    // A display-request card can be displaced by another bottom panel. The
+    // daemon request remains live, so the Attention item must restore the
+    // actual Allow/Deny surface rather than merely focusing its session.
+    if (typeof restoreDisplayRequestPanel === 'function') {
+      try {
+        if (restoreDisplayRequestPanel(item.sessionId, item.id)) return;
+      } catch (_) {}
+    }
+    // If the request resolved between the click and restoration, still land
+    // on the surface where a fresh request will appear.
+    if (typeof routeTo === 'function') {
+      try {
+        if (routeTo('activity', 'log') === false) return;
+      } catch (_) {
+        return;
+      }
+    }
+  }
   if (sid) {
     if (typeof focusSessionWindow === 'function') {
       try { focusSessionWindow(sid); } catch (_) {}
