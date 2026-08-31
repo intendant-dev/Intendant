@@ -727,7 +727,15 @@ async fn activate_user_display_inner(
     #[cfg(target_os = "linux")]
     if target_display_id != 0 && vision::virtual_display_socket_exists(target_display_id) {
         let display_str = format!(":{target_display_id}");
-        let backend = match display::x11::X11Backend::with_display(&display_str) {
+        let backend = match vision::virtual_display_x11_authorization(target_display_id) {
+            Some(authorization) => display::x11::X11Backend::with_display_authorization(
+                &display_str,
+                authorization.protocol(),
+                authorization.cookie(),
+            ),
+            None => display::x11::X11Backend::with_display(&display_str),
+        };
+        let backend = match backend {
             Ok(backend) => backend,
             Err(e) => {
                 report_user_display_capture_unavailable_with_generation(

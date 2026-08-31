@@ -18,6 +18,7 @@
 //! functions wrap the work in `spawn_blocking`.
 
 use std::collections::HashMap;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
-use x11rb::rust_connection::RustConnection;
+use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::keymap::{char_to_x11_keysym, dom_code_to_x11_keycode};
@@ -42,6 +43,82 @@ const DRAG_STEPS: i32 = 5;
 const PASTE_TRANSFER_WINDOW: Duration = Duration::from_millis(500);
 /// Refuse pastes larger than this rather than implementing INCR transfers.
 const PASTE_MAX_BYTES: usize = 1 << 20;
+const X11_AUTH_PROTOCOL: &[u8] = b"MIT-MAGIC-COOKIE-1";
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct X11Authorization {
+    protocol: Vec<u8>,
+    cookie: Vec<u8>,
+}
+
+/// Exact connection identity for one X11 server. Authenticated connections
+/// always use the display's local Unix socket; an auth cookie can therefore
+/// never authorize a caller-selected TCP endpoint.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct X11Connection {
+    display: String,
+    authorization: Option<X11Authorization>,
+}
+
+impl X11Connection {
+    #[must_use]
+    pub fn unauthenticated(display: impl Into<String>) -> Self {
+        Self {
+            display: display.into(),
+            authorization: None,
+        }
+    }
+
+    pub fn authenticated(
+        display: impl Into<String>,
+        protocol: &[u8],
+        cookie: &[u8],
+    ) -> Result<Self, String> {
+        let display = display.into();
+        parse_local_display_id(&display)?;
+        if protocol != X11_AUTH_PROTOCOL {
+            return Err("unsupported X11 authorization protocol".to_string());
+        }
+        if cookie.len() != 16 {
+            return Err("MIT-MAGIC-COOKIE-1 data must contain exactly 16 bytes".to_string());
+        }
+        Ok(Self {
+            display,
+            authorization: Some(X11Authorization {
+                protocol: protocol.to_vec(),
+                cookie: cookie.to_vec(),
+            }),
+        })
+    }
+
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    #[must_use]
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authorization.is_some()
+    }
+
+    pub(crate) fn connect(&self) -> Result<(RustConnection, usize), String> {
+        connect_protocol(self)
+    }
+}
+
+fn parse_local_display_id(display: &str) -> Result<u32, String> {
+    let digits = display
+        .strip_prefix(':')
+        .ok_or_else(|| format!("authenticated X11 display must be local: {display}"))?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "authenticated X11 display must have the exact :N form: {display}"
+        ));
+    }
+    digits
+        .parse::<u32>()
+        .map_err(|_| format!("authenticated X11 display is out of range: {display}"))
+}
 
 // ── Connection cache ─────────────────────────────────────────────────────────
 
@@ -110,39 +187,45 @@ impl From<x11rb::errors::ReplyOrIdError> for OpError {
     }
 }
 
-fn cache() -> &'static Mutex<HashMap<String, Arc<DisplayConn>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<DisplayConn>>>> = OnceLock::new();
+fn cache() -> &'static Mutex<HashMap<X11Connection, Arc<DisplayConn>>> {
+    static CACHE: OnceLock<Mutex<HashMap<X11Connection, Arc<DisplayConn>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn invalidate(display: &str) {
-    cache().lock().unwrap().remove(display);
+fn invalidate(connection: &X11Connection) {
+    cache().lock().unwrap().remove(connection);
 }
 
-fn connect_cached(display: &str) -> Result<Arc<DisplayConn>, String> {
-    if let Some(dc) = cache().lock().unwrap().get(display) {
+pub(crate) fn forget_authenticated(connection: &X11Connection) {
+    if connection.is_authenticated() {
+        invalidate(connection);
+    }
+}
+
+fn connect_cached(connection: &X11Connection) -> Result<Arc<DisplayConn>, String> {
+    if let Some(dc) = cache().lock().unwrap().get(connection) {
         return Ok(dc.clone());
     }
-    let dc = Arc::new(connect(display)?);
+    let dc = Arc::new(connect(connection)?);
     // Dedicated event thread per connection: the single consumer of the X
     // event queue. It answers clipboard SelectionRequests (paste serving) and
     // exits when the connection dies. x11rb routes replies to their waiting
     // requesters independently of this queue, so blocking here is safe.
     let event_dc = dc.clone();
     std::thread::Builder::new()
-        .name(format!("x11-input-events-{display}"))
+        .name(format!("x11-input-events-{}", connection.display()))
         .spawn(move || event_loop(event_dc))
         .map_err(|e| format!("spawn X11 event thread: {e}"))?;
     cache()
         .lock()
         .unwrap()
-        .insert(display.to_string(), dc.clone());
+        .insert(connection.clone(), dc.clone());
     Ok(dc)
 }
 
-fn connect(display: &str) -> Result<DisplayConn, String> {
-    let (conn, screen_num) = RustConnection::connect(Some(display))
-        .map_err(|e| format!("cannot connect to X display {display}: {e}"))?;
+fn connect(connection: &X11Connection) -> Result<DisplayConn, String> {
+    let (conn, screen_num) = connect_protocol(connection)?;
+    let display = connection.display();
     let setup = conn.setup();
     let min_keycode = setup.min_keycode;
     let max_keycode = setup.max_keycode;
@@ -202,6 +285,29 @@ fn connect(display: &str) -> Result<DisplayConn, String> {
     })
 }
 
+fn connect_protocol(connection: &X11Connection) -> Result<(RustConnection, usize), String> {
+    let display = connection.display();
+    match connection.authorization.as_ref() {
+        Some(authorization) => {
+            let display_id = parse_local_display_id(display)?;
+            let stream = UnixStream::connect(format!("/tmp/.X11-unix/X{display_id}"))
+                .map_err(|error| format!("cannot open X display {display} Unix socket: {error}"))?;
+            let (stream, _) = DefaultStream::from_unix_stream(stream)
+                .map_err(|error| format!("cannot prepare X display {display} stream: {error}"))?;
+            let connection = RustConnection::connect_to_stream_with_auth_info(
+                stream,
+                0,
+                authorization.protocol.clone(),
+                authorization.cookie.clone(),
+            )
+            .map_err(|error| format!("cannot authenticate to X display {display}: {error}"))?;
+            Ok((connection, 0))
+        }
+        None => RustConnection::connect(Some(display))
+            .map_err(|e| format!("cannot connect to X display {display}: {e}")),
+    }
+}
+
 fn intern_atom(conn: &RustConnection, name: &str) -> Result<xproto::Atom, String> {
     Ok(conn
         .intern_atom(false, name.as_bytes())
@@ -219,15 +325,23 @@ where
     T: Send + 'static,
     F: Fn(&DisplayConn) -> Result<T, OpError> + Send + Sync + 'static,
 {
-    let display = display.to_string();
+    with_connection(&X11Connection::unauthenticated(display), op).await
+}
+
+async fn with_connection<T, F>(connection: &X11Connection, op: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Fn(&DisplayConn) -> Result<T, OpError> + Send + Sync + 'static,
+{
+    let connection = connection.clone();
     tokio::task::spawn_blocking(move || {
         let mut last_err = None;
         for attempt in 0..2 {
-            let dc = connect_cached(&display)?;
+            let dc = connect_cached(&connection)?;
             match op(&dc) {
                 Ok(v) => return Ok(v),
                 Err(OpError::Conn(e)) if attempt == 0 => {
-                    invalidate(&display);
+                    invalidate(&connection);
                     last_err = Some(e);
                 }
                 Err(OpError::Conn(e)) | Err(OpError::Other(e)) => return Err(e),
@@ -318,7 +432,16 @@ pub async fn click(display: &str, x: i32, y: i32, button: u8, clicks: u32) -> Re
 }
 
 pub async fn mouse_down(display: &str, x: i32, y: i32, button: u8) -> Result<(), String> {
-    with_conn(display, move |dc| {
+    mouse_down_on(&X11Connection::unauthenticated(display), x, y, button).await
+}
+
+pub async fn mouse_down_on(
+    connection: &X11Connection,
+    x: i32,
+    y: i32,
+    button: u8,
+) -> Result<(), String> {
+    with_connection(connection, move |dc| {
         fake_motion(dc, x, y)?;
         sync(dc)?;
         fake_button(dc, button, true)?;
@@ -329,7 +452,16 @@ pub async fn mouse_down(display: &str, x: i32, y: i32, button: u8) -> Result<(),
 }
 
 pub async fn mouse_up(display: &str, x: i32, y: i32, button: u8) -> Result<(), String> {
-    with_conn(display, move |dc| {
+    mouse_up_on(&X11Connection::unauthenticated(display), x, y, button).await
+}
+
+pub async fn mouse_up_on(
+    connection: &X11Connection,
+    x: i32,
+    y: i32,
+    button: u8,
+) -> Result<(), String> {
+    with_connection(connection, move |dc| {
         fake_motion(dc, x, y)?;
         sync(dc)?;
         fake_button(dc, button, false)?;
@@ -340,7 +472,11 @@ pub async fn mouse_up(display: &str, x: i32, y: i32, button: u8) -> Result<(), S
 }
 
 pub async fn move_mouse(display: &str, x: i32, y: i32) -> Result<(), String> {
-    with_conn(display, move |dc| {
+    move_mouse_on(&X11Connection::unauthenticated(display), x, y).await
+}
+
+pub async fn move_mouse_on(connection: &X11Connection, x: i32, y: i32) -> Result<(), String> {
+    with_connection(connection, move |dc| {
         fake_motion(dc, x, y)?;
         sync(dc)
     })
@@ -389,7 +525,24 @@ pub async fn drag(
 /// Scroll `amount` wheel ticks with the given X11 wheel button
 /// (4=up, 5=down, 6=left, 7=right).
 pub async fn scroll(display: &str, x: i32, y: i32, button: u8, amount: u32) -> Result<(), String> {
-    with_conn(display, move |dc| {
+    scroll_on(
+        &X11Connection::unauthenticated(display),
+        x,
+        y,
+        button,
+        amount,
+    )
+    .await
+}
+
+pub async fn scroll_on(
+    connection: &X11Connection,
+    x: i32,
+    y: i32,
+    button: u8,
+    amount: u32,
+) -> Result<(), String> {
+    with_connection(connection, move |dc| {
         fake_motion(dc, x, y)?;
         sync(dc)?;
         for i in 0..amount.max(1) {
@@ -409,7 +562,14 @@ pub async fn scroll(display: &str, x: i32, y: i32, button: u8, amount: u32) -> R
 /// the session backends. A mid-sequence failure releases any key left pressed
 /// before returning the error — a stuck modifier corrupts every later action.
 pub async fn key_sequence(display: &str, events: Vec<(String, bool)>) -> Result<(), String> {
-    with_conn(display, move |dc| {
+    key_sequence_on(&X11Connection::unauthenticated(display), events).await
+}
+
+pub async fn key_sequence_on(
+    connection: &X11Connection,
+    events: Vec<(String, bool)>,
+) -> Result<(), String> {
+    with_connection(connection, move |dc| {
         let mut outstanding: Vec<u8> = Vec::new();
         let mut result = Ok(());
         for (i, (code, press)) in events.iter().enumerate() {
@@ -544,8 +704,12 @@ fn build_keysym_index(dc: &DisplayConn) -> Result<KeysymIndex, OpError> {
 /// are pressed directly (with shift where needed); anything else goes through
 /// a scratch keycode temporarily remapped to the character's keysym.
 pub async fn type_text(display: &str, text: &str) -> Result<(), String> {
+    type_text_on(&X11Connection::unauthenticated(display), text).await
+}
+
+pub async fn type_text_on(connection: &X11Connection, text: &str) -> Result<(), String> {
     let text = text.to_string();
-    with_conn(display, move |dc| {
+    with_connection(connection, move |dc| {
         {
             let mut idx = dc.keysym_index.lock().unwrap();
             if idx.is_none() {
@@ -641,6 +805,10 @@ pub async fn type_text(display: &str, text: &str) -> Result<(), String> {
 /// selection keeps being served after this returns, like a normal clipboard
 /// owner, until another client takes the selection or the daemon exits.
 pub async fn paste(display: &str, text: &str) -> Result<(), String> {
+    paste_on(&X11Connection::unauthenticated(display), text).await
+}
+
+pub async fn paste_on(connection: &X11Connection, text: &str) -> Result<(), String> {
     if text.len() > PASTE_MAX_BYTES {
         return Err(format!(
             "paste text is {} bytes; the X11 direct-transfer limit is {} — use type or \
@@ -650,7 +818,7 @@ pub async fn paste(display: &str, text: &str) -> Result<(), String> {
         ));
     }
     let text = text.as_bytes().to_vec();
-    with_conn(display, move |dc| {
+    with_connection(connection, move |dc| {
         let _guard = dc.paste_lock.lock().unwrap();
         *dc.serving.lock().unwrap() = Some(ClipboardServing {
             text: Arc::new(text.clone()),
@@ -854,6 +1022,28 @@ mod tests {
         let text = "x".repeat(PASTE_MAX_BYTES + 1);
         let err = paste(":0", &text).await.unwrap_err();
         assert!(err.contains("direct-transfer limit"), "{err}");
+    }
+
+    #[test]
+    fn authenticated_connection_accepts_only_strict_local_display_and_cookie() {
+        let cookie = [7_u8; 16];
+        assert!(X11Connection::authenticated(":137", X11_AUTH_PROTOCOL, &cookie).is_ok());
+        for display in ["localhost:137", ":137.0", "137", ":", ":-1"] {
+            assert!(
+                X11Connection::authenticated(display, X11_AUTH_PROTOCOL, &cookie).is_err(),
+                "unsafe display unexpectedly accepted: {display}"
+            );
+        }
+        assert!(X11Connection::authenticated(":137", b"XDM-AUTHORIZATION-1", &cookie).is_err());
+        assert!(X11Connection::authenticated(":137", X11_AUTH_PROTOCOL, &[7_u8; 15]).is_err());
+    }
+
+    #[test]
+    fn connection_cache_identity_includes_authorization() {
+        let first = X11Connection::authenticated(":137", X11_AUTH_PROTOCOL, &[1_u8; 16]).unwrap();
+        let replacement =
+            X11Connection::authenticated(":137", X11_AUTH_PROTOCOL, &[2_u8; 16]).unwrap();
+        assert!(first != replacement);
     }
 
     /// Live test — needs a reachable X server (DISPLAY or :0). Run on the

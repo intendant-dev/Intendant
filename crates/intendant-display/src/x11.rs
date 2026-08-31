@@ -1,4 +1,4 @@
-//! X11 display backend using XShm for frame capture and xdotool for input
+//! X11 display backend using XShm for frame capture and XTest for input
 //! injection.
 //!
 //! The XShm capture loop runs on a dedicated `std::thread` (the X11 connection
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use x11rb::connection::Connection;
 
+use crate::x11_input::X11Connection;
+
 /// Active capture state: holds the thread handle for cleanup.
 struct CaptureState {
     thread: std::thread::JoinHandle<()>,
@@ -25,15 +27,15 @@ struct CaptureState {
 
 /// X11 screen capture and input injection backend.
 ///
-/// Uses `x11rb` with the XShm extension for fast full-screen capture and
-/// shells out to `xdotool` for keyboard/mouse/scroll input injection (same
-/// approach as the existing `computer_use.rs` X11 backend).
+/// Uses `x11rb` with the XShm extension for fast full-screen capture and a
+/// shared authenticated XTest connection for keyboard/mouse/scroll input.
 pub struct X11Backend {
     capture: Mutex<Option<CaptureState>>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     display: String,
+    connection: X11Connection,
     /// Demand probe slot shared with the capture thread. X11 capture is
     /// a full-screen copy at configured fps whether or not anything
     /// consumes it (~249 MB/s at 1080p30), so this polling backend is
@@ -51,9 +53,11 @@ impl X11Backend {
     /// setup -- the capture thread creates its own connection.
     pub fn new() -> Result<Self, CallerError> {
         let display_str = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        let connection = X11Connection::unauthenticated(&display_str);
 
         // Probe the display to get resolution.
-        let (conn, screen_num) = x11rb::connect(Some(&display_str))
+        let (conn, screen_num) = connection
+            .connect()
             .map_err(|e| CallerError::Display(format!("X11 connect: {e}")))?;
 
         let setup = conn.setup();
@@ -68,6 +72,7 @@ impl X11Backend {
             height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
             display: display_str,
+            connection,
             demand: Arc::new(DemandProbeSlot::new()),
         })
     }
@@ -76,7 +81,25 @@ impl X11Backend {
     /// Virtual display sessions use this to connect to their own Xvfb server
     /// regardless of where the process-wide `DISPLAY` points.
     pub fn with_display(display_str: &str) -> Result<Self, CallerError> {
-        let (conn, screen_num) = x11rb::connect(Some(display_str))
+        Self::with_connection(X11Connection::unauthenticated(display_str))
+    }
+
+    /// Create a backend for a private local X11 display using the exact
+    /// authorization bytes owned by its controller.
+    pub fn with_display_authorization(
+        display_str: &str,
+        protocol: &[u8],
+        cookie: &[u8],
+    ) -> Result<Self, CallerError> {
+        let connection = X11Connection::authenticated(display_str, protocol, cookie)
+            .map_err(CallerError::Display)?;
+        Self::with_connection(connection)
+    }
+
+    fn with_connection(connection: X11Connection) -> Result<Self, CallerError> {
+        let display_str = connection.display().to_string();
+        let (conn, screen_num) = connection
+            .connect()
             .map_err(|e| CallerError::Display(format!("X11 connect to {display_str}: {e}")))?;
 
         let setup = conn.setup();
@@ -89,9 +112,20 @@ impl X11Backend {
             width: Arc::new(AtomicU32::new(width)),
             height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            display: display_str.to_string(),
+            display: display_str,
+            connection,
             demand: Arc::new(DemandProbeSlot::new()),
         })
+    }
+}
+
+impl Drop for X11Backend {
+    fn drop(&mut self) {
+        // Private displays use a fresh cookie for every lifecycle. Evict its
+        // input connection so dead credentials cannot accumulate across the
+        // thousands of short-lived evidence captures this backend serves.
+        // The connection's event thread exits when the owned Xvfb closes.
+        crate::x11_input::forget_authenticated(&self.connection);
     }
 }
 
@@ -238,7 +272,7 @@ impl DisplayBackend for X11Backend {
 
         let (tx, rx) = mpsc::channel::<Frame>(4);
         let shutdown_flag = Arc::clone(&self.shutdown);
-        let display_str = self.display.clone();
+        let connection = self.connection.clone();
         let width = self.width.load(Ordering::SeqCst);
         let height = self.height.load(Ordering::SeqCst);
         let shared_w = Arc::clone(&self.width);
@@ -247,7 +281,7 @@ impl DisplayBackend for X11Backend {
 
         let thread = std::thread::spawn(move || {
             run_x11_capture(
-                display_str,
+                connection,
                 tx,
                 shutdown_flag,
                 fps,
@@ -296,39 +330,39 @@ impl DisplayBackend for X11Backend {
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
         let width = self.width.load(Ordering::SeqCst) as f64;
         let height = self.height.load(Ordering::SeqCst) as f64;
-        let display = &self.display;
+        let connection = &self.connection;
 
         // In-process XTest injection over the shared per-display connection
         // (crate::x11_input) — no xdotool fork per browser input event.
         match event {
             InputEvent::KeyDown { ref code, .. } => {
-                crate::x11_input::key_sequence(display, vec![(code.clone(), true)])
+                crate::x11_input::key_sequence_on(connection, vec![(code.clone(), true)])
                     .await
                     .map_err(CallerError::Display)?;
             }
             InputEvent::KeyUp { ref code, .. } => {
-                crate::x11_input::key_sequence(display, vec![(code.clone(), false)])
+                crate::x11_input::key_sequence_on(connection, vec![(code.clone(), false)])
                     .await
                     .map_err(CallerError::Display)?;
             }
             InputEvent::MouseMove { x, y, .. } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                crate::x11_input::move_mouse(display, px, py)
+                crate::x11_input::move_mouse_on(connection, px, py)
                     .await
                     .map_err(CallerError::Display)?;
             }
             InputEvent::MouseDown { x, y, b } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                crate::x11_input::mouse_down(display, px, py, x11_button_from_browser(b))
+                crate::x11_input::mouse_down_on(connection, px, py, x11_button_from_browser(b))
                     .await
                     .map_err(CallerError::Display)?;
             }
             InputEvent::MouseUp { x, y, b } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                crate::x11_input::mouse_up(display, px, py, x11_button_from_browser(b))
+                crate::x11_input::mouse_up_on(connection, px, py, x11_button_from_browser(b))
                     .await
                     .map_err(CallerError::Display)?;
             }
@@ -339,7 +373,7 @@ impl DisplayBackend for X11Backend {
                 if dy.abs() > f64::EPSILON {
                     let steps = dy.abs().round().max(1.0) as u32;
                     let button = if dy < 0.0 { 4 } else { 5 };
-                    crate::x11_input::scroll(display, px, py, button, steps)
+                    crate::x11_input::scroll_on(connection, px, py, button, steps)
                         .await
                         .map_err(CallerError::Display)?;
                 }
@@ -347,13 +381,32 @@ impl DisplayBackend for X11Backend {
                 if dx.abs() > f64::EPSILON {
                     let steps = dx.abs().round().max(1.0) as u32;
                     let button = if dx < 0.0 { 6 } else { 7 };
-                    crate::x11_input::scroll(display, px, py, button, steps)
+                    crate::x11_input::scroll_on(connection, px, py, button, steps)
                         .await
                         .map_err(CallerError::Display)?;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
+        crate::x11_input::type_text_on(&self.connection, text)
+            .await
+            .map_err(CallerError::Display)
+    }
+
+    async fn paste_text(&self, text: &str) -> Result<super::PasteOutcome, CallerError> {
+        crate::x11_input::paste_on(&self.connection, text)
+            .await
+            .map_err(CallerError::Display)?;
+        Ok(super::PasteOutcome {
+            clipboard_note: Some(
+                "clipboard: previous content not restored (X11 selections are pull-based); \
+                 the pasted text remains the CLIPBOARD selection"
+                    .to_string(),
+            ),
+        })
     }
 
     fn set_capture_demand_probe(&self, probe: pacing::CaptureDemandProbe) {
@@ -397,7 +450,7 @@ fn x11_button_from_browser(b: u8) -> u8 {
 /// and loops at the target framerate sending frames via `try_send()`.
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_x11_capture(
-    display_str: String,
+    connection: X11Connection,
     tx: mpsc::Sender<Frame>,
     shutdown: Arc<AtomicBool>,
     fps: u32,
@@ -413,7 +466,7 @@ fn run_x11_capture(
     let frame_interval =
         std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
 
-    let (conn, screen_num) = match x11rb::connect(Some(&display_str)) {
+    let (conn, screen_num) = match connection.connect() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[display/x11] X11 connect failed: {e}");
