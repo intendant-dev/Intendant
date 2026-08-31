@@ -880,18 +880,27 @@ pub(crate) async fn handle_mcp_post(
                     }
                 }
             };
-            if !client_gone {
-                let final_frame = match outcome {
-                    McpHttpOutcome::Response(resp) => {
-                        sse_frame("message", &serde_json::to_string(&resp).unwrap_or_default())
-                    }
-                    // Unreachable for a planned tools/call request
-                    // (notifications never plan); close the stream bare.
-                    McpHttpOutcome::Accepted => String::new(),
-                };
-                let _ = stream.write_all(final_frame.as_bytes()).await;
-                let _ = stream.flush().await;
+            if client_gone {
+                // The peer already failed a bounded write, so the
+                // graceful finalizer must not run: its unbounded
+                // flush + shutdown would push into the same
+                // backpressure (rustls can still hold ciphertext from
+                // the cancelled write) and park this task long after
+                // the verb finished. Dropping the stream closes the
+                // socket without the courtesy flush the peer stopped
+                // reading anyway.
+                return;
             }
+            let final_frame = match outcome {
+                McpHttpOutcome::Response(resp) => {
+                    sse_frame("message", &serde_json::to_string(&resp).unwrap_or_default())
+                }
+                // Unreachable for a planned tools/call request
+                // (notifications never plan); close the stream bare.
+                McpHttpOutcome::Accepted => String::new(),
+            };
+            let _ = stream.write_all(final_frame.as_bytes()).await;
+            let _ = stream.flush().await;
             finalize_http_stream(&mut stream).await;
             return;
         }

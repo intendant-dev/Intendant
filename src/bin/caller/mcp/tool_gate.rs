@@ -76,23 +76,30 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 /// - `execute_cu_actions` — a caller-supplied action list sleeps its
 ///   `wait`/`hold_key` millisecond durations verbatim
 ///   (`computer_use.rs`), so a sequence legitimately outlives the
-///   window.
+///   window (the 60 s cloud CU round trip also rides inside it).
 /// - `peer_execute_cu_actions` — the same caller-paced actions run on
 ///   a federated peer, bounded only by `PEER_MCP_TIMEOUT` (120 s).
+/// - `events` — the long-poll chunk may sit the full
+///   `EVENTS_WAIT_MAX_S` (60 s) on a quiet stream.
+/// - `remote_command` — `op=wait` chunks clamp to the same full
+///   window (`ctl::remote`'s 1–60 s chunk contract).
 ///
-/// Deliberately not held — quick by design, with caps at or under the
-/// window: the `events` long-poll (`EVENTS_WAIT_MAX_S` = 60, pinned by
-/// the test below), the cloud CU round trip (60 s), and the codex
-/// thread-action waits (20 s). The remaining peer round trips share
-/// `PEER_MCP_TIMEOUT` as a transport bound, but they are sub-second
-/// lookups — a cap is a bound, not a hold (the `events` reading).
-pub(crate) const MCP_HELD_POST_TOOLS: [&str; 6] = [
+/// A wait capped AT the window is held, not exempt: the full wait
+/// plus gate/dispatch overhead exceeds the idle window it equals, so
+/// the first response byte loses the race on a quiet chunk.
+/// Deliberately not held — quick by design with real margin: the
+/// codex thread-action waits (20 s) and the remaining peer round
+/// trips (sub-second lookups under `PEER_MCP_TIMEOUT`'s transport
+/// bound — a bound is not a hold).
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 8] = [
     "ask_user",
     "request_user_display",
     "spawn_live_audio",
     "fission_control",
     "execute_cu_actions",
     "peer_execute_cu_actions",
+    "events",
+    "remote_command",
 ];
 
 pub(crate) fn mcp_held_post_tool(name: &str) -> bool {
@@ -1885,21 +1892,15 @@ mod tests {
         });
     }
 
-    /// The held-POST classification tracks the real tool surface: every
-    /// held name is an advertised router tool, so a rename breaks here
-    /// instead of silently downgrading the verb to the plain JSON
-    /// answer that dies at the idle timeout; and the `events` long-poll
-    /// — deliberately excluded — stays at or under the window the
-    /// exclusion assumed, so raising its cap forces reclassification.
+    /// The held-POST classification tracks the real tool surface:
+    /// every held name must resolve to a live dispatch arm, so a
+    /// rename breaks here instead of silently downgrading the verb to
+    /// the plain JSON answer that dies at the idle timeout.
     #[test]
     fn held_post_classification_tracks_the_tool_surface() {
         use crate::event::EventBus;
         use crate::mcp::tests::{test_server, test_state};
 
-        assert!(
-            crate::mcp::tools_events::EVENTS_WAIT_MAX_S <= 60,
-            "the events long-poll cap crossed the held-POST window: move `events` into MCP_HELD_POST_TOOLS"
-        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
