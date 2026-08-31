@@ -2967,7 +2967,7 @@ pub(crate) static ROUTES: &[Route] = &[
         cors: CorsPosture::OwnOrigin,
         body: BodyPolicy::Capped(MCP_BODY_CAP_BYTES),
         handler: RouteHandlerId::McpPost,
-        doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
+        doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications; held-POST verbs answer as per-request SSE when accepted)",
         tunnel: None,
     },
     Route {

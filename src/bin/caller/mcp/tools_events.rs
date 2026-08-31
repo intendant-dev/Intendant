@@ -28,7 +28,11 @@ use super::*;
 use crate::event_ring::{EventRing, RingEntry};
 use std::sync::Arc;
 
-/// Long-poll ceiling — the `remote wait` chunk contract.
+/// Long-poll ceiling — the `remote wait` chunk contract. A chunk can
+/// sit this full window on a quiet stream, and the full wait plus
+/// dispatch overhead crosses a ~60 s idle window — which is why
+/// `events` is a held-POST verb (`MCP_HELD_POST_TOOLS`): SSE
+/// keepalives carry the quiet chunk when the client accepts them.
 const EVENTS_WAIT_MAX_S: u64 = 60;
 const EVENTS_PAGE_DEFAULT: usize = 100;
 const EVENTS_PAGE_MAX: usize = 500;

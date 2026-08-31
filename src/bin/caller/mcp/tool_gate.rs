@@ -55,6 +55,57 @@ pub(crate) fn fission_tool(name: &str) -> bool {
     )
 }
 
+/// The held-POST verbs: tools whose handlers can hold one `tools/call`
+/// past a ~60 s client/proxy idle window because they block on a human
+/// or on a long timer. The HTTP transport answers these as per-request
+/// SSE when the caller accepts it (`web_gateway::mcp_gate`); every
+/// other tool answers as plain JSON. The classification lives here,
+/// beside the other per-tool classifications, so a new held verb is
+/// declared once instead of mirrored into the gateway.
+///
+/// - `ask_user` — waits up to `ASK_USER_MAX_WAIT_SECS` (900 s) on the
+///   human's answer.
+/// - `request_user_display` — waits on the display-grant decision
+///   (caller-set `wait_secs`).
+/// - `spawn_live_audio` — always-consent gate
+///   (`live_audio::SPAWN_CONSENT_WAIT`, 300 s), then the voice
+///   conversation runs to its own completion.
+/// - `fission_control` — `op=wait` blocks up to 300 s
+///   (`clamp_fission_wait_timeout_s`); the quick ops answer in one
+///   frame, which the stream carries just as well.
+/// - `execute_cu_actions` — a caller-supplied action list sleeps its
+///   `wait`/`hold_key` millisecond durations verbatim
+///   (`computer_use.rs`), so a sequence legitimately outlives the
+///   window (the 60 s cloud CU round trip also rides inside it).
+/// - `peer_execute_cu_actions` — the same caller-paced actions run on
+///   a federated peer, bounded only by `PEER_MCP_TIMEOUT` (120 s).
+/// - `events` — the long-poll chunk may sit the full
+///   `EVENTS_WAIT_MAX_S` (60 s) on a quiet stream.
+/// - `remote_command` — `op=wait` chunks clamp to the same full
+///   window (`ctl::remote`'s 1–60 s chunk contract).
+///
+/// A wait capped AT the window is held, not exempt: the full wait
+/// plus gate/dispatch overhead exceeds the idle window it equals, so
+/// the first response byte loses the race on a quiet chunk.
+/// Deliberately not held — quick by design with real margin: the
+/// codex thread-action waits (20 s) and the remaining peer round
+/// trips (sub-second lookups under `PEER_MCP_TIMEOUT`'s transport
+/// bound — a bound is not a hold).
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 8] = [
+    "ask_user",
+    "request_user_display",
+    "spawn_live_audio",
+    "fission_control",
+    "execute_cu_actions",
+    "peer_execute_cu_actions",
+    "events",
+    "remote_command",
+];
+
+pub(crate) fn mcp_held_post_tool(name: &str) -> bool {
+    MCP_HELD_POST_TOOLS.contains(&name)
+}
+
 pub(crate) fn with_default_mcp_session_id(
     mut args: serde_json::Value,
     session_id: Option<&str>,
@@ -1836,6 +1887,52 @@ mod tests {
                     "router tool `{}` must declare a `\"type\": \"object\"` schema root \
                      — the stdio transport serves it verbatim",
                     tool.name
+                );
+            }
+        });
+    }
+
+    /// The held-POST classification tracks the real tool surface:
+    /// every held name must resolve to a live dispatch arm, so a
+    /// rename breaks here instead of silently downgrading the verb to
+    /// the plain JSON answer that dies at the idle timeout.
+    #[test]
+    fn held_post_classification_tracks_the_tool_surface() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            // Hidden-but-callable is a real category (`spawn_live_audio`
+            // and `fission_control` have dispatch arms but no listing),
+            // so no listing can be the universe: run each held name
+            // through the real dispatch with unparseable args instead. A
+            // live arm fails fast on its typed params; only a renamed or
+            // removed tool produces the unknown-tool fall-through.
+            let control = server
+                .call_tool_by_name_for_session(
+                    "definitely_not_a_tool",
+                    serde_json::json!([]),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("the unknown-tool probe must refuse");
+            assert!(
+                control.contains("Unknown tool"),
+                "the dispatch fall-through moved — reanchor this pin: {control}"
+            );
+            for held in MCP_HELD_POST_TOOLS {
+                let outcome = server
+                    .call_tool_by_name_for_session(held, serde_json::json!([]), None, None)
+                    .await;
+                assert!(
+                    !matches!(&outcome, Err(error) if error.contains("Unknown tool")),
+                    "held-POST tool `{held}` has no dispatch arm (renamed?)"
                 );
             }
         });

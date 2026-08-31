@@ -1377,6 +1377,20 @@ pub(crate) fn plan_for_meta(meta: &str, args: &serde_json::Value) -> Result<Plan
     })
 }
 
+/// The underlying tool an executor call resolves to, if it resolves —
+/// argv-only, values never parsed (the [`resolve_meta_argv`]
+/// discipline), so a transport may consult it pre-dispatch (per-request
+/// SSE mode selection) at the same cost class as the gate. `None`: not
+/// an executor call, or its path does not resolve.
+pub(crate) fn facade_resolved_tool(name: &str, args: &serde_json::Value) -> Option<&'static str> {
+    match name {
+        "inspect" | "act" | "authorize" => resolve_meta_argv(name, args)
+            .ok()
+            .map(|(_, spec)| spec.tool),
+        _ => None,
+    }
+}
+
 /// The gate-side authorization resolver. `None`: not a facade tool (fall
 /// through to the fixed per-tool map). `Some(op)`: authorize this
 /// operation, then dispatch. Resolution here NEVER builds arguments
