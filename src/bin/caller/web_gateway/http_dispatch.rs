@@ -372,12 +372,12 @@ pub(crate) async fn serve_http_request(
     let admitted_relay_peer = relay_peer_admission
         && base_discovery_only_ingress
         && !custom_domain_selected
-        && peer_connection_identity.as_ref().is_some_and(|identity| {
-            match identity.class {
+        && peer_connection_identity
+            .as_ref()
+            .is_some_and(|identity| match identity.class {
                 crate::peer::access_policy::IdentityClass::Peer => true,
                 crate::peer::access_policy::IdentityClass::Agent => req_path == "/mcp",
-            }
-        });
+            });
     // A custom-domain TLS name is itself a live authority decision even
     // before a passkey endpoint mints a lease. Retain that decision at the
     // transport edge now, so body reads, authority-worker awaits, and

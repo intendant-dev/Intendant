@@ -3232,8 +3232,10 @@ pub(crate) fn resolve_peer_connection_identity_from_cert_dir(
             // silently reinterpret. (Header-less requests resolve by
             // the record class alone, matching the peer transport's
             // long-standing contract that the header is an opt-in.)
-            let is_agent =
-                matches!(record.class, crate::peer::access_policy::IdentityClass::Agent);
+            let is_agent = matches!(
+                record.class,
+                crate::peer::access_policy::IdentityClass::Agent
+            );
             if (peer_mode && is_agent) || (agent_mode && !is_agent) {
                 return Err((
                     403,
@@ -3320,6 +3322,7 @@ mod tests {
         let bus = EventBus::new();
         let mut events = bus.subscribe();
         let identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peer-fingerprint".to_string(),
             label: "Peer label".to_string(),
             profile: "file-reader".to_string(),
@@ -4123,6 +4126,97 @@ mod tests {
         assert!(err.1.contains("peer identity revoked"));
     }
 
+    /// The class matrix at resolution: an agent record resolves with
+    /// its class; a lane-declaration mismatch in either direction is a
+    /// 403, never a silent reinterpretation; an unknown certificate
+    /// that declares the agent lane is refused like the peer twin.
+    #[test]
+    fn connection_identity_classes_never_cross_lanes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_fp = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let peer_fp = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let bare = "GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n";
+        let peer_header = "GET /mcp HTTP/1.1\r\nHost: x\r\nx-intendant-peer: 1\r\n\r\n";
+        let agent_header = "GET /mcp HTTP/1.1\r\nHost: x\r\nx-intendant-agent: 1\r\n\r\n";
+
+        // Unknown cert declaring the agent lane: refused by name.
+        let err = resolve_peer_connection_identity_from_cert_dir(
+            tmp.path(),
+            agent_header,
+            Some(agent_fp),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("unknown agent client certificate"));
+
+        crate::peer::access_policy::write_approved_agent_identity(
+            tmp.path(),
+            agent_fp,
+            "sidecar",
+            "agent-operator",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            peer_fp,
+            "peer-b",
+            "read-only-display",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The agent record resolves — headerless and with its own
+        // declaration — carrying its class.
+        for header in [bare, agent_header] {
+            let identity =
+                resolve_peer_connection_identity_from_cert_dir(tmp.path(), header, Some(agent_fp))
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                identity.class,
+                crate::peer::access_policy::IdentityClass::Agent
+            ));
+            assert_eq!(identity.profile, "agent-operator");
+        }
+
+        // Lane mismatches refuse in both directions.
+        let err =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), peer_header, Some(agent_fp))
+                .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("does not match the declared lane"));
+        let err =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), agent_header, Some(peer_fp))
+                .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("does not match the declared lane"));
+
+        // The classed identities bind classed principals at the one
+        // choke point.
+        let agent_identity =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(agent_fp))
+                .unwrap()
+                .unwrap();
+        let principal = peer_identity_access_principal(&agent_identity, "https");
+        assert_eq!(principal.kind, "agent_client");
+        let peer_identity =
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(peer_fp))
+                .unwrap()
+                .unwrap();
+        let principal = peer_identity_access_principal(&peer_identity, "https");
+        assert_eq!(principal.kind, "peer_daemon");
+
+        // Revoked agent records name their lane in the refusal.
+        crate::peer::access_policy::revoke_identity(tmp.path(), agent_fp).unwrap();
+        let err = resolve_peer_connection_identity_from_cert_dir(tmp.path(), bare, Some(agent_fp))
+            .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("agent identity revoked"));
+    }
+
     /// Connections without a TLS client certificate resolve as anonymous,
     /// even when the peer transport's `x-intendant-peer` header is present.
     /// Certless federation modes (`AuthRequirements::none()` on trusted
@@ -4214,6 +4308,7 @@ mod tests {
     fn http_access_context_carries_the_peer_identity_filesystem() {
         let tmp = tempfile::TempDir::new().unwrap();
         let identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "peerfp01".to_string(),
             label: "peer-a".to_string(),
             profile: "terminal-operator".to_string(),
@@ -4471,6 +4566,7 @@ mod tests {
             iam_cert_dir: None,
         };
         let peer_identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "fp".to_string(),
             label: "peer".to_string(),
             profile: "peer-root".to_string(),
@@ -4745,6 +4841,7 @@ mod tests {
             iam_cert_dir: None,
         };
         let peer_identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "fp".to_string(),
             label: "peer".to_string(),
             profile: "viewer".to_string(),

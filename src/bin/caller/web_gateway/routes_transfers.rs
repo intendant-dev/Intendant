@@ -1592,6 +1592,7 @@ mod tests {
         // for the fs-scoped grant and for a peer identity carrying the
         // same policy — identical decisions and wording on both.
         let peer = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "aabbccdd".to_string(),
             label: "peer".to_string(),
             profile: "file-operator".to_string(),

@@ -2225,6 +2225,106 @@ mod tests {
         );
     }
 
+    /// The agent lane's ceiling: the same custody exclusion as
+    /// peer-root — one lane rule, two lanes, so the two ceilings carry
+    /// the identical operation set — and the entire operator-assignable
+    /// peer vocabulary fits under it (any peer profile is a valid
+    /// narrower agent grant). The validators keep the vocabularies
+    /// one-way: the peer path never accepts `agent-operator`; the
+    /// agent path accepts both.
+    #[test]
+    fn agent_operator_is_the_custodyless_ceiling_with_its_own_vocabulary() {
+        assert!(profile_allows_operation(
+            AGENT_OPERATOR_PROFILE,
+            PeerOperation::Approval
+        ));
+        assert!(profile_allows_operation(
+            AGENT_OPERATOR_PROFILE,
+            PeerOperation::TerminalWrite
+        ));
+        assert!(!profile_allows_operation(
+            AGENT_OPERATOR_PROFILE,
+            PeerOperation::AccessManage
+        ));
+        assert!(!profile_allows_operation(
+            AGENT_OPERATOR_PROFILE,
+            PeerOperation::CredentialsManage
+        ));
+        assert_eq!(
+            profile_operation_permission_ids(AGENT_OPERATOR_PROFILE),
+            profile_operation_permission_ids("peer-root"),
+        );
+        for (name, _) in PROFILES {
+            assert!(
+                profile_fits_under(name, AGENT_OPERATOR_PROFILE),
+                "{name} must fit under the agent ceiling"
+            );
+        }
+        assert!(matches!(
+            profile_class(AGENT_OPERATOR_PROFILE),
+            ProfileClass::AgentOperator
+        ));
+        assert!(
+            require_known_profile(AGENT_OPERATOR_PROFILE).is_err(),
+            "the peer approval vocabulary must reject the agent profile"
+        );
+        assert_eq!(
+            require_known_agent_profile(AGENT_OPERATOR_PROFILE).unwrap(),
+            AGENT_OPERATOR_PROFILE
+        );
+        assert_eq!(
+            require_known_agent_profile("read-only-display").unwrap(),
+            "read-only-display"
+        );
+        assert_eq!(
+            require_known_agent_profile("operator").unwrap(),
+            "peer-operator",
+            "peer aliases resolve on the agent path too"
+        );
+        assert!(require_known_agent_profile("made-up").is_err());
+    }
+
+    /// Identity records written before the agent lane existed carry no
+    /// class field and must stay peers; agent records round-trip; the
+    /// peer default never serializes, so existing stores stay
+    /// byte-identical.
+    #[test]
+    fn identity_class_serde_defaults_legacy_records_to_peer() {
+        let legacy = r#"{
+            "version": 1,
+            "fingerprint": "aabb",
+            "label": "old peer",
+            "profile": "stats",
+            "status": "approved",
+            "created_at_unix": 0
+        }"#;
+        let record: PeerIdentityRecord = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(record.class, IdentityClass::Peer));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains("\"class\""),
+            "the peer default must not serialize"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = write_approved_agent_identity(
+            dir.path(),
+            &"ab".repeat(32),
+            "sidecar",
+            AGENT_OPERATOR_PROFILE,
+            Some("req-1"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(agent.class, IdentityClass::Agent));
+        let read = lookup_identity(dir.path(), &"ab".repeat(32))
+            .unwrap()
+            .expect("agent record persists");
+        assert!(matches!(read.class, IdentityClass::Agent));
+        assert_eq!(read.profile, AGENT_OPERATOR_PROFILE);
+        assert!(serde_json::to_string(&read).unwrap().contains("\"agent\""));
+    }
+
     #[test]
     fn peer_signal_relays_classify_as_peer_use() {
         // Acting through a connected peer — the three signaling relays and

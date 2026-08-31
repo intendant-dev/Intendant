@@ -1542,6 +1542,7 @@ mod tests {
         let nonce = "0123456789abcdef".to_string();
         let transcript = doorbell_transcript(dialed_origin, public_key_pem, &nonce, ts);
         AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: public_key_pem.to_string(),
@@ -1575,6 +1576,7 @@ mod tests {
             tier.unwrap_or(""),
         );
         AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: public_key_pem.to_string(),
@@ -1829,6 +1831,7 @@ mod tests {
     fn disabled_public_access_request_config_rejects_before_creating() {
         let certs = tempfile::TempDir::new().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: "not checked while disabled".into(),
@@ -1878,6 +1881,7 @@ mod tests {
         setup_certs(certs.path());
         let key = access::certs::generate_client_key_material().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: key.public_key_pem,
@@ -1915,6 +1919,7 @@ mod tests {
         setup_certs(certs.path());
         let key = access::certs::generate_client_key_material().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: key.public_key_pem,
@@ -1952,12 +1957,122 @@ mod tests {
             .contains("BEGIN CERTIFICATE"));
     }
 
+    /// An agent-class knock mints the agent lane end-to-end: the
+    /// stored request carries the class, approval writes an
+    /// agent-class identity record (default profile when none was
+    /// asked), and the granted profile validates strictly against the
+    /// agent vocabulary — typos fail the approval loudly, never a
+    /// silent presence-only degrade.
+    #[test]
+    fn approve_request_mints_the_agent_lane_when_requested() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "sidecar-box".into(),
+            public_key_pem: key.public_key_pem,
+            nonce: "agentnonce0000001".into(),
+            requested_profile: None,
+            requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
+            requester_tier: None,
+            requested_class: Some(crate::access::access_policy::IdentityClass::Agent),
+        };
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+            None,
+        )
+        .unwrap();
+        let approved = approve_request(certs.path(), &created.code, None).unwrap();
+        assert_eq!(
+            approved.approved_profile.as_deref(),
+            Some(crate::peer::access_policy::DEFAULT_PROFILE)
+        );
+        let cert_pem = approved.client_cert_pem.clone().unwrap();
+        let fingerprint = crate::peer::access_policy::fingerprint_pem(&cert_pem).unwrap();
+        let record = crate::peer::access_policy::lookup_identity(certs.path(), &fingerprint)
+            .unwrap()
+            .expect("approval writes the identity record");
+        assert!(matches!(
+            record.class,
+            crate::access::access_policy::IdentityClass::Agent
+        ));
+        assert_eq!(
+            record.profile,
+            crate::peer::access_policy::DEFAULT_PROFILE,
+            "an unrequested profile lands on the cautious default"
+        );
+
+        // A second agent knock: a typo'd profile fails the approval
+        // loudly; the agent ceiling itself approves.
+        let key2 = access::certs::generate_client_key_material().unwrap();
+        let request2 = AccessRequestCreate {
+            version: 1,
+            requester_label: "sidecar-two".into(),
+            public_key_pem: key2.public_key_pem,
+            nonce: "agentnonce0000002".into(),
+            requested_profile: None,
+            requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
+            requester_tier: None,
+            requested_class: Some(crate::access::access_policy::IdentityClass::Agent),
+        };
+        let created2 = create_pending_request(
+            certs.path(),
+            request2,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            approve_request(certs.path(), &created2.code, Some("no-such-profile")).is_err(),
+            "agent approvals validate strictly"
+        );
+        let approved2 = approve_request(
+            certs.path(),
+            &created2.code,
+            Some(crate::access::access_policy::AGENT_OPERATOR_PROFILE),
+        )
+        .unwrap();
+        assert_eq!(
+            approved2.approved_profile.as_deref(),
+            Some(crate::access::access_policy::AGENT_OPERATOR_PROFILE)
+        );
+        let cert2 = approved2.client_cert_pem.unwrap();
+        let fp2 = crate::peer::access_policy::fingerprint_pem(&cert2).unwrap();
+        let record2 = crate::peer::access_policy::lookup_identity(certs.path(), &fp2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record2.profile,
+            crate::access::access_policy::AGENT_OPERATOR_PROFILE
+        );
+        assert!(matches!(
+            record2.class,
+            crate::access::access_policy::IdentityClass::Agent
+        ));
+    }
+
     #[test]
     fn approve_request_without_profile_uses_peer_operator_default() {
         let certs = tempfile::TempDir::new().unwrap();
         setup_certs(certs.path());
         let key = access::certs::generate_client_key_material().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: key.public_key_pem,
@@ -1998,6 +2113,7 @@ mod tests {
         setup_certs(certs.path());
         let key = access::certs::generate_client_key_material().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: key.public_key_pem,
@@ -2088,6 +2204,7 @@ mod tests {
         // Target side: stamped at create, carried on the approved result.
         let requester_key = access::certs::generate_client_key_material().unwrap();
         let request = AccessRequestCreate {
+            requested_class: None,
             version: 1,
             requester_label: "primary".into(),
             public_key_pem: requester_key.public_key_pem,

@@ -2998,6 +2998,7 @@ mod tests {
         );
 
         let peer_identity = PeerConnectionIdentity {
+            class: crate::peer::access_policy::IdentityClass::Peer,
             fingerprint: "abc123".to_string(),
             label: "peer-a".to_string(),
             profile: "peer-operator".to_string(),

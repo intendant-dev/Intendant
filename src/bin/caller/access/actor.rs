@@ -326,6 +326,25 @@ mod tests {
     /// named principal kind, the unknown-kind fallback) and asserts
     /// none reaches [`ActorKind::Daemon`] — in-process construction via
     /// [`ActorBinding::daemon`] is the only mint.
+    /// The agent lane classifies as its own kind — never `Peer`, never
+    /// a dashboard/owner class — with the gate-bound principal id
+    /// preserved for attribution.
+    #[test]
+    fn agent_client_principals_classify_as_agent() {
+        let principal = crate::access::iam::AccessPrincipal::agent_client(
+            "fp-agent",
+            "Sidecar",
+            "agent-operator",
+            "https",
+        );
+        let binding = ActorBinding::from_principal(&principal, None);
+        assert_eq!(binding.kind, ActorKind::Agent);
+        assert_eq!(
+            binding.principal_id.as_deref(),
+            Some("principal:agent-client:fp-agent")
+        );
+    }
+
     #[test]
     fn from_principal_never_mints_the_daemon_kind() {
         let loopback = crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http");

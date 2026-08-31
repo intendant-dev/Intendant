@@ -1058,6 +1058,33 @@ mod tests {
         assert_eq!(view.proposed_by.actor, "peer");
     }
 
+    /// The agent lane (enrolled R1 agent clients) is refused at the
+    /// memory edge BY NAME — not even propose — until an owner ruling
+    /// admits it. The peer propose admission was its own ruling; the
+    /// classes are distinct by construction and must not inherit each
+    /// other's admissions.
+    #[test]
+    fn agent_lane_is_refused_at_the_memory_edge() {
+        let agent = ActorBinding::agent(Some("principal:agent-client:fp".into()));
+        for verb in [
+            Verb::Propose,
+            Verb::Assert,
+            Verb::JudgeSafe,
+            Verb::JudgeFull,
+            Verb::PinSafe,
+            Verb::PinFull,
+            Verb::CurateInstruction,
+        ] {
+            match MemoryService::authorize_write(&agent, verb) {
+                Err(MemoryError::NotPermitted { verb: v, actor: a }) => {
+                    assert_eq!(v, verb.as_str());
+                    assert_eq!(a, "agent");
+                }
+                other => panic!("expected actor-not-permitted for {verb:?}, got {other:?}"),
+            }
+        }
+    }
+
     /// Ring-2 propose-only (the seam ruling's tenant-edge decision):
     /// supervised agent sessions, peers, and unattributed callers may
     /// author candidates and NOTHING else — every other write verb

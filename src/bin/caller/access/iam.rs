@@ -5108,6 +5108,55 @@ mod tests {
         assert!(evaluate_principal_operation(&local, PeerOperation::AccessManage).allowed);
     }
 
+    /// The agent lane's principal is pure profile authority: never an
+    /// owner surface, approvals allowed at its ceiling, custody
+    /// unreachable at ANY profile, state evaluation short-circuits
+    /// without a grant, and hosted-Connect transport refuses it
+    /// outright — the same posture peers hold, under its own kind.
+    #[test]
+    fn agent_client_principal_is_scoped_profile_authority() {
+        use crate::access::access_policy::PeerOperation;
+
+        let principal = AccessPrincipal::agent_client(
+            "fp-agent",
+            "Sidecar",
+            crate::access::access_policy::AGENT_OPERATOR_PROFILE,
+            "https",
+        );
+        assert_eq!(principal.kind, "agent_client");
+        assert_eq!(principal.id, "principal:agent-client:fp-agent");
+        assert!(!principal.is_owner_surface());
+        assert!(evaluate_principal_operation(&principal, PeerOperation::Approval).allowed);
+        assert!(evaluate_principal_operation(&principal, PeerOperation::TerminalWrite).allowed);
+        for op in [
+            PeerOperation::AccessManage,
+            PeerOperation::CredentialsManage,
+        ] {
+            assert!(
+                !evaluate_principal_operation(&principal, op).allowed,
+                "custody must stay unreachable"
+            );
+        }
+        let state = LocalIamState::default();
+        assert!(
+            evaluate_principal_operation_with_state(&state, &principal, PeerOperation::StatsRead)
+                .allowed,
+            "profile authority needs no local IAM grant"
+        );
+        let mut hosted = principal.clone();
+        hosted.hosted_connect = true;
+        assert!(
+            !evaluate_principal_operation_with_state(&state, &hosted, PeerOperation::StatsRead)
+                .allowed,
+            "hosted Connect transport can never exercise an agent principal"
+        );
+        // A narrower granted profile caps the same way it does for
+        // peers: read-only-display never reaches approvals.
+        let narrow = AccessPrincipal::agent_client("fp2", "Narrow", "read-only-display", "https");
+        assert!(evaluate_principal_operation(&narrow, PeerOperation::DisplayView).allowed);
+        assert!(!evaluate_principal_operation(&narrow, PeerOperation::Approval).allowed);
+    }
+
     #[test]
     fn owner_surface_excludes_the_root_compatible_transport_defaults() {
         // Owner surfaces: the trusted dashboard and the documented
