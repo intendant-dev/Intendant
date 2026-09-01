@@ -2444,6 +2444,37 @@ mod tests {
             plan_for_meta("act", &argv(&["browser", "open", "https://example.com"])).unwrap();
         assert_eq!(planned.tool, "create_browser_workspace");
         assert_eq!(planned.args["url"], "https://example.com");
+        let planned = plan_for_meta(
+            "act",
+            &argv(&[
+                "browser",
+                "create",
+                "https://example.com",
+                "--provider",
+                "cdp",
+                "--profile-dir",
+                "/private/profile",
+                "--extension-archive",
+                "/private/rabby.zip",
+                "--extension-sha256",
+                "daf7819d7371a67ef447c788e899b1df628f95e380a460c6e5dd3b86bbe09e4f",
+                "--extension-bytes",
+                "16216742",
+                "--extension-manifest-version",
+                "3",
+                "--extension-version",
+                "0.94.6",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.args["extension_archive_path"], "/private/rabby.zip");
+        assert_eq!(
+            planned.args["extension_archive_sha256"],
+            "daf7819d7371a67ef447c788e899b1df628f95e380a460c6e5dd3b86bbe09e4f"
+        );
+        assert_eq!(planned.args["extension_archive_byte_length"], 16_216_742);
+        assert_eq!(planned.args["extension_manifest_version"], 3);
+        assert_eq!(planned.args["extension_version"], "0.94.6");
         let planned = plan_for_meta("act", &argv(&["browser", "take", "ws-1"])).unwrap();
         assert_eq!(planned.tool, "acquire_browser_workspace");
         // Round 31: the alias TABLES — family spellings and ctl's
