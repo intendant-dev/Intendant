@@ -366,6 +366,7 @@ claim instead.
 | `read_screen`        | User session's frontmost-app accessibility tree — macOS AX, Linux AT-SPI, or Windows UIA. | `display_target?`, `format?`, `full_values?` |
 | `display_readiness`  | Probe display authority, capture/accessibility permission, target availability, and input backend live; names each missing layer. | `display_target?` |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
+| `run_bounded_cu_task` | Run an owner-only synchronous, fixed-budget CU-only task on one exact daemon-owned virtual-display generation and attempt-leased local CDP workspace. `stage` permits native CU actions but exposes no function tools or escalation; `attest` supplies one internally captured frame and rejects every subsequent action. The compact receipt binds the exact resources, provider/model, timestamps, task/result hashes, transcript lineage, and action counters. | `mode`, `attempt_id`, `workspace_id`, `display_id`, `display_target`, `capture_generation`, `task`, attestation lineage fields? |
 | `list_frames`        | List captured video frames. | filter params |
 | `read_frame`         | Read a specific frame. | `frame_id` |
 

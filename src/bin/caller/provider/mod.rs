@@ -1036,6 +1036,24 @@ pub fn select_provider_with_overrides(
 pub fn select_cu_provider(
     cu_config: &crate::project::ComputerUseConfig,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
+    select_cu_provider_with_tools(cu_config, vec![crate::tools::escalate_to_agent_tool()])
+}
+
+/// Select a native computer-use provider without exposing any function tool.
+///
+/// The bounded CU lane uses this selector so neither escalation nor a general
+/// agent capability exists in the provider request. Native computer actions
+/// remain available and are separately constrained by the bounded runner.
+pub fn select_bounded_cu_provider(
+    cu_config: &crate::project::ComputerUseConfig,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    select_cu_provider_with_tools(cu_config, Vec::new())
+}
+
+fn select_cu_provider_with_tools(
+    cu_config: &crate::project::ComputerUseConfig,
+    cu_tools: Vec<ToolDefinition>,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
     let provider_str = cu_config
         .provider
         .as_deref()
@@ -1055,9 +1073,6 @@ pub fn select_cu_provider(
     );
     let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI);
 
-    // CU providers get native CU tools + escalation function tool
-    let escalate_tools = vec![crate::tools::escalate_to_agent_tool()];
-
     match provider_str.as_deref() {
         Some("gemini") => {
             let key = gemini_key.ok_or_else(|| {
@@ -1067,7 +1082,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_resolution_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+            let mut p = GeminiProvider::new_with_tools(key, model, ctx, max_out, cu_tools);
             p.cu_enabled = true;
             p.cu_display = Some(display);
             Ok(Box::new(p))
@@ -1080,7 +1095,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_resolution_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+            let mut p = AnthropicProvider::new_with_tools(key, model, ctx, max_out, cu_tools);
             p.cu_enabled = true;
             p.cu_display = Some(display);
             Ok(Box::new(p))
@@ -1094,7 +1109,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_resolution_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            let mut p = OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+            let mut p = OpenAIProvider::new_with_tools(key, model, ctx, max_out, cu_tools);
             p.set_cu_enabled(true);
             p.cu_display = Some(display);
             Ok(Box::new(p))
@@ -1119,7 +1134,7 @@ pub fn select_cu_provider(
                     model,
                     ctx,
                     max_out,
-                    escalate_tools,
+                    cu_tools,
                 );
                 p.set_cu_enabled(true);
                 p.cu_display = Some(display);
@@ -1129,8 +1144,7 @@ pub fn select_cu_provider(
                 let display = crate::vision::display_resolution_for_provider("anthropic");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                let mut p =
-                    AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                let mut p = AnthropicProvider::new_with_tools(key, model, ctx, max_out, cu_tools);
                 p.cu_enabled = true;
                 p.cu_display = Some(display);
                 Ok(Box::new(p))
@@ -1139,8 +1153,7 @@ pub fn select_cu_provider(
                 let display = crate::vision::display_resolution_for_provider("gemini");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                let mut p =
-                    GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                let mut p = GeminiProvider::new_with_tools(key, model, ctx, max_out, cu_tools);
                 p.cu_enabled = true;
                 p.cu_display = Some(display);
                 Ok(Box::new(p))

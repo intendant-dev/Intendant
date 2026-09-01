@@ -326,6 +326,7 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.peer_registry = Some(peer_registry.clone());
     mcp_http_state.event_ring = event_ring;
     mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    mcp_http_state.computer_use_config = project.config.computer_use.clone();
     // The gateway shape always has an answerable frontend: a dashboard can
     // attach while an `ask_user` blocks, so asks wait instead of
     // auto-answering.

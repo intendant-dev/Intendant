@@ -72,6 +72,7 @@ pub(crate) use tools_ask::{
 // clean the process-global registry through this.
 #[cfg(test)]
 pub(crate) use tools_ask::unregister_pending_ask;
+mod tools_bounded_cu;
 mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
@@ -997,6 +998,12 @@ impl IntendantServer {
                 let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
                     self.release_browser_workspace(params).await,
+                ))
+            }
+            "run_bounded_cu_task" => {
+                let Parameters(params) = parse_params::<RunBoundedCuTaskParams>(args)?;
+                Ok(text_tool_result(
+                    self.run_bounded_cu_task_as_caller(params, caller).await,
                 ))
             }
             "terminal_list" => Ok(text_tool_result(
