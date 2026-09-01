@@ -29,6 +29,8 @@ const BOUNDED_CU_MAX_KEY_BYTES: usize = 256;
 const BOUNDED_CU_MAX_SCROLL_TICKS: i32 = 100;
 const BOUNDED_CU_MAX_HOLD_MS: u64 = 5_000;
 const BOUNDED_CU_MAX_WAIT_MS: u64 = 5_000;
+const BOUNDED_CU_MAX_TRANSCRIPT_EVENTS: usize = 512;
+const BOUNDED_CU_MAX_TRANSCRIPT_DETAIL_BYTES: usize = 4 * 1024;
 const BOUNDED_CU_STAGE_MAX_TURNS: u32 = 12;
 const BOUNDED_CU_ATTEST_MAX_TURNS: u32 = 2;
 const BOUNDED_CU_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -122,6 +124,7 @@ pub(crate) struct BoundedCuTaskReceipt {
     pub(crate) prior_transcript_sha256: Option<String>,
     pub(crate) observation_sha256: Option<String>,
     pub(crate) current_transcript_event_count: u64,
+    pub(crate) current_transcript: Vec<TranscriptEvent>,
     pub(crate) transcript_event_count: u64,
     pub(crate) transcript_sha256: String,
     pub(crate) task_sha256: String,
@@ -161,13 +164,13 @@ pub(crate) trait BoundedCuActionExecutor: Send {
     ) -> Result<BoundedCuActionOutcome, BoundedCuTaskError>;
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TranscriptEvent {
-    sequence: u64,
-    turn: u32,
-    kind: &'static str,
-    detail: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TranscriptEvent {
+    pub(crate) sequence: u64,
+    pub(crate) turn: u32,
+    pub(crate) kind: String,
+    pub(crate) detail: String,
 }
 
 #[derive(Default)]
@@ -180,28 +183,75 @@ impl Transcript {
         self.events.push(TranscriptEvent {
             sequence: self.events.len() as u64 + 1,
             turn,
-            kind,
+            kind: kind.to_string(),
             detail,
         });
     }
 
     fn digest(&self, request: &BoundedCuTaskRequest) -> Result<String, BoundedCuTaskError> {
-        let bytes = serde_json::to_vec(&self.events).map_err(|error| {
-            BoundedCuTaskError::new(
-                "bounded-cu-transcript-serialization-failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"intendant-bounded-cu-transcript-v1\0");
-        if let Some(prior) = &request.prior_transcript_sha256 {
-            hasher.update(prior.as_bytes());
-        }
-        hasher.update(b"\0");
-        hasher.update(&bytes);
-        Ok(format!("{:x}", hasher.finalize()))
+        transcript_digest(&self.events, request.prior_transcript_sha256.as_deref())
     }
+}
+
+fn transcript_digest(
+    events: &[TranscriptEvent],
+    prior_transcript_sha256: Option<&str>,
+) -> Result<String, BoundedCuTaskError> {
+    let bytes = serde_json::to_vec(events).map_err(|error| {
+        BoundedCuTaskError::new(
+            "bounded-cu-transcript-serialization-failed",
+            error.to_string(),
+            false,
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"intendant-bounded-cu-transcript-v1\0");
+    if let Some(prior) = prior_transcript_sha256 {
+        hasher.update(prior.as_bytes());
+    }
+    hasher.update(b"\0");
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_transcript_events(events: &[TranscriptEvent]) -> Result<(), BoundedCuTaskError> {
+    if events.is_empty() || events.len() > BOUNDED_CU_MAX_TRANSCRIPT_EVENTS {
+        return Err(BoundedCuTaskError::new(
+            "bounded-cu-transcript-shape-invalid",
+            "redacted transcript event cardinality was outside its closed bound",
+            false,
+        ));
+    }
+    for (index, event) in events.iter().enumerate() {
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1));
+        if sequence != Some(event.sequence)
+            || event.turn > BOUNDED_CU_STAGE_MAX_TURNS
+            || !matches!(
+                event.kind.as_str(),
+                "request"
+                    | "initial_frame"
+                    | "provider_response"
+                    | "cu_batch"
+                    | "result"
+                    | "invalid_result"
+            )
+            || event.detail.is_empty()
+            || event.detail.len() > BOUNDED_CU_MAX_TRANSCRIPT_DETAIL_BYTES
+            || !event
+                .detail
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-transcript-shape-invalid",
+                "redacted transcript event was unordered, unknown, controlled, or overlong",
+                false,
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct TaskCounters {
@@ -286,6 +336,9 @@ fn bind_issued_stage_receipt(request: &mut BoundedCuTaskRequest) -> Result<(), B
         || prior.prior_transcript_sha256.is_some()
         || prior.observation_sha256.is_some()
         || prior.current_transcript_event_count != prior.transcript_event_count
+        || prior.current_transcript_event_count != prior.current_transcript.len() as u64
+        || validate_transcript_events(&prior.current_transcript).is_err()
+        || transcript_digest(&prior.current_transcript, None)? != prior.transcript_sha256
     {
         return Err(BoundedCuTaskError::new(
             "bounded-cu-prior-receipt-binding-mismatch",
@@ -697,6 +750,7 @@ fn build_receipt(
         ));
     }
     let current_transcript_event_count = transcript.events.len() as u64;
+    validate_transcript_events(&transcript.events)?;
     let transcript_event_count = request
         .prior_transcript_event_count
         .unwrap_or(0)
@@ -737,6 +791,7 @@ fn build_receipt(
         prior_transcript_sha256: request.prior_transcript_sha256,
         observation_sha256: request.observation_sha256,
         current_transcript_event_count,
+        current_transcript: transcript.events,
         transcript_event_count,
         transcript_sha256,
         task_sha256,
@@ -1232,6 +1287,15 @@ mod tests {
         assert_eq!(receipt.escalation_count, 0);
         assert_eq!(receipt.result["ready"], true);
         assert!(receipt.transcript_event_count >= 5);
+        assert_eq!(
+            receipt.current_transcript_event_count,
+            receipt.current_transcript.len() as u64
+        );
+        validate_transcript_events(&receipt.current_transcript).unwrap();
+        assert_eq!(
+            transcript_digest(&receipt.current_transcript, None).unwrap(),
+            receipt.transcript_sha256
+        );
         assert!(is_sha256(&receipt.transcript_sha256));
         assert!(is_receipt_id(&receipt.receipt_id));
         assert_eq!(receipt_id(&receipt).unwrap(), receipt.receipt_id);
@@ -1288,6 +1352,14 @@ mod tests {
         assert_eq!(
             receipt.observation_sha256.as_deref(),
             Some(receipt.initial_frame_sha256.as_str())
+        );
+        assert_eq!(
+            transcript_digest(
+                &receipt.current_transcript,
+                Some(stage.transcript_sha256.as_str())
+            )
+            .unwrap(),
+            receipt.transcript_sha256
         );
     }
 
