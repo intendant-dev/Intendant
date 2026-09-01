@@ -844,6 +844,51 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Execute a JSON array of computer-use actions",
     },
     CommandSpec {
+        path: &["cu", "task"],
+        lane: RiskLane::Act,
+        tool: "run_bounded_cu_task",
+        seed: "{}",
+        positionals: &[p_str("TASK", "task", true, true)],
+        flags: &[
+            flag!("mode", "mode", Str, "stage or attest"),
+            flag!("attempt", "attempt_id", Str, "exact Scout attempt id"),
+            flag!("workspace", "workspace_id", Str, "exact browser workspace id"),
+            flag!("display-id", "display_id", U64, "daemon virtual display id"),
+            flag!("target", "display_target", Str, "canonical display_N target"),
+            flag!(
+                "capture-generation",
+                "capture_generation",
+                Str,
+                "opaque display generation"
+            ),
+            flag!(
+                "prior-receipt",
+                "prior_receipt_id",
+                Str,
+                "stage receipt continued by attest"
+            ),
+            flag!(
+                "prior-count",
+                "prior_transcript_event_count",
+                U64,
+                "stage transcript event count"
+            ),
+            flag!(
+                "prior-transcript",
+                "prior_transcript_sha256",
+                Str,
+                "stage transcript SHA-256"
+            ),
+            flag!(
+                "observation-sha256",
+                "observation_sha256",
+                Str,
+                "authenticated pre-attestation observation SHA-256"
+            ),
+        ],
+        help: "Run a bounded CU-only stage or read-only attestation task",
+    },
+    CommandSpec {
         path: &["display", "create"],
         lane: RiskLane::Act,
         tool: "create_virtual_display",

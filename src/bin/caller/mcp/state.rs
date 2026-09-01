@@ -154,6 +154,9 @@ pub struct McpAppState {
     pub event_ring: Option<std::sync::Arc<crate::event_ring::EventRing>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
+    /// Dedicated native computer-use configuration for bounded CU tasks.
+    /// The lane never inherits arbitrary agent tools from the active session.
+    pub computer_use_config: crate::project::ComputerUseConfig,
     /// Persistent counter for screenshot filenames (avoids overwriting).
     pub screenshot_counter: std::sync::atomic::AtomicU64,
     /// External agent backend selected via web UI (deferred: takes effect on next task).
@@ -345,6 +348,7 @@ impl McpAppState {
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,
+            computer_use_config: crate::project::ComputerUseConfig::default(),
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
             external_agent: None,
             configured_codex_managed_context: false,

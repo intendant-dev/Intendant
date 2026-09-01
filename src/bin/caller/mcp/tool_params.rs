@@ -643,6 +643,37 @@ pub struct DestroyVirtualDisplayParams {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct RunBoundedCuTaskParams {
+    /// `stage` permits bounded native computer input; `attest` is strictly
+    /// observation-only after its internally captured initial frame.
+    pub mode: crate::bounded_cu_task::BoundedCuTaskMode,
+    /// Exact Scout attempt that owns the browser-workspace lease.
+    pub attempt_id: String,
+    /// Exact ready, local CDP workspace created for this attempt.
+    pub workspace_id: String,
+    /// Numeric daemon-created virtual-display ID.
+    pub display_id: u32,
+    /// Canonical `display_N` target; must agree with `display_id`.
+    pub display_target: String,
+    /// Opaque generation returned by the matching display-create operation.
+    pub capture_generation: String,
+    /// Fully primed task and required JSON result shape.
+    pub task: String,
+    /// Stage receipt continued by an attestation; forbidden in stage mode.
+    #[serde(default)]
+    pub prior_receipt_id: Option<String>,
+    /// Stage transcript count continued by an attestation.
+    #[serde(default)]
+    pub prior_transcript_event_count: Option<u64>,
+    /// Stage transcript digest continued by an attestation.
+    #[serde(default)]
+    pub prior_transcript_sha256: Option<String>,
+    /// Authenticated observation digest that precedes read-only attestation.
+    #[serde(default)]
+    pub observation_sha256: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RevokeUserDisplayParams {
     /// User session display ID to revoke. Omit for the primary display (0).

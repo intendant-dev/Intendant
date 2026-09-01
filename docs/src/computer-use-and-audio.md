@@ -95,6 +95,27 @@ element): multi-line/control text (Return may submit, Tab may move focus),
 secure fields, and elements without an AX-readable value stay `injected`
 with the reason in the result detail.
 
+### Bounded proof tasks
+
+`intendant ctl cu task` is the owner-only orchestration lane for evidence
+capture on an exact daemon-created virtual-display generation and exact
+attempt-leased local CDP browser workspace. It is deliberately smaller than
+an agent session: the selected provider receives native CU plus no function
+tools, shell, filesystem, browser API, delegation, or escalation capability.
+`stage` has fixed turn/action/time limits and may operate the isolated display;
+`attest` receives one internally captured PNG and refuses every later action.
+The daemon rechecks the exact display generation and browser lease around each
+action, serializes tasks per display generation, and deletes its mode-0700
+scratch directory before returning.
+
+Successful calls return a compact receipt rather than screenshots or typed
+text. Its identity binds the exact resources, provider/model, timestamps and
+monotonic elapsed time, task and normalized-result hashes, every model-visible
+frame hash, action-kind/payload hashes and counters, plus the prior stage and
+observation lineage required by `attest`. Scoped agent callers are rejected;
+the intended caller is a local owner-side orchestrator using the loopback
+`intendant ctl` lane.
+
 **Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
 same proven event shape as `key`), newlines as Return and tabs as Tab;
 characters with no ANSI-US key are delivered as paced unicode-string events

@@ -25,7 +25,7 @@ use crate::frames;
 use crate::types::LogLevel;
 use crate::vision;
 use intendant_platform::DisplayTarget;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -47,9 +47,9 @@ pub(crate) struct VirtualDisplayGuards {
     ownership: HashMap<u32, VirtualDisplayOwnership>,
 }
 
-fn browser_bindable_displays() -> &'static Mutex<HashSet<u32>> {
-    static DISPLAYS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-    DISPLAYS.get_or_init(|| Mutex::new(HashSet::new()))
+fn browser_bindable_displays() -> &'static Mutex<HashMap<u32, String>> {
+    static DISPLAYS: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    DISPLAYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Whether this exact daemon-owned display participates in the correlated
@@ -58,7 +58,7 @@ fn browser_bindable_displays() -> &'static Mutex<HashSet<u32>> {
 pub(crate) fn process_owns_browser_bindable_display(display_id: u32) -> bool {
     let lifecycle_owned = browser_bindable_displays()
         .lock()
-        .is_ok_and(|displays| displays.contains(&display_id))
+        .is_ok_and(|displays| displays.contains_key(&display_id))
         && vision::process_owns_virtual_display(display_id);
     #[cfg(target_os = "linux")]
     {
@@ -71,9 +71,20 @@ pub(crate) fn process_owns_browser_bindable_display(display_id: u32) -> bool {
     }
 }
 
-fn register_browser_bindable_display(display_id: u32) {
+/// Whether the exact opaque generation returned by `create_virtual_display`
+/// still owns this daemon-created, capture-ready display.
+pub(crate) fn process_owns_browser_bindable_display_generation(
+    display_id: u32,
+    capture_generation: &str,
+) -> bool {
+    browser_bindable_displays().lock().is_ok_and(|displays| {
+        displays.get(&display_id).map(String::as_str) == Some(capture_generation)
+    }) && process_owns_browser_bindable_display(display_id)
+}
+
+fn register_browser_bindable_display(display_id: u32, capture_generation: &str) {
     if let Ok(mut displays) = browser_bindable_displays().lock() {
-        displays.insert(display_id);
+        displays.insert(display_id, capture_generation.to_string());
     }
 }
 
@@ -352,7 +363,7 @@ pub(crate) async fn handle_virtual_display_capture_readiness(
     // A browser may bind only after capture has stayed live through the
     // readiness window. Before this point the X server exists but is not a
     // usable, evidence-producing workspace.
-    register_browser_bindable_display(display_id);
+    register_browser_bindable_display(display_id, capture_generation);
 
     let request_id = ownership.request_id.clone();
     let width = ownership.width;
