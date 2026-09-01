@@ -805,6 +805,11 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             owner_session_id,
             display_target,
             profile_dir,
+            extension_archive_path,
+            extension_archive_sha256,
+            extension_archive_byte_length,
+            extension_manifest_version,
+            extension_version,
         } => {
             let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
                 url: url.clone(),
@@ -814,6 +819,11 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 owner_session_id: owner_session_id.clone(),
                 display_target: display_target.clone(),
                 profile_dir: profile_dir.clone(),
+                extension_archive_path: extension_archive_path.clone(),
+                extension_archive_sha256: extension_archive_sha256.clone(),
+                extension_archive_byte_length: *extension_archive_byte_length,
+                extension_manifest_version: *extension_manifest_version,
+                extension_version: extension_version.clone(),
             };
             match crate::browser_workspace::create_workspace(request, &state.bus).await {
                 Ok(_) => {}

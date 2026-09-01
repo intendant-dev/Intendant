@@ -853,6 +853,19 @@ pub struct CreateBrowserWorkspaceParams {
     /// Explicit browser profile directory. If omitted, Intendant creates one under its data dir.
     #[serde(default)]
     pub profile_dir: Option<String>,
+    /// Absolute path to a compiled-approved immutable extension zip. The archive identity,
+    /// byte length, manifest version, and extension version fields are
+    /// required together and are accepted only with provider=cdp.
+    #[serde(default)]
+    pub extension_archive_path: Option<String>,
+    #[serde(default)]
+    pub extension_archive_sha256: Option<String>,
+    #[serde(default)]
+    pub extension_archive_byte_length: Option<u64>,
+    #[serde(default)]
+    pub extension_manifest_version: Option<u32>,
+    #[serde(default)]
+    pub extension_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

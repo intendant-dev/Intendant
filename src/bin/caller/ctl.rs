@@ -1192,6 +1192,11 @@ async fn run_browser(
                     "--session",
                     "--display-target",
                     "--profile-dir",
+                    "--extension-archive",
+                    "--extension-sha256",
+                    "--extension-bytes",
+                    "--extension-manifest-version",
+                    "--extension-version",
                 ],
                 &[],
             )?;
@@ -1206,6 +1211,31 @@ async fn run_browser(
             insert_string(&mut map, "owner_session_id", args.one("--session"));
             insert_string(&mut map, "display_target", args.one("--display-target"));
             insert_string(&mut map, "profile_dir", args.one("--profile-dir"));
+            insert_string(
+                &mut map,
+                "extension_archive_path",
+                args.one("--extension-archive"),
+            );
+            insert_string(
+                &mut map,
+                "extension_archive_sha256",
+                args.one("--extension-sha256"),
+            );
+            insert_u64(
+                &mut map,
+                "extension_archive_byte_length",
+                args.one("--extension-bytes"),
+            )?;
+            insert_u64(
+                &mut map,
+                "extension_manifest_version",
+                args.one("--extension-manifest-version"),
+            )?;
+            insert_string(
+                &mut map,
+                "extension_version",
+                args.one("--extension-version"),
+            );
             let response = call_tool(
                 client,
                 config,
@@ -6097,6 +6127,7 @@ fn help_browser() {
   intendant ctl browser providers\n\
   intendant ctl browser list\n\
   intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|system_cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--display-target display_N] [--profile-dir PATH]\n\
+      [--extension-archive ZIP --extension-sha256 HEX --extension-bytes N --extension-manifest-version N --extension-version VERSION]\n\
   intendant ctl browser acquire WORKSPACE_ID [--holder ID] [--holder-kind agent|human] [--note TEXT] [--force]\n\
   intendant ctl browser release WORKSPACE_ID [--holder ID] [--note TEXT]\n\
   intendant ctl browser close WORKSPACE_ID [--reason TEXT]\n\
