@@ -1779,6 +1779,14 @@ pub fn is_root() -> bool {
     }
 }
 
+/// Effective Unix user id for ownership checks performed by higher-level
+/// safe Rust. Keep the libc probe inside this documented platform island.
+#[cfg(unix)]
+pub fn unix_effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// The calling user's uid, for launchd's `gui/<uid>/…` service targets.
 #[cfg(unix)]
 pub fn unix_uid() -> u32 {

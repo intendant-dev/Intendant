@@ -3905,6 +3905,46 @@ fn mouse_button_index(button: MouseButton) -> u8 {
     }
 }
 
+/// Releases that make one bounded action cancellation-safe. The caller
+/// records these before dispatch and clears them only after the action and
+/// its trailing observation complete. Split mouse-edge actions are rejected
+/// by the bounded lane, but remain covered here as a defensive fallback.
+pub(crate) fn bounded_action_safety_releases(
+    action: &CuAction,
+    resolution: (u32, u32),
+) -> Result<Vec<crate::display::InputEvent>, String> {
+    let mouse_up = |x: i32, y: i32, button: MouseButton| {
+        let width = f64::from(resolution.0.max(1));
+        let height = f64::from(resolution.1.max(1));
+        crate::display::InputEvent::MouseUp {
+            x: (f64::from(x) / width).clamp(0.0, 1.0),
+            y: (f64::from(y) / height).clamp(0.0, 1.0),
+            b: mouse_button_index(button),
+        }
+    };
+    match action {
+        CuAction::Click { x, y, button }
+        | CuAction::DoubleClick { x, y, button }
+        | CuAction::TripleClick { x, y, button }
+        | CuAction::MouseDown { x, y, button }
+        | CuAction::MouseUp { x, y, button } => Ok(vec![mouse_up(*x, *y, *button)]),
+        CuAction::Drag { end_x, end_y, .. } => {
+            Ok(vec![mouse_up(*end_x, *end_y, MouseButton::Left)])
+        }
+        CuAction::Key { key } | CuAction::HoldKey { key, .. } => Ok(key_action_events(key)?
+            .into_iter()
+            .filter(|event| matches!(event, crate::display::InputEvent::KeyUp { .. }))
+            .collect()),
+        CuAction::Type { .. }
+        | CuAction::Paste { .. }
+        | CuAction::Scroll { .. }
+        | CuAction::MoveMouse { .. }
+        | CuAction::Screenshot
+        | CuAction::Zoom { .. }
+        | CuAction::Wait { .. } => Ok(Vec::new()),
+    }
+}
+
 /// Map a character to a DOM `KeyboardEvent.code` value.
 fn char_to_dom_code(ch: char) -> &'static str {
     match ch.to_ascii_lowercase() {
@@ -5295,6 +5335,37 @@ mod tests {
         assert_eq!(mouse_button_index(MouseButton::Left), 0);
         assert_eq!(mouse_button_index(MouseButton::Middle), 1);
         assert_eq!(mouse_button_index(MouseButton::Right), 2);
+    }
+
+    #[test]
+    fn bounded_safety_plan_releases_mouse_and_every_key_edge() {
+        let mouse = bounded_action_safety_releases(
+            &CuAction::Click {
+                x: 100,
+                y: 50,
+                button: MouseButton::Right,
+            },
+            (200, 100),
+        )
+        .unwrap();
+        assert!(matches!(
+            mouse.as_slice(),
+            [crate::display::InputEvent::MouseUp { x, y, b: 2 }]
+                if (*x - 0.5).abs() < f64::EPSILON && (*y - 0.5).abs() < f64::EPSILON
+        ));
+
+        let keys = bounded_action_safety_releases(
+            &CuAction::HoldKey {
+                key: "CTRL+C".to_string(),
+                ms: 1,
+            },
+            (200, 100),
+        )
+        .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys
+            .iter()
+            .all(|event| matches!(event, crate::display::InputEvent::KeyUp { .. })));
     }
 
     // ── Result statuses & read-back helpers ─────────────────────────────

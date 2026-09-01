@@ -5,16 +5,17 @@ use super::*;
 use async_trait::async_trait;
 
 use crate::bounded_cu_task::{
-    run_bounded_cu_task as execute_bounded_cu_task, validate_bounded_cu_task_request,
-    BoundedCuActionExecutor, BoundedCuActionOutcome, BoundedCuTaskError, BoundedCuTaskRequest,
+    remember_issued_stage_receipt, run_bounded_cu_task as execute_bounded_cu_task,
+    validate_bounded_cu_task_request, BoundedCuActionExecutor, BoundedCuActionOutcome,
+    BoundedCuTaskError, BoundedCuTaskRequest,
 };
 use crate::browser_workspace::{
     BrowserWorkspace, BrowserWorkspaceProvider, BrowserWorkspaceStatus,
 };
 use crate::computer_use::{
-    execute_actions_with_exclusive_access, summarize_results_for_model, CuAction, CuActionResult,
-    CuActionStatus, CuExecOptions, DisplayBackend, DisplayTarget, ScreenshotData,
-    VirtualDisplayExclusiveAccess,
+    bounded_action_safety_releases, execute_actions_with_exclusive_access,
+    summarize_results_for_model, CuAction, CuActionResult, CuActionStatus, CuExecOptions,
+    DisplayBackend, DisplayTarget, ScreenshotData, VirtualDisplayExclusiveAccess,
 };
 use crate::conversation::ImageData;
 
@@ -28,7 +29,76 @@ struct NativeBoundedCuExecutor {
     session_registry: Option<crate::display::SharedSessionRegistry>,
     params: RunBoundedCuTaskParams,
     bus: crate::event::EventBus,
-    display_access: VirtualDisplayExclusiveAccess,
+    display_access: Option<VirtualDisplayExclusiveAccess>,
+    proof_session: std::sync::Arc<crate::display::DisplaySession>,
+    pending_safety_releases: Vec<crate::display::InputEvent>,
+}
+
+impl NativeBoundedCuExecutor {
+    async fn validate_proof_session_liveness(&self) -> Result<(), BoundedCuTaskError> {
+        if self.proof_session.capture_bridge_running().await {
+            Ok(())
+        } else {
+            Err(BoundedCuTaskError::new(
+                "bounded-cu-capture-session-unavailable",
+                "bound display capture stopped during the proof task",
+                false,
+            ))
+        }
+    }
+
+    async fn release_pending_input_edges(&mut self) -> Result<(), BoundedCuTaskError> {
+        // Keep the authoritative list on `self` until every release returns.
+        // If this cleanup future is itself cancelled, Drop can retry the full
+        // idempotent release set while retaining exclusive display access.
+        let releases = self.pending_safety_releases.clone();
+        let mut errors = Vec::new();
+        for release in releases {
+            if let Err(error) = self.proof_session.inject_input(release).await {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            self.pending_safety_releases.clear();
+            Ok(())
+        } else {
+            Err(BoundedCuTaskError::new(
+                "bounded-cu-input-safety-release-failed",
+                format!(
+                    "could not release every possibly-held direct input edge: {}",
+                    errors.join("; ")
+                ),
+                false,
+            ))
+        }
+    }
+}
+
+impl Drop for NativeBoundedCuExecutor {
+    fn drop(&mut self) {
+        if self.pending_safety_releases.is_empty() {
+            return;
+        }
+        let releases = std::mem::take(&mut self.pending_safety_releases);
+        let Some(display_access) = self.display_access.take() else {
+            return;
+        };
+        let session = std::sync::Arc::clone(&self.proof_session);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            eprintln!(
+                "[bounded-cu] no Tokio runtime was available for cancellation safety releases"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            for release in releases {
+                if let Err(error) = session.inject_input(release).await {
+                    eprintln!("[bounded-cu] cancellation safety release failed: {error}");
+                }
+            }
+            drop(display_access);
+        });
+    }
 }
 
 #[async_trait]
@@ -40,9 +110,23 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
         let mut results = Vec::with_capacity(actions.len());
         let mut screenshot = None;
         for action in actions {
+            self.validate_proof_session_liveness().await?;
             validate_resource_binding(&self.params, &self.bus).await?;
+            self.pending_safety_releases = bounded_action_safety_releases(
+                action,
+                self.proof_session.resolution(),
+            )
+            .map_err(|error| {
+                BoundedCuTaskError::new("bounded-cu-input-safety-plan-invalid", error, false)
+            })?;
             let mut outcome = execute_actions_with_exclusive_access(
-                &self.display_access,
+                self.display_access.as_ref().ok_or_else(|| {
+                    BoundedCuTaskError::new(
+                        "bounded-cu-exclusive-display-access-missing",
+                        "bounded executor lost exclusive virtual-display access",
+                        false,
+                    )
+                })?,
                 std::slice::from_ref(action),
                 self.target,
                 self.backend,
@@ -67,6 +151,8 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
             screenshot = Some(action_screenshot);
             results.push(action_result);
             validate_resource_binding(&self.params, &self.bus).await?;
+            self.validate_proof_session_liveness().await?;
+            self.pending_safety_releases.clear();
         }
         let screenshot = screenshot.ok_or_else(|| {
             BoundedCuTaskError::new(
@@ -201,6 +287,13 @@ impl IntendantServer {
                 false,
             )
         })?;
+        if !proof_session.capture_bridge_running().await {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-capture-session-unavailable",
+                "bound display capture was not live before proof automation",
+                false,
+            ));
+        }
         proof_session
             .seal_browser_interactive_for_automation(
                 "bounded proof automation acquired exclusive display control",
@@ -236,10 +329,14 @@ impl IntendantServer {
             session_registry,
             params: params.clone(),
             bus: self.bus.clone(),
-            display_access,
+            display_access: Some(display_access),
+            proof_session,
+            pending_safety_releases: Vec::new(),
         };
         let task_result = execute_bounded_cu_task(provider.as_ref(), &mut executor, request).await;
+        let safety_release = executor.release_pending_input_edges().await;
         let final_binding = validate_resource_binding(&params, &self.bus).await;
+        let final_session_liveness = executor.validate_proof_session_liveness().await;
         let cleanup = scratch.close().map_err(|error| {
             BoundedCuTaskError::new(
                 "bounded-cu-private-scratch-cleanup-failed",
@@ -247,35 +344,66 @@ impl IntendantServer {
                 false,
             )
         });
-        match (task_result, final_binding, cleanup) {
-            (Ok(receipt), Ok(()), Ok(())) => Ok(receipt),
-            (Err(error), Ok(()), Ok(())) => Err(error),
-            (Ok(_), Err(error), Ok(())) | (Ok(_), Ok(()), Err(error)) => Err(error),
-            (Err(task), Err(binding), Ok(())) => Err(BoundedCuTaskError::new(
-                "bounded-cu-task-and-binding-failed",
-                format!("{}; additionally: {}", task.message, binding.message),
-                false,
-            )),
-            (Err(task), Ok(()), Err(cleanup)) => Err(BoundedCuTaskError::new(
-                "bounded-cu-task-and-cleanup-failed",
-                format!("{}; additionally: {}", task.message, cleanup.message),
-                false,
-            )),
-            (Ok(_), Err(binding), Err(cleanup)) => Err(BoundedCuTaskError::new(
-                "bounded-cu-binding-and-cleanup-failed",
-                format!("{}; additionally: {}", binding.message, cleanup.message),
-                false,
-            )),
-            (Err(task), Err(binding), Err(cleanup)) => Err(BoundedCuTaskError::new(
-                "bounded-cu-task-binding-and-cleanup-failed",
-                format!(
-                    "{}; additionally: {}; additionally: {}",
-                    task.message, binding.message, cleanup.message
-                ),
-                false,
-            )),
+        let result = finish_bounded_task(
+            task_result,
+            safety_release,
+            final_binding,
+            final_session_liveness,
+            cleanup,
+        );
+        if params.mode == crate::bounded_cu_task::BoundedCuTaskMode::Stage {
+            if let Ok(receipt) = result.as_ref() {
+                remember_issued_stage_receipt(receipt)?;
+            }
+        }
+        result
+    }
+}
+
+fn finish_bounded_task(
+    task: Result<crate::bounded_cu_task::BoundedCuTaskReceipt, BoundedCuTaskError>,
+    safety_release: Result<(), BoundedCuTaskError>,
+    final_binding: Result<(), BoundedCuTaskError>,
+    final_session_liveness: Result<(), BoundedCuTaskError>,
+    cleanup: Result<(), BoundedCuTaskError>,
+) -> Result<crate::bounded_cu_task::BoundedCuTaskReceipt, BoundedCuTaskError> {
+    let mut receipt = None;
+    let mut errors = Vec::new();
+    match task {
+        Ok(value) => receipt = Some(value),
+        Err(error) => errors.push(error),
+    }
+    for result in [
+        safety_release,
+        final_binding,
+        final_session_liveness,
+        cleanup,
+    ] {
+        if let Err(error) = result {
+            errors.push(error);
         }
     }
+    if errors.is_empty() {
+        return receipt.ok_or_else(|| {
+            BoundedCuTaskError::new(
+                "bounded-cu-receipt-missing",
+                "bounded task completed without a receipt",
+                false,
+            )
+        });
+    }
+    if errors.len() == 1 {
+        return Err(errors.remove(0));
+    }
+    Err(BoundedCuTaskError::new(
+        "bounded-cu-task-finalization-failed",
+        errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; additionally: "),
+        false,
+    ))
 }
 
 fn require_owner_surface(caller: ToolCallerTrust) -> Result<(), BoundedCuTaskError> {
@@ -382,8 +510,7 @@ fn validate_private_scratch(path: &std::path::Path) -> Result<(), BoundedCuTaskE
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        // SAFETY: `geteuid(2)` takes no arguments and cannot fail.
-        let effective_uid = unsafe { libc::geteuid() };
+        let effective_uid = intendant_platform::platform::unix_effective_uid();
         if metadata.mode() & 0o7777 != 0o700 || metadata.uid() != effective_uid {
             return Err(BoundedCuTaskError::new(
                 "bounded-cu-private-scratch-unsafe",
