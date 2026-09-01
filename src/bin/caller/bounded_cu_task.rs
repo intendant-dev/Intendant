@@ -212,7 +212,9 @@ fn issued_stage_receipts() -> &'static std::sync::Mutex<VecDeque<BoundedCuTaskRe
     RECEIPTS.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
 }
 
-fn remember_issued_stage_receipt(receipt: &BoundedCuTaskReceipt) -> Result<(), BoundedCuTaskError> {
+pub(crate) fn remember_issued_stage_receipt(
+    receipt: &BoundedCuTaskReceipt,
+) -> Result<(), BoundedCuTaskError> {
     let mut receipts = issued_stage_receipts().lock().map_err(|_| {
         BoundedCuTaskError::new(
             "bounded-cu-receipt-registry-unavailable",
@@ -292,14 +294,8 @@ pub(crate) async fn run_bounded_cu_task(
         bind_issued_stage_receipt(&mut request)?;
     }
     let timeout = request.mode.timeout();
-    let mode = request.mode;
     match tokio::time::timeout(timeout, run_inner(provider, executor, request)).await {
-        Ok(Ok(receipt)) => {
-            if mode == BoundedCuTaskMode::Stage {
-                remember_issued_stage_receipt(&receipt)?;
-            }
-            Ok(receipt)
-        }
+        Ok(Ok(receipt)) => Ok(receipt),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(BoundedCuTaskError::new(
             "bounded-cu-deadline-exceeded",
@@ -489,6 +485,18 @@ async fn apply_cu_calls(
             return Err(BoundedCuTaskError::new(
                 "bounded-cu-paste-refused",
                 "clipboard paste is not permitted in the bounded proof lane; use typed input",
+                false,
+            ));
+        }
+        if call.actions.iter().any(|action| {
+            matches!(
+                action,
+                CuAction::MouseDown { .. } | CuAction::MouseUp { .. }
+            )
+        }) {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-split-input-edge-refused",
+                "split mouse down/up actions are not permitted in the bounded proof lane",
                 false,
             ));
         }
@@ -1142,9 +1150,11 @@ mod tests {
     async fn issue_stage_receipt() -> BoundedCuTaskReceipt {
         let provider = FakeProvider::new(vec![response(r#"{"ready":true}"#)]);
         let mut executor = FakeExecutor::default();
-        run_bounded_cu_task(&provider, &mut executor, stage_request())
+        let receipt = run_bounded_cu_task(&provider, &mut executor, stage_request())
             .await
-            .unwrap()
+            .unwrap();
+        remember_issued_stage_receipt(&receipt).unwrap();
+        receipt
     }
 
     #[tokio::test]
@@ -1313,6 +1323,28 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "bounded-cu-paste-refused");
+        assert_eq!(executor.batches, vec![vec!["screenshot"]]);
+    }
+
+    #[tokio::test]
+    async fn split_mouse_edges_are_rejected_before_input() {
+        let mut action_response = response("");
+        action_response.cu_calls.push(CuToolCall {
+            call_id: "cu-mouse-down".to_string(),
+            actions: vec![CuAction::MouseDown {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+            }],
+            metadata: CuCallMetadata::default(),
+        });
+        let provider = FakeProvider::new(vec![action_response]);
+        let mut executor = FakeExecutor::default();
+        let error = run_bounded_cu_task(&provider, &mut executor, stage_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "bounded-cu-split-input-edge-refused");
         assert_eq!(executor.batches, vec![vec!["screenshot"]]);
     }
 

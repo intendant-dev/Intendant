@@ -560,6 +560,10 @@ async fn retire_virtual_display_generation(
     capture_generation: &str,
     reason: &str,
 ) {
+    // Capture loss is a lifecycle mutation too. Acquire before removing the
+    // session so a bounded proof cannot pass its final binding check against
+    // a session whose teardown has already begun.
+    let _display_access = crate::computer_use::acquire_virtual_display_shared(display_id).await;
     let Some(ownership) = guards.get(&display_id) else {
         return;
     };
@@ -581,7 +585,7 @@ async fn retire_virtual_display_generation(
     if let Some(session) = session_registry.write().await.remove(display_id) {
         session.stop().await;
     }
-    reap_virtual_display(bus, guards, display_id, "capture unavailable").await;
+    reap_virtual_display_with_access(bus, guards, display_id, "capture unavailable").await;
     if let Some(request_id) = request_id {
         let _ = bus.complete_virtual_display_create(
             &request_id,
@@ -663,6 +667,15 @@ pub(crate) async fn reap_virtual_display(
     context: &str,
 ) -> bool {
     let _display_access = crate::computer_use::acquire_virtual_display_shared(display_id).await;
+    reap_virtual_display_with_access(bus, guards, display_id, context).await
+}
+
+async fn reap_virtual_display_with_access(
+    bus: &EventBus,
+    guards: &mut VirtualDisplayGuards,
+    display_id: u32,
+    context: &str,
+) -> bool {
     let guard = guards.remove(&display_id);
     // The browser registry lock serializes both sides of this transition:
     // creation checks bindability and reserves Starting under the same lock,

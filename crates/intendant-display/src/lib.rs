@@ -46,6 +46,7 @@ pub(crate) mod input_queue;
 /// display session's ordered browser-input queue. Keeping one exported value
 /// prevents the transport shim from growing a larger hidden backlog.
 pub const BROWSER_INPUT_QUEUE_HARD_CAP: usize = input_queue::INPUT_QUEUE_HARD_CAP;
+const BROWSER_CLIPBOARD_TASK_HARD_CAP: usize = 64;
 pub mod input_telemetry;
 pub mod keymap;
 #[cfg(target_os = "macos")]
@@ -1383,6 +1384,11 @@ pub struct DisplaySession {
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Browser-to-system clipboard mutations already admitted by a live
+    /// interactive authority. A synchronous mutex makes admission + task
+    /// registration atomic with proof sealing; sealing then drains every
+    /// admitted mutation before direct automation begins.
+    browser_clipboard_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Ordered browser-input queue (see [`input_queue`]). Every browser
     /// input lane — the WebRTC data channels, the dashboard-control
     /// tunnel, and the legacy `/ws` socket — enqueues here via
@@ -2182,6 +2188,7 @@ impl DisplaySession {
             metrics_epoch: Mutex::new(Instant::now()),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
+            browser_clipboard_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             input_queue: Arc::new(input_queue::InputQueue::new()),
             input_pump_started: AtomicBool::new(false),
             input_pump_handle: std::sync::Mutex::new(None),
@@ -2877,6 +2884,12 @@ impl DisplaySession {
                 }
             }
         }
+        if let Err(error) = self
+            .drain_browser_clipboard_mutations(Duration::from_secs(2))
+            .await
+        {
+            eprintln!("[display/clipboard] shutdown drain failed: {error}");
+        }
         if !backend_stopped {
             self.backend.stop_capture().await;
         }
@@ -3433,17 +3446,28 @@ impl DisplaySession {
         let authority_handler = lifecycle_gated_authority_handler(&input_source, authority_handler);
 
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
+        let browser_clipboard_tasks = Arc::clone(&self.browser_clipboard_tasks);
         let clipboard_authorized = interactive_authorization.clone();
         let clipboard_authorized_for_handler = interactive_authorization;
         let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
             Arc::new(move |content: clipboard::ClipboardContent| {
+                let mut tasks = browser_clipboard_tasks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                tasks.retain(|task| !task.is_finished());
+                if tasks.len() >= BROWSER_CLIPBOARD_TASK_HARD_CAP {
+                    eprintln!(
+                        "[display/clipboard] refused browser clipboard mutation: task cap reached"
+                    );
+                    return;
+                }
                 let Ok(admitted_revision) = clipboard_authorized_for_handler.admission_revision()
                 else {
                     return;
                 };
                 let monitor = Arc::clone(&clipboard_monitor);
                 let still_authorized = clipboard_authorized_for_handler.clone();
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     // The task may sit behind unrelated runtime work after the
                     // data-channel callback returns. Re-check at the mutation
                     // boundary so revocation/teardown in that window wins.
@@ -3463,6 +3487,7 @@ impl DisplaySession {
                         }
                     }
                 });
+                tasks.push(task);
             });
         let tile_control_handler = self.build_tile_control_handler(peer_id);
 
@@ -4805,37 +4830,86 @@ impl DisplaySession {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        let Some(mut input_pump) = input_pump else {
-            self.browser_interactive_seal_state
-                .store(2, Ordering::SeqCst);
-            return Ok(());
-        };
         const SEAL_TIMEOUT: Duration = Duration::from_secs(2);
-        match tokio::time::timeout(SEAL_TIMEOUT, &mut input_pump).await {
-            Ok(Ok(())) => {
-                self.browser_interactive_seal_state
-                    .store(2, Ordering::SeqCst);
-                Ok(())
+        if let Some(mut input_pump) = input_pump {
+            match tokio::time::timeout(SEAL_TIMEOUT, &mut input_pump).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.browser_interactive_seal_state
+                        .store(3, Ordering::SeqCst);
+                    return Err(CallerError::Display(format!(
+                        "browser input pump failed while sealing proof display: {error}"
+                    )));
+                }
+                Err(_) => {
+                    *self
+                        .input_pump_handle
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(input_pump);
+                    self.browser_interactive_seal_state
+                        .store(3, Ordering::SeqCst);
+                    return Err(CallerError::Display(format!(
+                        "browser input pump did not seal within {}s; recreate the display session",
+                        SEAL_TIMEOUT.as_secs()
+                    )));
+                }
             }
-            Ok(Err(error)) => {
-                self.browser_interactive_seal_state
-                    .store(3, Ordering::SeqCst);
-                Err(CallerError::Display(format!(
-                    "browser input pump failed while sealing proof display: {error}"
-                )))
+        }
+        if let Err(error) = self.drain_browser_clipboard_mutations(SEAL_TIMEOUT).await {
+            self.browser_interactive_seal_state
+                .store(3, Ordering::SeqCst);
+            return Err(error);
+        }
+        self.browser_interactive_seal_state
+            .store(2, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn drain_browser_clipboard_mutations(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), CallerError> {
+        let mut tasks = std::mem::take(
+            &mut *self
+                .browser_clipboard_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut errors = Vec::new();
+        for index in 0..tasks.len() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let outcome = if remaining.is_zero() {
+                None
+            } else {
+                tokio::time::timeout(remaining, &mut tasks[index])
+                    .await
+                    .ok()
+            };
+            match outcome {
+                Some(Ok(())) => {}
+                Some(Err(error)) => errors.push(error.to_string()),
+                None => {
+                    for task in tasks.iter().skip(index) {
+                        task.abort();
+                    }
+                    for task in tasks.iter_mut().skip(index) {
+                        let _ = task.await;
+                    }
+                    return Err(CallerError::Display(format!(
+                        "browser clipboard mutations did not drain within {}s",
+                        timeout.as_secs()
+                    )));
+                }
             }
-            Err(_) => {
-                *self
-                    .input_pump_handle
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(input_pump);
-                self.browser_interactive_seal_state
-                    .store(3, Ordering::SeqCst);
-                Err(CallerError::Display(format!(
-                    "browser input pump did not seal within {}s; recreate the display session",
-                    SEAL_TIMEOUT.as_secs()
-                )))
-            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CallerError::Display(format!(
+                "browser clipboard mutation task failed while sealing: {}",
+                errors.join("; ")
+            )))
         }
     }
 
@@ -8370,6 +8444,52 @@ mod tests {
                 .await
                 .is_err()
         );
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn automation_seal_waits_for_every_admitted_browser_clipboard_mutation() {
+        let (injected_tx, _injected_rx) = mpsc::unbounded_channel();
+        let session = Arc::new(DisplaySession::new(
+            0,
+            Arc::new(SourceRecordingBackend {
+                injected: injected_tx,
+            }),
+        ));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let task = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                started.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        session
+            .browser_clipboard_tasks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(task);
+        started.notified().await;
+
+        let sealing = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                session
+                    .seal_browser_interactive_for_automation("clipboard drain test")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!sealing.is_finished());
+        assert!(!finished.load(Ordering::SeqCst));
+        release.notify_one();
+        sealing.await.unwrap().unwrap();
+        assert!(finished.load(Ordering::SeqCst));
         session.stop().await;
     }
 
