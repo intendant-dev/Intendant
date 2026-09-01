@@ -77,6 +77,8 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 ///   `wait`/`hold_key` millisecond durations verbatim
 ///   (`computer_use.rs`), so a sequence legitimately outlives the
 ///   window (the 60 s cloud CU round trip also rides inside it).
+/// - `run_bounded_cu_task` — the proof-stage deadline is 180 s and its
+///   attestation deadline is 45 s, both including provider round trips.
 /// - `peer_execute_cu_actions` — the same caller-paced actions run on
 ///   a federated peer, bounded only by `PEER_MCP_TIMEOUT` (120 s).
 /// - `events` — the long-poll chunk may sit the full
@@ -91,12 +93,13 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 /// codex thread-action waits (20 s) and the remaining peer round
 /// trips (sub-second lookups under `PEER_MCP_TIMEOUT`'s transport
 /// bound — a bound is not a hold).
-pub(crate) const MCP_HELD_POST_TOOLS: [&str; 8] = [
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 9] = [
     "ask_user",
     "request_user_display",
     "spawn_live_audio",
     "fission_control",
     "execute_cu_actions",
+    "run_bounded_cu_task",
     "peer_execute_cu_actions",
     "events",
     "remote_command",

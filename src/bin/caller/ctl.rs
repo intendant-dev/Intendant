@@ -1355,9 +1355,6 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                     "--target",
                     "--capture-generation",
                     "--prior-receipt",
-                    "--prior-count",
-                    "--prior-transcript",
-                    "--observation-sha256",
                 ],
                 &[],
             )?;
@@ -1399,25 +1396,6 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 Value::String(required("--capture-generation")?),
             );
             insert_string(&mut map, "prior_receipt_id", args.one("--prior-receipt"));
-            insert_string(
-                &mut map,
-                "prior_transcript_sha256",
-                args.one("--prior-transcript"),
-            );
-            insert_string(
-                &mut map,
-                "observation_sha256",
-                args.one("--observation-sha256"),
-            );
-            if let Some(raw_count) = args.one("--prior-count") {
-                let count = raw_count
-                    .parse::<u64>()
-                    .map_err(|_| "--prior-count must be an unsigned integer".to_string())?;
-                map.insert(
-                    "prior_transcript_event_count".to_string(),
-                    Value::from(count),
-                );
-            }
             let response =
                 call_tool(client, config, "run_bounded_cu_task", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
@@ -6158,7 +6136,7 @@ fn help_cu() {
     println!(
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
-  intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [attest lineage flags]\n\
+  intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
@@ -6176,10 +6154,11 @@ If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
 
 fn help_cu_task() {
     println!(
-        "Usage: intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID --prior-count N --prior-transcript SHA256 --observation-sha256 SHA256]\n\
+        "Usage: intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
 Runs a synchronous CU-only task against the exact daemon-created display generation and\n\
 attempt-owned browser lease. stage permits bounded native computer actions; attest is\n\
-strictly observation-only and requires all four lineage flags. The provider receives no\n\
+strictly observation-only and requires a stage receipt issued by this daemon lifetime.\n\
+Transcript and screenshot lineage are derived and verified internally. The provider receives no\n\
 shell, filesystem, browser API, delegation, function tools, or escalation capability."
     );
 }

@@ -867,24 +867,6 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 Str,
                 "stage receipt continued by attest"
             ),
-            flag!(
-                "prior-count",
-                "prior_transcript_event_count",
-                U64,
-                "stage transcript event count"
-            ),
-            flag!(
-                "prior-transcript",
-                "prior_transcript_sha256",
-                Str,
-                "stage transcript SHA-256"
-            ),
-            flag!(
-                "observation-sha256",
-                "observation_sha256",
-                Str,
-                "authenticated pre-attestation observation SHA-256"
-            ),
         ],
         help: "Run a bounded CU-only stage or read-only attestation task",
     },

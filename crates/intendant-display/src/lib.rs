@@ -24,7 +24,7 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1398,6 +1398,11 @@ pub struct DisplaySession {
     /// `enqueue_input` path (spawn) and briefly from async `stop()`
     /// (join) — never held across an await.
     input_pump_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// 0 = browser interactive lanes open, 1 = sealing, 2 = sealed, 3 =
+    /// failed sealing. Proof automation permanently seals its ephemeral
+    /// display before direct input; every existing and future browser-input
+    /// or clipboard predicate observes this shared state.
+    browser_interactive_seal_state: Arc<AtomicU8>,
     /// Wakes the pool-feed bridge to open a peer-join burst window
     /// when a new pool peer attaches. `Some` after
     /// [`Self::spawn_pool_feed_bridge`] has run (eagerly from
@@ -2180,6 +2185,7 @@ impl DisplaySession {
             input_queue: Arc::new(input_queue::InputQueue::new()),
             input_pump_started: AtomicBool::new(false),
             input_pump_handle: std::sync::Mutex::new(None),
+            browser_interactive_seal_state: Arc::new(AtomicU8::new(0)),
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
@@ -3401,9 +3407,12 @@ impl DisplaySession {
         // must also make every input/clipboard callback fail closed during
         // that short pre-registration window.
         let shutdown_for_interactive = self.shutdown.clone();
+        let seal_state_for_interactive = Arc::clone(&self.browser_interactive_seal_state);
         let external_interactive_predicate = Arc::clone(&interactive_authorized.predicate);
         let interactive_authorized = interactive_authorized.with_predicate(Arc::new(move || {
-            !shutdown_for_interactive.is_cancelled() && external_interactive_predicate()
+            !shutdown_for_interactive.is_cancelled()
+                && seal_state_for_interactive.load(Ordering::SeqCst) == 0
+                && external_interactive_predicate()
         }));
         let peer_alive = Arc::new(AtomicBool::new(true));
         let peer_lifecycle_gate = Arc::new(std::sync::RwLock::new(true));
@@ -4752,7 +4761,82 @@ impl DisplaySession {
         input_authorized: BrowserInputAuthorization,
     ) -> Arc<BrowserInputSource> {
         self.ensure_input_pump();
+        let seal_state = Arc::clone(&self.browser_interactive_seal_state);
+        let external_predicate = Arc::clone(&input_authorized.predicate);
+        let input_authorized = input_authorized.with_predicate(Arc::new(move || {
+            seal_state.load(Ordering::SeqCst) == 0 && external_predicate()
+        }));
         BrowserInputSource::new(&self.input_queue, input_authorized)
+    }
+
+    /// Permanently seal browser-originated input and clipboard mutation for
+    /// this ephemeral display, drain the ordered input pump, and wait for its
+    /// safety releases before proof automation injects direct CU actions.
+    /// Idempotent after a successful seal; a failed seal remains failed
+    /// closed and requires recreating the display session.
+    pub async fn seal_browser_interactive_for_automation(
+        &self,
+        reason: &str,
+    ) -> Result<(), CallerError> {
+        match self.browser_interactive_seal_state.compare_exchange(
+            0,
+            1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(2) => return Ok(()),
+            Err(1) => {
+                return Err(CallerError::Display(
+                    "browser interactive sealing is already in progress".to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(CallerError::Display(
+                    "browser interactive sealing previously failed; recreate the display session"
+                        .to_string(),
+                ));
+            }
+        }
+
+        self.input_queue.trip(reason);
+        let input_pump = self
+            .input_pump_handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(mut input_pump) = input_pump else {
+            self.browser_interactive_seal_state
+                .store(2, Ordering::SeqCst);
+            return Ok(());
+        };
+        const SEAL_TIMEOUT: Duration = Duration::from_secs(2);
+        match tokio::time::timeout(SEAL_TIMEOUT, &mut input_pump).await {
+            Ok(Ok(())) => {
+                self.browser_interactive_seal_state
+                    .store(2, Ordering::SeqCst);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.browser_interactive_seal_state
+                    .store(3, Ordering::SeqCst);
+                Err(CallerError::Display(format!(
+                    "browser input pump failed while sealing proof display: {error}"
+                )))
+            }
+            Err(_) => {
+                *self
+                    .input_pump_handle
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(input_pump);
+                self.browser_interactive_seal_state
+                    .store(3, Ordering::SeqCst);
+                Err(CallerError::Display(format!(
+                    "browser input pump did not seal within {}s; recreate the display session",
+                    SEAL_TIMEOUT.as_secs()
+                )))
+            }
+        }
     }
 
     /// Fail browser-originated input closed for this display session and wake
@@ -8251,6 +8335,42 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), session.stop())
             .await
             .expect("stop must tear down the backend instead of deadlocking on injection");
+    }
+
+    #[tokio::test]
+    async fn automation_seal_drains_and_permanently_blocks_browser_interactive_input() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let session = DisplaySession::new(
+            0,
+            Arc::new(SourceRecordingBackend {
+                injected: injected_tx,
+            }),
+        );
+        let existing =
+            session.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        existing.enqueue(test_key_down());
+        assert_eq!(injected_rx.recv().await, Some("kd"));
+
+        session
+            .seal_browser_interactive_for_automation("unit-test proof seal")
+            .await
+            .unwrap();
+        assert_eq!(injected_rx.recv().await, Some("ku"));
+        session
+            .seal_browser_interactive_for_automation("idempotent proof seal")
+            .await
+            .unwrap();
+
+        existing.enqueue(test_key_down());
+        let future =
+            session.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        future.enqueue(test_key_down());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), injected_rx.recv())
+                .await
+                .is_err()
+        );
+        session.stop().await;
     }
 
     // -----------------------------------------------------------------------

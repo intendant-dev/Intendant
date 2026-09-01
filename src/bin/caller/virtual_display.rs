@@ -417,6 +417,18 @@ pub(crate) async fn destroy_virtual_display(
         return;
     }
 
+    // A bounded proof task owns the exclusive side of this gate from its
+    // first resource check through its final receipt. Teardown therefore
+    // cannot invalidate the generation between a check and injected input.
+    let _display_access = crate::computer_use::acquire_virtual_display_shared(display_id).await;
+    // The proof task may hold the exclusive side for minutes. A caller that
+    // disconnected while this destroy waited must not leave a delayed
+    // destructive intent behind.
+    if !bus.virtual_display_destroy_is_pending(request_id) {
+        eprintln!("[virtual_display] skipped cancelled destroy request {request_id}");
+        return;
+    }
+
     let Some(ownership) = guards.get(&display_id) else {
         refuse_virtual_display_destroy(
             bus,
@@ -650,6 +662,7 @@ pub(crate) async fn reap_virtual_display(
     display_id: u32,
     context: &str,
 ) -> bool {
+    let _display_access = crate::computer_use::acquire_virtual_display_shared(display_id).await;
     let guard = guards.remove(&display_id);
     // The browser registry lock serializes both sides of this transition:
     // creation checks bindability and reserves Starting under the same lock,

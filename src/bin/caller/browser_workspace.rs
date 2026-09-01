@@ -741,6 +741,12 @@ pub async fn create_workspace(
     let bound_display_target = display_binding
         .as_ref()
         .map(|binding| binding.canonical.clone());
+    let _display_access = match bound_display_id {
+        Some(display_id) => {
+            Some(crate::computer_use::acquire_virtual_display_shared(display_id).await)
+        }
+        None => None,
+    };
     let profile_dir = request
         .profile_dir
         .as_deref()
@@ -969,6 +975,7 @@ pub async fn close_workspace(
     id: &str,
     reason: Option<String>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let _display_access = acquire_workspace_display_access(id).await?;
     let (mut workspace, child) = global_registry()
         .write()
         .await
@@ -986,6 +993,7 @@ pub async fn acquire_workspace(
     request: AcquireBrowserWorkspaceRequest,
     bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let _display_access = acquire_workspace_display_access(&request.workspace_id).await?;
     let (result, retired) = {
         let registry = global_registry();
         let mut registry = registry.write().await;
@@ -1005,6 +1013,7 @@ pub async fn release_workspace(
     request: ReleaseBrowserWorkspaceRequest,
     bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let _display_access = acquire_workspace_display_access(&request.workspace_id).await?;
     let (result, retired) = {
         let registry = global_registry();
         let mut registry = registry.write().await;
@@ -1018,6 +1027,24 @@ pub async fn release_workspace(
     };
     terminate_retired_processes(retired);
     result
+}
+
+async fn acquire_workspace_display_access(
+    workspace_id: &str,
+) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, BrowserWorkspaceError> {
+    let display_target = global_registry()
+        .read()
+        .await
+        .workspaces
+        .get(workspace_id)
+        .and_then(|workspace| workspace.display_target.clone());
+    let Some(display_target) = display_target else {
+        return Ok(None);
+    };
+    let binding = parse_browser_display_binding(&display_target)?;
+    Ok(Some(
+        crate::computer_use::acquire_virtual_display_shared(binding.display_id).await,
+    ))
 }
 
 fn publish_retirements_locked(bus: &EventBus, retired: &[RetiredBrowserWorkspace]) {
