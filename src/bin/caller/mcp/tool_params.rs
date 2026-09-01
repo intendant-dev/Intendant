@@ -663,15 +663,6 @@ pub struct RunBoundedCuTaskParams {
     /// Stage receipt continued by an attestation; forbidden in stage mode.
     #[serde(default)]
     pub prior_receipt_id: Option<String>,
-    /// Stage transcript count continued by an attestation.
-    #[serde(default)]
-    pub prior_transcript_event_count: Option<u64>,
-    /// Stage transcript digest continued by an attestation.
-    #[serde(default)]
-    pub prior_transcript_sha256: Option<String>,
-    /// Authenticated observation digest that precedes read-only attestation.
-    #[serde(default)]
-    pub observation_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

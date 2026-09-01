@@ -3,8 +3,6 @@
 
 use super::*;
 use async_trait::async_trait;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 
 use crate::bounded_cu_task::{
     run_bounded_cu_task as execute_bounded_cu_task, validate_bounded_cu_task_request,
@@ -14,55 +12,13 @@ use crate::browser_workspace::{
     BrowserWorkspace, BrowserWorkspaceProvider, BrowserWorkspaceStatus,
 };
 use crate::computer_use::{
-    execute_actions, summarize_results_for_model, CuAction, CuActionStatus, CuExecOptions,
-    DisplayBackend, DisplayTarget,
+    execute_actions_with_exclusive_access, summarize_results_for_model, CuAction, CuActionResult,
+    CuActionStatus, CuExecOptions, DisplayBackend, DisplayTarget, ScreenshotData,
+    VirtualDisplayExclusiveAccess,
 };
 use crate::conversation::ImageData;
 
 const SCOUT_CDN_LEASE_KIND: &str = "scout_cdn_capture";
-
-fn active_bounded_displays() -> &'static Mutex<HashSet<(u32, String)>> {
-    static ACTIVE: OnceLock<Mutex<HashSet<(u32, String)>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[derive(Debug)]
-struct BoundedDisplayExecutionLease {
-    display_id: u32,
-    capture_generation: String,
-}
-
-impl BoundedDisplayExecutionLease {
-    fn acquire(display_id: u32, capture_generation: &str) -> Result<Self, BoundedCuTaskError> {
-        let mut active = active_bounded_displays().lock().map_err(|_| {
-            BoundedCuTaskError::new(
-                "bounded-cu-execution-lease-unavailable",
-                "bounded CU execution-lease registry was poisoned",
-                false,
-            )
-        })?;
-        let key = (display_id, capture_generation.to_string());
-        if !active.insert(key) {
-            return Err(BoundedCuTaskError::new(
-                "bounded-cu-execution-already-active",
-                "another bounded CU task already owns this exact display generation",
-                true,
-            ));
-        }
-        Ok(Self {
-            display_id,
-            capture_generation: capture_generation.to_string(),
-        })
-    }
-}
-
-impl Drop for BoundedDisplayExecutionLease {
-    fn drop(&mut self) {
-        if let Ok(mut active) = active_bounded_displays().lock() {
-            active.remove(&(self.display_id, self.capture_generation.clone()));
-        }
-    }
-}
 
 struct NativeBoundedCuExecutor {
     target: DisplayTarget,
@@ -72,6 +28,7 @@ struct NativeBoundedCuExecutor {
     session_registry: Option<crate::display::SharedSessionRegistry>,
     params: RunBoundedCuTaskParams,
     bus: crate::event::EventBus,
+    display_access: VirtualDisplayExclusiveAccess,
 }
 
 #[async_trait]
@@ -84,7 +41,8 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
         let mut screenshot = None;
         for action in actions {
             validate_resource_binding(&self.params, &self.bus).await?;
-            let outcome = execute_actions(
+            let mut outcome = execute_actions_with_exclusive_access(
+                &self.display_access,
                 std::slice::from_ref(action),
                 self.target,
                 self.backend,
@@ -97,21 +55,9 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
                 CuExecOptions::default(),
             )
             .await;
-            if outcome.results.len() != 1 {
-                return Err(BoundedCuTaskError::new(
-                    "bounded-cu-action-cardinality-mismatch",
-                    "native computer use did not return exactly one result for one action",
-                    false,
-                ));
-            }
-            let action_screenshot = outcome.last_screenshot().cloned().ok_or_else(|| {
-                BoundedCuTaskError::new(
-                    "bounded-cu-observation-missing",
-                    "native computer-use action returned no trailing screenshot",
-                    false,
-                )
-            })?;
-            if outcome.results[0].status == CuActionStatus::Failed {
+            let (action_result, action_screenshot) =
+                split_action_and_observation(action, std::mem::take(&mut outcome.results))?;
+            if action_result.status == CuActionStatus::Failed {
                 return Err(BoundedCuTaskError::new(
                     "bounded-cu-action-failed",
                     "native computer-use action failed; later actions were not executed",
@@ -119,7 +65,7 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
                 ));
             }
             screenshot = Some(action_screenshot);
-            results.extend(outcome.results);
+            results.push(action_result);
             validate_resource_binding(&self.params, &self.bus).await?;
         }
         let screenshot = screenshot.ok_or_else(|| {
@@ -141,6 +87,46 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
                 .collect::<Vec<CuActionStatus>>(),
         })
     }
+}
+
+fn split_action_and_observation(
+    action: &CuAction,
+    mut results: Vec<CuActionResult>,
+) -> Result<(CuActionResult, ScreenshotData), BoundedCuTaskError> {
+    let captures_itself = matches!(action, CuAction::Screenshot | CuAction::Zoom { .. });
+    let expected_results = if captures_itself { 1 } else { 2 };
+    if results.len() != expected_results {
+        return Err(BoundedCuTaskError::new(
+            "bounded-cu-action-cardinality-mismatch",
+            format!(
+                "native computer use returned {} results; expected {expected_results} for one action plus its policy-driven observation",
+                results.len()
+            ),
+            false,
+        ));
+    }
+    let mut action_result = results.remove(0);
+    let observation_result = if captures_itself { None } else { results.pop() };
+    let screenshot = match observation_result {
+        Some(result) if result.status == CuActionStatus::Failed => {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-observation-failed",
+                "native computer-use trailing observation failed",
+                false,
+            ));
+        }
+        Some(mut result) => result.screenshot.take(),
+        None => action_result.screenshot.take(),
+    }
+    .ok_or_else(|| {
+        BoundedCuTaskError::new(
+            "bounded-cu-observation-missing",
+            "native computer-use action returned no trailing screenshot",
+            false,
+        )
+    })?;
+    action_result.screenshot = None;
+    Ok((action_result, screenshot))
 }
 
 impl IntendantServer {
@@ -182,14 +168,15 @@ impl IntendantServer {
             capture_generation: params.capture_generation.clone(),
             task: params.task.clone(),
             prior_receipt_id: params.prior_receipt_id.clone(),
-            prior_transcript_event_count: params.prior_transcript_event_count,
-            prior_transcript_sha256: params.prior_transcript_sha256.clone(),
-            observation_sha256: params.observation_sha256.clone(),
+            prior_transcript_event_count: None,
+            prior_transcript_sha256: None,
+            observation_sha256: None,
+            prior_completed_at: None,
         };
         validate_bounded_cu_task_request(&request)?;
+        let display_access =
+            crate::computer_use::acquire_virtual_display_exclusive(params.display_id).await;
         validate_resource_binding(&params, &self.bus).await?;
-        let _execution_lease =
-            BoundedDisplayExecutionLease::acquire(params.display_id, &params.capture_generation)?;
         let (cu_config, session_registry, action_counter) = {
             let state = self.state.read().await;
             (
@@ -203,6 +190,29 @@ impl IntendantServer {
         let target = DisplayTarget::Virtual {
             id: params.display_id,
         };
+        let proof_session = match session_registry.as_ref() {
+            Some(registry) => registry.read().await.get(params.display_id),
+            None => None,
+        }
+        .ok_or_else(|| {
+            BoundedCuTaskError::new(
+                "bounded-cu-display-session-missing",
+                "bound virtual display had no agent-visible capture/input session",
+                false,
+            )
+        })?;
+        proof_session
+            .seal_browser_interactive_for_automation(
+                "bounded proof automation acquired exclusive display control",
+            )
+            .await
+            .map_err(|error| {
+                BoundedCuTaskError::new(
+                    "bounded-cu-browser-interactive-seal-failed",
+                    error.to_string(),
+                    false,
+                )
+            })?;
         let dimensions = crate::computer_use::target_pixel_size(target, &session_registry).await;
         if dimensions.0 == 0 || dimensions.1 == 0 {
             return Err(BoundedCuTaskError::new(
@@ -226,6 +236,7 @@ impl IntendantServer {
             session_registry,
             params: params.clone(),
             bus: self.bus.clone(),
+            display_access,
         };
         let task_result = execute_bounded_cu_task(provider.as_ref(), &mut executor, request).await;
         let final_binding = validate_resource_binding(&params, &self.bus).await;
@@ -296,17 +307,35 @@ async fn validate_resource_binding(
         ));
     }
     let workspaces = crate::browser_workspace::list_workspaces(bus).await;
-    let workspace = workspaces
-        .iter()
-        .find(|workspace| workspace.id == params.workspace_id)
-        .ok_or_else(|| {
-            BoundedCuTaskError::new(
-                "bounded-cu-workspace-missing",
-                "exact browser workspace was not found",
-                false,
-            )
-        })?;
+    let workspace = exclusive_workspace_on_display(&workspaces, params)?;
     validate_workspace(workspace, params)
+}
+
+fn exclusive_workspace_on_display<'a>(
+    workspaces: &'a [BrowserWorkspace],
+    params: &RunBoundedCuTaskParams,
+) -> Result<&'a BrowserWorkspace, BoundedCuTaskError> {
+    let mut active_on_display = workspaces.iter().filter(|workspace| {
+        matches!(
+            workspace.status,
+            BrowserWorkspaceStatus::Starting | BrowserWorkspaceStatus::Ready
+        ) && workspace.display_target.as_deref() == Some(params.display_target.as_str())
+    });
+    let workspace = active_on_display.next().ok_or_else(|| {
+        BoundedCuTaskError::new(
+            "bounded-cu-workspace-missing",
+            "no eligible browser workspace was bound to the exact display",
+            false,
+        )
+    })?;
+    if active_on_display.next().is_some() || workspace.id != params.workspace_id {
+        return Err(BoundedCuTaskError::new(
+            "bounded-cu-display-workspace-not-exclusive",
+            "the proof display was not exclusively bound to the selected browser workspace",
+            false,
+        ));
+    }
+    Ok(workspace)
 }
 
 fn validate_workspace(
@@ -399,6 +428,24 @@ fn bounded_error_json(error: BoundedCuTaskError) -> String {
 mod tests {
     use super::*;
 
+    fn screenshot_data(name: &str) -> ScreenshotData {
+        ScreenshotData {
+            path: std::path::PathBuf::from(name),
+            base64_png: "iVBORw0KGgo=".to_string(),
+            width: 1,
+            height: 1,
+        }
+    }
+
+    fn action_result(status: CuActionStatus, screenshot: Option<ScreenshotData>) -> CuActionResult {
+        CuActionResult {
+            status,
+            screenshot,
+            error: None,
+            detail: None,
+        }
+    }
+
     fn params() -> RunBoundedCuTaskParams {
         RunBoundedCuTaskParams {
             mode: crate::bounded_cu_task::BoundedCuTaskMode::Stage,
@@ -409,9 +456,6 @@ mod tests {
             capture_generation: "vdcg-1".to_string(),
             task: "stage".to_string(),
             prior_receipt_id: None,
-            prior_transcript_event_count: None,
-            prior_transcript_sha256: None,
-            observation_sha256: None,
         }
     }
 
@@ -461,6 +505,72 @@ mod tests {
     }
 
     #[test]
+    fn proof_display_rejects_every_second_active_browser_workspace() {
+        let params = params();
+        let selected = workspace();
+        assert_eq!(
+            exclusive_workspace_on_display(std::slice::from_ref(&selected), &params)
+                .unwrap()
+                .id,
+            selected.id
+        );
+
+        let mut second = selected.clone();
+        second.id = "bw-2".to_string();
+        second.provider = BrowserWorkspaceProvider::SystemCdp;
+        let error = exclusive_workspace_on_display(&[selected, second], &params).unwrap_err();
+        assert_eq!(error.code, "bounded-cu-display-workspace-not-exclusive");
+    }
+
+    #[test]
+    fn ordinary_action_keeps_one_status_and_uses_the_trailing_observation() {
+        let action = CuAction::Click {
+            x: 1,
+            y: 2,
+            button: Default::default(),
+        };
+        let (result, screenshot) = split_action_and_observation(
+            &action,
+            vec![
+                action_result(
+                    CuActionStatus::Injected,
+                    Some(screenshot_data("convenience-copy.png")),
+                ),
+                action_result(
+                    CuActionStatus::Verified,
+                    Some(screenshot_data("trailing.png")),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CuActionStatus::Injected);
+        assert!(result.screenshot.is_none());
+        assert_eq!(screenshot.path, std::path::PathBuf::from("trailing.png"));
+    }
+
+    #[test]
+    fn failed_trailing_observation_is_not_masked_by_its_convenience_copy() {
+        let action = CuAction::Wait { ms: 1 };
+        let error = split_action_and_observation(
+            &action,
+            vec![
+                action_result(
+                    CuActionStatus::Verified,
+                    Some(screenshot_data("convenience-copy.png")),
+                ),
+                action_result(
+                    CuActionStatus::Failed,
+                    Some(screenshot_data("failed-trailing.png")),
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "bounded-cu-observation-failed");
+    }
+
+    #[test]
     fn private_scratch_is_mode_0700() {
         let scratch = create_private_scratch().unwrap();
         validate_private_scratch(scratch.path()).unwrap();
@@ -477,16 +587,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_display_generation_allows_only_one_bounded_task() {
-        let first = BoundedDisplayExecutionLease::acquire(424_242, "vdcg-test-exclusive").unwrap();
-        assert_eq!(
-            BoundedDisplayExecutionLease::acquire(424_242, "vdcg-test-exclusive")
-                .unwrap_err()
-                .code,
-            "bounded-cu-execution-already-active"
-        );
-        drop(first);
-        BoundedDisplayExecutionLease::acquire(424_242, "vdcg-test-exclusive").unwrap();
+    #[tokio::test]
+    async fn bounded_task_excludes_other_access_to_its_virtual_display() {
+        let exclusive = crate::computer_use::acquire_virtual_display_exclusive(424_242).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            crate::computer_use::acquire_virtual_display_shared(424_242),
+        )
+        .await
+        .is_err());
+        drop(exclusive);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::computer_use::acquire_virtual_display_shared(424_242),
+        )
+        .await
+        .unwrap();
     }
 }

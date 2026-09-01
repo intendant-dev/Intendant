@@ -12,7 +12,7 @@ use base64::Engine as _;
 use serde::de::{self, DeserializeSeed as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::computer_use::{CuAction, CuActionStatus};
@@ -29,6 +29,7 @@ const BOUNDED_CU_ATTEST_MAX_TURNS: u32 = 2;
 const BOUNDED_CU_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
 const BOUNDED_CU_ATTEST_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_BINDING_BYTES: usize = 256;
+const BOUNDED_CU_MAX_ISSUED_STAGE_RECEIPTS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +74,7 @@ pub(crate) struct BoundedCuTaskRequest {
     pub(crate) prior_transcript_event_count: Option<u64>,
     pub(crate) prior_transcript_sha256: Option<String>,
     pub(crate) observation_sha256: Option<String>,
+    pub(crate) prior_completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,16 +206,101 @@ impl TaskCounters {
     }
 }
 
+fn issued_stage_receipts() -> &'static std::sync::Mutex<VecDeque<BoundedCuTaskReceipt>> {
+    static RECEIPTS: std::sync::OnceLock<std::sync::Mutex<VecDeque<BoundedCuTaskReceipt>>> =
+        std::sync::OnceLock::new();
+    RECEIPTS.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
+}
+
+fn remember_issued_stage_receipt(receipt: &BoundedCuTaskReceipt) -> Result<(), BoundedCuTaskError> {
+    let mut receipts = issued_stage_receipts().lock().map_err(|_| {
+        BoundedCuTaskError::new(
+            "bounded-cu-receipt-registry-unavailable",
+            "issued stage receipt registry was poisoned",
+            false,
+        )
+    })?;
+    receipts.retain(|existing| existing.receipt_id != receipt.receipt_id);
+    receipts.push_back(receipt.clone());
+    while receipts.len() > BOUNDED_CU_MAX_ISSUED_STAGE_RECEIPTS {
+        receipts.pop_front();
+    }
+    Ok(())
+}
+
+fn bind_issued_stage_receipt(request: &mut BoundedCuTaskRequest) -> Result<(), BoundedCuTaskError> {
+    let prior_receipt_id = request.prior_receipt_id.as_deref().ok_or_else(|| {
+        BoundedCuTaskError::new(
+            "bounded-cu-attestation-lineage-invalid",
+            "attest mode requires an issued stage receipt ID",
+            false,
+        )
+    })?;
+    let prior = issued_stage_receipts()
+        .lock()
+        .map_err(|_| {
+            BoundedCuTaskError::new(
+                "bounded-cu-receipt-registry-unavailable",
+                "issued stage receipt registry was poisoned",
+                false,
+            )
+        })?
+        .iter()
+        .find(|receipt| receipt.receipt_id == prior_receipt_id)
+        .cloned()
+        .ok_or_else(|| {
+            BoundedCuTaskError::new(
+                "bounded-cu-prior-receipt-not-issued",
+                "the referenced stage receipt was not issued by this daemon lifetime",
+                false,
+            )
+        })?;
+    if prior.schema_version != 1
+        || prior.mode != BoundedCuTaskMode::Stage
+        || receipt_id(&prior)? != prior.receipt_id
+        || prior.attempt_id != request.attempt_id
+        || prior.workspace_id != request.workspace_id
+        || prior.display_id != request.display_id
+        || prior.display_target != request.display_target
+        || prior.capture_generation != request.capture_generation
+        || prior.prior_receipt_id.is_some()
+        || prior.prior_transcript_event_count.is_some()
+        || prior.prior_transcript_sha256.is_some()
+        || prior.observation_sha256.is_some()
+        || prior.current_transcript_event_count != prior.transcript_event_count
+    {
+        return Err(BoundedCuTaskError::new(
+            "bounded-cu-prior-receipt-binding-mismatch",
+            "issued stage receipt did not match the exact attempt, workspace, and display generation",
+            false,
+        ));
+    }
+    request.prior_transcript_event_count = Some(prior.transcript_event_count);
+    request.prior_transcript_sha256 = Some(prior.transcript_sha256);
+    request.prior_completed_at = Some(prior.completed_at);
+    Ok(())
+}
+
 /// Run one strictly bounded CU-only task.
 pub(crate) async fn run_bounded_cu_task(
     provider: &dyn ChatProvider,
     executor: &mut dyn BoundedCuActionExecutor,
-    request: BoundedCuTaskRequest,
+    mut request: BoundedCuTaskRequest,
 ) -> Result<BoundedCuTaskReceipt, BoundedCuTaskError> {
     validate_bounded_cu_task_request(&request)?;
+    if request.mode == BoundedCuTaskMode::Attest {
+        bind_issued_stage_receipt(&mut request)?;
+    }
     let timeout = request.mode.timeout();
+    let mode = request.mode;
     match tokio::time::timeout(timeout, run_inner(provider, executor, request)).await {
-        Ok(result) => result,
+        Ok(Ok(receipt)) => {
+            if mode == BoundedCuTaskMode::Stage {
+                remember_issued_stage_receipt(&receipt)?;
+            }
+            Ok(receipt)
+        }
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(BoundedCuTaskError::new(
             "bounded-cu-deadline-exceeded",
             format!(
@@ -228,7 +315,7 @@ pub(crate) async fn run_bounded_cu_task(
 async fn run_inner(
     provider: &dyn ChatProvider,
     executor: &mut dyn BoundedCuActionExecutor,
-    request: BoundedCuTaskRequest,
+    mut request: BoundedCuTaskRequest,
 ) -> Result<BoundedCuTaskReceipt, BoundedCuTaskError> {
     if !provider.cu_enabled() {
         return Err(BoundedCuTaskError::new(
@@ -238,6 +325,23 @@ async fn run_inner(
         ));
     }
     let started_at = now_rfc3339();
+    if let Some(prior_completed_at) = request.prior_completed_at.as_deref() {
+        let prior = chrono::DateTime::parse_from_rfc3339(prior_completed_at).map_err(|_| {
+            BoundedCuTaskError::new(
+                "bounded-cu-prior-receipt-time-invalid",
+                "issued stage receipt had an invalid completion timestamp",
+                false,
+            )
+        })?;
+        let started = chrono::DateTime::parse_from_rfc3339(&started_at).expect("own RFC3339 time");
+        if started < prior {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-attestation-chronology-invalid",
+                "attestation began before its issued stage receipt completed",
+                false,
+            ));
+        }
+    }
     let started_monotonic = Instant::now();
     let task_sha256 = sha256(request.task.as_bytes());
     let mut transcript = Transcript::default();
@@ -260,6 +364,9 @@ async fn run_inner(
         ));
     }
     let initial_frame_sha256 = image_sha256(&initial.screenshot)?;
+    if request.mode == BoundedCuTaskMode::Attest {
+        request.observation_sha256 = Some(initial_frame_sha256.clone());
+    }
     transcript.push(
         0,
         "initial_frame",
@@ -367,6 +474,24 @@ async fn apply_cu_calls(
 ) -> Result<(), BoundedCuTaskError> {
     let mut call_ids = HashSet::with_capacity(response.cu_calls.len());
     let response_action_count = response.cu_calls.iter().try_fold(0_u64, |count, call| {
+        if !call.metadata.pending_safety_checks.is_empty() {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-pending-safety-check-refused",
+                "provider returned a pending computer-use safety check; no action was executed",
+                false,
+            ));
+        }
+        if call
+            .actions
+            .iter()
+            .any(|action| matches!(action, CuAction::Paste { .. }))
+        {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-paste-refused",
+                "clipboard paste is not permitted in the bounded proof lane; use typed input",
+                false,
+            ));
+        }
         if call.call_id.trim().is_empty()
             || call.call_id.len() > MAX_BINDING_BYTES
             || !call_ids.insert(call.call_id.as_str())
@@ -600,7 +725,8 @@ pub(crate) fn validate_bounded_cu_task_request(
             if request.prior_receipt_id.is_some()
                 || request.prior_transcript_event_count.is_some()
                 || request.prior_transcript_sha256.is_some()
-                || request.observation_sha256.is_some() =>
+                || request.observation_sha256.is_some()
+                || request.prior_completed_at.is_some() =>
         {
             Err(BoundedCuTaskError::new(
                 "bounded-cu-stage-lineage-invalid",
@@ -614,24 +740,19 @@ pub(crate) fn validate_bounded_cu_task_request(
 }
 
 fn validate_attestation_lineage(request: &BoundedCuTaskRequest) -> Result<(), BoundedCuTaskError> {
-    let prior_receipt = request
+    let prior_receipt_id = request
         .prior_receipt_id
         .as_deref()
         .filter(|value| is_receipt_id(value));
-    let prior_count = request
-        .prior_transcript_event_count
-        .filter(|count| *count > 0);
-    if prior_receipt.is_none()
-        || prior_count.is_none()
-        || !request
-            .prior_transcript_sha256
-            .as_deref()
-            .is_some_and(is_sha256)
-        || !request.observation_sha256.as_deref().is_some_and(is_sha256)
+    if prior_receipt_id.is_none()
+        || request.prior_transcript_event_count.is_some()
+        || request.prior_transcript_sha256.is_some()
+        || request.observation_sha256.is_some()
+        || request.prior_completed_at.is_some()
     {
         return Err(BoundedCuTaskError::new(
             "bounded-cu-attestation-lineage-invalid",
-            "attest mode requires the exact prior receipt, transcript, and observation digest",
+            "attest mode accepts only an issued stage receipt ID; transcript and frame lineage are derived by the daemon",
             false,
         ));
     }
@@ -1005,19 +1126,25 @@ mod tests {
             prior_transcript_event_count: None,
             prior_transcript_sha256: None,
             observation_sha256: None,
+            prior_completed_at: None,
         }
     }
 
-    fn attest_request() -> BoundedCuTaskRequest {
+    fn attest_request(prior_receipt_id: String) -> BoundedCuTaskRequest {
         BoundedCuTaskRequest {
             mode: BoundedCuTaskMode::Attest,
-            prior_receipt_id: Some(format!("bcu-{}", "c".repeat(64))),
-            prior_transcript_event_count: Some(4),
-            prior_transcript_sha256: Some("a".repeat(64)),
-            observation_sha256: Some("b".repeat(64)),
+            prior_receipt_id: Some(prior_receipt_id),
             task: "Inspect only and return {\"ready\":true}.".to_string(),
             ..stage_request()
         }
+    }
+
+    async fn issue_stage_receipt() -> BoundedCuTaskReceipt {
+        let provider = FakeProvider::new(vec![response(r#"{"ready":true}"#)]);
+        let mut executor = FakeExecutor::default();
+        run_bounded_cu_task(&provider, &mut executor, stage_request())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1057,6 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn attest_rejects_native_action_before_execution() {
+        let stage = issue_stage_receipt().await;
         let mut action_response = response("");
         action_response.cu_calls.push(CuToolCall {
             call_id: "cu-1".to_string(),
@@ -1065,12 +1193,43 @@ mod tests {
         });
         let provider = FakeProvider::new(vec![action_response]);
         let mut executor = FakeExecutor::default();
-        let error = run_bounded_cu_task(&provider, &mut executor, attest_request())
+        let error = run_bounded_cu_task(&provider, &mut executor, attest_request(stage.receipt_id))
             .await
             .unwrap_err();
 
         assert_eq!(error.code, "bounded-cu-post-observation-action-refused");
         assert_eq!(executor.batches, vec![vec!["screenshot"]]);
+    }
+
+    #[tokio::test]
+    async fn attest_derives_lineage_and_observation_from_issued_stage_and_frame() {
+        let stage = issue_stage_receipt().await;
+        let provider = FakeProvider::new(vec![response(r#"{"ready":true}"#)]);
+        let mut executor = FakeExecutor::default();
+        let receipt = run_bounded_cu_task(
+            &provider,
+            &mut executor,
+            attest_request(stage.receipt_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            receipt.prior_receipt_id.as_deref(),
+            Some(stage.receipt_id.as_str())
+        );
+        assert_eq!(
+            receipt.prior_transcript_event_count,
+            Some(stage.transcript_event_count)
+        );
+        assert_eq!(
+            receipt.prior_transcript_sha256.as_deref(),
+            Some(stage.transcript_sha256.as_str())
+        );
+        assert_eq!(
+            receipt.observation_sha256.as_deref(),
+            Some(receipt.initial_frame_sha256.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1112,17 +1271,61 @@ mod tests {
         assert_eq!(executor.batches, vec![vec!["screenshot"]]);
     }
 
+    #[tokio::test]
+    async fn pending_safety_checks_are_rejected_before_any_input() {
+        let mut action_response = response("");
+        action_response.cu_calls.push(CuToolCall {
+            call_id: "cu-safety".to_string(),
+            actions: vec![CuAction::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Left,
+            }],
+            metadata: CuCallMetadata {
+                pending_safety_checks: vec![serde_json::json!({"id": "check-1"})],
+                safety_decision: None,
+            },
+        });
+        let provider = FakeProvider::new(vec![action_response]);
+        let mut executor = FakeExecutor::default();
+        let error = run_bounded_cu_task(&provider, &mut executor, stage_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "bounded-cu-pending-safety-check-refused");
+        assert_eq!(executor.batches, vec![vec!["screenshot"]]);
+    }
+
+    #[tokio::test]
+    async fn paste_is_rejected_before_clipboard_mutation() {
+        let mut action_response = response("");
+        action_response.cu_calls.push(CuToolCall {
+            call_id: "cu-paste".to_string(),
+            actions: vec![CuAction::Paste {
+                text: "secret".to_string(),
+            }],
+            metadata: CuCallMetadata::default(),
+        });
+        let provider = FakeProvider::new(vec![action_response]);
+        let mut executor = FakeExecutor::default();
+        let error = run_bounded_cu_task(&provider, &mut executor, stage_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "bounded-cu-paste-refused");
+        assert_eq!(executor.batches, vec![vec!["screenshot"]]);
+    }
+
     #[test]
     fn stage_and_attest_lineage_are_mutually_exclusive() {
         let mut stage = stage_request();
-        stage.observation_sha256 = Some("a".repeat(64));
+        stage.prior_receipt_id = Some(format!("bcu-{}", "a".repeat(64)));
         assert_eq!(
             validate_bounded_cu_task_request(&stage).unwrap_err().code,
             "bounded-cu-stage-lineage-invalid"
         );
 
-        let mut attest = attest_request();
-        attest.prior_transcript_sha256 = None;
+        let attest = attest_request("not-a-receipt".to_string());
         assert_eq!(
             validate_bounded_cu_task_request(&attest).unwrap_err().code,
             "bounded-cu-attestation-lineage-invalid"
