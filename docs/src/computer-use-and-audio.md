@@ -124,8 +124,10 @@ monotonic elapsed time, task and normalized-result hashes, every model-visible
 frame hash, action kinds, redacted geometry/timing projection hashes and
 counters, plus the prior stage and observation lineage required by `attest`.
 Typed text and key values are excluded from the public projection so the
-receipt cannot act as an offline oracle for low-entropy credentials. Scoped
-agent callers are rejected; the intended caller is a local owner-side
+receipt cannot act as an offline oracle for low-entropy credentials. Provider
+response text, hashes, and exact lengths are excluded for the same reason; its
+public event records only whether content existed and the CU/tool-call counts.
+Scoped agent callers are rejected; the intended caller is a local owner-side
 orchestrator using the loopback `intendant ctl` lane.
 
 **Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
