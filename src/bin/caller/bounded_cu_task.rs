@@ -162,6 +162,68 @@ struct Transcript {
     events: Vec<TranscriptEvent>,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RedactedActionProjection<'a> {
+    Click {
+        x: i32,
+        y: i32,
+        button: &'a crate::computer_use::MouseButton,
+    },
+    DoubleClick {
+        x: i32,
+        y: i32,
+        button: &'a crate::computer_use::MouseButton,
+    },
+    TripleClick {
+        x: i32,
+        y: i32,
+        button: &'a crate::computer_use::MouseButton,
+    },
+    MouseDown {
+        x: i32,
+        y: i32,
+        button: &'a crate::computer_use::MouseButton,
+    },
+    MouseUp {
+        x: i32,
+        y: i32,
+        button: &'a crate::computer_use::MouseButton,
+    },
+    Type,
+    Paste,
+    Key,
+    HoldKey {
+        ms: u64,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        direction: &'a crate::computer_use::ScrollDirection,
+        amount: i32,
+    },
+    MoveMouse {
+        x: i32,
+        y: i32,
+    },
+    Drag {
+        start_x: i32,
+        start_y: i32,
+        end_x: i32,
+        end_y: i32,
+    },
+    Screenshot,
+    Zoom {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    Wait {
+        ms: u64,
+    },
+}
+
 impl Transcript {
     fn push(&mut self, turn: u32, kind: &'static str, detail: String) {
         self.events.push(TranscriptEvent {
@@ -618,14 +680,7 @@ async fn apply_cu_calls(
             .map(action_kind)
             .collect::<Vec<_>>()
             .join(",");
-        let action_bytes = serde_json::to_vec(&call.actions).map_err(|error| {
-            BoundedCuTaskError::new(
-                "bounded-cu-action-serialization-failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-        let actions_sha256 = sha256(&action_bytes);
+        let action_projection_sha256 = action_projection_sha256(&call.actions)?;
         let call_id_sha256 = sha256(call.call_id.as_bytes());
         let input_count = call
             .actions
@@ -655,7 +710,7 @@ async fn apply_cu_calls(
             turn,
             "cu_batch",
             format!(
-                "actions={action_kinds};actions_sha256={actions_sha256};call_id_sha256={call_id_sha256};frame_sha256={frame_sha256};statuses={};inputs={input_count}",
+                "actions={action_kinds};action_projection_sha256={action_projection_sha256};call_id_sha256={call_id_sha256};frame_sha256={frame_sha256};statuses={};inputs={input_count}",
                 status_labels(&outcome.statuses)
             ),
         );
@@ -1016,6 +1071,94 @@ fn action_kind(action: &CuAction) -> &'static str {
     }
 }
 
+fn redacted_action_projection(action: &CuAction) -> RedactedActionProjection<'_> {
+    match action {
+        CuAction::Click { x, y, button } => RedactedActionProjection::Click {
+            x: *x,
+            y: *y,
+            button,
+        },
+        CuAction::DoubleClick { x, y, button } => RedactedActionProjection::DoubleClick {
+            x: *x,
+            y: *y,
+            button,
+        },
+        CuAction::TripleClick { x, y, button } => RedactedActionProjection::TripleClick {
+            x: *x,
+            y: *y,
+            button,
+        },
+        CuAction::MouseDown { x, y, button } => RedactedActionProjection::MouseDown {
+            x: *x,
+            y: *y,
+            button,
+        },
+        CuAction::MouseUp { x, y, button } => RedactedActionProjection::MouseUp {
+            x: *x,
+            y: *y,
+            button,
+        },
+        CuAction::Type { .. } => RedactedActionProjection::Type,
+        CuAction::Paste { .. } => RedactedActionProjection::Paste,
+        CuAction::Key { .. } => RedactedActionProjection::Key,
+        CuAction::HoldKey { ms, .. } => RedactedActionProjection::HoldKey { ms: *ms },
+        CuAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => RedactedActionProjection::Scroll {
+            x: *x,
+            y: *y,
+            direction,
+            amount: *amount,
+        },
+        CuAction::MoveMouse { x, y } => RedactedActionProjection::MoveMouse { x: *x, y: *y },
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => RedactedActionProjection::Drag {
+            start_x: *start_x,
+            start_y: *start_y,
+            end_x: *end_x,
+            end_y: *end_y,
+        },
+        CuAction::Screenshot => RedactedActionProjection::Screenshot,
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => RedactedActionProjection::Zoom {
+            x: *x,
+            y: *y,
+            width: *width,
+            height: *height,
+        },
+        CuAction::Wait { ms } => RedactedActionProjection::Wait { ms: *ms },
+    }
+}
+
+fn action_projection_sha256(actions: &[CuAction]) -> Result<String, BoundedCuTaskError> {
+    let projection = actions
+        .iter()
+        .map(redacted_action_projection)
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&projection).map_err(|error| {
+        BoundedCuTaskError::new(
+            "bounded-cu-action-serialization-failed",
+            error.to_string(),
+            false,
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"intendant-bounded-cu-action-projection-v1\0");
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn is_input(action: &CuAction) -> bool {
     !matches!(
         action,
@@ -1254,6 +1397,63 @@ mod tests {
         let mut altered = receipt.clone();
         altered.input_event_count += 1;
         assert_ne!(receipt_id(&altered).unwrap(), receipt.receipt_id);
+    }
+
+    #[test]
+    fn transcript_action_projection_omits_typed_and_key_material() {
+        let first = vec![
+            CuAction::Type {
+                text: "123456".to_string(),
+            },
+            CuAction::Key {
+                key: "hunter2".to_string(),
+            },
+            CuAction::HoldKey {
+                key: "otp-123456".to_string(),
+                ms: 250,
+            },
+        ];
+        let second = vec![
+            CuAction::Type {
+                text: "654321".to_string(),
+            },
+            CuAction::Key {
+                key: "different".to_string(),
+            },
+            CuAction::HoldKey {
+                key: "otp-654321".to_string(),
+                ms: 250,
+            },
+        ];
+
+        let serialized = serde_json::to_string(
+            &first
+                .iter()
+                .map(redacted_action_projection)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!serialized.contains("123456"));
+        assert!(!serialized.contains("hunter2"));
+        assert_eq!(
+            action_projection_sha256(&first).unwrap(),
+            action_projection_sha256(&second).unwrap()
+        );
+
+        let shifted = vec![CuAction::Click {
+            x: 11,
+            y: 20,
+            button: MouseButton::Left,
+        }];
+        let original = vec![CuAction::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+        }];
+        assert_ne!(
+            action_projection_sha256(&original).unwrap(),
+            action_projection_sha256(&shifted).unwrap()
+        );
     }
 
     #[tokio::test]
