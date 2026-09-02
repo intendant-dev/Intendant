@@ -108,6 +108,16 @@ The daemon rechecks the exact display generation and browser lease around each
 action, serializes tasks per display generation, and deletes its mode-0700
 scratch directory before returning.
 
+The 180-second `stage` and 45-second `attest` deadlines begin at request
+admission, including any wait for exclusive display control and all setup. A
+ready workspace is also probed for a live daemon-owned browser child and its
+exact CDP page target around every action. The initial model frame must have
+been captured after browser-originated input was permanently sealed. Text,
+scroll, hold, and wait parameters carry fixed per-action caps; if a platform
+operation has already entered non-abortable OS work when the deadline fires,
+it retains the exclusive display and private scratch lifetimes until that
+bounded work finishes.
+
 Successful calls return a compact receipt rather than screenshots or typed
 text. Its identity binds the exact resources, provider/model, timestamps and
 monotonic elapsed time, task and normalized-result hashes, every model-visible
