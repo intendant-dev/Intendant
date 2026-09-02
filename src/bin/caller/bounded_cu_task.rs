@@ -1017,9 +1017,8 @@ fn record_response(transcript: &mut Transcript, turn: u32, response: &ChatRespon
         turn,
         "provider_response",
         format!(
-            "content_sha256={};content_bytes={};cu_calls={};tool_calls={}",
-            sha256(response.content.as_bytes()),
-            response.content.len(),
+            "content_present={};cu_calls={};tool_calls={}",
+            !response.content.is_empty(),
             response.cu_calls.len(),
             response.tool_calls.len()
         ),
@@ -1453,6 +1452,31 @@ mod tests {
         assert_ne!(
             action_projection_sha256(&original).unwrap(),
             action_projection_sha256(&shifted).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_response_projection_does_not_oracle_content() {
+        let mut first = Transcript::default();
+        let mut second = Transcript::default();
+        record_response(&mut first, 1, &response("123456"));
+        record_response(&mut second, 1, &response("654321"));
+
+        assert_eq!(first.events, second.events);
+        assert_eq!(
+            first.events[0].detail,
+            "content_present=true;cu_calls=0;tool_calls=0"
+        );
+        assert!(!first.events[0].detail.contains("123456"));
+        assert!(!first.events[0].detail.contains("654321"));
+        assert!(!first.events[0].detail.contains("sha256"));
+        assert!(!first.events[0].detail.contains("bytes"));
+
+        let mut empty = Transcript::default();
+        record_response(&mut empty, 1, &response(""));
+        assert_eq!(
+            empty.events[0].detail,
+            "content_present=false;cu_calls=0;tool_calls=0"
         );
     }
 
