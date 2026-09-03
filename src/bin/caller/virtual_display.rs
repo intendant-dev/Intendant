@@ -417,6 +417,17 @@ pub(crate) async fn destroy_virtual_display(
         return;
     }
 
+    // Refuse a stale exact-generation request before waiting on a replacement
+    // proof fence. Validate again after the wait so a future caller that does
+    // not hold the serial ownership loop cannot turn this fast check into a
+    // check-then-teardown race.
+    if let Some(reason) =
+        virtual_display_destroy_target_error(guards, display_id, capture_generation)
+    {
+        refuse_virtual_display_destroy(bus, request_id, reason);
+        return;
+    }
+
     // A bounded proof task owns the exclusive side of this gate from its
     // first resource check through its final receipt. Teardown therefore
     // cannot invalidate the generation between a check and injected input.
@@ -428,31 +439,10 @@ pub(crate) async fn destroy_virtual_display(
         eprintln!("[virtual_display] skipped cancelled destroy request {request_id}");
         return;
     }
-
-    let Some(ownership) = guards.get(&display_id) else {
-        refuse_virtual_display_destroy(
-            bus,
-            request_id,
-            format!("display :{display_id} is not a daemon-owned virtual display"),
-        );
-        return;
-    };
-    if ownership.capture_generation != capture_generation {
-        refuse_virtual_display_destroy(
-            bus,
-            request_id,
-            format!(
-                "capture generation does not match the live daemon-owned display :{display_id}"
-            ),
-        );
-        return;
-    }
-    if !guards.owns_generation(display_id, capture_generation) {
-        refuse_virtual_display_destroy(
-            bus,
-            request_id,
-            format!("display :{display_id} has incomplete daemon ownership state"),
-        );
+    if let Some(reason) =
+        virtual_display_destroy_target_error(guards, display_id, capture_generation)
+    {
+        refuse_virtual_display_destroy(bus, request_id, reason);
         return;
     }
     let Some(guard) = guards.remove(&display_id) else {
@@ -526,6 +516,29 @@ pub(crate) async fn destroy_virtual_display(
     );
 }
 
+fn virtual_display_destroy_target_error(
+    guards: &VirtualDisplayGuards,
+    display_id: u32,
+    capture_generation: &str,
+) -> Option<String> {
+    let Some(ownership) = guards.get(&display_id) else {
+        return Some(format!(
+            "display :{display_id} is not a daemon-owned virtual display"
+        ));
+    };
+    if ownership.capture_generation != capture_generation {
+        return Some(format!(
+            "capture generation does not match the live daemon-owned display :{display_id}"
+        ));
+    }
+    if !guards.owns_generation(display_id, capture_generation) {
+        return Some(format!(
+            "display :{display_id} has incomplete daemon ownership state"
+        ));
+    }
+    None
+}
+
 fn refuse_virtual_display_destroy(bus: &EventBus, request_id: &str, reason: String) {
     let _ = bus.complete_virtual_display_destroy(
         request_id,
@@ -560,6 +573,21 @@ async fn retire_virtual_display_generation(
     capture_generation: &str,
     reason: &str,
 ) {
+    // Reject a delayed loss event before waiting on a potentially long-lived
+    // proof fence held by a replacement generation that reused this numeric
+    // display id. Recheck after acquiring the gate to close the race with a
+    // same-generation teardown or replacement during the await.
+    match guards.get(&display_id) {
+        None => return,
+        Some(ownership) if ownership.capture_generation != capture_generation => {
+            eprintln!(
+                "[virtual_display] ignored stale capture generation {capture_generation} for :{display_id}"
+            );
+            return;
+        }
+        Some(_) => {}
+    }
+
     // Capture loss is a lifecycle mutation too. Acquire before removing the
     // session so a bounded proof cannot pass its final binding check against
     // a session whose teardown has already begun.
@@ -839,6 +867,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_capture_loss_does_not_wait_for_reused_display_proof_fence() {
+        let display_id = 400_000 + (uuid::Uuid::new_v4().as_u128() as u32 % 100_000);
+        let bus = EventBus::new();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let mut guards = VirtualDisplayGuards::new();
+        guards.ownership.insert(
+            display_id,
+            VirtualDisplayOwnership {
+                capture_generation: "generation-replacement".to_string(),
+                request_id: None,
+                width: 1280,
+                height: 720,
+            },
+        );
+        let replacement_proof =
+            crate::computer_use::acquire_virtual_display_exclusive(display_id).await;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_virtual_display_capture_lost(
+                &bus,
+                &registry,
+                &mut guards,
+                display_id,
+                "generation-retired",
+                "delayed stale capture loss",
+            ),
+        )
+        .await
+        .expect("a stale loss event must not wait on the replacement proof fence");
+
+        assert_eq!(
+            guards
+                .get(&display_id)
+                .map(|ownership| ownership.capture_generation.as_str()),
+            Some("generation-replacement")
+        );
+        drop(replacement_proof);
+    }
+
+    #[tokio::test]
     async fn readiness_and_loss_are_scoped_to_one_capture_generation() {
         let bus = EventBus::new();
         let mut events = bus.subscribe();
@@ -1002,7 +1073,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_destroy_generation_is_refused_without_touching_live_ownership() {
+    async fn stale_destroy_generation_is_refused_without_waiting_for_replacement_proof() {
+        let display_id = 500_000 + (uuid::Uuid::new_v4().as_u128() as u32 % 100_000);
         let bus = EventBus::new();
         let waiter = bus
             .register_virtual_display_destroy_waiter("vdd-stale".to_string())
@@ -1012,7 +1084,7 @@ mod tests {
         ));
         let mut guards = VirtualDisplayGuards::new();
         guards.ownership.insert(
-            199,
+            display_id,
             VirtualDisplayOwnership {
                 capture_generation: "generation-live".to_string(),
                 request_id: None,
@@ -1020,31 +1092,39 @@ mod tests {
                 height: 720,
             },
         );
+        let replacement_proof =
+            crate::computer_use::acquire_virtual_display_exclusive(display_id).await;
 
-        destroy_virtual_display(
-            &bus,
-            &registry,
-            &mut guards,
-            "vdd-stale",
-            199,
-            "generation-old",
-            None,
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            destroy_virtual_display(
+                &bus,
+                &registry,
+                &mut guards,
+                "vdd-stale",
+                display_id,
+                "generation-old",
+                None,
+            ),
         )
-        .await;
+        .await
+        .expect("a stale destroy must not wait on the replacement proof fence");
 
         assert_eq!(
             waiter.wait(Duration::from_millis(100)).await,
             Ok(VirtualDisplayDestroyOutcome::Refused {
-                reason: "capture generation does not match the live daemon-owned display :199"
-                    .to_string(),
+                reason: format!(
+                    "capture generation does not match the live daemon-owned display :{display_id}"
+                ),
             })
         );
         assert_eq!(
             guards
-                .get(&199)
+                .get(&display_id)
                 .map(|ownership| ownership.capture_generation.as_str()),
             Some("generation-live")
         );
+        drop(replacement_proof);
     }
 
     #[tokio::test]
