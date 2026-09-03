@@ -23,6 +23,25 @@ const SCOUT_CDN_LEASE_KIND: &str = "scout_cdn_capture";
 
 type NativeActionJoinHandle = tokio::task::JoinHandle<(crate::computer_use::CuBatchOutcome, u64)>;
 
+/// Run a cancellation-sensitive display operation in an owned task that retains
+/// the exclusive display fence. Dropping the caller's await detaches the owned
+/// task, so the fence is not released until the already-started operation has
+/// actually completed.
+async fn run_with_display_fence<T, F>(
+    display_access: VirtualDisplayExclusiveAccess,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _display_access = display_access;
+        operation.await
+    })
+    .await
+}
+
 struct NativeBoundedCuExecutor {
     target: DisplayTarget,
     backend: DisplayBackend,
@@ -422,18 +441,35 @@ impl IntendantServer {
                 false,
             ));
         }
-        proof_session
-            .seal_browser_interactive_for_automation(
-                "bounded proof automation acquired exclusive display control",
-            )
-            .await
-            .map_err(|error| {
-                BoundedCuTaskError::new(
-                    "bounded-cu-browser-interactive-seal-failed",
-                    error.to_string(),
-                    false,
+        // Sealing waits for the browser input pump and every admitted clipboard
+        // mutation. The outer task deadline may cancel this await after those
+        // operations have started, so run it in an owned task that keeps a clone
+        // of the exclusive display fence until the seal has actually completed.
+        // This mirrors the detached native-action boundary below and prevents a
+        // timed-out proof request from overlapping lingering browser input.
+        let sealing_session = std::sync::Arc::clone(&proof_session);
+        run_with_display_fence(display_access.clone(), async move {
+            sealing_session
+                .seal_browser_interactive_for_automation(
+                    "bounded proof automation acquired exclusive display control",
                 )
-            })?;
+                .await
+        })
+        .await
+        .map_err(|error| {
+            BoundedCuTaskError::new(
+                "bounded-cu-browser-interactive-seal-task-failed",
+                format!("browser interactive sealing task failed: {error}"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            BoundedCuTaskError::new(
+                "bounded-cu-browser-interactive-seal-failed",
+                error.to_string(),
+                false,
+            )
+        })?;
         let initial_frame_not_before = std::time::Instant::now();
         let dimensions = crate::computer_use::target_pixel_size(target, &session_registry).await;
         if dimensions.0 == 0 || dimensions.1 == 0 {
@@ -882,6 +918,38 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_seal_waiter_retains_display_fence_until_operation_finishes() {
+        const DISPLAY_ID: u32 = 424_246;
+        let exclusive = crate::computer_use::acquire_virtual_display_exclusive(DISPLAY_ID).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let waiter = tokio::spawn(run_with_display_fence(exclusive, async move {
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+        }));
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            crate::computer_use::acquire_virtual_display_shared(DISPLAY_ID),
+        )
+        .await
+        .is_err());
+
+        finish_tx.send(()).unwrap();
+        let shared = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::computer_use::acquire_virtual_display_shared(DISPLAY_ID),
+        )
+        .await
+        .expect("the owned sealing operation must eventually release the display fence");
+        drop(shared);
     }
 
     #[tokio::test]
