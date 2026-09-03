@@ -35,9 +35,14 @@ pub(crate) async fn acquire_virtual_display_shared(
     virtual_display_gate(display_id).read_owned().await
 }
 
+#[derive(Clone)]
 pub(crate) struct VirtualDisplayExclusiveAccess {
     display_id: u32,
-    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    // The bounded lane may have to detach a non-abortable platform input
+    // operation when its request deadline expires. Every detached operation
+    // keeps a clone so ordinary input cannot resume until the OS work has
+    // actually stopped.
+    _guard: std::sync::Arc<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
 pub(crate) async fn acquire_virtual_display_exclusive(
@@ -45,7 +50,7 @@ pub(crate) async fn acquire_virtual_display_exclusive(
 ) -> VirtualDisplayExclusiveAccess {
     VirtualDisplayExclusiveAccess {
         display_id,
-        _guard: virtual_display_gate(display_id).write_owned().await,
+        _guard: std::sync::Arc::new(virtual_display_gate(display_id).write_owned().await),
     }
 }
 

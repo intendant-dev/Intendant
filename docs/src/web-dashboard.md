@@ -1406,6 +1406,14 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 `intendant setup browsers` to install or repair the managed browser cache. On
 Linux, callers can explicitly bind a workspace to a virtual display created by
 the same daemon; Intendant refuses user-session and foreign X servers.
+The optional proof-extension lane accepts only the compiled-approved Rabby
+archive identity and requires Intendant-managed Chrome for Testing. Intendant
+reads and verifies the archive once, materializes that verified snapshot under
+its own state root rather than the caller's profile, makes the extension tree
+read-only, and does not publish the workspace as ready until the expected MV3
+service worker is visible over CDP. The profile and extension tree share one
+cleanup lifetime across launch failure, cancellation, display retirement, and
+explicit close.
 
 ### Settings
 

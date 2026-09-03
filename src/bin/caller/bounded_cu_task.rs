@@ -24,6 +24,11 @@ pub(crate) const BOUNDED_CU_MAX_RESULT_BYTES: usize = 16 * 1024;
 const BOUNDED_CU_MAX_BATCH_ACTIONS: usize = 16;
 const BOUNDED_CU_MAX_TOTAL_ACTIONS: u64 = 64;
 const BOUNDED_CU_MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
+const BOUNDED_CU_MAX_TYPE_BYTES: usize = 4 * 1024;
+const BOUNDED_CU_MAX_KEY_BYTES: usize = 256;
+const BOUNDED_CU_MAX_SCROLL_TICKS: i32 = 100;
+const BOUNDED_CU_MAX_HOLD_MS: u64 = 5_000;
+const BOUNDED_CU_MAX_WAIT_MS: u64 = 5_000;
 const BOUNDED_CU_MAX_TRANSCRIPT_EVENTS: usize = 512;
 const BOUNDED_CU_MAX_TRANSCRIPT_DETAIL_BYTES: usize = 4 * 1024;
 const BOUNDED_CU_STAGE_MAX_TURNS: u32 = 12;
@@ -48,7 +53,7 @@ impl BoundedCuTaskMode {
         }
     }
 
-    fn timeout(self) -> Duration {
+    pub(crate) fn timeout(self) -> Duration {
         match self {
             Self::Stage => BOUNDED_CU_STAGE_TIMEOUT,
             Self::Attest => BOUNDED_CU_ATTEST_TIMEOUT,
@@ -60,6 +65,17 @@ impl BoundedCuTaskMode {
             Self::Stage => "stage",
             Self::Attest => "attest",
         }
+    }
+
+    pub(crate) fn deadline_error(self) -> BoundedCuTaskError {
+        BoundedCuTaskError::new(
+            "bounded-cu-deadline-exceeded",
+            format!(
+                "bounded CU task exceeded its fixed {}s deadline",
+                self.timeout().as_secs()
+            ),
+            true,
+        )
     }
 }
 
@@ -399,27 +415,35 @@ fn bind_issued_stage_receipt(request: &mut BoundedCuTaskRequest) -> Result<(), B
 }
 
 /// Run one strictly bounded CU-only task.
+#[cfg(test)]
 pub(crate) async fn run_bounded_cu_task(
     provider: &dyn ChatProvider,
     executor: &mut dyn BoundedCuActionExecutor,
+    request: BoundedCuTaskRequest,
+) -> Result<BoundedCuTaskReceipt, BoundedCuTaskError> {
+    let deadline = tokio::time::Instant::now() + request.mode.timeout();
+    run_bounded_cu_task_until(provider, executor, request, deadline).await
+}
+
+/// Run against a deadline established by the caller at request admission.
+/// The owner-facing lane uses this form so waiting for display exclusivity,
+/// resource probes, provider setup, execution, and finalization all share one
+/// fixed budget instead of restarting the clock after setup.
+pub(crate) async fn run_bounded_cu_task_until(
+    provider: &dyn ChatProvider,
+    executor: &mut dyn BoundedCuActionExecutor,
     mut request: BoundedCuTaskRequest,
+    deadline: tokio::time::Instant,
 ) -> Result<BoundedCuTaskReceipt, BoundedCuTaskError> {
     validate_bounded_cu_task_request(&request)?;
     if request.mode == BoundedCuTaskMode::Attest {
         bind_issued_stage_receipt(&mut request)?;
     }
-    let timeout = request.mode.timeout();
-    match tokio::time::timeout(timeout, run_inner(provider, executor, request)).await {
+    let mode = request.mode;
+    match tokio::time::timeout_at(deadline, run_inner(provider, executor, request)).await {
         Ok(Ok(receipt)) => Ok(receipt),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(BoundedCuTaskError::new(
-            "bounded-cu-deadline-exceeded",
-            format!(
-                "bounded CU task exceeded its fixed {}s deadline",
-                timeout.as_secs()
-            ),
-            true,
-        )),
+        Err(_) => Err(mode.deadline_error()),
     }
 }
 
@@ -632,6 +656,9 @@ async fn apply_cu_calls(
                 false,
             ));
         }
+        for action in &call.actions {
+            validate_bounded_action(action)?;
+        }
         let payload_bytes = serde_json::to_vec(&call.actions).map_err(|error| {
             BoundedCuTaskError::new(
                 "bounded-cu-action-serialization-failed",
@@ -721,6 +748,28 @@ async fn apply_cu_calls(
         );
     }
     Ok(())
+}
+
+fn validate_bounded_action(action: &CuAction) -> Result<(), BoundedCuTaskError> {
+    let invalid = match action {
+        CuAction::Type { text } => text.len() > BOUNDED_CU_MAX_TYPE_BYTES,
+        CuAction::Key { key } => key.is_empty() || key.len() > BOUNDED_CU_MAX_KEY_BYTES,
+        CuAction::HoldKey { key, ms } => {
+            key.is_empty() || key.len() > BOUNDED_CU_MAX_KEY_BYTES || *ms > BOUNDED_CU_MAX_HOLD_MS
+        }
+        CuAction::Scroll { amount, .. } => !(1..=BOUNDED_CU_MAX_SCROLL_TICKS).contains(amount),
+        CuAction::Wait { ms } => *ms > BOUNDED_CU_MAX_WAIT_MS,
+        _ => false,
+    };
+    if invalid {
+        Err(BoundedCuTaskError::new(
+            "bounded-cu-action-parameter-invalid",
+            "native computer action exceeded a fixed text, key, scroll, hold, or wait bound",
+            false,
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 struct ReceiptCompletion {
@@ -1642,6 +1691,57 @@ mod tests {
 
         assert_eq!(error.code, "bounded-cu-split-input-edge-refused");
         assert_eq!(executor.batches, vec![vec!["screenshot"]]);
+    }
+
+    #[test]
+    fn bounded_action_parameters_cap_non_abortable_work() {
+        for action in [
+            CuAction::Type {
+                text: "x".repeat(BOUNDED_CU_MAX_TYPE_BYTES + 1),
+            },
+            CuAction::Key {
+                key: "x".repeat(BOUNDED_CU_MAX_KEY_BYTES + 1),
+            },
+            CuAction::HoldKey {
+                key: "a".to_string(),
+                ms: BOUNDED_CU_MAX_HOLD_MS + 1,
+            },
+            CuAction::Scroll {
+                x: 0,
+                y: 0,
+                direction: crate::computer_use::ScrollDirection::Down,
+                amount: BOUNDED_CU_MAX_SCROLL_TICKS + 1,
+            },
+            CuAction::Wait {
+                ms: BOUNDED_CU_MAX_WAIT_MS + 1,
+            },
+        ] {
+            assert_eq!(
+                validate_bounded_action(&action).unwrap_err().code,
+                "bounded-cu-action-parameter-invalid"
+            );
+        }
+
+        for action in [
+            CuAction::Type {
+                text: "x".repeat(BOUNDED_CU_MAX_TYPE_BYTES),
+            },
+            CuAction::HoldKey {
+                key: "a".to_string(),
+                ms: BOUNDED_CU_MAX_HOLD_MS,
+            },
+            CuAction::Scroll {
+                x: 0,
+                y: 0,
+                direction: crate::computer_use::ScrollDirection::Down,
+                amount: BOUNDED_CU_MAX_SCROLL_TICKS,
+            },
+            CuAction::Wait {
+                ms: BOUNDED_CU_MAX_WAIT_MS,
+            },
+        ] {
+            validate_bounded_action(&action).unwrap();
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -18,6 +18,7 @@ pub type SharedBrowserWorkspaceRegistry = Arc<RwLock<BrowserWorkspaceRegistry>>;
 static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = OnceLock::new();
 
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const CDP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
 const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
 // macOS-only system-browser escape hatch; other platforms' discovery path never consults it.
@@ -32,6 +33,7 @@ const BROWSER_EXTENSION_MAX_FILES: usize = 4_096;
 const BROWSER_EXTENSION_MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 const BROWSER_EXTENSION_MAX_ENTRY_BYTES: u64 = 96 * 1024 * 1024;
 const BROWSER_EXTENSION_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+const APPROVED_BROWSER_EXTENSION_SERVICE_WORKER: &str = "sw.js";
 // Rabby Wallet v0.94.6, published by RabbyHub at
 // https://github.com/RabbyHub/Rabby/releases/tag/v0.94.6. Loading an
 // arbitrary caller-selected extension would turn an ordinary browser-workspace
@@ -195,6 +197,8 @@ pub struct BrowserWorkspaceExtension {
     pub manifest_version: u32,
     pub version: String,
     pub load_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +351,35 @@ struct StartingReservationGuard {
     workspace_id: String,
     bus: EventBus,
     armed: bool,
+}
+
+#[derive(Debug)]
+struct ExtensionFilesystemGuard {
+    profile_dir: PathBuf,
+    extension_root: PathBuf,
+    armed: bool,
+}
+
+impl ExtensionFilesystemGuard {
+    fn new(profile_dir: PathBuf, extension_root: PathBuf) -> Self {
+        Self {
+            profile_dir,
+            extension_root,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExtensionFilesystemGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_extension_workspace_paths(&self.profile_dir, &self.extension_root);
+        }
+    }
 }
 
 impl StartingReservationGuard {
@@ -558,8 +591,8 @@ impl BrowserWorkspaceRegistry {
 }
 
 pub async fn provider_statuses() -> Vec<BrowserProviderStatus> {
-    let cdp_exe = resolve_chromium_executable(false);
-    let system_cdp_exe = resolve_chromium_executable(true);
+    let cdp_exe = resolve_chromium_executable(false, false);
+    let system_cdp_exe = resolve_chromium_executable(true, false);
     let playwright_exe = find_executable("playwright").or_else(|| find_executable("npx"));
     let agent_browser_exe = find_executable("agent-browser");
     vec![
@@ -808,35 +841,21 @@ pub async fn create_workspace(
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_profile_dir(&id));
-    if extension_spec.is_some() {
-        if request
+    if extension_spec.is_some()
+        && (request
             .profile_dir
             .as_deref()
             .map(str::trim)
             .is_none_or(str::is_empty)
-            || !profile_dir.is_absolute()
-        {
-            return Err(BrowserWorkspaceError::Unsupported(
-                "browser extension launch requires an explicit absolute fresh profile_dir"
-                    .to_string(),
-            ));
-        }
-        match fs::symlink_metadata(&profile_dir) {
-            Ok(_) => {
-                return Err(BrowserWorkspaceError::Unsupported(format!(
-                    "browser extension launch requires a profile_dir that does not already exist: {}",
-                    profile_dir.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(BrowserWorkspaceError::Io(format!(
-                    "failed to inspect browser profile {}: {error}",
-                    profile_dir.display()
-                )));
-            }
-        }
+            || !profile_dir.is_absolute())
+    {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "browser extension launch requires an explicit absolute fresh profile_dir".to_string(),
+        ));
     }
+    let extension_root = extension_spec
+        .as_ref()
+        .map(|_| browser_extension_workspace_root(&id));
     let mut workspace = BrowserWorkspace {
         label: request
             .label
@@ -899,43 +918,36 @@ pub async fn create_workspace(
     // the unpublished Starting row (and any child committed just before the
     // cancellation) so request abortion cannot leave a ghost workspace.
     let mut reservation = StartingReservationGuard::new(workspace.id.clone(), bus.clone());
-
-    if let Err(error) = std::fs::create_dir_all(&profile_dir) {
-        let message = format!(
-            "failed to create browser workspace profile {}: {error}",
-            profile_dir.display()
-        );
-        reservation.cleanup(&message).await;
-        return Err(BrowserWorkspaceError::Io(message));
-    }
-    #[cfg(unix)]
-    if extension_spec.is_some() {
-        use std::os::unix::fs::PermissionsExt as _;
-        if let Err(error) = fs::set_permissions(&profile_dir, fs::Permissions::from_mode(0o700)) {
-            let message = format!(
-                "failed to make browser extension profile private {}: {error}",
-                profile_dir.display()
-            );
-            reservation.cleanup(&message).await;
-            let _ = fs::remove_dir_all(&profile_dir);
-            return Err(BrowserWorkspaceError::Io(message));
+    let mut extension_filesystem = match extension_root.as_ref() {
+        Some(extension_root) => {
+            match create_extension_workspace_filesystem(&profile_dir, extension_root) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    reservation.cleanup(&error.to_string()).await;
+                    return Err(error);
+                }
+            }
         }
-    }
+        None => {
+            if let Err(error) = fs::create_dir_all(&profile_dir) {
+                let message = format!(
+                    "failed to create browser workspace profile {}: {error}",
+                    profile_dir.display()
+                );
+                reservation.cleanup(&message).await;
+                return Err(BrowserWorkspaceError::Io(message));
+            }
+            None
+        }
+    };
 
     if let Some(spec) = extension_spec.as_ref() {
-        match prepare_browser_extension(spec, &profile_dir) {
+        let extension_root = extension_root.as_ref().expect("presence checked");
+        match prepare_browser_extension(spec, extension_root) {
             Ok(extension) => workspace.extension = Some(extension),
             Err(error) => {
                 let message = error.to_string();
                 reservation.cleanup(&message).await;
-                if let Err(cleanup_error) = fs::remove_dir_all(&profile_dir) {
-                    if profile_dir.exists() {
-                        eprintln!(
-                            "warning: failed to remove rejected browser profile {}: {cleanup_error}",
-                            profile_dir.display()
-                        );
-                    }
-                }
                 return Err(error);
             }
         }
@@ -945,19 +957,15 @@ pub async fn create_workspace(
         Ok(launched) => launched,
         Err(error) => {
             reservation.cleanup(&error.to_string()).await;
-            if extension_spec.is_some() {
-                if let Err(cleanup_error) = fs::remove_dir_all(&profile_dir) {
-                    if profile_dir.exists() {
-                        eprintln!(
-                            "warning: failed to remove unlaunched browser extension profile {}: {cleanup_error}",
-                            profile_dir.display()
-                        );
-                    }
-                }
-            }
             return Err(error);
         }
     };
+    if let (Some(extension), Some(runtime_id)) = (
+        workspace.extension.as_mut(),
+        cdp.extension_runtime_id.clone(),
+    ) {
+        extension.runtime_id = Some(runtime_id);
+    }
     workspace.browser_executable = Some(cdp.executable.path.display().to_string());
     workspace.browser_executable_source = Some(cdp.executable.source);
     workspace.process_id = cdp.process_id;
@@ -1018,6 +1026,9 @@ pub async fn create_workspace(
     };
     match commit {
         Ok(committed) => {
+            if let Some(filesystem) = extension_filesystem.as_mut() {
+                filesystem.disarm();
+            }
             reservation.disarm();
             Ok(committed)
         }
@@ -1039,6 +1050,93 @@ pub async fn list_workspaces(bus: &EventBus) -> Vec<BrowserWorkspace> {
     };
     terminate_retired_processes(retired);
     workspaces
+}
+
+/// Prove that the exact local workspace record still names a live child and
+/// an extant page target. Stored `Ready` metadata alone is not liveness: a
+/// browser may exit or its selected tab may close between bounded proof
+/// actions. The registry/child check brackets the CDP probe so a concurrent
+/// close or replacement cannot be mistaken for the requested workspace.
+pub(crate) async fn verify_live_workspace(workspace: &BrowserWorkspace) -> Result<(), String> {
+    verify_registered_child(workspace).await?;
+
+    let pid = workspace
+        .process_id
+        .ok_or_else(|| "browser workspace has no process id".to_string())?;
+    let port = workspace
+        .debugging_port
+        .ok_or_else(|| "browser workspace has no debugging port".to_string())?;
+    let target_id = workspace
+        .active_target_id
+        .as_deref()
+        .ok_or_else(|| "browser workspace has no active target id".to_string())?;
+    let expected_http = format!("http://127.0.0.1:{port}");
+    if workspace.cdp_http_url.as_deref() != Some(expected_http.as_str()) {
+        return Err("browser workspace CDP URL is not its exact loopback port".to_string());
+    }
+    if !crate::platform::process_alive(pid) {
+        return Err("browser workspace process is no longer live".to_string());
+    }
+
+    let list_url = format!("{expected_http}/json/list");
+    let response = reqwest::Client::new()
+        .get(&list_url)
+        .timeout(CDP_LIVENESS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?;
+    let targets: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("browser workspace CDP target list was invalid: {error}"))?;
+    let target = exact_page_target(&targets, target_id)
+        .ok_or_else(|| "browser workspace active page target is no longer live".to_string())?;
+    let target_ws = target
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "browser workspace active page target has no debugger URL".to_string())?;
+    if workspace.cdp_ws_url.as_deref() != Some(target_ws) {
+        return Err("browser workspace active page debugger URL changed".to_string());
+    }
+
+    verify_registered_child(workspace).await?;
+    if !crate::platform::process_alive(pid) {
+        return Err("browser workspace process exited during its CDP liveness probe".to_string());
+    }
+    Ok(())
+}
+
+async fn verify_registered_child(workspace: &BrowserWorkspace) -> Result<(), String> {
+    let registry = global_registry();
+    let mut registry = registry.write().await;
+    let current = registry
+        .workspaces
+        .get(&workspace.id)
+        .ok_or_else(|| "browser workspace disappeared from the live registry".to_string())?;
+    if current != workspace {
+        return Err("browser workspace binding changed during the bounded proof task".to_string());
+    }
+    let child = registry
+        .children
+        .get_mut(&workspace.id)
+        .ok_or_else(|| "browser workspace has no daemon-owned child process".to_string())?;
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => Err(format!("browser workspace child exited with {status}")),
+        Err(error) => Err(format!("cannot inspect browser workspace child: {error}")),
+    }
+}
+
+fn exact_page_target<'a>(
+    targets: &'a serde_json::Value,
+    target_id: &str,
+) -> Option<&'a serde_json::Value> {
+    targets.as_array()?.iter().find(|target| {
+        target.get("type").and_then(serde_json::Value::as_str) == Some("page")
+            && target.get("id").and_then(serde_json::Value::as_str) == Some(target_id)
+    })
 }
 
 pub async fn close_display_binding(
@@ -1066,6 +1164,7 @@ pub async fn close_display_binding(
         .into_iter()
         .map(|retired| {
             terminate_workspace_process(retired.process_id, retired.child);
+            cleanup_extension_workspace(&retired.workspace);
             retired.workspace
         })
         .collect()
@@ -1096,6 +1195,7 @@ async fn remove_failed_reservation(id: &str, message: &str, bus: &EventBus) {
     };
     if let Some((workspace, child)) = removed {
         terminate_workspace_process(workspace.process_id, child);
+        cleanup_extension_workspace(&workspace);
     }
 }
 
@@ -1114,6 +1214,7 @@ pub async fn close_workspace(
     workspace.message = reason.or_else(|| Some("closed".to_string()));
     workspace.updated_at = now_string();
     terminate_workspace_process(workspace.process_id, child);
+    cleanup_extension_workspace(&workspace);
     Ok(workspace)
 }
 
@@ -1184,6 +1285,7 @@ fn publish_retirements_locked(bus: &EventBus, retired: &[RetiredBrowserWorkspace
 fn terminate_retired_processes(retired: Vec<RetiredBrowserWorkspace>) {
     for retired in retired {
         terminate_workspace_process(retired.process_id, retired.child);
+        cleanup_extension_workspace(&retired.workspace);
     }
 }
 
@@ -1221,6 +1323,79 @@ struct CdpLaunch {
     port: u16,
     web_socket_debugger_url: Option<String>,
     target_id: Option<String>,
+    extension_runtime_id: Option<String>,
+}
+
+fn browser_extension_workspace_root(workspace_id: &str) -> PathBuf {
+    crate::platform::intendant_home()
+        .join("browser-extension-workspaces")
+        .join(workspace_id)
+}
+
+fn create_extension_workspace_filesystem(
+    profile_dir: &Path,
+    extension_root: &Path,
+) -> Result<ExtensionFilesystemGuard, BrowserWorkspaceError> {
+    let profile_parent = profile_dir.parent().ok_or_else(|| {
+        BrowserWorkspaceError::Unsupported(
+            "browser extension profile_dir must have an absolute parent".to_string(),
+        )
+    })?;
+    fs::create_dir_all(profile_parent).map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to create browser profile parent {}: {error}",
+            profile_parent.display()
+        ))
+    })?;
+    fs::create_dir(profile_dir).map_err(|error| {
+        let context = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "browser extension launch requires a fresh profile_dir"
+        } else {
+            "failed to atomically reserve browser extension profile_dir"
+        };
+        BrowserWorkspaceError::Io(format!("{context} {}: {error}", profile_dir.display()))
+    })?;
+
+    let extension_parent = extension_root.parent().ok_or_else(|| {
+        let _ = fs::remove_dir(profile_dir);
+        BrowserWorkspaceError::Io(
+            "daemon extension workspace path had no parent directory".to_string(),
+        )
+    })?;
+    if let Err(error) = fs::create_dir_all(extension_parent) {
+        let _ = fs::remove_dir(profile_dir);
+        return Err(BrowserWorkspaceError::Io(format!(
+            "failed to create daemon extension workspace parent {}: {error}",
+            extension_parent.display()
+        )));
+    }
+    if let Err(error) = fs::create_dir(extension_root) {
+        let _ = fs::remove_dir(profile_dir);
+        return Err(BrowserWorkspaceError::Io(format!(
+            "failed to atomically reserve daemon extension workspace {}: {error}",
+            extension_root.display()
+        )));
+    }
+
+    let guard =
+        ExtensionFilesystemGuard::new(profile_dir.to_path_buf(), extension_root.to_path_buf());
+    set_private_directory(profile_dir)?;
+    set_private_directory(extension_root)?;
+    Ok(guard)
+}
+
+fn set_private_directory(path: &Path) -> Result<(), BrowserWorkspaceError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to make browser workspace directory private {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn parse_extension_archive_spec(
@@ -1317,7 +1492,7 @@ fn parse_extension_archive_spec(
 
 fn prepare_browser_extension(
     spec: &BrowserExtensionArchiveSpec,
-    profile_dir: &Path,
+    extension_root: &Path,
 ) -> Result<BrowserWorkspaceExtension, BrowserWorkspaceError> {
     let source_metadata = fs::symlink_metadata(&spec.archive_path).map_err(|error| {
         BrowserWorkspaceError::Io(format!(
@@ -1325,9 +1500,18 @@ fn prepare_browser_extension(
             spec.archive_path.display()
         ))
     })?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+    let source_is_link_like = intendant_platform::platform::path_leaf_is_symlink_or_reparse(
+        &spec.archive_path,
+    )
+    .map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to inspect extension archive leaf {}: {error}",
+            spec.archive_path.display()
+        ))
+    })?;
+    if source_is_link_like || !source_metadata.is_file() {
         return Err(BrowserWorkspaceError::Unsupported(format!(
-            "extension archive must be a regular non-symlink file: {}",
+            "extension archive must be a regular non-symlink, non-reparse file: {}",
             spec.archive_path.display()
         )));
     }
@@ -1339,7 +1523,13 @@ fn prepare_browser_extension(
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut archive_file = options.open(&spec.archive_path).map_err(|error| {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let archive_file = options.open(&spec.archive_path).map_err(|error| {
         BrowserWorkspaceError::Io(format!(
             "failed to open extension archive {} without following links: {error}",
             spec.archive_path.display()
@@ -1351,6 +1541,17 @@ fn prepare_browser_extension(
             spec.archive_path.display()
         ))
     })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(BrowserWorkspaceError::Unsupported(format!(
+                "opened extension archive is a Windows reparse point: {}",
+                spec.archive_path.display()
+            )));
+        }
+    }
     if !opened_metadata.is_file() || opened_metadata.len() != spec.archive_byte_length {
         return Err(BrowserWorkspaceError::Unsupported(format!(
             "extension archive length mismatch: expected {}, opened {}",
@@ -1359,22 +1560,33 @@ fn prepare_browser_extension(
         )));
     }
 
-    let mut hasher = Sha256::new();
-    let hashed_bytes = std::io::copy(&mut std::io::Read::by_ref(&mut archive_file), &mut hasher)
+    let capacity = usize::try_from(spec.archive_byte_length).map_err(|_| {
+        BrowserWorkspaceError::Unsupported(
+            "extension archive length does not fit this platform".to_string(),
+        )
+    })?;
+    let mut archive_bytes = Vec::with_capacity(capacity);
+    let mut bounded_reader = archive_file.take(spec.archive_byte_length.saturating_add(1));
+    bounded_reader
+        .read_to_end(&mut archive_bytes)
         .map_err(|error| {
             BrowserWorkspaceError::Io(format!(
-                "failed to hash extension archive {}: {error}",
+                "failed to snapshot extension archive {}: {error}",
                 spec.archive_path.display()
             ))
         })?;
+    let hashed_bytes = u64::try_from(archive_bytes.len()).map_err(|_| {
+        BrowserWorkspaceError::Unsupported(
+            "extension archive length does not fit the receipt".to_string(),
+        )
+    })?;
     if hashed_bytes != spec.archive_byte_length {
         return Err(BrowserWorkspaceError::Unsupported(format!(
-            "extension archive changed while hashing: expected {} bytes, read {hashed_bytes}",
+            "extension archive changed while snapshotting: expected {} bytes, read {hashed_bytes}",
             spec.archive_byte_length
         )));
     }
-    let actual_sha256 = hasher
-        .finalize()
+    let actual_sha256 = Sha256::digest(&archive_bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -1384,21 +1596,14 @@ fn prepare_browser_extension(
             spec.archive_sha256
         )));
     }
-    archive_file.seek(SeekFrom::Start(0)).map_err(|error| {
-        BrowserWorkspaceError::Io(format!(
-            "failed to rewind extension archive {}: {error}",
-            spec.archive_path.display()
-        ))
-    })?;
-
-    let load_path = profile_dir.join("intendant-extension");
+    let load_path = extension_root.join("extension");
     fs::create_dir(&load_path).map_err(|error| {
         BrowserWorkspaceError::Io(format!(
             "failed to create isolated extension directory {}: {error}",
             load_path.display()
         ))
     })?;
-    extract_browser_extension_archive(archive_file, &load_path)?;
+    extract_browser_extension_archive(Cursor::new(archive_bytes), &load_path)?;
     let manifest_path = load_path.join("manifest.json");
     let manifest_metadata = fs::symlink_metadata(&manifest_path).map_err(|error| {
         BrowserWorkspaceError::Unsupported(format!(
@@ -1430,12 +1635,29 @@ fn prepare_browser_extension(
         != Some(u64::from(spec.manifest_version))
         || manifest.get("version").and_then(serde_json::Value::as_str)
             != Some(spec.version.as_str())
+        || manifest
+            .pointer("/background/service_worker")
+            .and_then(serde_json::Value::as_str)
+            != Some(APPROVED_BROWSER_EXTENSION_SERVICE_WORKER)
     {
         return Err(BrowserWorkspaceError::Unsupported(format!(
-            "extension manifest identity mismatch: expected manifest_version {} and version {}",
-            spec.manifest_version, spec.version
+            "extension manifest identity mismatch: expected manifest_version {}, version {}, and service worker {}",
+            spec.manifest_version, spec.version, APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
         )));
     }
+    let service_worker = load_path.join(APPROVED_BROWSER_EXTENSION_SERVICE_WORKER);
+    let worker_metadata = fs::symlink_metadata(&service_worker).map_err(|error| {
+        BrowserWorkspaceError::Unsupported(format!(
+            "extension archive has no expected service worker {}: {error}",
+            service_worker.display()
+        ))
+    })?;
+    if worker_metadata.file_type().is_symlink() || !worker_metadata.is_file() {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "extension service worker must be a regular non-symlink file".to_string(),
+        ));
+    }
+    protect_extension_tree(extension_root)?;
 
     Ok(BrowserWorkspaceExtension {
         archive_sha256: actual_sha256,
@@ -1443,11 +1665,12 @@ fn prepare_browser_extension(
         manifest_version: spec.manifest_version,
         version: spec.version.clone(),
         load_path: load_path.display().to_string(),
+        runtime_id: None,
     })
 }
 
-fn extract_browser_extension_archive(
-    archive_file: fs::File,
+fn extract_browser_extension_archive<R: Read + Seek>(
+    archive_file: R,
     destination: &Path,
 ) -> Result<(), BrowserWorkspaceError> {
     let mut archive = zip::ZipArchive::new(archive_file).map_err(|error| {
@@ -1580,14 +1803,123 @@ fn extract_browser_extension_archive(
     Ok(())
 }
 
+fn protect_extension_tree(path: &Path) -> Result<(), BrowserWorkspaceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to inspect materialized extension path {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "materialized extension path must not be a symlink: {}",
+            path.display()
+        )));
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .map_err(|error| {
+                BrowserWorkspaceError::Io(format!(
+                    "failed to enumerate materialized extension directory {}: {error}",
+                    path.display()
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                BrowserWorkspaceError::Io(format!(
+                    "failed to enumerate materialized extension directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            protect_extension_tree(&entry.path())?;
+        }
+    } else if !metadata.is_file() {
+        return Err(BrowserWorkspaceError::Unsupported(format!(
+            "materialized extension contains a non-file entry: {}",
+            path.display()
+        )));
+    }
+
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if metadata.is_dir() { 0o500 } else { 0o400 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to protect materialized extension path {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn make_extension_tree_writable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    let _ = fs::set_permissions(path, permissions);
+    if metadata.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_extension_tree_writable(&entry.path());
+            }
+        }
+    }
+}
+
+fn cleanup_extension_workspace_paths(profile_dir: &Path, extension_root: &Path) {
+    make_extension_tree_writable(extension_root);
+    for path in [extension_root, profile_dir] {
+        if let Err(error) = fs::remove_dir_all(path) {
+            if path.exists() {
+                eprintln!(
+                    "warning: failed to remove browser extension workspace path {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn cleanup_extension_workspace(workspace: &BrowserWorkspace) {
+    let Some(extension) = workspace.extension.as_ref() else {
+        return;
+    };
+    let Some(profile_dir) = workspace.profile_dir.as_deref().map(Path::new) else {
+        return;
+    };
+    let load_path = Path::new(&extension.load_path);
+    let Some(extension_root) = load_path.parent() else {
+        return;
+    };
+    cleanup_extension_workspace_paths(profile_dir, extension_root);
+}
+
 async fn launch_cdp_browser(
     workspace: &BrowserWorkspace,
     profile_dir: &Path,
 ) -> Result<(Child, CdpLaunch), BrowserWorkspaceError> {
-    let executable = resolve_chromium_executable(matches!(
-        workspace.provider,
-        BrowserWorkspaceProvider::SystemCdp
-    ))?;
+    let extension_required = workspace.extension.is_some();
+    let executable = resolve_chromium_executable(
+        matches!(workspace.provider, BrowserWorkspaceProvider::SystemCdp),
+        extension_required,
+    )?;
     let display_binding = workspace
         .display_target
         .as_deref()
@@ -1663,8 +1995,8 @@ async fn launch_cdp_browser(
         ))
     })?;
     let process_id = child.id();
-    match wait_for_cdp_target(port).await {
-        Ok((ws, target_id)) => Ok((
+    match wait_for_cdp_target(port, extension_required).await {
+        Ok((ws, target_id, extension_runtime_id)) => Ok((
             child,
             CdpLaunch {
                 executable,
@@ -1672,6 +2004,7 @@ async fn launch_cdp_browser(
                 port,
                 web_socket_debugger_url: ws,
                 target_id,
+                extension_runtime_id,
             },
         )),
         Err(err) => {
@@ -1707,7 +2040,8 @@ async fn reserve_local_port() -> Result<u16, BrowserWorkspaceError> {
 
 async fn wait_for_cdp_target(
     port: u16,
-) -> Result<(Option<String>, Option<String>), BrowserWorkspaceError> {
+    extension_required: bool,
+) -> Result<(Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + CDP_STARTUP_TIMEOUT;
     let list_url = format!("http://127.0.0.1:{port}/json/list");
@@ -1720,18 +2054,47 @@ async fn wait_for_cdp_target(
                     ))
                 })?;
                 if let Some((ws, id)) = first_page_target(&targets) {
-                    return Ok((ws, id));
+                    let extension_runtime_id = active_extension_runtime_id(&targets);
+                    if !extension_required || extension_runtime_id.is_some() {
+                        return Ok((ws, id, extension_runtime_id));
+                    }
                 }
             }
             _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
+            let expected = if extension_required {
+                format!(
+                    "page target and approved extension service worker {}",
+                    APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
+                )
+            } else {
+                "page target".to_string()
+            };
             return Err(BrowserWorkspaceError::Launch(format!(
-                "timed out waiting for CDP target at {list_url}"
+                "timed out waiting for CDP {expected} at {list_url}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+fn active_extension_runtime_id(value: &serde_json::Value) -> Option<String> {
+    value.as_array()?.iter().find_map(|target| {
+        if target.get("type").and_then(serde_json::Value::as_str) != Some("service_worker") {
+            return None;
+        }
+        let url = target.get("url").and_then(serde_json::Value::as_str)?;
+        let remainder = url.strip_prefix("chrome-extension://")?;
+        let (runtime_id, worker_path) = remainder.split_once('/')?;
+        if worker_path != APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
+            || runtime_id.len() != 32
+            || !runtime_id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
+        {
+            return None;
+        }
+        Some(runtime_id.to_string())
+    })
 }
 
 fn first_page_target(value: &serde_json::Value) -> Option<(Option<String>, Option<String>)> {
@@ -1761,7 +2124,21 @@ struct ChromiumExecutable {
 
 fn resolve_chromium_executable(
     allow_system_for_request: bool,
+    require_extension_compatible: bool,
 ) -> Result<ChromiumExecutable, BrowserWorkspaceError> {
+    if require_extension_compatible {
+        return find_intendant_managed_chromium_executable()
+            .map(|path| ChromiumExecutable {
+                path,
+                source: "intendant-managed-cache".to_string(),
+            })
+            .ok_or_else(|| {
+                BrowserWorkspaceError::Launch(
+                    "browser extension launch requires Intendant-managed Chrome for Testing; run `intendant setup browsers`"
+                        .to_string(),
+                )
+            });
+    }
     if let Some((env_name, path)) = configured_browser_executable() {
         if is_regular_file(&path) {
             return Ok(ChromiumExecutable {
@@ -2068,6 +2445,14 @@ fn find_managed_chromium_executable() -> Option<PathBuf> {
     None
 }
 
+fn find_intendant_managed_chromium_executable() -> Option<PathBuf> {
+    find_executable_under(
+        &managed_browser_install_root(),
+        managed_browser_executable_names(),
+        8,
+    )
+}
+
 fn managed_browser_install_root() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -2280,12 +2665,14 @@ mod tests {
             .unix_permissions(0o100_644);
         archive.start_file("manifest.json", options).unwrap();
         archive
-            .write_all(br#"{"manifest_version":3,"version":"0.94.6","name":"Test"}"#)
+            .write_all(
+                br#"{"manifest_version":3,"version":"0.94.6","name":"Test","background":{"service_worker":"sw.js"}}"#,
+            )
             .unwrap();
-        archive.start_file("worker.js", options).unwrap();
+        archive.start_file("sw.js", options).unwrap();
         archive.write_all(b"self.test = true;\n").unwrap();
         if case_collision {
-            archive.start_file("WORKER.JS", options).unwrap();
+            archive.start_file("SW.JS", options).unwrap();
             archive.write_all(b"self.other = true;\n").unwrap();
         }
         archive.finish().unwrap();
@@ -2341,8 +2728,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let archive_path = temp.path().join("extension.zip");
         let (sha256, byte_length) = write_test_extension_archive(&archive_path, false);
-        let profile = temp.path().join("profile");
-        fs::create_dir(&profile).unwrap();
+        let profile = temp.path().join("profiles").join("attempt-1");
+        let extension_root = temp.path().join("state").join("extension-1");
+        let _guard = create_extension_workspace_filesystem(&profile, &extension_root).unwrap();
         let spec = BrowserExtensionArchiveSpec {
             archive_path,
             archive_sha256: sha256.clone(),
@@ -2351,13 +2739,16 @@ mod tests {
             version: "0.94.6".to_string(),
         };
 
-        let prepared = prepare_browser_extension(&spec, &profile).unwrap();
+        let prepared = prepare_browser_extension(&spec, &extension_root).unwrap();
         assert_eq!(prepared.archive_sha256, sha256);
         assert_eq!(prepared.archive_byte_length, byte_length);
         assert_eq!(prepared.manifest_version, 3);
         assert_eq!(prepared.version, "0.94.6");
+        assert!(prepared.runtime_id.is_none());
+        assert!(Path::new(&prepared.load_path).starts_with(&extension_root));
+        assert!(!Path::new(&prepared.load_path).starts_with(&profile));
         assert_eq!(
-            fs::read_to_string(Path::new(&prepared.load_path).join("worker.js")).unwrap(),
+            fs::read_to_string(Path::new(&prepared.load_path).join("sw.js")).unwrap(),
             "self.test = true;\n"
         );
     }
@@ -2367,8 +2758,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let archive_path = temp.path().join("extension.zip");
         let (sha256, byte_length) = write_test_extension_archive(&archive_path, true);
-        let wrong_profile = temp.path().join("wrong-profile");
-        fs::create_dir(&wrong_profile).unwrap();
+        let wrong_root = temp.path().join("wrong-root");
+        fs::create_dir(&wrong_root).unwrap();
         let wrong = BrowserExtensionArchiveSpec {
             archive_path: archive_path.clone(),
             archive_sha256: "0".repeat(64),
@@ -2376,13 +2767,13 @@ mod tests {
             manifest_version: 3,
             version: "0.94.6".to_string(),
         };
-        assert!(prepare_browser_extension(&wrong, &wrong_profile)
+        assert!(prepare_browser_extension(&wrong, &wrong_root)
             .unwrap_err()
             .to_string()
             .contains("sha256 mismatch"));
 
-        let collision_profile = temp.path().join("collision-profile");
-        fs::create_dir(&collision_profile).unwrap();
+        let collision_root = temp.path().join("collision-root");
+        fs::create_dir(&collision_root).unwrap();
         let collision = BrowserExtensionArchiveSpec {
             archive_path,
             archive_sha256: sha256,
@@ -2390,7 +2781,7 @@ mod tests {
             manifest_version: 3,
             version: "0.94.6".to_string(),
         };
-        assert!(prepare_browser_extension(&collision, &collision_profile)
+        assert!(prepare_browser_extension(&collision, &collision_root)
             .unwrap_err()
             .to_string()
             .contains("case-colliding"));
@@ -2406,8 +2797,8 @@ mod tests {
         let (sha256, byte_length) = write_test_extension_archive(&archive_path, false);
         let linked_path = temp.path().join("linked.zip");
         symlink(&archive_path, &linked_path).unwrap();
-        let profile = temp.path().join("profile");
-        fs::create_dir(&profile).unwrap();
+        let extension_root = temp.path().join("extension-root");
+        fs::create_dir(&extension_root).unwrap();
         let spec = BrowserExtensionArchiveSpec {
             archive_path: linked_path,
             archive_sha256: sha256,
@@ -2416,7 +2807,7 @@ mod tests {
             version: "0.94.6".to_string(),
         };
 
-        assert!(prepare_browser_extension(&spec, &profile)
+        assert!(prepare_browser_extension(&spec, &extension_root)
             .unwrap_err()
             .to_string()
             .contains("regular non-symlink"));
@@ -2434,6 +2825,7 @@ mod tests {
             manifest_version: 3,
             version: "0.94.6".to_string(),
             load_path: "/private/profile/intendant-extension".to_string(),
+            runtime_id: None,
         };
         assert_eq!(
             browser_extension_launch_flags(Some(&extension)),
@@ -2442,6 +2834,27 @@ mod tests {
                 "--load-extension=/private/profile/intendant-extension"
             ]
         );
+    }
+
+    #[test]
+    fn extension_profile_and_storage_are_reserved_and_cleaned_as_one_lifetime() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profiles").join("attempt-1");
+        let extension_root = temp.path().join("state").join("extension-1");
+        let guard = create_extension_workspace_filesystem(&profile, &extension_root).unwrap();
+        assert!(profile.is_dir());
+        assert!(extension_root.is_dir());
+
+        let duplicate = create_extension_workspace_filesystem(
+            &profile,
+            &temp.path().join("state").join("extension-2"),
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("fresh profile_dir"));
+
+        drop(guard);
+        assert!(!profile.exists());
+        assert!(!extension_root.exists());
     }
 
     #[tokio::test]
@@ -2765,6 +3178,47 @@ mod tests {
         let (ws, id) = first_page_target(&targets).unwrap();
         assert_eq!(id.as_deref(), Some("page-1"));
         assert_eq!(ws.as_deref(), Some("ws://127.0.0.1/devtools/page/page-1"));
+    }
+
+    #[test]
+    fn cdp_liveness_parser_requires_the_exact_page_target() {
+        let targets = serde_json::json!([
+            {"type":"page","id":"replacement","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/replacement"},
+            {"type":"service_worker","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/worker/page-1"},
+            {"type":"page","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/page-1"}
+        ]);
+        let target = exact_page_target(&targets, "page-1").unwrap();
+        assert_eq!(
+            target
+                .get("webSocketDebuggerUrl")
+                .and_then(serde_json::Value::as_str),
+            Some("ws://127.0.0.1/devtools/page/page-1")
+        );
+        assert!(exact_page_target(&targets, "closed-page").is_none());
+    }
+
+    #[test]
+    fn extension_readiness_requires_the_exact_service_worker_shape() {
+        let valid_id = "abcdefghijklmnopabcdefghijklmnop";
+        let targets = serde_json::json!([
+            {
+                "type": "service_worker",
+                "url": format!("chrome-extension://{valid_id}/sw.js")
+            }
+        ]);
+        assert_eq!(
+            active_extension_runtime_id(&targets).as_deref(),
+            Some(valid_id)
+        );
+
+        for url in [
+            format!("chrome-extension://{valid_id}/other.js"),
+            "chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/sw.js".to_string(),
+            format!("https://{valid_id}/sw.js"),
+        ] {
+            let targets = serde_json::json!([{"type":"service_worker","url":url}]);
+            assert!(active_extension_runtime_id(&targets).is_none());
+        }
     }
 
     #[test]
