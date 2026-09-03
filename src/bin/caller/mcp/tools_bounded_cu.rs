@@ -5,7 +5,7 @@ use super::*;
 use async_trait::async_trait;
 
 use crate::bounded_cu_task::{
-    remember_issued_stage_receipt, run_bounded_cu_task as execute_bounded_cu_task,
+    remember_issued_stage_receipt, run_bounded_cu_task_until as execute_bounded_cu_task_until,
     validate_bounded_cu_task_request, BoundedCuActionExecutor, BoundedCuActionOutcome,
     BoundedCuTaskError, BoundedCuTaskRequest,
 };
@@ -21,6 +21,8 @@ use crate::conversation::ImageData;
 
 const SCOUT_CDN_LEASE_KIND: &str = "scout_cdn_capture";
 
+type NativeActionJoinHandle = tokio::task::JoinHandle<(crate::computer_use::CuBatchOutcome, u64)>;
+
 struct NativeBoundedCuExecutor {
     target: DisplayTarget,
     backend: DisplayBackend,
@@ -31,7 +33,10 @@ struct NativeBoundedCuExecutor {
     bus: crate::event::EventBus,
     display_access: Option<VirtualDisplayExclusiveAccess>,
     proof_session: std::sync::Arc<crate::display::DisplaySession>,
+    scratch_guard: std::sync::Arc<tempfile::TempDir>,
+    initial_frame_not_before: Option<std::time::Instant>,
     pending_safety_releases: Vec<crate::display::InputEvent>,
+    in_flight_action: Option<NativeActionJoinHandle>,
 }
 
 impl NativeBoundedCuExecutor {
@@ -47,12 +52,20 @@ impl NativeBoundedCuExecutor {
         }
     }
 
+    /// Wait for a detached native operation before issuing any fallback input
+    /// releases. The handle remains stored on `self` while it is awaited, so
+    /// cancellation of this cleanup future leaves Drop able to resume the same
+    /// ordering boundary.
     async fn release_pending_input_edges(&mut self) -> Result<(), BoundedCuTaskError> {
+        let in_flight_error = self.await_in_flight_native_action().await.err();
         // Keep the authoritative list on `self` until every release returns.
         // If this cleanup future is itself cancelled, Drop can retry the full
         // idempotent release set while retaining exclusive display access.
         let releases = self.pending_safety_releases.clone();
         let mut errors = Vec::new();
+        if let Some(error) = in_flight_error.as_ref() {
+            errors.push(error.message.clone());
+        }
         for release in releases {
             if let Err(error) = self.proof_session.inject_input(release).await {
                 errors.push(error.to_string());
@@ -61,36 +74,154 @@ impl NativeBoundedCuExecutor {
         if errors.is_empty() {
             self.pending_safety_releases.clear();
             Ok(())
+        } else if errors.len() == 1 && in_flight_error.is_some() {
+            self.pending_safety_releases.clear();
+            Err(in_flight_error.expect("checked above"))
         } else {
             Err(BoundedCuTaskError::new(
                 "bounded-cu-input-safety-release-failed",
                 format!(
-                    "could not release every possibly-held direct input edge: {}",
+                    "could not complete the in-flight action and release every possibly-held direct input edge: {}",
                     errors.join("; ")
                 ),
                 false,
             ))
         }
     }
+
+    async fn await_in_flight_native_action(
+        &mut self,
+    ) -> Result<Option<crate::computer_use::CuBatchOutcome>, BoundedCuTaskError> {
+        if self.in_flight_action.is_none() {
+            return Ok(None);
+        }
+        let joined = {
+            let execution = self
+                .in_flight_action
+                .as_mut()
+                .expect("checked in-flight native action above");
+            execution.await
+        };
+        self.in_flight_action.take();
+        let (outcome, action_counter) = joined.map_err(|error| {
+            BoundedCuTaskError::new(
+                "bounded-cu-native-action-task-failed",
+                format!("native computer-use action task failed: {error}"),
+                false,
+            )
+        })?;
+        self.action_counter = action_counter;
+        Ok(Some(outcome))
+    }
+
+    async fn require_post_seal_initial_frame(&mut self) -> Result<(), BoundedCuTaskError> {
+        let Some(not_before) = self.initial_frame_not_before else {
+            return Ok(());
+        };
+        let frame = self
+            .proof_session
+            .fresh_frame(not_before, std::time::Duration::from_secs(1))
+            .await
+            .map_err(|error| {
+                BoundedCuTaskError::new(
+                    "bounded-cu-post-seal-frame-unavailable",
+                    format!("could not capture a frame after browser input sealing: {error}"),
+                    false,
+                )
+            })?;
+        if frame.timestamp < not_before {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-post-seal-frame-stale",
+                "capture did not produce a frame after browser input sealing",
+                false,
+            ));
+        }
+        self.initial_frame_not_before = None;
+        Ok(())
+    }
+
+    /// Execute through an owned task that retains both the exclusive display
+    /// token and scratch lifetime. Tokio cannot abort an already-started X11
+    /// `spawn_blocking` operation; if the request deadline cancels this await,
+    /// the detached task therefore keeps other input excluded until the
+    /// bounded OS operation and its observation have actually completed.
+    async fn execute_native_action(
+        &mut self,
+        action: &CuAction,
+    ) -> Result<crate::computer_use::CuBatchOutcome, BoundedCuTaskError> {
+        let display_access = self.display_access.as_ref().cloned().ok_or_else(|| {
+            BoundedCuTaskError::new(
+                "bounded-cu-exclusive-display-access-missing",
+                "bounded executor lost exclusive virtual-display access",
+                false,
+            )
+        })?;
+        if self.in_flight_action.is_some() {
+            return Err(BoundedCuTaskError::new(
+                "bounded-cu-native-action-overlap",
+                "a prior native computer-use action was still in flight",
+                false,
+            ));
+        }
+        let action = action.clone();
+        let target = self.target;
+        let backend = self.backend;
+        let scratch_dir = self.scratch_dir.clone();
+        let scratch_guard = std::sync::Arc::clone(&self.scratch_guard);
+        let session_registry = self.session_registry.clone();
+        let mut action_counter = self.action_counter;
+        self.in_flight_action = Some(tokio::spawn(async move {
+            let _scratch_guard = scratch_guard;
+            let outcome = execute_actions_with_exclusive_access(
+                &display_access,
+                std::slice::from_ref(&action),
+                target,
+                backend,
+                &scratch_dir,
+                &mut action_counter,
+                &session_registry,
+                None,
+                false,
+                None,
+                CuExecOptions::default(),
+            )
+            .await;
+            (outcome, action_counter)
+        }));
+        self.await_in_flight_native_action().await?.ok_or_else(|| {
+            BoundedCuTaskError::new(
+                "bounded-cu-native-action-result-missing",
+                "native computer-use action completed without an outcome",
+                false,
+            )
+        })
+    }
 }
 
 impl Drop for NativeBoundedCuExecutor {
     fn drop(&mut self) {
-        if self.pending_safety_releases.is_empty() {
+        let in_flight_action = self.in_flight_action.take();
+        let releases = std::mem::take(&mut self.pending_safety_releases);
+        if in_flight_action.is_none() && releases.is_empty() {
             return;
         }
-        let releases = std::mem::take(&mut self.pending_safety_releases);
         let Some(display_access) = self.display_access.take() else {
             return;
         };
         let session = std::sync::Arc::clone(&self.proof_session);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            eprintln!(
-                "[bounded-cu] no Tokio runtime was available for cancellation safety releases"
-            );
+            eprintln!("[bounded-cu] no Tokio runtime was available for cancellation cleanup");
+            // Fail closed during runtime teardown: do not make the display
+            // available while an in-flight native operation or possibly-held input edge cannot be completed safely.
+            std::mem::forget(display_access);
             return;
         };
         runtime.spawn(async move {
+            if let Some(execution) = in_flight_action {
+                if let Err(error) = execution.await {
+                    eprintln!("[bounded-cu] cancelled native action task failed: {error}");
+                }
+            }
             for release in releases {
                 if let Err(error) = session.inject_input(release).await {
                     eprintln!("[bounded-cu] cancellation safety release failed: {error}");
@@ -110,6 +241,16 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
         let mut results = Vec::with_capacity(actions.len());
         let mut screenshot = None;
         for action in actions {
+            if self.initial_frame_not_before.is_some() {
+                if !matches!(action, CuAction::Screenshot) {
+                    return Err(BoundedCuTaskError::new(
+                        "bounded-cu-initial-frame-order-invalid",
+                        "bounded proof task attempted input before its post-seal initial frame",
+                        false,
+                    ));
+                }
+                self.require_post_seal_initial_frame().await?;
+            }
             self.validate_proof_session_liveness().await?;
             validate_resource_binding(&self.params, &self.bus).await?;
             self.pending_safety_releases = bounded_action_safety_releases(
@@ -119,26 +260,7 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
             .map_err(|error| {
                 BoundedCuTaskError::new("bounded-cu-input-safety-plan-invalid", error, false)
             })?;
-            let mut outcome = execute_actions_with_exclusive_access(
-                self.display_access.as_ref().ok_or_else(|| {
-                    BoundedCuTaskError::new(
-                        "bounded-cu-exclusive-display-access-missing",
-                        "bounded executor lost exclusive virtual-display access",
-                        false,
-                    )
-                })?,
-                std::slice::from_ref(action),
-                self.target,
-                self.backend,
-                &self.scratch_dir,
-                &mut self.action_counter,
-                &self.session_registry,
-                None,
-                false,
-                None,
-                CuExecOptions::default(),
-            )
-            .await;
+            let mut outcome = self.execute_native_action(action).await?;
             let (action_result, action_screenshot) =
                 split_action_and_observation(action, std::mem::take(&mut outcome.results))?;
             if action_result.status == CuActionStatus::Failed {
@@ -232,18 +354,24 @@ impl IntendantServer {
         params: RunBoundedCuTaskParams,
         caller: ToolCallerTrust,
     ) -> String {
+        let mode = params.mode;
+        let deadline = tokio::time::Instant::now() + mode.timeout();
         if let Err(error) = require_owner_surface(caller) {
             return bounded_error_json(error);
         }
-        match self.run_bounded_cu_task_inner(params).await {
-            Ok(receipt) => serde_json::json!({ "ok": true, "receipt": receipt }).to_string(),
-            Err(error) => bounded_error_json(error),
+        match tokio::time::timeout_at(deadline, self.run_bounded_cu_task_inner(params, deadline))
+            .await
+        {
+            Ok(Ok(receipt)) => serde_json::json!({ "ok": true, "receipt": receipt }).to_string(),
+            Ok(Err(error)) => bounded_error_json(error),
+            Err(_) => bounded_error_json(mode.deadline_error()),
         }
     }
 
     async fn run_bounded_cu_task_inner(
         &self,
         params: RunBoundedCuTaskParams,
+        deadline: tokio::time::Instant,
     ) -> Result<crate::bounded_cu_task::BoundedCuTaskReceipt, BoundedCuTaskError> {
         let request = BoundedCuTaskRequest {
             mode: params.mode,
@@ -306,6 +434,7 @@ impl IntendantServer {
                     false,
                 )
             })?;
+        let initial_frame_not_before = std::time::Instant::now();
         let dimensions = crate::computer_use::target_pixel_size(target, &session_registry).await;
         if dimensions.0 == 0 || dimensions.1 == 0 {
             return Err(BoundedCuTaskError::new(
@@ -319,7 +448,7 @@ impl IntendantServer {
                 BoundedCuTaskError::new("bounded-cu-provider-unavailable", error.to_string(), true)
             })?;
         provider.set_cu_display(dimensions);
-        let scratch = create_private_scratch()?;
+        let scratch = std::sync::Arc::new(create_private_scratch()?);
         validate_private_scratch(scratch.path())?;
         let mut executor = NativeBoundedCuExecutor {
             target,
@@ -331,19 +460,34 @@ impl IntendantServer {
             bus: self.bus.clone(),
             display_access: Some(display_access),
             proof_session,
+            scratch_guard: std::sync::Arc::clone(&scratch),
+            initial_frame_not_before: Some(initial_frame_not_before),
             pending_safety_releases: Vec::new(),
+            in_flight_action: None,
         };
-        let task_result = execute_bounded_cu_task(provider.as_ref(), &mut executor, request).await;
+        let task_result =
+            execute_bounded_cu_task_until(provider.as_ref(), &mut executor, request, deadline)
+                .await;
         let safety_release = executor.release_pending_input_edges().await;
         let final_binding = validate_resource_binding(&params, &self.bus).await;
         let final_session_liveness = executor.validate_proof_session_liveness().await;
-        let cleanup = scratch.close().map_err(|error| {
-            BoundedCuTaskError::new(
-                "bounded-cu-private-scratch-cleanup-failed",
-                format!("cannot remove private CU scratch directory: {error}"),
-                false,
-            )
-        });
+        drop(executor);
+        let cleanup = match std::sync::Arc::try_unwrap(scratch) {
+            Ok(scratch) => scratch.close().map_err(|error| {
+                BoundedCuTaskError::new(
+                    "bounded-cu-private-scratch-cleanup-failed",
+                    format!("cannot remove private CU scratch directory: {error}"),
+                    false,
+                )
+            }),
+            // A request deadline can detach one already-started platform
+            // operation. Its owned Arc removes the scratch directory when it
+            // finishes; the same task retains exclusive display access.
+            Err(scratch) => {
+                drop(scratch);
+                Ok(())
+            }
+        };
         let result = finish_bounded_task(
             task_result,
             safety_release,
@@ -436,7 +580,12 @@ async fn validate_resource_binding(
     }
     let workspaces = crate::browser_workspace::list_workspaces(bus).await;
     let workspace = exclusive_workspace_on_display(&workspaces, params)?;
-    validate_workspace(workspace, params)
+    validate_workspace(workspace, params)?;
+    crate::browser_workspace::verify_live_workspace(workspace)
+        .await
+        .map_err(|error| {
+            BoundedCuTaskError::new("bounded-cu-workspace-runtime-unavailable", error, false)
+        })
 }
 
 fn exclusive_workspace_on_display<'a>(
@@ -479,7 +628,9 @@ fn validate_workspace(
         || workspace.display_target.as_deref() != Some(params.display_target.as_str())
         || workspace.owner_session_id.as_deref() != Some(params.attempt_id.as_str())
         || workspace.process_id.is_none()
+        || workspace.debugging_port.is_none()
         || workspace.cdp_http_url.is_none()
+        || workspace.cdp_ws_url.is_none()
         || workspace.active_target_id.is_none()
         || !exact_lease
     {
@@ -731,5 +882,178 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_exclusive_access_outlives_the_request_owner() {
+        let exclusive = crate::computer_use::acquire_virtual_display_exclusive(424_243).await;
+        let detached_operation = exclusive.clone();
+        drop(exclusive);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            crate::computer_use::acquire_virtual_display_shared(424_243),
+        )
+        .await
+        .is_err());
+        drop(detached_operation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::computer_use::acquire_virtual_display_shared(424_243),
+        )
+        .await
+        .unwrap();
+    }
+
+    struct OrderedReleaseBackend {
+        events: std::sync::Arc<tokio::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for OrderedReleaseBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<tokio::sync::mpsc::Receiver<crate::display::Frame>, crate::error::CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            self.events.lock().await.push("release");
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (1280, 720)
+        }
+
+        fn kind(&self) -> &'static str {
+            "ordered-release-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_cleanup_waits_for_detached_native_action_before_releasing() {
+        const DISPLAY_ID: u32 = 424_244;
+        let events = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let action_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let action_events = std::sync::Arc::clone(&events);
+        let task_gate = std::sync::Arc::clone(&action_gate);
+        let in_flight_action: NativeActionJoinHandle = tokio::spawn(async move {
+            task_gate.notified().await;
+            action_events.lock().await.push("action-finished");
+            panic!("synthetic detached native action failure");
+        });
+
+        let backend = std::sync::Arc::new(OrderedReleaseBackend {
+            events: std::sync::Arc::clone(&events),
+        });
+        let proof_session =
+            std::sync::Arc::new(crate::display::DisplaySession::new(DISPLAY_ID, backend));
+        let scratch_guard = std::sync::Arc::new(tempfile::tempdir().unwrap());
+        let display_access =
+            crate::computer_use::acquire_virtual_display_exclusive(DISPLAY_ID).await;
+        let mut executor = NativeBoundedCuExecutor {
+            target: DisplayTarget::Virtual { id: DISPLAY_ID },
+            backend: DisplayBackend::X11,
+            display_access: Some(display_access),
+            proof_session,
+            bus: crate::event::EventBus::new(),
+            params: params(),
+            session_registry: None,
+            action_counter: 0,
+            scratch_dir: scratch_guard.path().to_path_buf(),
+            scratch_guard,
+            initial_frame_not_before: None,
+            pending_safety_releases: vec![crate::display::InputEvent::KeyUp {
+                code: "KeyA".to_string(),
+                key: "a".to_string(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            }],
+            in_flight_action: Some(in_flight_action),
+        };
+
+        let mut cleanup = Box::pin(executor.release_pending_input_edges());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), cleanup.as_mut(),)
+                .await
+                .is_err()
+        );
+        assert!(events.lock().await.is_empty());
+
+        action_gate.notify_one();
+        let error = cleanup.await.unwrap_err();
+        assert_eq!(error.code, "bounded-cu-native-action-task-failed");
+        assert_eq!(
+            events.lock().await.as_slice(),
+            &["action-finished", "release"]
+        );
+        assert!(executor.pending_safety_releases.is_empty());
+        assert!(executor.in_flight_action.is_none());
+    }
+
+    #[tokio::test]
+    async fn drop_retains_display_fence_for_in_flight_action_without_input_releases() {
+        const DISPLAY_ID: u32 = 424_245;
+        let events = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let action_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let action_events = std::sync::Arc::clone(&events);
+        let task_gate = std::sync::Arc::clone(&action_gate);
+        let in_flight_action: NativeActionJoinHandle = tokio::spawn(async move {
+            task_gate.notified().await;
+            action_events.lock().await.push("action-finished");
+            panic!("synthetic detached native action failure");
+        });
+
+        let backend = std::sync::Arc::new(OrderedReleaseBackend {
+            events: std::sync::Arc::clone(&events),
+        });
+        let proof_session =
+            std::sync::Arc::new(crate::display::DisplaySession::new(DISPLAY_ID, backend));
+        let scratch_guard = std::sync::Arc::new(tempfile::tempdir().unwrap());
+        let display_access =
+            crate::computer_use::acquire_virtual_display_exclusive(DISPLAY_ID).await;
+        let executor = NativeBoundedCuExecutor {
+            target: DisplayTarget::Virtual { id: DISPLAY_ID },
+            backend: DisplayBackend::X11,
+            display_access: Some(display_access),
+            proof_session,
+            bus: crate::event::EventBus::new(),
+            params: params(),
+            session_registry: None,
+            action_counter: 0,
+            scratch_dir: scratch_guard.path().to_path_buf(),
+            scratch_guard,
+            initial_frame_not_before: None,
+            pending_safety_releases: Vec::new(),
+            in_flight_action: Some(in_flight_action),
+        };
+
+        drop(executor);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            crate::computer_use::acquire_virtual_display_shared(DISPLAY_ID),
+        )
+        .await
+        .is_err());
+
+        action_gate.notify_one();
+        let shared = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::computer_use::acquire_virtual_display_shared(DISPLAY_ID),
+        )
+        .await
+        .expect("detached action completion must release the display fence");
+        assert_eq!(events.lock().await.as_slice(), &["action-finished"]);
+        drop(shared);
     }
 }

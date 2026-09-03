@@ -18,6 +18,7 @@ pub type SharedBrowserWorkspaceRegistry = Arc<RwLock<BrowserWorkspaceRegistry>>;
 static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = OnceLock::new();
 
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const CDP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
 const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
 // macOS-only system-browser escape hatch; other platforms' discovery path never consults it.
@@ -1049,6 +1050,93 @@ pub async fn list_workspaces(bus: &EventBus) -> Vec<BrowserWorkspace> {
     };
     terminate_retired_processes(retired);
     workspaces
+}
+
+/// Prove that the exact local workspace record still names a live child and
+/// an extant page target. Stored `Ready` metadata alone is not liveness: a
+/// browser may exit or its selected tab may close between bounded proof
+/// actions. The registry/child check brackets the CDP probe so a concurrent
+/// close or replacement cannot be mistaken for the requested workspace.
+pub(crate) async fn verify_live_workspace(workspace: &BrowserWorkspace) -> Result<(), String> {
+    verify_registered_child(workspace).await?;
+
+    let pid = workspace
+        .process_id
+        .ok_or_else(|| "browser workspace has no process id".to_string())?;
+    let port = workspace
+        .debugging_port
+        .ok_or_else(|| "browser workspace has no debugging port".to_string())?;
+    let target_id = workspace
+        .active_target_id
+        .as_deref()
+        .ok_or_else(|| "browser workspace has no active target id".to_string())?;
+    let expected_http = format!("http://127.0.0.1:{port}");
+    if workspace.cdp_http_url.as_deref() != Some(expected_http.as_str()) {
+        return Err("browser workspace CDP URL is not its exact loopback port".to_string());
+    }
+    if !crate::platform::process_alive(pid) {
+        return Err("browser workspace process is no longer live".to_string());
+    }
+
+    let list_url = format!("{expected_http}/json/list");
+    let response = reqwest::Client::new()
+        .get(&list_url)
+        .timeout(CDP_LIVENESS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?;
+    let targets: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("browser workspace CDP target list was invalid: {error}"))?;
+    let target = exact_page_target(&targets, target_id)
+        .ok_or_else(|| "browser workspace active page target is no longer live".to_string())?;
+    let target_ws = target
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "browser workspace active page target has no debugger URL".to_string())?;
+    if workspace.cdp_ws_url.as_deref() != Some(target_ws) {
+        return Err("browser workspace active page debugger URL changed".to_string());
+    }
+
+    verify_registered_child(workspace).await?;
+    if !crate::platform::process_alive(pid) {
+        return Err("browser workspace process exited during its CDP liveness probe".to_string());
+    }
+    Ok(())
+}
+
+async fn verify_registered_child(workspace: &BrowserWorkspace) -> Result<(), String> {
+    let registry = global_registry();
+    let mut registry = registry.write().await;
+    let current = registry
+        .workspaces
+        .get(&workspace.id)
+        .ok_or_else(|| "browser workspace disappeared from the live registry".to_string())?;
+    if current != workspace {
+        return Err("browser workspace binding changed during the bounded proof task".to_string());
+    }
+    let child = registry
+        .children
+        .get_mut(&workspace.id)
+        .ok_or_else(|| "browser workspace has no daemon-owned child process".to_string())?;
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => Err(format!("browser workspace child exited with {status}")),
+        Err(error) => Err(format!("cannot inspect browser workspace child: {error}")),
+    }
+}
+
+fn exact_page_target<'a>(
+    targets: &'a serde_json::Value,
+    target_id: &str,
+) -> Option<&'a serde_json::Value> {
+    targets.as_array()?.iter().find(|target| {
+        target.get("type").and_then(serde_json::Value::as_str) == Some("page")
+            && target.get("id").and_then(serde_json::Value::as_str) == Some(target_id)
+    })
 }
 
 pub async fn close_display_binding(
@@ -3064,6 +3152,23 @@ mod tests {
         let (ws, id) = first_page_target(&targets).unwrap();
         assert_eq!(id.as_deref(), Some("page-1"));
         assert_eq!(ws.as_deref(), Some("ws://127.0.0.1/devtools/page/page-1"));
+    }
+
+    #[test]
+    fn cdp_liveness_parser_requires_the_exact_page_target() {
+        let targets = serde_json::json!([
+            {"type":"page","id":"replacement","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/replacement"},
+            {"type":"service_worker","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/worker/page-1"},
+            {"type":"page","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/page-1"}
+        ]);
+        let target = exact_page_target(&targets, "page-1").unwrap();
+        assert_eq!(
+            target
+                .get("webSocketDebuggerUrl")
+                .and_then(serde_json::Value::as_str),
+            Some("ws://127.0.0.1/devtools/page/page-1")
+        );
+        assert!(exact_page_target(&targets, "closed-page").is_none());
     }
 
     #[test]
