@@ -1500,9 +1500,18 @@ fn prepare_browser_extension(
             spec.archive_path.display()
         ))
     })?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+    let source_is_link_like = intendant_platform::platform::path_leaf_is_symlink_or_reparse(
+        &spec.archive_path,
+    )
+    .map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to inspect extension archive leaf {}: {error}",
+            spec.archive_path.display()
+        ))
+    })?;
+    if source_is_link_like || !source_metadata.is_file() {
         return Err(BrowserWorkspaceError::Unsupported(format!(
-            "extension archive must be a regular non-symlink file: {}",
+            "extension archive must be a regular non-symlink, non-reparse file: {}",
             spec.archive_path.display()
         )));
     }
@@ -1513,6 +1522,12 @@ fn prepare_browser_extension(
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let archive_file = options.open(&spec.archive_path).map_err(|error| {
         BrowserWorkspaceError::Io(format!(
@@ -1526,6 +1541,17 @@ fn prepare_browser_extension(
             spec.archive_path.display()
         ))
     })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(BrowserWorkspaceError::Unsupported(format!(
+                "opened extension archive is a Windows reparse point: {}",
+                spec.archive_path.display()
+            )));
+        }
+    }
     if !opened_metadata.is_file() || opened_metadata.len() != spec.archive_byte_length {
         return Err(BrowserWorkspaceError::Unsupported(format!(
             "extension archive length mismatch: expected {}, opened {}",
