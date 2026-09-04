@@ -77,6 +77,8 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 ///   `wait`/`hold_key` millisecond durations verbatim
 ///   (`computer_use.rs`), so a sequence legitimately outlives the
 ///   window (the 60 s cloud CU round trip also rides inside it).
+/// - `run_bounded_cu_task` — the proof-stage deadline is 180 s and its
+///   attestation deadline is 45 s, both including provider round trips.
 /// - `peer_execute_cu_actions` — the same caller-paced actions run on
 ///   a federated peer, bounded only by `PEER_MCP_TIMEOUT` (120 s).
 /// - `events` — the long-poll chunk may sit the full
@@ -91,12 +93,13 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 /// codex thread-action waits (20 s) and the remaining peer round
 /// trips (sub-second lookups under `PEER_MCP_TIMEOUT`'s transport
 /// bound — a bound is not a hold).
-pub(crate) const MCP_HELD_POST_TOOLS: [&str; 8] = [
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 9] = [
     "ask_user",
     "request_user_display",
     "spawn_live_audio",
     "fission_control",
     "execute_cu_actions",
+    "run_bounded_cu_task",
     "peer_execute_cu_actions",
     "events",
     "remote_command",
@@ -453,7 +456,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
-        | "execute_cu_actions" => PeerOperation::DisplayInput,
+        | "execute_cu_actions"
+        | "run_bounded_cu_task" => PeerOperation::DisplayInput,
         // Browser workspaces, live audio, autonomy/verbosity, lifecycle, and
         // controller-restart orchestration are runtime-control surfaces.
         "create_browser_workspace"
@@ -894,6 +898,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             "destroy_virtual_display",
             "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes bound browser workspaces first, and refuses stale generations without touching the live display.",
             DestroyVirtualDisplayParams
+        ),
+    );
+    push(
+        "run_bounded_cu_task",
+        manual_http_tool_definition!(
+            "run_bounded_cu_task",
+            "Run one owner-only synchronous computer-use task on an exact daemon-owned virtual-display generation and exact attempt-leased local CDP workspace. stage permits bounded native CU actions; attest is observation-only. No shell, filesystem, browser API, delegation, function tools, or escalation is exposed. Returns a compact lineage-bound JSON receipt.",
+            RunBoundedCuTaskParams
         ),
     );
     push(
@@ -1518,6 +1530,45 @@ mod tests {
             manual_description,
             attr.description.as_deref().unwrap_or_default(),
             "display_readiness manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn bounded_cu_task_is_owner_only_and_description_stays_in_sync() {
+        for profile in [
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+            Some("screen"),
+            Some("display"),
+            Some("managed"),
+            Some("facade"),
+        ] {
+            assert!(
+                !tool_allowed_for_profile("run_bounded_cu_task", false, profile),
+                "bounded CU must not be advertised to profile {profile:?}"
+            );
+        }
+        for profile in [None, Some("full")] {
+            assert!(tool_allowed_for_profile(
+                "run_bounded_cu_task",
+                false,
+                profile
+            ));
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("full"));
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "run_bounded_cu_task")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for run_bounded_cu_task");
+        let attr = IntendantServer::run_bounded_cu_task_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "run_bounded_cu_task manual HTTP description drifted from its #[tool] attribute"
         );
     }
 

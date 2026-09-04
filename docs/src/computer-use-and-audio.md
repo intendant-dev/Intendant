@@ -95,6 +95,37 @@ element): multi-line/control text (Return may submit, Tab may move focus),
 secure fields, and elements without an AX-readable value stay `injected`
 with the reason in the result detail.
 
+### Bounded proof tasks
+
+`intendant ctl cu task` is the owner-only orchestration lane for evidence
+capture on an exact daemon-created virtual-display generation and exact
+attempt-leased local CDP browser workspace. It is deliberately smaller than
+an agent session: the selected provider receives native CU plus no function
+tools, shell, filesystem, browser API, delegation, or escalation capability.
+`stage` has fixed turn/action/time limits and may operate the isolated display;
+`attest` receives one internally captured PNG and refuses every later action.
+The daemon rechecks the exact display generation and browser lease around each
+action, serializes tasks per display generation, and deletes its mode-0700
+scratch directory before returning.
+
+The 180-second `stage` and 45-second `attest` deadlines begin at request
+admission, including any wait for exclusive display control and all setup. A
+ready workspace is also probed for a live daemon-owned browser child and its
+exact CDP page target around every action. The initial model frame must have
+been captured after browser-originated input was permanently sealed. Text,
+scroll, hold, and wait parameters carry fixed per-action caps; if a platform
+operation has already entered non-abortable OS work when the deadline fires,
+it retains the exclusive display and private scratch lifetimes until that
+bounded work finishes.
+
+Successful calls return a compact receipt rather than screenshots or typed
+text. Its identity binds the exact resources, provider/model, timestamps and
+monotonic elapsed time, task and normalized-result hashes, every model-visible
+frame hash, action-kind/payload hashes and counters, plus the prior stage and
+observation lineage required by `attest`. Scoped agent callers are rejected;
+the intended caller is a local owner-side orchestrator using the loopback
+`intendant ctl` lane.
+
 **Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
 same proven event shape as `key`), newlines as Return and tabs as Tab;
 characters with no ANSI-US key are delivered as paced unicode-string events

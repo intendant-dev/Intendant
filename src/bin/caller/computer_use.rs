@@ -8,6 +8,52 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// Per-virtual-display action/lifecycle gates. Ordinary display operations
+/// take a shared guard; the bounded proof lane takes the exclusive guard for
+/// its whole task. This closes the check-then-inject race without serializing
+/// independent Xvfb displays.
+fn virtual_display_gate(display_id: u32) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<tokio::sync::RwLock<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&display_id).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+    gates.insert(display_id, std::sync::Arc::downgrade(&gate));
+    gate
+}
+
+pub(crate) async fn acquire_virtual_display_shared(
+    display_id: u32,
+) -> tokio::sync::OwnedRwLockReadGuard<()> {
+    virtual_display_gate(display_id).read_owned().await
+}
+
+#[derive(Clone)]
+pub(crate) struct VirtualDisplayExclusiveAccess {
+    display_id: u32,
+    // The bounded lane may have to detach a non-abortable platform input
+    // operation when its request deadline expires. Every detached operation
+    // keeps a clone so ordinary input cannot resume until the OS work has
+    // actually stopped.
+    _guard: std::sync::Arc<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+pub(crate) async fn acquire_virtual_display_exclusive(
+    display_id: u32,
+) -> VirtualDisplayExclusiveAccess {
+    VirtualDisplayExclusiveAccess {
+        display_id,
+        _guard: std::sync::Arc::new(virtual_display_gate(display_id).write_owned().await),
+    }
+}
+
 // ── Display backend ──────────────────────────────────────────────────────────
 
 /// Display backend for input simulation and screenshot capture.
@@ -1008,22 +1054,90 @@ pub async fn execute_actions(
     observer: Option<&CuActionObserver>,
     options: CuExecOptions,
 ) -> CuBatchOutcome {
+    let _display_access = match target {
+        DisplayTarget::Virtual { id } => Some(acquire_virtual_display_shared(id).await),
+        DisplayTarget::UserSession => None,
+    };
+    execute_actions_inner(
+        actions,
+        target,
+        backend,
+        screenshot_dir,
+        action_counter,
+        session_registry,
+        denorm_ref,
+        user_session_allowed,
+        observer,
+        options,
+    )
+    .await
+}
+
+/// Execute while the bounded proof lane holds exclusive access to the exact
+/// virtual display. The access token prevents the proof path from
+/// recursively taking the ordinary shared gate and binds this bypass to the
+/// same display id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_actions_with_exclusive_access(
+    access: &VirtualDisplayExclusiveAccess,
+    actions: &[CuAction],
+    target: DisplayTarget,
+    backend: DisplayBackend,
+    screenshot_dir: &Path,
+    action_counter: &mut u64,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+    denorm_ref: Option<(u32, u32)>,
+    user_session_allowed: bool,
+    observer: Option<&CuActionObserver>,
+    options: CuExecOptions,
+) -> CuBatchOutcome {
+    if target
+        != (DisplayTarget::Virtual {
+            id: access.display_id,
+        })
+    {
+        return failed_batch(
+            actions,
+            "exclusive virtual-display access token does not match the action target",
+            "exclusive virtual-display access token mismatch",
+        );
+    }
+    execute_actions_inner(
+        actions,
+        target,
+        backend,
+        screenshot_dir,
+        action_counter,
+        session_registry,
+        denorm_ref,
+        user_session_allowed,
+        observer,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_actions_inner(
+    actions: &[CuAction],
+    target: DisplayTarget,
+    backend: DisplayBackend,
+    screenshot_dir: &Path,
+    action_counter: &mut u64,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+    denorm_ref: Option<(u32, u32)>,
+    user_session_allowed: bool,
+    observer: Option<&CuActionObserver>,
+    options: CuExecOptions,
+) -> CuBatchOutcome {
     if target.is_user_session() && !user_session_allowed {
         // One result per action, like every other outcome of this function
         // (a screenshot-only batch still gets its one denial).
-        return CuBatchOutcome {
-            results: actions
-                .iter()
-                .map(|_| CuActionResult::failed(user_session_denied_message()))
-                .collect(),
-            observation: CuObservation {
-                kind: CuObservationKind::None,
-                reason: "user_session denied".to_string(),
-                ax_text: None,
-            },
-            settle: None,
-            metrics: CuBatchMetrics::default(),
-        };
+        return failed_batch(
+            actions,
+            user_session_denied_message(),
+            "user_session denied",
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1178,6 +1292,27 @@ pub async fn execute_actions(
         outcome.metrics_line(),
     );
     outcome
+}
+
+fn failed_batch(
+    actions: &[CuAction],
+    message: impl Into<String>,
+    reason: impl Into<String>,
+) -> CuBatchOutcome {
+    let message = message.into();
+    CuBatchOutcome {
+        results: actions
+            .iter()
+            .map(|_| CuActionResult::failed(message.clone()))
+            .collect(),
+        observation: CuObservation {
+            kind: CuObservationKind::None,
+            reason: reason.into(),
+            ax_text: None,
+        },
+        settle: None,
+        metrics: CuBatchMetrics::default(),
+    }
 }
 
 fn target_uses_private_x11_session(target: DisplayTarget) -> bool {
@@ -3775,6 +3910,46 @@ fn mouse_button_index(button: MouseButton) -> u8 {
     }
 }
 
+/// Releases that make one bounded action cancellation-safe. The caller
+/// records these before dispatch and clears them only after the action and
+/// its trailing observation complete. Split mouse-edge actions are rejected
+/// by the bounded lane, but remain covered here as a defensive fallback.
+pub(crate) fn bounded_action_safety_releases(
+    action: &CuAction,
+    resolution: (u32, u32),
+) -> Result<Vec<crate::display::InputEvent>, String> {
+    let mouse_up = |x: i32, y: i32, button: MouseButton| {
+        let width = f64::from(resolution.0.max(1));
+        let height = f64::from(resolution.1.max(1));
+        crate::display::InputEvent::MouseUp {
+            x: (f64::from(x) / width).clamp(0.0, 1.0),
+            y: (f64::from(y) / height).clamp(0.0, 1.0),
+            b: mouse_button_index(button),
+        }
+    };
+    match action {
+        CuAction::Click { x, y, button }
+        | CuAction::DoubleClick { x, y, button }
+        | CuAction::TripleClick { x, y, button }
+        | CuAction::MouseDown { x, y, button }
+        | CuAction::MouseUp { x, y, button } => Ok(vec![mouse_up(*x, *y, *button)]),
+        CuAction::Drag { end_x, end_y, .. } => {
+            Ok(vec![mouse_up(*end_x, *end_y, MouseButton::Left)])
+        }
+        CuAction::Key { key } | CuAction::HoldKey { key, .. } => Ok(key_action_events(key)?
+            .into_iter()
+            .filter(|event| matches!(event, crate::display::InputEvent::KeyUp { .. }))
+            .collect()),
+        CuAction::Type { .. }
+        | CuAction::Paste { .. }
+        | CuAction::Scroll { .. }
+        | CuAction::MoveMouse { .. }
+        | CuAction::Screenshot
+        | CuAction::Zoom { .. }
+        | CuAction::Wait { .. } => Ok(Vec::new()),
+    }
+}
+
 /// Map a character to a DOM `KeyboardEvent.code` value.
 fn char_to_dom_code(ch: char) -> &'static str {
     match ch.to_ascii_lowercase() {
@@ -4748,6 +4923,75 @@ mod tests {
         assert_ne!(error, user_session_denied_message());
     }
 
+    #[tokio::test]
+    async fn execute_actions_waits_for_exclusive_virtual_display_access() {
+        let target = DisplayTarget::Virtual { id: 4322 };
+        let exclusive = acquire_virtual_display_exclusive(4322).await;
+        let dir = std::env::temp_dir();
+        let mut counter = 0_u64;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            execute_actions(
+                &[CuAction::Screenshot],
+                target,
+                DisplayBackend::Windows,
+                &dir,
+                &mut counter,
+                &None,
+                None,
+                false,
+                None,
+                CuExecOptions::default(),
+            ),
+        )
+        .await
+        .is_err());
+        drop(exclusive);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            execute_actions(
+                &[CuAction::Screenshot],
+                target,
+                DisplayBackend::Windows,
+                &dir,
+                &mut counter,
+                &None,
+                None,
+                false,
+                None,
+                CuExecOptions::default(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclusive_virtual_display_access_is_target_bound() {
+        let exclusive = acquire_virtual_display_exclusive(4323).await;
+        let dir = std::env::temp_dir();
+        let mut counter = 0_u64;
+        let outcome = execute_actions_with_exclusive_access(
+            &exclusive,
+            &[CuAction::Screenshot],
+            DisplayTarget::Virtual { id: 4324 },
+            DisplayBackend::Windows,
+            &dir,
+            &mut counter,
+            &None,
+            None,
+            false,
+            None,
+            CuExecOptions::default(),
+        )
+        .await;
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(
+            outcome.results[0].error.as_deref(),
+            Some("exclusive virtual-display access token does not match the action target")
+        );
+    }
+
     #[test]
     fn no_session_message_wayland_virtual_target_suggests_xvfb() {
         let msg = no_session_message(
@@ -5096,6 +5340,37 @@ mod tests {
         assert_eq!(mouse_button_index(MouseButton::Left), 0);
         assert_eq!(mouse_button_index(MouseButton::Middle), 1);
         assert_eq!(mouse_button_index(MouseButton::Right), 2);
+    }
+
+    #[test]
+    fn bounded_safety_plan_releases_mouse_and_every_key_edge() {
+        let mouse = bounded_action_safety_releases(
+            &CuAction::Click {
+                x: 100,
+                y: 50,
+                button: MouseButton::Right,
+            },
+            (200, 100),
+        )
+        .unwrap();
+        assert!(matches!(
+            mouse.as_slice(),
+            [crate::display::InputEvent::MouseUp { x, y, b: 2 }]
+                if (*x - 0.5).abs() < f64::EPSILON && (*y - 0.5).abs() < f64::EPSILON
+        ));
+
+        let keys = bounded_action_safety_releases(
+            &CuAction::HoldKey {
+                key: "CTRL+C".to_string(),
+                ms: 1,
+            },
+            (200, 100),
+        )
+        .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys
+            .iter()
+            .all(|event| matches!(event, crate::display::InputEvent::KeyUp { .. })));
     }
 
     // ── Result statuses & read-back helpers ─────────────────────────────

@@ -14,6 +14,7 @@ mod backend_install;
 mod backend_model_catalog;
 mod background_tasks;
 mod boot_readopt;
+mod bounded_cu_task;
 mod browser_workspace;
 #[path = "../../build_info.rs"]
 mod build_info;

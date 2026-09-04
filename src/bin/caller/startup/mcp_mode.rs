@@ -160,6 +160,7 @@ pub(crate) async fn run_mcp_mode(
         .map(|gateway| gateway.peer_registry.clone());
     mcp_app_state.peer_registry = mcp_peer_registry.clone();
     mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    mcp_app_state.computer_use_config = project.config.computer_use.clone();
     // The stdio MCP client is itself an answerable frontend (it receives
     // UserQuestion events and can send answer_question), and a dashboard
     // can attach through the optional gateway — asks block, never

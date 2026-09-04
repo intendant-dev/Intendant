@@ -1342,6 +1342,64 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
             print_tool_response(response, config, output)?;
         }
+        "task" | "bounded" => {
+            ensure_help(&raw[1..], help_cu_task)?;
+            let args = parse_command_args(
+                &raw[1..],
+                &[
+                    "--task",
+                    "--mode",
+                    "--attempt",
+                    "--workspace",
+                    "--display-id",
+                    "--target",
+                    "--capture-generation",
+                    "--prior-receipt",
+                ],
+                &[],
+            )?;
+            let task = args
+                .one("--task")
+                .map(str::to_string)
+                .or_else(|| (!args.positional.is_empty()).then(|| args.positional.join(" ")))
+                .ok_or_else(|| "cu task requires TASK or --task".to_string())?;
+            let required = |flag: &str| {
+                args.one(flag)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("cu task requires {flag}"))
+            };
+            let mode = required("--mode")?;
+            if !matches!(mode.as_str(), "stage" | "attest") {
+                return Err("--mode must be stage or attest".to_string());
+            }
+            let display_id = required("--display-id")?
+                .parse::<u32>()
+                .map_err(|_| "--display-id must be an unsigned 32-bit integer".to_string())?;
+            let mut map = Map::new();
+            map.insert("task".to_string(), Value::String(task));
+            map.insert("mode".to_string(), Value::String(mode));
+            map.insert(
+                "attempt_id".to_string(),
+                Value::String(required("--attempt")?),
+            );
+            map.insert(
+                "workspace_id".to_string(),
+                Value::String(required("--workspace")?),
+            );
+            map.insert("display_id".to_string(), Value::from(display_id));
+            map.insert(
+                "display_target".to_string(),
+                Value::String(required("--target")?),
+            );
+            map.insert(
+                "capture_generation".to_string(),
+                Value::String(required("--capture-generation")?),
+            );
+            insert_string(&mut map, "prior_receipt_id", args.one("--prior-receipt"));
+            let response =
+                call_tool(client, config, "run_bounded_cu_task", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "screenshot" => {
             let next = std::iter::once("screenshot".to_string())
                 .chain(raw[1..].iter().cloned())
@@ -6078,6 +6136,7 @@ fn help_cu() {
     println!(
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
@@ -6090,6 +6149,17 @@ Targets: user_session (needs display grant), 99/display_99 (virtual).\n\
 Omit to auto-detect: a live agent virtual display when one exists, else the user session.\n\
 If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
 (grant, OS permissions, display, input) with fixes."
+    );
+}
+
+fn help_cu_task() {
+    println!(
+        "Usage: intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
+Runs a synchronous CU-only task against the exact daemon-created display generation and\n\
+attempt-owned browser lease. stage permits bounded native computer actions; attest is\n\
+strictly observation-only and requires a stage receipt issued by this daemon lifetime.\n\
+Transcript and screenshot lineage are derived and verified internally. The provider receives no\n\
+shell, filesystem, browser API, delegation, function tools, or escalation capability."
     );
 }
 
