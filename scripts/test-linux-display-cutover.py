@@ -827,6 +827,13 @@ def main() -> int:
             screenshots[0]["sha256"] != screenshots[1]["sha256"],
             "distinct pages produced identical screenshots",
         )
+        for workspace, (url, title, _, _) in zip(
+            workspaces, workspace_inputs, strict=True
+        ):
+            require(
+                cdp_target_matches(workspace, url, title),
+                f"CDP binding changed across screenshot for {workspace['id']}",
+            )
         receipt["screenshots"] = screenshots
         receipt["workspaces"] = workspaces
         receipt["displays"] = displays
