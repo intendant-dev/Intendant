@@ -2355,6 +2355,21 @@ async fn fetch_bounded_cdp_json(
     })
 }
 
+async fn fetch_bounded_cdp_json_before(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value, BrowserWorkspaceError> {
+    tokio::time::timeout_at(deadline, fetch_bounded_cdp_json(client, url, label))
+        .await
+        .map_err(|_| {
+            BrowserWorkspaceError::Launch(format!(
+                "{label} exceeded the fixed CDP startup deadline"
+            ))
+        })?
+}
+
 fn exact_loopback_websocket_url(raw: &str, port: u16, expected_path: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw) else {
         return false;
@@ -2417,10 +2432,35 @@ async fn wait_for_cdp_target(
     profile_dir: &Path,
     extension_required: bool,
 ) -> Result<(u16, Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
+    wait_for_cdp_target_until(
+        child,
+        profile_dir,
+        extension_required,
+        tokio::time::Instant::now() + CDP_STARTUP_TIMEOUT,
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+async fn wait_for_cdp_target_until(
+    child: &mut Child,
+    profile_dir: &Path,
+    extension_required: bool,
+    deadline: tokio::time::Instant,
+    retry_delay: Duration,
+) -> Result<(u16, Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
     let client = local_cdp_client()?;
-    let deadline = tokio::time::Instant::now() + CDP_STARTUP_TIMEOUT;
-    let mut last_error = None;
+    let mut last_error: Option<String> = None;
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            let detail = last_error
+                .as_deref()
+                .map(|error| format!("; last observation: {error}"))
+                .unwrap_or_default();
+            return Err(BrowserWorkspaceError::Launch(format!(
+                "timed out waiting for a profile-bound CDP endpoint{detail}"
+            )));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Err(BrowserWorkspaceError::Launch(format!(
@@ -2437,56 +2477,80 @@ async fn wait_for_cdp_target(
         if let Some(endpoint) = read_devtools_active_port(profile_dir)? {
             let version_url = format!("http://127.0.0.1:{}/json/version", endpoint.port);
             let list_url = format!("http://127.0.0.1:{}/json/list", endpoint.port);
-            match fetch_bounded_cdp_json(&client, &version_url, "CDP version endpoint").await {
+            match fetch_bounded_cdp_json_before(
+                &client,
+                &version_url,
+                "CDP version endpoint",
+                deadline,
+            )
+            .await
+            {
                 Ok(version) => match validate_browser_websocket_identity(&version, &endpoint) {
                     Ok(()) => {
-                        match fetch_bounded_cdp_json(&client, &list_url, "CDP target list").await {
+                        match fetch_bounded_cdp_json_before(
+                            &client,
+                            &list_url,
+                            "CDP target list",
+                            deadline,
+                        )
+                        .await
+                        {
                             Ok(targets) => {
-                                if let Some((ws, id)) =
-                                    validated_page_target(&targets, endpoint.port)
-                                {
-                                    let extension_runtime_id =
-                                        active_extension_runtime_id(&targets);
-                                    if !extension_required || extension_runtime_id.is_some() {
+                                let extension_runtime_id = active_extension_runtime_id(&targets);
+                                match validated_page_target(&targets, endpoint.port) {
+                                    Some((ws, id))
+                                        if !extension_required
+                                            || extension_runtime_id.is_some() =>
+                                    {
                                         let endpoint_after =
                                             read_devtools_active_port(profile_dir)?;
-                                        if endpoint_after.as_ref() != Some(&endpoint) {
+                                        if endpoint_after.as_ref() == Some(&endpoint) {
+                                            match child.try_wait() {
+                                                Ok(None) => {
+                                                    return Ok((
+                                                        endpoint.port,
+                                                        Some(ws),
+                                                        Some(id),
+                                                        extension_runtime_id,
+                                                    ))
+                                                }
+                                                Ok(Some(status)) => {
+                                                    return Err(BrowserWorkspaceError::Launch(
+                                                        format!(
+                                                            "browser exited while its CDP endpoint became ready: {status}"
+                                                        ),
+                                                    ))
+                                                }
+                                                Err(error) => {
+                                                    return Err(BrowserWorkspaceError::Launch(
+                                                        format!(
+                                                            "failed to inspect browser after CDP readiness: {error}"
+                                                        ),
+                                                    ))
+                                                }
+                                            }
+                                        } else {
+                                            // Endpoint churn is a retry, not an early continue:
+                                            // every retry must reach the shared deadline and
+                                            // bounded sleep below.
                                             last_error = Some(
                                                 "profile-bound CDP endpoint changed during readiness"
                                                     .to_string(),
                                             );
-                                            continue;
-                                        }
-                                        match child.try_wait() {
-                                            Ok(None) => {
-                                                return Ok((
-                                                    endpoint.port,
-                                                    Some(ws),
-                                                    Some(id),
-                                                    extension_runtime_id,
-                                                ))
-                                            }
-                                            Ok(Some(status)) => {
-                                                return Err(BrowserWorkspaceError::Launch(format!(
-                                                    "browser exited while its CDP endpoint became ready: {status}"
-                                                )))
-                                            }
-                                            Err(error) => {
-                                                return Err(BrowserWorkspaceError::Launch(format!(
-                                                    "failed to inspect browser after CDP readiness: {error}"
-                                                )))
-                                            }
                                         }
                                     }
+                                    _ => {
+                                        last_error = Some(if extension_required {
+                                            format!(
+                                                "CDP target list had no exact loopback page and approved extension service worker {}",
+                                                APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
+                                            )
+                                        } else {
+                                            "CDP target list had no exact loopback page target"
+                                                .to_string()
+                                        });
+                                    }
                                 }
-                                last_error = Some(if extension_required {
-                                    format!(
-                                        "CDP target list had no exact loopback page and approved extension service worker {}",
-                                        APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
-                                    )
-                                } else {
-                                    "CDP target list had no exact loopback page target".to_string()
-                                });
                             }
                             Err(error) => last_error = Some(error.to_string()),
                         }
@@ -2496,16 +2560,8 @@ async fn wait_for_cdp_target(
                 Err(error) => last_error = Some(error.to_string()),
             }
         }
-        if tokio::time::Instant::now() >= deadline {
-            let detail = last_error
-                .map(|error| format!("; last observation: {error}"))
-                .unwrap_or_default();
-            return Err(BrowserWorkspaceError::Launch(format!(
-                "timed out waiting for a profile-bound CDP endpoint within {}s{detail}",
-                CDP_STARTUP_TIMEOUT.as_secs()
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(retry_delay.min(remaining)).await;
     }
 }
 
@@ -3112,6 +3168,184 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         (address, task)
+    }
+
+    fn write_test_devtools_active_port(profile_dir: &Path, port: u16, token: &str) {
+        fs::write(
+            devtools_active_port_path(profile_dir),
+            format!("{port}\n/devtools/browser/{token}\n"),
+        )
+        .unwrap();
+    }
+
+    async fn spawn_churning_cdp_server(profile_dir: PathBuf) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_test_devtools_active_port(&profile_dir, port, "browser-a");
+        let task = tokio::spawn(async move {
+            let mut token_is_a = true;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let size =
+                    match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request))
+                        .await
+                    {
+                        Ok(Ok(size)) => size,
+                        _ => return,
+                    };
+                let request_text = String::from_utf8_lossy(&request[..size]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let body = match path {
+                    "/json/version" => {
+                        let token = if token_is_a { "browser-a" } else { "browser-b" };
+                        serde_json::json!({
+                            "webSocketDebuggerUrl":
+                                format!("ws://127.0.0.1:{port}/devtools/browser/{token}")
+                        })
+                        .to_string()
+                    }
+                    "/json/list" => {
+                        token_is_a = !token_is_a;
+                        let token = if token_is_a { "browser-a" } else { "browser-b" };
+                        write_test_devtools_active_port(&profile_dir, port, token);
+                        serde_json::json!([{
+                            "type": "page",
+                            "id": "page-1",
+                            "webSocketDebuggerUrl":
+                                format!("ws://127.0.0.1:{port}/devtools/page/page-1")
+                        }])
+                        .to_string()
+                    }
+                    _ => "{}".to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        (port, task)
+    }
+
+    async fn spawn_stalling_cdp_server(profile_dir: PathBuf) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_test_devtools_active_port(&profile_dir, port, "browser-a");
+        let task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        (port, task)
+    }
+
+    #[cfg(unix)]
+    fn spawn_long_running_test_child() -> Child {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        command.kill_on_drop(true);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_long_running_test_child() -> Child {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "ping -n 11 127.0.0.1 >NUL"]);
+        command.kill_on_drop(true);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn stalled_cdp_response_respects_startup_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_port, server) = spawn_stalling_cdp_server(temp.path().to_path_buf()).await;
+        let mut child = spawn_long_running_test_child();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_cdp_target_until(
+                &mut child,
+                temp.path(),
+                false,
+                tokio::time::Instant::now() + Duration::from_millis(300),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the internal CDP startup deadline must bound a stalled response");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for a profile-bound CDP endpoint"));
+        assert!(
+            error.contains("CDP version endpoint exceeded the fixed CDP startup deadline"),
+            "unexpected terminal observation: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled CDP response exceeded the bounded startup deadline"
+        );
+
+        let _ = child.start_kill();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cdp_endpoint_churn_remains_deadline_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_port, server) = spawn_churning_cdp_server(temp.path().to_path_buf()).await;
+        let mut child = spawn_long_running_test_child();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_cdp_target_until(
+                &mut child,
+                temp.path(),
+                false,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the internal CDP startup deadline must terminate endpoint churn");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for a profile-bound CDP endpoint"));
+        assert!(
+            error.contains("profile-bound CDP endpoint changed during readiness"),
+            "unexpected terminal observation: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "endpoint churn exceeded the bounded startup deadline"
+        );
+
+        let _ = child.start_kill();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
