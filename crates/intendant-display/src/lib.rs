@@ -4797,8 +4797,9 @@ impl DisplaySession {
     /// Permanently seal browser-originated input and clipboard mutation for
     /// this ephemeral display, drain the ordered input pump, and wait for its
     /// safety releases before proof automation injects direct CU actions.
-    /// Idempotent after a successful seal; a failed seal remains failed
-    /// closed and requires recreating the display session.
+    /// Idempotent after a successful seal. A failed seal stops the display
+    /// session before returning so no lingering browser input can overlap a
+    /// later direct-input caller; recovery requires recreating the session.
     pub async fn seal_browser_interactive_for_automation(
         &self,
         reason: &str,
@@ -4830,39 +4831,50 @@ impl DisplaySession {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        const SEAL_TIMEOUT: Duration = Duration::from_secs(2);
+        const SEAL_TIMEOUT: Duration = if cfg!(test) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(2)
+        };
         if let Some(mut input_pump) = input_pump {
             match tokio::time::timeout(SEAL_TIMEOUT, &mut input_pump).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    self.browser_interactive_seal_state
-                        .store(3, Ordering::SeqCst);
-                    return Err(CallerError::Display(format!(
+                    let error = CallerError::Display(format!(
                         "browser input pump failed while sealing proof display: {error}"
-                    )));
+                    ));
+                    return Err(self.fail_browser_interactive_seal(error).await);
                 }
                 Err(_) => {
                     *self
                         .input_pump_handle
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) = Some(input_pump);
-                    self.browser_interactive_seal_state
-                        .store(3, Ordering::SeqCst);
-                    return Err(CallerError::Display(format!(
-                        "browser input pump did not seal within {}s; recreate the display session",
-                        SEAL_TIMEOUT.as_secs()
-                    )));
+                    let error = CallerError::Display(format!(
+                        "browser input pump did not seal within {:?}; display session was stopped",
+                        SEAL_TIMEOUT
+                    ));
+                    return Err(self.fail_browser_interactive_seal(error).await);
                 }
             }
         }
         if let Err(error) = self.drain_browser_clipboard_mutations(SEAL_TIMEOUT).await {
-            self.browser_interactive_seal_state
-                .store(3, Ordering::SeqCst);
-            return Err(error);
+            return Err(self.fail_browser_interactive_seal(error).await);
         }
         self.browser_interactive_seal_state
             .store(2, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn fail_browser_interactive_seal(&self, error: CallerError) -> CallerError {
+        self.browser_interactive_seal_state
+            .store(3, Ordering::SeqCst);
+        // The input pump may be blocked inside a platform injector after the
+        // sealing wait expires. Stop and join the whole display session while
+        // the bounded proof still owns its exclusive display fence. Returning
+        // first would let a later direct-input caller overlap that old pump.
+        self.stop().await;
+        error
     }
 
     async fn drain_browser_clipboard_mutations(
@@ -8409,6 +8421,52 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), session.stop())
             .await
             .expect("stop must tear down the backend instead of deadlocking on injection");
+    }
+
+    #[tokio::test]
+    async fn failed_automation_seal_stops_stuck_input_before_returning() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(StopUnblocksInputBackend {
+            inject_started: started_tx,
+            stopped: AtomicBool::new(false),
+            stopped_notify: tokio::sync::Notify::new(),
+        });
+        let session = DisplaySession::new(0, backend.clone());
+        let source =
+            session.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        source.enqueue(test_key_down());
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("input injection must start")
+            .expect("started channel closed");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.seal_browser_interactive_for_automation("unit-test stuck proof seal"),
+        )
+        .await
+        .expect("failed seal must tear down the display within its bound")
+        .expect_err("stuck browser input must fail the automation seal");
+        assert!(
+            error.to_string().contains("display session was stopped"),
+            "unexpected seal failure: {error}"
+        );
+        assert!(
+            backend.stopped.load(Ordering::SeqCst),
+            "seal failure returned before backend teardown"
+        );
+        assert!(
+            session.shutdown.is_cancelled(),
+            "failed seal must permanently retire the display session"
+        );
+        assert!(
+            session
+                .input_pump_handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "failed seal returned with a live input pump"
+        );
     }
 
     #[tokio::test]
