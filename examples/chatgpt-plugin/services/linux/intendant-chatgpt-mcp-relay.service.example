@@ -1,0 +1,14 @@
+[Unit]
+Description=Intendant stable MCP relay for Secure MCP Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /absolute/path/to/Intendant/scripts/intendant-mcp-relay.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

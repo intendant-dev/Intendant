@@ -49,6 +49,9 @@ Add Intendant to your MCP client config (Claude Code
 }
 ```
 
+For a private ChatGPT or Codex connection that follows the daemon across web
+port handovers, see [ChatGPT Plugin over Secure MCP Tunnel](./chatgpt-plugin.md).
+
 ## Tools
 
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For

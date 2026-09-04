@@ -1,0 +1,40 @@
+{
+  "name": "intendant",
+  "version": "0.1.0",
+  "description": "Connect ChatGPT and Codex to a private local Intendant MCP facade.",
+  "author": {
+    "name": "Intendant",
+    "url": "https://github.com/intendant-dev/Intendant"
+  },
+  "homepage": "https://github.com/intendant-dev/Intendant",
+  "repository": "https://github.com/intendant-dev/Intendant",
+  "license": "MIT",
+  "keywords": [
+    "intendant",
+    "mcp",
+    "agents"
+  ],
+  "interface": {
+    "displayName": "Intendant",
+    "shortDescription": "Use the local Intendant MCP facade.",
+    "longDescription": "Connect ChatGPT and Codex to the local Intendant MCP facade through a private outbound-only Secure MCP Tunnel.",
+    "developerName": "Intendant",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/intendant-dev/Intendant",
+    "defaultPrompt": [
+      "Show me the available Intendant tools.",
+      "Use Intendant to inspect the running daemon.",
+      "Help me operate Intendant safely."
+    ],
+    "brandColor": "#5B61F6",
+    "composerIcon": "./assets/icon-128.png",
+    "logo": "./assets/logo.png",
+    "screenshots": [
+      "./assets/Intendant-X-banner-light.png"
+    ]
+  }
+}
