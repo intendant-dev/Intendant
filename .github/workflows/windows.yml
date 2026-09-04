@@ -656,6 +656,16 @@ jobs:
             --daemon-pid "${{ steps.daemon.outputs.pid }}" \
             --rig "${{ steps.daemon.outputs.rig }}"
 
+      - name: Upload CDN Linux cutover evidence
+        if: always() && runner.os == 'Linux' && steps.daemon.outputs.rig != '' && steps.relevance_unix.outputs.relevant != 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cdn-linux-display-cutover-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.daemon.outputs.rig }}/artifacts/cdn-linux-cutover/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
         shell: bash
