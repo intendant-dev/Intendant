@@ -25,6 +25,7 @@
 - [Station](./station.md)
 - [XR (immersive spatial dashboard)](./xr.md)
 - [MCP Server](./mcp-server.md)
+- [ChatGPT Plugin over Secure MCP Tunnel](./chatgpt-plugin.md)
 - [Integrations](./integrations.md)
 - [GitHub PR Integration](./github-pr-integration.md)
 - [Session Logging](./session-logging.md)

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.intendant.chatgpt-mcp-tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/tunnel-client</string>
+    <string>run</string>
+    <string>--profile-dir</string>
+    <string>/ABSOLUTE/PATH/TO/PRIVATE/PROFILE/DIRECTORY</string>
+    <string>--profile</string>
+    <string>intendant</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
