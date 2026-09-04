@@ -639,6 +639,33 @@ jobs:
             --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}#access/daemons&carry=$carry" \
             --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
 
+      # Production CDN admission stays at concurrency one. This cutover gate
+      # deliberately exercises two explicit display generations at once and
+      # proves caller/result isolation, child-scoped DISPLAY/XAUTHORITY, foreign
+      # Xvfb survival, exact teardown, and CI-runner non-interference.
+      - name: CDN Linux two-display isolation cutover
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          command -v Xvfb
+          command -v xauth
+          python3 scripts/test-linux-display-cutover.py \
+            --bin "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant" \
+            --port "${{ steps.daemon.outputs.port }}" \
+            --daemon-pid "${{ steps.daemon.outputs.pid }}" \
+            --rig "${{ steps.daemon.outputs.rig }}"
+
+      - name: Upload CDN Linux cutover evidence
+        if: always() && runner.os == 'Linux' && steps.daemon.outputs.rig != '' && steps.relevance_unix.outputs.relevant != 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cdn-linux-display-cutover-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.daemon.outputs.rig }}/artifacts/cdn-linux-cutover/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
         shell: bash
