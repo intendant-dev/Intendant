@@ -2690,8 +2690,9 @@ mod tests {
             .unwrap()
             .is_none());
 
+        let archive_path = std::env::temp_dir().join("extension.zip");
         let mut partial = sample_create_request();
-        partial.extension_archive_path = Some("/tmp/extension.zip".to_string());
+        partial.extension_archive_path = Some(archive_path.to_string_lossy().into_owned());
         assert!(parse_extension_archive_spec(&partial)
             .unwrap_err()
             .to_string()
@@ -2702,7 +2703,7 @@ mod tests {
         partial.extension_manifest_version = Some(APPROVED_BROWSER_EXTENSION_MANIFEST_VERSION);
         partial.extension_version = Some(APPROVED_BROWSER_EXTENSION_VERSION.to_string());
         let parsed = parse_extension_archive_spec(&partial).unwrap().unwrap();
-        assert_eq!(parsed.archive_path, PathBuf::from("/tmp/extension.zip"));
+        assert_eq!(parsed.archive_path, archive_path);
         assert_eq!(parsed.archive_sha256, APPROVED_BROWSER_EXTENSION_SHA256);
         assert_eq!(
             parsed.archive_byte_length,
