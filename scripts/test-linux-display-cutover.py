@@ -18,10 +18,16 @@ import sys
 import threading
 import time
 import urllib.request
+import stat
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+
+
+MAX_CDP_JSON_BYTES = 1024 * 1024
+MAX_ACTIVE_PORT_BYTES = 4096
+LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class CutoverError(RuntimeError):
@@ -132,7 +138,13 @@ class Driver:
     port: int
     home: Path
 
-    def call(self, *args: str, label: str = "ctl", allow_failure: bool = False) -> Any:
+    def call(
+        self,
+        *args: str,
+        label: str = "ctl",
+        allow_failure: bool = False,
+        command_timeout: float = 90.0,
+    ) -> Any:
         env = os.environ.copy()
         env["HOME"] = str(self.home)
         completed = subprocess.run(
@@ -148,7 +160,7 @@ class Driver:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=90,
+            timeout=command_timeout,
             check=False,
         )
         return parse_json_output(completed, label, allow_failure)
@@ -291,7 +303,7 @@ def decode_png(path: Path) -> tuple[int, int, int, list[bytes]]:
     return width, height, bytes_per_pixel, rows
 
 
-def verify_page_background(
+def inspect_page_background(
     path: Path,
     expected_geometry: tuple[int, int],
     expected_rgb: tuple[int, int, int],
@@ -309,17 +321,131 @@ def verify_page_background(
             samples.append(list(rgb))
             if all(abs(actual - expected) <= 8 for actual, expected in zip(rgb, expected_rgb)):
                 matching += 1
-    require(
-        matching >= 10,
-        f"{path} does not show the expected page color {expected_rgb}; "
-        f"matched {matching}/{len(samples)} samples",
-    )
     return {
         "expectedRgb": list(expected_rgb),
         "matchingSamples": matching,
         "sampleCount": len(samples),
+        "matchesExpectedColor": matching >= 10,
         "samples": samples,
     }
+
+
+SCREENSHOT_RECEIPT_FIELDS = {
+    "ok",
+    "artifactPath",
+    "sha256",
+    "mediaType",
+    "byteLength",
+    "width",
+    "height",
+    "capturedAt",
+    "savedAt",
+}
+
+
+def validate_screenshot_capture(
+    name: str,
+    display: dict[str, Any],
+    output: Path,
+    geometry: tuple[int, int],
+    ctl_receipt: Any,
+) -> dict[str, Any]:
+    require(output.is_file() and output.stat().st_size > 0, f"missing {name} screenshot")
+    screenshot_sha256 = sha256_file(output)
+    screenshot_size = output.stat().st_size
+
+    require(isinstance(ctl_receipt, dict), f"{name} screenshot returned no receipt")
+    require(
+        set(ctl_receipt) == SCREENSHOT_RECEIPT_FIELDS,
+        f"{name} screenshot receipt shape changed: {ctl_receipt}",
+    )
+    require(ctl_receipt["ok"] is True, f"{name} screenshot receipt is not successful")
+    require(ctl_receipt["artifactPath"] == str(output), f"{name} receipt path mismatch")
+    require(ctl_receipt["sha256"] == screenshot_sha256, f"{name} receipt hash mismatch")
+    require(ctl_receipt["mediaType"] == "image/png", f"{name} receipt media mismatch")
+    require(ctl_receipt["byteLength"] == screenshot_size, f"{name} receipt size mismatch")
+    require(
+        (ctl_receipt["width"], ctl_receipt["height"]) == geometry,
+        f"{name} receipt geometry mismatch",
+    )
+    require(
+        isinstance(ctl_receipt["capturedAt"], str) and ctl_receipt["capturedAt"],
+        f"{name} receipt has no capture time",
+    )
+    require(
+        isinstance(ctl_receipt["savedAt"], str) and ctl_receipt["savedAt"],
+        f"{name} receipt has no save time",
+    )
+    return {
+        "name": name,
+        "displayId": display["display_id"],
+        "artifactPath": str(output),
+        "sha256": screenshot_sha256,
+        "byteLength": screenshot_size,
+        "geometry": list(geometry),
+        "ctlReceipt": ctl_receipt,
+    }
+
+
+def capture_expected_page(
+    driver: Driver,
+    attempts_dir: Path,
+    name: str,
+    display: dict[str, Any],
+    geometry: tuple[int, int],
+    expected_rgb: tuple[int, int, int],
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    # CDP can report the target before Chromium has painted its X11 surface.
+    # Retry only a valid, receipt-bound frame whose pixels are not ready; any
+    # command, receipt, hash, shape, or geometry failure remains terminal.
+    started = time.monotonic()
+    deadline = started + timeout
+    prior_frames: list[dict[str, Any]] = []
+    attempt = 0
+    while True:
+        attempt += 1
+        output = (attempts_dir / f"{name}-{attempt:03d}.png").resolve()
+        ctl_receipt = driver.call(
+            "display",
+            "screenshot",
+            "--target",
+            display["display_target"],
+            "--output",
+            str(output),
+            label=f"screenshot {name} attempt {attempt}",
+            command_timeout=10.0,
+        )
+        evidence = validate_screenshot_capture(name, display, output, geometry, ctl_receipt)
+        color_evidence = inspect_page_background(output, geometry, expected_rgb)
+        evidence["pageColorEvidence"] = color_evidence
+        if color_evidence["matchesExpectedColor"]:
+            evidence["captureAttempts"] = attempt
+            evidence["paintReadyAfterMilliseconds"] = round(
+                (time.monotonic() - started) * 1000
+            )
+            evidence["priorCaptureFrames"] = prior_frames[-5:]
+            return evidence
+
+        prior_frames.append(
+            {
+                "attempt": attempt,
+                "artifactPath": str(output),
+                "sha256": evidence["sha256"],
+                "matchingSamples": color_evidence["matchingSamples"],
+                "samples": color_evidence["samples"],
+            }
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CutoverError(
+                f"{name} page did not paint within {timeout:.1f}s after "
+                f"{attempt} receipt-bound screenshots; last frame matched "
+                f"{color_evidence['matchingSamples']}/{color_evidence['sampleCount']} "
+                f"samples at {output}"
+            )
+        time.sleep(min(0.25, remaining))
+
 
 def choose_foreign_display() -> int:
     for display_id in range(99, 200):
@@ -330,16 +456,75 @@ def choose_foreign_display() -> int:
     raise CutoverError("no free display in the managed range")
 
 
+def fetch_loopback_json(url: str) -> Any:
+    request = urllib.request.Request(url, headers={"Connection": "close"})
+    with LOOPBACK_OPENER.open(request, timeout=2) as response:
+        require(response.status == 200, f"loopback endpoint returned HTTP {response.status}")
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            require(int(declared) <= MAX_CDP_JSON_BYTES, "loopback JSON exceeded its declared limit")
+        raw = response.read(MAX_CDP_JSON_BYTES + 1)
+    require(len(raw) <= MAX_CDP_JSON_BYTES, "loopback JSON exceeded its byte limit")
+    return json.loads(raw)
+
+
+def read_profile_cdp_endpoint(workspace: dict[str, Any]) -> tuple[int, str]:
+    path = Path(workspace["profile_dir"]) / "DevToolsActivePort"
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode), f"profile CDP endpoint is not a regular file: {path}")
+    require(before.st_nlink == 1, f"profile CDP endpoint is multiply linked: {path}")
+    require(0 < before.st_size <= MAX_ACTIVE_PORT_BYTES, f"profile CDP endpoint size is invalid: {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        require(
+            (opened.st_dev, opened.st_ino, opened.st_size)
+            == (before.st_dev, before.st_ino, before.st_size),
+            f"profile CDP endpoint changed before opening: {path}",
+        )
+        raw = os.read(fd, MAX_ACTIVE_PORT_BYTES + 1)
+        opened_after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    after = path.lstat()
+    require(len(raw) == opened.st_size <= MAX_ACTIVE_PORT_BYTES, f"profile CDP endpoint read was unstable: {path}")
+    require(
+        (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        == (opened_after.st_dev, opened_after.st_ino, opened_after.st_size, opened_after.st_mtime_ns)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+        f"profile CDP endpoint changed while reading: {path}",
+    )
+    text = raw.decode("ascii")
+    lines = text.splitlines()
+    require(len(lines) == 2, f"profile CDP endpoint shape is invalid: {path}")
+    require(lines[0].isdigit(), f"profile CDP endpoint port is invalid: {path}")
+    port = int(lines[0])
+    require(port == workspace["debugging_port"], f"profile CDP endpoint port drifted: {path}")
+    browser_path = lines[1]
+    token = browser_path.removeprefix("/devtools/browser/")
+    require(
+        browser_path == f"/devtools/browser/{token}"
+        and 0 < len(token) <= 128
+        and all(character.isascii() and (character.isalnum() or character in "-_") for character in token),
+        f"profile CDP browser WebSocket path is invalid: {path}",
+    )
+    return port, browser_path
+
+
 def cdp_target_matches(workspace: dict[str, Any], url: str, title: str) -> bool:
     try:
-        with urllib.request.urlopen(workspace["cdp_http_url"] + "/json/list", timeout=2) as response:
-            targets = json.load(response)
+        port, browser_path = read_profile_cdp_endpoint(workspace)
+        version = fetch_loopback_json(workspace["cdp_http_url"] + "/json/version")
+        if version.get("webSocketDebuggerUrl") != f"ws://127.0.0.1:{port}{browser_path}":
+            return False
+        targets = fetch_loopback_json(workspace["cdp_http_url"] + "/json/list")
     except Exception:
         return False
-    return any(
+    return isinstance(targets, list) and any(
         target.get("type") == "page"
         and target.get("id") == workspace["active_target_id"]
         and target.get("url") == url
+        and target.get("webSocketDebuggerUrl") == workspace["cdp_ws_url"]
         and title in str(target.get("title", ""))
         for target in targets
     )
@@ -365,9 +550,32 @@ def validate_workspace(value: Any, url: str, display: dict[str, Any]) -> dict[st
     require(value.get("provider") == "cdp", f"wrong provider: {value}")
     require(value.get("url") == url, f"workspace URL mismatch: {value}")
     require(value.get("display_target") == display["display_target"], f"workspace display mismatch: {value}")
-    require(isinstance(value.get("process_id"), int), f"missing browser pid: {value}")
-    require(isinstance(value.get("active_target_id"), str), f"missing active target: {value}")
-    require(isinstance(value.get("cdp_http_url"), str), f"missing CDP URL: {value}")
+    workspace_id = value.get("id")
+    require(
+        isinstance(workspace_id, str)
+        and len(workspace_id) == 35
+        and workspace_id.startswith("bw-")
+        and all(character in "0123456789abcdef" for character in workspace_id[3:]),
+        f"workspace id is not canonical: {value}",
+    )
+    process_id = value.get("process_id")
+    require(isinstance(process_id, int) and process_id > 0, f"missing browser pid: {value}")
+    port = value.get("debugging_port")
+    require(isinstance(port, int) and 0 < port <= 65535, f"invalid debugging port: {value}")
+    target_id = value.get("active_target_id")
+    require(
+        isinstance(target_id, str)
+        and 0 < len(target_id) <= 128
+        and all(character.isascii() and (character.isalnum() or character in "-_") for character in target_id),
+        f"invalid active target: {value}",
+    )
+    profile_dir = value.get("profile_dir")
+    require(isinstance(profile_dir, str) and Path(profile_dir).is_absolute(), f"invalid profile path: {value}")
+    require(value.get("cdp_http_url") == f"http://127.0.0.1:{port}", f"CDP HTTP URL mismatch: {value}")
+    require(
+        value.get("cdp_ws_url") == f"ws://127.0.0.1:{port}/devtools/page/{target_id}",
+        f"CDP page WebSocket mismatch: {value}",
+    )
     return value
 
 
@@ -598,76 +806,23 @@ def main() -> int:
             ("alpha", first, (800, 600), (220, 35, 45)),
             ("bravo", second, (1024, 720), (30, 65, 220)),
         ]
+        attempts_dir = artifact_dir / "paint-attempts"
+        attempts_dir.mkdir(mode=0o700)
         with ThreadPoolExecutor(max_workers=2) as pool:
             screenshot_futures = [
                 pool.submit(
-                    driver.call,
-                    "display",
-                    "screenshot",
-                    "--target",
-                    display["display_target"],
-                    "--output",
-                    str(artifact_dir / f"{name}.png"),
-                    label="screenshot " + name,
+                    capture_expected_page,
+                    driver,
+                    attempts_dir,
+                    name,
+                    display,
+                    geometry,
+                    expected_rgb,
                 )
-                for name, display, _, _ in screenshot_inputs
+                for name, display, geometry, expected_rgb in screenshot_inputs
             ]
+            screenshots = [future.result() for future in screenshot_futures]
 
-            screenshots: list[dict[str, Any]] = []
-            for (name, display, geometry, expected_rgb), future in zip(
-                screenshot_inputs, screenshot_futures, strict=True
-            ):
-                output = (artifact_dir / f"{name}.png").resolve()
-                ctl_receipt = future.result()
-                require(output.is_file() and output.stat().st_size > 0, f"missing {name} screenshot")
-                screenshot_sha256 = sha256_file(output)
-                screenshot_size = output.stat().st_size
-                color_evidence = verify_page_background(output, geometry, expected_rgb)
-
-                require(isinstance(ctl_receipt, dict), f"{name} screenshot returned no receipt")
-                require(
-                    set(ctl_receipt)
-                    == {
-                        "ok",
-                        "artifactPath",
-                        "sha256",
-                        "mediaType",
-                        "byteLength",
-                        "width",
-                        "height",
-                        "capturedAt",
-                        "savedAt",
-                    },
-                    f"{name} screenshot receipt shape changed: {ctl_receipt}",
-                )
-                require(ctl_receipt["ok"] is True, f"{name} screenshot receipt is not successful")
-                require(ctl_receipt["artifactPath"] == str(output), f"{name} receipt path mismatch")
-                require(ctl_receipt["sha256"] == screenshot_sha256, f"{name} receipt hash mismatch")
-                require(ctl_receipt["mediaType"] == "image/png", f"{name} receipt media mismatch")
-                require(ctl_receipt["byteLength"] == screenshot_size, f"{name} receipt size mismatch")
-                require(
-                    (ctl_receipt["width"], ctl_receipt["height"]) == geometry,
-                    f"{name} receipt geometry mismatch",
-                )
-                require(
-                    isinstance(ctl_receipt["capturedAt"], str) and ctl_receipt["capturedAt"],
-                    f"{name} receipt has no capture time",
-                )
-                require(
-                    isinstance(ctl_receipt["savedAt"], str) and ctl_receipt["savedAt"],
-                    f"{name} receipt has no save time",
-                )
-                screenshots.append(
-                    {
-                        "name": name,
-                        "displayId": display["display_id"],
-                        "sha256": screenshot_sha256,
-                        "byteLength": screenshot_size,
-                        "geometry": list(geometry),
-                        "pageColorEvidence": color_evidence,
-                        "ctlReceipt": ctl_receipt,
-                    }
-                )
         require(
             screenshots[0]["sha256"] != screenshots[1]["sha256"],
             "distinct pages produced identical screenshots",
