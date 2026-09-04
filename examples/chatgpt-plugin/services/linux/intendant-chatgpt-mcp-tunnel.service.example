@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for Intendant
+After=network-online.target intendant-chatgpt-mcp-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/absolute/path/to/tunnel-client run --profile-dir /absolute/path/to/private/profile/directory --profile intendant
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
