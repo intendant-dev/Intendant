@@ -1026,6 +1026,36 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "daemon-created virtual display"
             ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
+            flag!(
+                "extension-archive",
+                "extension_archive_path",
+                Str,
+                "absolute immutable extension zip"
+            ),
+            flag!(
+                "extension-sha256",
+                "extension_archive_sha256",
+                Str,
+                "expected lowercase extension archive sha256"
+            ),
+            flag!(
+                "extension-bytes",
+                "extension_archive_byte_length",
+                U64,
+                "expected extension archive byte length"
+            ),
+            flag!(
+                "extension-manifest-version",
+                "extension_manifest_version",
+                U64,
+                "expected manifest_version"
+            ),
+            flag!(
+                "extension-version",
+                "extension_version",
+                Str,
+                "expected extension version"
+            ),
         ],
         help: "Create a browser workspace",
     },

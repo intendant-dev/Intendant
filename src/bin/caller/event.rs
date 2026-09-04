@@ -2843,6 +2843,16 @@ pub enum ControlMsg {
         display_target: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_archive_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_archive_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_archive_byte_length: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_manifest_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_version: Option<String>,
     },
     CloseBrowserWorkspace {
         workspace_id: String,
@@ -5968,6 +5978,11 @@ mod tests {
                 owner_session_id: Some("session-1".to_string()),
                 display_target: None,
                 profile_dir: None,
+                extension_archive_path: None,
+                extension_archive_sha256: None,
+                extension_archive_byte_length: None,
+                extension_manifest_version: None,
+                extension_version: None,
             },
             ControlMsg::CloseBrowserWorkspace {
                 workspace_id: "bw-test".to_string(),

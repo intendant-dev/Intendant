@@ -786,6 +786,7 @@ mod tests {
             owner_session_id: Some("attempt-1".to_string()),
             display_target: Some("display_99".to_string()),
             profile_dir: Some("/tmp/profile".to_string()),
+            extension: None,
             browser_executable: Some("/usr/bin/chromium".to_string()),
             browser_executable_source: Some("managed".to_string()),
             process_id: Some(10),
