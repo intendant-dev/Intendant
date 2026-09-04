@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import binascii
 import hashlib
 import http.server
 import json
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -178,12 +180,146 @@ font:800 52px sans-serif}}</style><div>{title}</div>""".encode()
         print("proof-http: " + fmt % args)
 
 
-def png_geometry(path: Path) -> tuple[int, int]:
-    data = path.read_bytes()[:24]
-    require(data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG")
-    require(data[12:16] == b"IHDR", f"{path} has no leading IHDR")
-    return struct.unpack(">II", data[16:24])
+def paeth_predictor(left: int, up: int, upper_left: int) -> int:
+    estimate = left + up - upper_left
+    left_distance = abs(estimate - left)
+    up_distance = abs(estimate - up)
+    upper_left_distance = abs(estimate - upper_left)
+    if left_distance <= up_distance and left_distance <= upper_left_distance:
+        return left
+    if up_distance <= upper_left_distance:
+        return up
+    return upper_left
 
+
+def decode_png(path: Path) -> tuple[int, int, int, list[bytes]]:
+    data = path.read_bytes()
+    require(data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG")
+    cursor = 8
+    width = height = bit_depth = color_type = None
+    compression = filter_method = interlace = None
+    compressed = bytearray()
+    saw_iend = False
+
+    while cursor < len(data):
+        require(cursor + 12 <= len(data), f"{path} has a truncated PNG chunk")
+        length = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        chunk_type = data[cursor + 4 : cursor + 8]
+        payload_start = cursor + 8
+        payload_end = payload_start + length
+        require(payload_end + 4 <= len(data), f"{path} has an oversized PNG chunk")
+        payload = data[payload_start:payload_end]
+        expected_crc = struct.unpack(">I", data[payload_end : payload_end + 4])[0]
+        actual_crc = binascii.crc32(chunk_type + payload) & 0xFFFFFFFF
+        require(actual_crc == expected_crc, f"{path} has a bad {chunk_type!r} CRC")
+        cursor = payload_end + 4
+
+        if chunk_type == b"IHDR":
+            require(width is None and length == 13, f"{path} has an invalid IHDR")
+            (
+                width,
+                height,
+                bit_depth,
+                color_type,
+                compression,
+                filter_method,
+                interlace,
+            ) = struct.unpack(">IIBBBBB", payload)
+        elif chunk_type == b"IDAT":
+            require(width is not None, f"{path} has IDAT before IHDR")
+            compressed.extend(payload)
+            require(len(compressed) <= 64 * 1024 * 1024, f"{path} has oversized IDAT data")
+        elif chunk_type == b"IEND":
+            require(length == 0, f"{path} has a non-empty IEND")
+            saw_iend = True
+            break
+
+    require(saw_iend and cursor == len(data), f"{path} has a missing IEND or trailing bytes")
+    require(
+        width is not None
+        and height is not None
+        and 0 < width <= 4096
+        and 0 < height <= 4096,
+        f"{path} has invalid dimensions",
+    )
+    require(bit_depth == 8, f"{path} must use 8-bit PNG samples")
+    require(color_type in {2, 6}, f"{path} must be RGB or RGBA")
+    require(
+        compression == 0 and filter_method == 0 and interlace == 0,
+        f"{path} uses unsupported PNG encoding",
+    )
+
+    bytes_per_pixel = 3 if color_type == 2 else 4
+    row_bytes = width * bytes_per_pixel
+    expected_length = height * (row_bytes + 1)
+    try:
+        inflated = zlib.decompress(bytes(compressed))
+    except zlib.error as error:
+        raise CutoverError(f"{path} has invalid compressed pixels: {error}") from error
+    require(
+        len(inflated) == expected_length,
+        f"{path} decoded to {len(inflated)} bytes; expected {expected_length}",
+    )
+
+    rows: list[bytes] = []
+    previous = bytearray(row_bytes)
+    offset = 0
+    for row_index in range(height):
+        filter_type = inflated[offset]
+        raw = inflated[offset + 1 : offset + 1 + row_bytes]
+        offset += row_bytes + 1
+        require(filter_type <= 4, f"{path} row {row_index} uses bad PNG filter {filter_type}")
+        reconstructed = bytearray(row_bytes)
+        for index, byte in enumerate(raw):
+            left = reconstructed[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            up = previous[index]
+            upper_left = previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            if filter_type == 0:
+                predictor = 0
+            elif filter_type == 1:
+                predictor = left
+            elif filter_type == 2:
+                predictor = up
+            elif filter_type == 3:
+                predictor = (left + up) // 2
+            else:
+                predictor = paeth_predictor(left, up, upper_left)
+            reconstructed[index] = (byte + predictor) & 0xFF
+        rows.append(bytes(reconstructed))
+        previous = reconstructed
+
+    return width, height, bytes_per_pixel, rows
+
+
+def verify_page_background(
+    path: Path,
+    expected_geometry: tuple[int, int],
+    expected_rgb: tuple[int, int, int],
+) -> dict[str, Any]:
+    width, height, bytes_per_pixel, rows = decode_png(path)
+    require((width, height) == expected_geometry, f"{path} screenshot geometry mismatch")
+    samples: list[list[int]] = []
+    matching = 0
+    for y_fraction in (0.60, 0.75, 0.90):
+        y = min(height - 1, int(height * y_fraction))
+        for x_fraction in (0.15, 0.35, 0.65, 0.85):
+            x = min(width - 1, int(width * x_fraction))
+            offset = x * bytes_per_pixel
+            rgb = tuple(rows[y][offset : offset + 3])
+            samples.append(list(rgb))
+            if all(abs(actual - expected) <= 8 for actual, expected in zip(rgb, expected_rgb)):
+                matching += 1
+    require(
+        matching >= 10,
+        f"{path} does not show the expected page color {expected_rgb}; "
+        f"matched {matching}/{len(samples)} samples",
+    )
+    return {
+        "expectedRgb": list(expected_rgb),
+        "matchingSamples": matching,
+        "sampleCount": len(samples),
+        "samples": samples,
+    }
 
 def choose_foreign_display() -> int:
     for display_id in range(99, 200):
@@ -264,6 +400,7 @@ def main() -> int:
     displays: list[dict[str, Any]] = []
     browser_pids: list[dict[str, Any]] = []
     foreign: subprocess.Popen[bytes] | None = None
+    foreign_log: Any | None = None
     sentinel: subprocess.Popen[bytes] | None = None
     server: http.server.ThreadingHTTPServer | None = None
     server_thread: threading.Thread | None = None
@@ -298,8 +435,16 @@ def main() -> int:
         receipt["tmpInodeUsePercent"] = inode_use
 
         daemon_before = pid_signature(args.daemon_pid)
+        daemon_environment_before = process_environment(args.daemon_pid)
+        daemon_display_before = daemon_environment_before.get("DISPLAY")
+        daemon_xauthority_before = daemon_environment_before.get("XAUTHORITY")
         runners_before = runner_snapshot()
         receipt["daemon"] = daemon_before
+        receipt["daemonEnvironment"] = {
+            "displayPresentBefore": daemon_display_before is not None,
+            "xauthorityPresentBefore": daemon_xauthority_before is not None,
+            "unchanged": False,
+        }
         receipt["runnerSentinelsBefore"] = runners_before
 
         foreign_id = choose_foreign_display()
@@ -449,33 +594,80 @@ def main() -> int:
             "displays reused Xauthority",
         )
 
-        screenshots: list[dict[str, Any]] = []
-        for name, display, geometry in [
-            ("alpha", first, (800, 600)),
-            ("bravo", second, (1024, 720)),
-        ]:
-            output = artifact_dir / f"{name}.png"
-            ctl_receipt = driver.call(
-                "display",
-                "screenshot",
-                "--target",
-                display["display_target"],
-                "--output",
-                str(output),
-                label="screenshot " + name,
-            )
-            require(output.is_file() and output.stat().st_size > 0, f"missing {name} screenshot")
-            require(png_geometry(output) == geometry, f"{name} screenshot geometry mismatch")
-            screenshots.append(
-                {
-                    "name": name,
-                    "displayId": display["display_id"],
-                    "sha256": sha256_file(output),
-                    "byteLength": output.stat().st_size,
-                    "geometry": list(geometry),
-                    "ctlReceipt": ctl_receipt,
-                }
-            )
+        screenshot_inputs = [
+            ("alpha", first, (800, 600), (220, 35, 45)),
+            ("bravo", second, (1024, 720), (30, 65, 220)),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            screenshot_futures = [
+                pool.submit(
+                    driver.call,
+                    "display",
+                    "screenshot",
+                    "--target",
+                    display["display_target"],
+                    "--output",
+                    str(artifact_dir / f"{name}.png"),
+                    label="screenshot " + name,
+                )
+                for name, display, _, _ in screenshot_inputs
+            ]
+
+            screenshots: list[dict[str, Any]] = []
+            for (name, display, geometry, expected_rgb), future in zip(
+                screenshot_inputs, screenshot_futures, strict=True
+            ):
+                output = (artifact_dir / f"{name}.png").resolve()
+                ctl_receipt = future.result()
+                require(output.is_file() and output.stat().st_size > 0, f"missing {name} screenshot")
+                screenshot_sha256 = sha256_file(output)
+                screenshot_size = output.stat().st_size
+                color_evidence = verify_page_background(output, geometry, expected_rgb)
+
+                require(isinstance(ctl_receipt, dict), f"{name} screenshot returned no receipt")
+                require(
+                    set(ctl_receipt)
+                    == {
+                        "ok",
+                        "artifactPath",
+                        "sha256",
+                        "mediaType",
+                        "byteLength",
+                        "width",
+                        "height",
+                        "capturedAt",
+                        "savedAt",
+                    },
+                    f"{name} screenshot receipt shape changed: {ctl_receipt}",
+                )
+                require(ctl_receipt["ok"] is True, f"{name} screenshot receipt is not successful")
+                require(ctl_receipt["artifactPath"] == str(output), f"{name} receipt path mismatch")
+                require(ctl_receipt["sha256"] == screenshot_sha256, f"{name} receipt hash mismatch")
+                require(ctl_receipt["mediaType"] == "image/png", f"{name} receipt media mismatch")
+                require(ctl_receipt["byteLength"] == screenshot_size, f"{name} receipt size mismatch")
+                require(
+                    (ctl_receipt["width"], ctl_receipt["height"]) == geometry,
+                    f"{name} receipt geometry mismatch",
+                )
+                require(
+                    isinstance(ctl_receipt["capturedAt"], str) and ctl_receipt["capturedAt"],
+                    f"{name} receipt has no capture time",
+                )
+                require(
+                    isinstance(ctl_receipt["savedAt"], str) and ctl_receipt["savedAt"],
+                    f"{name} receipt has no save time",
+                )
+                screenshots.append(
+                    {
+                        "name": name,
+                        "displayId": display["display_id"],
+                        "sha256": screenshot_sha256,
+                        "byteLength": screenshot_size,
+                        "geometry": list(geometry),
+                        "pageColorEvidence": color_evidence,
+                        "ctlReceipt": ctl_receipt,
+                    }
+                )
         require(
             screenshots[0]["sha256"] != screenshots[1]["sha256"],
             "distinct pages produced identical screenshots",
@@ -526,6 +718,16 @@ def main() -> int:
         require(signature_live(foreign_signature), "foreign Xvfb was killed")
         require(signature_live(sentinel_signature), "synthetic sentinel was disturbed")
         require(pid_signature(args.daemon_pid) == daemon_before, "daemon identity changed")
+        daemon_environment_after = process_environment(args.daemon_pid)
+        require(
+            daemon_environment_after.get("DISPLAY") == daemon_display_before,
+            "virtual-display creation mutated the daemon-wide DISPLAY",
+        )
+        require(
+            daemon_environment_after.get("XAUTHORITY") == daemon_xauthority_before,
+            "virtual-display creation mutated the daemon-wide XAUTHORITY",
+        )
+        receipt["daemonEnvironment"]["unchanged"] = True
         runners_after = runner_snapshot()
         require(runners_after == runners_before, "CI runner identities changed")
         receipt["runnerSentinelsAfter"] = runners_after
@@ -555,6 +757,8 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        if foreign_log is not None:
+            foreign_log.close()
         (artifact_dir / "cutover-receipt.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n"
         )
