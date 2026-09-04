@@ -19,6 +19,9 @@ static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = Onc
 
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const CDP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+const CDP_JSON_MAX_BYTES: usize = 1024 * 1024;
+const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
+const DEVTOOLS_ACTIVE_PORT_MAX_BYTES: u64 = 4 * 1024;
 const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
 const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
 // macOS-only system-browser escape hatch; other platforms' discovery path never consults it.
@@ -1070,6 +1073,10 @@ pub(crate) async fn verify_live_workspace(workspace: &BrowserWorkspace) -> Resul
         .active_target_id
         .as_deref()
         .ok_or_else(|| "browser workspace has no active target id".to_string())?;
+    let profile_dir = workspace
+        .profile_dir
+        .as_deref()
+        .ok_or_else(|| "browser workspace has no profile directory".to_string())?;
     let expected_http = format!("http://127.0.0.1:{port}");
     if workspace.cdp_http_url.as_deref() != Some(expected_http.as_str()) {
         return Err("browser workspace CDP URL is not its exact loopback port".to_string());
@@ -1078,29 +1085,74 @@ pub(crate) async fn verify_live_workspace(workspace: &BrowserWorkspace) -> Resul
         return Err("browser workspace process is no longer live".to_string());
     }
 
+    let endpoint = read_devtools_active_port(Path::new(profile_dir))
+        .map_err(|error| {
+            format!("browser workspace profile-bound CDP endpoint could not be read: {error}")
+        })?
+        .ok_or_else(|| {
+            "browser workspace profile-bound CDP endpoint is no longer present".to_string()
+        })?;
+    if endpoint.port != port {
+        return Err("browser workspace profile-bound CDP port changed after launch".to_string());
+    }
+
+    let client = local_cdp_client()
+        .map_err(|error| format!("browser workspace CDP client failed: {error}"))?;
+    let version_url = format!("{expected_http}/json/version");
+    let version = fetch_bounded_cdp_json(
+        &client,
+        &version_url,
+        "browser workspace CDP version endpoint",
+    )
+    .await
+    .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?;
+    validate_browser_websocket_identity(&version, &endpoint)
+        .map_err(|error| format!("browser workspace CDP identity check failed: {error}"))?;
+
     let list_url = format!("{expected_http}/json/list");
-    let response = reqwest::Client::new()
-        .get(&list_url)
-        .timeout(CDP_LIVENESS_TIMEOUT)
-        .send()
+    let targets = fetch_bounded_cdp_json(&client, &list_url, "browser workspace CDP target list")
         .await
-        .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?
-        .error_for_status()
         .map_err(|error| format!("browser workspace CDP liveness probe failed: {error}"))?;
-    let targets: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| format!("browser workspace CDP target list was invalid: {error}"))?;
     let target = exact_page_target(&targets, target_id)
         .ok_or_else(|| "browser workspace active page target is no longer live".to_string())?;
     let target_ws = target
         .get("webSocketDebuggerUrl")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "browser workspace active page target has no debugger URL".to_string())?;
+    let expected_target_path = format!("/devtools/page/{target_id}");
+    if !exact_loopback_websocket_url(target_ws, port, &expected_target_path) {
+        return Err(
+            "browser workspace active page debugger URL is not its exact loopback target"
+                .to_string(),
+        );
+    }
     if workspace.cdp_ws_url.as_deref() != Some(target_ws) {
         return Err("browser workspace active page debugger URL changed".to_string());
     }
+    if let Some(extension) = workspace.extension.as_ref() {
+        let expected_runtime_id = extension
+            .runtime_id
+            .as_deref()
+            .ok_or_else(|| "browser workspace extension has no runtime id".to_string())?;
+        if active_extension_runtime_id(&targets).as_deref() != Some(expected_runtime_id) {
+            return Err(
+                "browser workspace approved extension service worker is no longer live".to_string(),
+            );
+        }
+    }
 
+    let endpoint_after = read_devtools_active_port(Path::new(profile_dir))
+        .map_err(|error| {
+            format!("browser workspace profile-bound CDP endpoint changed during probe: {error}")
+        })?
+        .ok_or_else(|| {
+            "browser workspace profile-bound CDP endpoint disappeared during probe".to_string()
+        })?;
+    if endpoint_after != endpoint {
+        return Err(
+            "browser workspace profile-bound CDP endpoint changed during probe".to_string(),
+        );
+    }
     verify_registered_child(workspace).await?;
     if !crate::platform::process_alive(pid) {
         return Err("browser workspace process exited during its CDP liveness probe".to_string());
@@ -1324,6 +1376,12 @@ struct CdpLaunch {
     web_socket_debugger_url: Option<String>,
     target_id: Option<String>,
     extension_runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DevToolsActivePort {
+    port: u16,
+    browser_websocket_path: String,
 }
 
 fn browser_extension_workspace_root(workspace_id: &str) -> PathBuf {
@@ -1933,7 +1991,7 @@ async fn launch_cdp_browser(
             )));
         }
     }
-    let port = reserve_local_port().await?;
+    clear_stale_devtools_active_port(profile_dir)?;
     let mut command = tokio::process::Command::new(&executable.path);
     // If the async create request is cancelled while CDP readiness is being
     // awaited, dropping its future must also terminate the spawned browser.
@@ -1961,7 +2019,7 @@ async fn launch_cdp_browser(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-debugging-port=0")
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
@@ -1988,15 +2046,15 @@ async fn launch_cdp_browser(
     } else {
         command.arg("about:blank");
     }
-    let child = command.spawn().map_err(|e| {
+    let mut child = command.spawn().map_err(|e| {
         BrowserWorkspaceError::Launch(format!(
             "failed to launch {}: {e}",
             executable.path.display()
         ))
     })?;
     let process_id = child.id();
-    match wait_for_cdp_target(port, extension_required).await {
-        Ok((ws, target_id, extension_runtime_id)) => Ok((
+    match wait_for_cdp_target(&mut child, profile_dir, extension_required).await {
+        Ok((port, ws, target_id, extension_runtime_id)) => Ok((
             child,
             CdpLaunch {
                 executable,
@@ -2026,56 +2084,484 @@ fn browser_extension_launch_flags(extension: Option<&BrowserWorkspaceExtension>)
     }
 }
 
-async fn reserve_local_port() -> Result<u16, BrowserWorkspaceError> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+fn devtools_active_port_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join(DEVTOOLS_ACTIVE_PORT_FILE)
+}
+
+fn clear_stale_devtools_active_port(profile_dir: &Path) -> Result<(), BrowserWorkspaceError> {
+    let path = devtools_active_port_path(profile_dir);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                return Err(BrowserWorkspaceError::Launch(format!(
+                    "stale {DEVTOOLS_ACTIVE_PORT_FILE} path is a directory: {}",
+                    path.display()
+                )));
+            }
+            // remove_file removes a symlink/reparse leaf itself rather than its
+            // target. The subsequent reader also opens without following links.
+            fs::remove_file(&path).map_err(|error| {
+                BrowserWorkspaceError::Io(format!(
+                    "failed to remove stale {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+                    path.display()
+                ))
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BrowserWorkspaceError::Io(format!(
+            "failed to inspect stale {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn parse_devtools_active_port(
+    bytes: &[u8],
+) -> Result<Option<DevToolsActivePort>, BrowserWorkspaceError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        BrowserWorkspaceError::Launch(format!("{DEVTOOLS_ACTIVE_PORT_FILE} was not valid UTF-8"))
+    })?;
+    if text
+        .bytes()
+        .any(|byte| byte == 0 || (byte.is_ascii_control() && !matches!(byte, b'\r' | b'\n')))
+    {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} contained control bytes"
+        )));
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() < 2 {
+        // Chrome may have created the file before its one small write is fully
+        // observable. Let the bounded startup loop retry.
+        return Ok(None);
+    }
+    if lines.len() != 2 {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} must contain exactly a port and browser WebSocket path"
+        )));
+    }
+    let port_line = lines[0];
+    if port_line.is_empty() || !port_line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} contained an invalid port"
+        )));
+    }
+    let port = port_line.parse::<u16>().map_err(|_| {
+        BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} contained an out-of-range port"
+        ))
+    })?;
+    if port == 0 {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} contained port zero"
+        )));
+    }
+    let browser_websocket_path = lines[1];
+    let token = browser_websocket_path
+        .strip_prefix("/devtools/browser/")
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            BrowserWorkspaceError::Launch(format!(
+                "{DEVTOOLS_ACTIVE_PORT_FILE} contained an invalid browser WebSocket path"
+            ))
+        })?;
+    if browser_websocket_path.len() > 256
+        || token.len() > 128
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} contained an unsafe browser WebSocket path"
+        )));
+    }
+    Ok(Some(DevToolsActivePort {
+        port,
+        browser_websocket_path: browser_websocket_path.to_string(),
+    }))
+}
+
+fn read_devtools_active_port(
+    profile_dir: &Path,
+) -> Result<Option<DevToolsActivePort>, BrowserWorkspaceError> {
+    let path = devtools_active_port_path(profile_dir);
+    let source_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BrowserWorkspaceError::Io(format!(
+                "failed to inspect {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let source_is_link_like = intendant_platform::platform::path_leaf_is_symlink_or_reparse(&path)
+        .map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to inspect {DEVTOOLS_ACTIVE_PORT_FILE} leaf {}: {error}",
+                path.display()
+            ))
+        })?;
+    if source_is_link_like || !source_metadata.is_file() {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} must be a regular non-symlink, non-reparse file: {}",
+            path.display()
+        )));
+    }
+    if source_metadata.len() == 0 {
+        return Ok(None);
+    }
+    if source_metadata.len() > DEVTOOLS_ACTIVE_PORT_MAX_BYTES {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} exceeded the {DEVTOOLS_ACTIVE_PORT_MAX_BYTES}-byte limit"
+        )));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to open {DEVTOOLS_ACTIVE_PORT_FILE} {} without following links: {error}",
+            path.display()
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        BrowserWorkspaceError::Io(format!(
+            "failed to inspect opened {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(BrowserWorkspaceError::Launch(format!(
+                "opened {DEVTOOLS_ACTIVE_PORT_FILE} is a Windows reparse point: {}",
+                path.display()
+            )));
+        }
+    }
+    if !opened_metadata.is_file() || opened_metadata.len() > DEVTOOLS_ACTIVE_PORT_MAX_BYTES {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "opened {DEVTOOLS_ACTIVE_PORT_FILE} was not a bounded regular file"
+        )));
+    }
+    let opened_len = opened_metadata.len();
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_len).unwrap_or(0));
+    std::io::Read::by_ref(&mut file)
+        .take(DEVTOOLS_ACTIVE_PORT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to read {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+                path.display()
+            ))
+        })?;
+    let read_len = u64::try_from(bytes.len()).map_err(|_| {
+        BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} length did not fit this platform"
+        ))
+    })?;
+    if read_len > DEVTOOLS_ACTIVE_PORT_MAX_BYTES {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{DEVTOOLS_ACTIVE_PORT_FILE} exceeded the {DEVTOOLS_ACTIVE_PORT_MAX_BYTES}-byte limit"
+        )));
+    }
+    let after_len = file
+        .metadata()
+        .map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to re-inspect {DEVTOOLS_ACTIVE_PORT_FILE} {}: {error}",
+                path.display()
+            ))
+        })?
+        .len();
+    if opened_len != after_len || read_len != after_len {
+        return Ok(None);
+    }
+    parse_devtools_active_port(&bytes)
+}
+
+fn build_local_cdp_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, BrowserWorkspaceError> {
+    builder
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CDP_LIVENESS_TIMEOUT)
+        .timeout(CDP_LIVENESS_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            BrowserWorkspaceError::Launch(format!("failed to build local CDP client: {error}"))
+        })
+}
+
+fn local_cdp_client() -> Result<reqwest::Client, BrowserWorkspaceError> {
+    build_local_cdp_client(reqwest::Client::builder())
+}
+
+async fn fetch_bounded_cdp_json(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+) -> Result<serde_json::Value, BrowserWorkspaceError> {
+    let mut response = client.get(url).send().await.map_err(|error| {
+        BrowserWorkspaceError::Launch(format!("{label} request failed: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{label} returned HTTP {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > CDP_JSON_MAX_BYTES as u64)
+    {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "{label} exceeded the {CDP_JSON_MAX_BYTES}-byte limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| BrowserWorkspaceError::Io(format!("failed to reserve CDP port: {e}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| BrowserWorkspaceError::Io(format!("failed to read CDP port: {e}")))?
-        .port();
-    drop(listener);
-    Ok(port)
+        .map_err(|error| BrowserWorkspaceError::Launch(format!("{label} body failed: {error}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > CDP_JSON_MAX_BYTES {
+            return Err(BrowserWorkspaceError::Launch(format!(
+                "{label} exceeded the {CDP_JSON_MAX_BYTES}-byte limit"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        BrowserWorkspaceError::Launch(format!("{label} returned invalid JSON: {error}"))
+    })
+}
+
+async fn fetch_bounded_cdp_json_before(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+    deadline: tokio::time::Instant,
+) -> Result<serde_json::Value, BrowserWorkspaceError> {
+    tokio::time::timeout_at(deadline, fetch_bounded_cdp_json(client, url, label))
+        .await
+        .map_err(|_| {
+            BrowserWorkspaceError::Launch(format!(
+                "{label} exceeded the fixed CDP startup deadline"
+            ))
+        })?
+}
+
+fn exact_loopback_websocket_url(raw: &str, port: u16, expected_path: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "ws"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(port)
+        && url.path() == expected_path
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn validate_browser_websocket_identity(
+    version: &serde_json::Value,
+    endpoint: &DevToolsActivePort,
+) -> Result<(), BrowserWorkspaceError> {
+    let websocket = version
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            BrowserWorkspaceError::Launch(
+                "CDP version response omitted its browser WebSocket URL".to_string(),
+            )
+        })?;
+    if !exact_loopback_websocket_url(websocket, endpoint.port, &endpoint.browser_websocket_path) {
+        return Err(BrowserWorkspaceError::Launch(
+            "CDP version response did not match the profile-bound browser endpoint".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validated_page_target(value: &serde_json::Value, port: u16) -> Option<(String, String)> {
+    value.as_array()?.iter().find_map(|target| {
+        if target.get("type").and_then(serde_json::Value::as_str) != Some("page") {
+            return None;
+        }
+        let id = target.get("id").and_then(serde_json::Value::as_str)?;
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        let websocket = target
+            .get("webSocketDebuggerUrl")
+            .and_then(serde_json::Value::as_str)?;
+        let expected_path = format!("/devtools/page/{id}");
+        exact_loopback_websocket_url(websocket, port, &expected_path)
+            .then(|| (websocket.to_string(), id.to_string()))
+    })
 }
 
 async fn wait_for_cdp_target(
-    port: u16,
+    child: &mut Child,
+    profile_dir: &Path,
     extension_required: bool,
-) -> Result<(Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
-    let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + CDP_STARTUP_TIMEOUT;
-    let list_url = format!("http://127.0.0.1:{port}/json/list");
+) -> Result<(u16, Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
+    wait_for_cdp_target_until(
+        child,
+        profile_dir,
+        extension_required,
+        tokio::time::Instant::now() + CDP_STARTUP_TIMEOUT,
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+async fn wait_for_cdp_target_until(
+    child: &mut Child,
+    profile_dir: &Path,
+    extension_required: bool,
+    deadline: tokio::time::Instant,
+    retry_delay: Duration,
+) -> Result<(u16, Option<String>, Option<String>, Option<String>), BrowserWorkspaceError> {
+    let client = local_cdp_client()?;
+    let mut last_error: Option<String> = None;
     loop {
-        match client.get(&list_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let targets: serde_json::Value = resp.json().await.map_err(|e| {
-                    BrowserWorkspaceError::Launch(format!(
-                        "failed to parse CDP target list from {list_url}: {e}"
-                    ))
-                })?;
-                if let Some((ws, id)) = first_page_target(&targets) {
-                    let extension_runtime_id = active_extension_runtime_id(&targets);
-                    if !extension_required || extension_runtime_id.is_some() {
-                        return Ok((ws, id, extension_runtime_id));
-                    }
-                }
-            }
-            _ => {}
-        }
         if tokio::time::Instant::now() >= deadline {
-            let expected = if extension_required {
-                format!(
-                    "page target and approved extension service worker {}",
-                    APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
-                )
-            } else {
-                "page target".to_string()
-            };
+            let detail = last_error
+                .as_deref()
+                .map(|error| format!("; last observation: {error}"))
+                .unwrap_or_default();
             return Err(BrowserWorkspaceError::Launch(format!(
-                "timed out waiting for CDP {expected} at {list_url}"
+                "timed out waiting for a profile-bound CDP endpoint{detail}"
             )));
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(BrowserWorkspaceError::Launch(format!(
+                    "browser exited before its profile-bound CDP endpoint was ready: {status}"
+                )))
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(BrowserWorkspaceError::Launch(format!(
+                    "failed to inspect browser while waiting for CDP: {error}"
+                )))
+            }
+        }
+        if let Some(endpoint) = read_devtools_active_port(profile_dir)? {
+            let version_url = format!("http://127.0.0.1:{}/json/version", endpoint.port);
+            let list_url = format!("http://127.0.0.1:{}/json/list", endpoint.port);
+            match fetch_bounded_cdp_json_before(
+                &client,
+                &version_url,
+                "CDP version endpoint",
+                deadline,
+            )
+            .await
+            {
+                Ok(version) => match validate_browser_websocket_identity(&version, &endpoint) {
+                    Ok(()) => {
+                        match fetch_bounded_cdp_json_before(
+                            &client,
+                            &list_url,
+                            "CDP target list",
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(targets) => {
+                                let extension_runtime_id = active_extension_runtime_id(&targets);
+                                match validated_page_target(&targets, endpoint.port) {
+                                    Some((ws, id))
+                                        if !extension_required
+                                            || extension_runtime_id.is_some() =>
+                                    {
+                                        let endpoint_after =
+                                            read_devtools_active_port(profile_dir)?;
+                                        if endpoint_after.as_ref() == Some(&endpoint) {
+                                            match child.try_wait() {
+                                                Ok(None) => {
+                                                    return Ok((
+                                                        endpoint.port,
+                                                        Some(ws),
+                                                        Some(id),
+                                                        extension_runtime_id,
+                                                    ))
+                                                }
+                                                Ok(Some(status)) => {
+                                                    return Err(BrowserWorkspaceError::Launch(
+                                                        format!(
+                                                            "browser exited while its CDP endpoint became ready: {status}"
+                                                        ),
+                                                    ))
+                                                }
+                                                Err(error) => {
+                                                    return Err(BrowserWorkspaceError::Launch(
+                                                        format!(
+                                                            "failed to inspect browser after CDP readiness: {error}"
+                                                        ),
+                                                    ))
+                                                }
+                                            }
+                                        } else {
+                                            // Endpoint churn is a retry, not an early continue:
+                                            // every retry must reach the shared deadline and
+                                            // bounded sleep below.
+                                            last_error = Some(
+                                                "profile-bound CDP endpoint changed during readiness"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        last_error = Some(if extension_required {
+                                            format!(
+                                                "CDP target list had no exact loopback page and approved extension service worker {}",
+                                                APPROVED_BROWSER_EXTENSION_SERVICE_WORKER
+                                            )
+                                        } else {
+                                            "CDP target list had no exact loopback page target"
+                                                .to_string()
+                                        });
+                                    }
+                                }
+                            }
+                            Err(error) => last_error = Some(error.to_string()),
+                        }
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
+                },
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(retry_delay.min(remaining)).await;
     }
 }
 
@@ -2095,25 +2581,6 @@ fn active_extension_runtime_id(value: &serde_json::Value) -> Option<String> {
         }
         Some(runtime_id.to_string())
     })
-}
-
-fn first_page_target(value: &serde_json::Value) -> Option<(Option<String>, Option<String>)> {
-    let targets = value.as_array()?;
-    targets
-        .iter()
-        .find(|target| target.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .map(|target| {
-            (
-                target
-                    .get("webSocketDebuggerUrl")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                target
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            )
-        })
 }
 
 #[derive(Debug, Clone)]
@@ -2684,6 +3151,421 @@ mod tests {
         (sha256, u64::try_from(bytes.len()).unwrap())
     }
 
+    async fn spawn_one_shot_http_response(
+        response: Vec<u8>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+            stream.write_all(&response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (address, task)
+    }
+
+    fn write_test_devtools_active_port(profile_dir: &Path, port: u16, token: &str) {
+        fs::write(
+            devtools_active_port_path(profile_dir),
+            format!("{port}\n/devtools/browser/{token}\n"),
+        )
+        .unwrap();
+    }
+
+    async fn spawn_churning_cdp_server(profile_dir: PathBuf) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_test_devtools_active_port(&profile_dir, port, "browser-a");
+        let task = tokio::spawn(async move {
+            let mut token_is_a = true;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let size =
+                    match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request))
+                        .await
+                    {
+                        Ok(Ok(size)) => size,
+                        _ => return,
+                    };
+                let request_text = String::from_utf8_lossy(&request[..size]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let body = match path {
+                    "/json/version" => {
+                        let token = if token_is_a { "browser-a" } else { "browser-b" };
+                        serde_json::json!({
+                            "webSocketDebuggerUrl":
+                                format!("ws://127.0.0.1:{port}/devtools/browser/{token}")
+                        })
+                        .to_string()
+                    }
+                    "/json/list" => {
+                        token_is_a = !token_is_a;
+                        let token = if token_is_a { "browser-a" } else { "browser-b" };
+                        write_test_devtools_active_port(&profile_dir, port, token);
+                        serde_json::json!([{
+                            "type": "page",
+                            "id": "page-1",
+                            "webSocketDebuggerUrl":
+                                format!("ws://127.0.0.1:{port}/devtools/page/page-1")
+                        }])
+                        .to_string()
+                    }
+                    _ => "{}".to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        (port, task)
+    }
+
+    async fn spawn_stalling_cdp_server(profile_dir: PathBuf) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_test_devtools_active_port(&profile_dir, port, "browser-a");
+        let task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        (port, task)
+    }
+
+    #[cfg(unix)]
+    fn spawn_long_running_test_child() -> Child {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        command.kill_on_drop(true);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_long_running_test_child() -> Child {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "ping -n 11 127.0.0.1 >NUL"]);
+        command.kill_on_drop(true);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn stalled_cdp_response_respects_startup_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_port, server) = spawn_stalling_cdp_server(temp.path().to_path_buf()).await;
+        let mut child = spawn_long_running_test_child();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_cdp_target_until(
+                &mut child,
+                temp.path(),
+                false,
+                tokio::time::Instant::now() + Duration::from_millis(300),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the internal CDP startup deadline must bound a stalled response");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for a profile-bound CDP endpoint"));
+        assert!(
+            error.contains("CDP version endpoint exceeded the fixed CDP startup deadline"),
+            "unexpected terminal observation: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled CDP response exceeded the bounded startup deadline"
+        );
+
+        let _ = child.start_kill();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cdp_endpoint_churn_remains_deadline_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_port, server) = spawn_churning_cdp_server(temp.path().to_path_buf()).await;
+        let mut child = spawn_long_running_test_child();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_cdp_target_until(
+                &mut child,
+                temp.path(),
+                false,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the internal CDP startup deadline must terminate endpoint churn");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for a profile-bound CDP endpoint"));
+        assert!(
+            error.contains("profile-bound CDP endpoint changed during readiness"),
+            "unexpected terminal observation: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "endpoint churn exceeded the bounded startup deadline"
+        );
+
+        let _ = child.start_kill();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn local_cdp_client_is_proxy_free_redirect_free_and_response_bounded() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (origin_address, origin_task) = spawn_one_shot_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
+                .to_vec(),
+        )
+        .await;
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_hit = Arc::new(AtomicBool::new(false));
+        let proxy_hit_for_task = Arc::clone(&proxy_hit);
+        let proxy_task = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), proxy_listener.accept()).await
+            {
+                proxy_hit_for_task.store(true, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let client = build_local_cdp_client(
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap()),
+        )
+        .unwrap();
+        let value = fetch_bounded_cdp_json(
+            &client,
+            &format!("http://{origin_address}/json/version"),
+            "proxy bypass test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        origin_task.await.unwrap();
+        proxy_task.await.unwrap();
+        assert!(
+            !proxy_hit.load(Ordering::SeqCst),
+            "the local CDP request must never traverse a configured proxy"
+        );
+
+        let redirect_target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let redirect_target_address = redirect_target.local_addr().unwrap();
+        let (redirect_source_address, redirect_source_task) = spawn_one_shot_http_response(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{redirect_target_address}/json/version\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let error = fetch_bounded_cdp_json(
+            &local_cdp_client().unwrap(),
+            &format!("http://{redirect_source_address}/json/version"),
+            "redirect test",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("returned HTTP 302"));
+        redirect_source_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), redirect_target.accept())
+                .await
+                .is_err(),
+            "the local CDP client must not follow redirects"
+        );
+
+        let (oversized_address, oversized_task) = spawn_one_shot_http_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                CDP_JSON_MAX_BYTES + 1
+            )
+            .into_bytes(),
+        )
+        .await;
+        let error = fetch_bounded_cdp_json(
+            &local_cdp_client().unwrap(),
+            &format!("http://{oversized_address}/json/list"),
+            "oversized response test",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+        oversized_task.await.unwrap();
+    }
+
+    #[test]
+    fn devtools_active_port_parser_is_strict_and_canonical() {
+        let parsed = parse_devtools_active_port(
+            b"9222\n/devtools/browser/01234567-89ab-cdef-0123-456789abcdef\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.port, 9222);
+        assert_eq!(
+            parsed.browser_websocket_path,
+            "/devtools/browser/01234567-89ab-cdef-0123-456789abcdef"
+        );
+
+        assert!(parse_devtools_active_port(b"9222\n").unwrap().is_none());
+        for invalid in [
+            b"0\n/devtools/browser/a\n".as_slice(),
+            b"65536\n/devtools/browser/a\n".as_slice(),
+            b"port\n/devtools/browser/a\n".as_slice(),
+            b"9222\n/devtools/page/a\n".as_slice(),
+            b"9222\n/devtools/browser/a/b\n".as_slice(),
+            b"9222\n/devtools/browser/a?b\n".as_slice(),
+            b"9222\n/devtools/browser/a\nextra\n".as_slice(),
+            b"9222\0\n/devtools/browser/a\n".as_slice(),
+        ] {
+            assert!(
+                parse_devtools_active_port(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cdp_websocket_identity_rejects_foreign_or_ambiguous_endpoints() {
+        let endpoint = DevToolsActivePort {
+            port: 9222,
+            browser_websocket_path: "/devtools/browser/browser-id".to_string(),
+        };
+        let valid = serde_json::json!({
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/browser-id"
+        });
+        validate_browser_websocket_identity(&valid, &endpoint).unwrap();
+
+        for invalid in [
+            "ws://localhost:9222/devtools/browser/browser-id",
+            "ws://127.0.0.1:9223/devtools/browser/browser-id",
+            "ws://127.0.0.1:9222/devtools/browser/other",
+            "ws://127.0.0.1:9222/devtools/browser/browser-id?token=x",
+            "ws://user@127.0.0.1:9222/devtools/browser/browser-id",
+            "http://127.0.0.1:9222/devtools/browser/browser-id",
+        ] {
+            let value = serde_json::json!({ "webSocketDebuggerUrl": invalid });
+            assert!(
+                validate_browser_websocket_identity(&value, &endpoint).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+
+        let targets = serde_json::json!([
+            {
+                "type": "page",
+                "id": "foreign",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/foreign"
+            },
+            {
+                "type": "page",
+                "id": "expected",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/expected"
+            }
+        ]);
+        assert_eq!(
+            validated_page_target(&targets, 9222),
+            Some((
+                "ws://127.0.0.1:9222/devtools/page/expected".to_string(),
+                "expected".to_string()
+            ))
+        );
+        assert!(validated_page_target(&targets, 9444).is_none());
+    }
+
+    #[test]
+    fn devtools_active_port_file_is_bounded_and_stale_state_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let active_port = devtools_active_port_path(temp.path());
+        fs::write(
+            &active_port,
+            b"9222\n/devtools/browser/01234567-89ab-cdef-0123-456789abcdef\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_devtools_active_port(temp.path())
+                .unwrap()
+                .unwrap()
+                .port,
+            9222
+        );
+        clear_stale_devtools_active_port(temp.path()).unwrap();
+        assert!(!active_port.exists());
+
+        fs::create_dir(&active_port).unwrap();
+        assert!(clear_stale_devtools_active_port(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devtools_active_port_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real-active-port");
+        fs::write(
+            &target,
+            b"9222\n/devtools/browser/01234567-89ab-cdef-0123-456789abcdef\n",
+        )
+        .unwrap();
+        symlink(&target, devtools_active_port_path(temp.path())).unwrap();
+        assert!(read_devtools_active_port(temp.path()).is_err());
+    }
+
     #[test]
     fn extension_archive_tuple_is_all_or_none_and_strict() {
         assert!(parse_extension_archive_spec(&sample_create_request())
@@ -3171,14 +4053,19 @@ mod tests {
     }
 
     #[test]
-    fn cdp_target_parser_prefers_page() {
+    fn cdp_target_parser_accepts_only_exact_loopback_page() {
         let targets = serde_json::json!([
             {"type":"service_worker","id":"worker"},
-            {"type":"page","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/page-1"}
+            {"type":"page","id":"page-1","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/page-1"}
         ]);
-        let (ws, id) = first_page_target(&targets).unwrap();
-        assert_eq!(id.as_deref(), Some("page-1"));
-        assert_eq!(ws.as_deref(), Some("ws://127.0.0.1/devtools/page/page-1"));
+        assert_eq!(
+            validated_page_target(&targets, 9222),
+            Some((
+                "ws://127.0.0.1:9222/devtools/page/page-1".to_string(),
+                "page-1".to_string()
+            ))
+        );
+        assert!(validated_page_target(&targets, 9223).is_none());
     }
 
     #[test]
