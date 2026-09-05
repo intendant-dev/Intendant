@@ -844,6 +844,11 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Execute a JSON array of computer-use actions",
     },
     CommandSpec {
+        path: &["cu", "proof"], lane: RiskLane::Act, tool: "external_cu_proof", seed: "{}",
+        positionals: &[], flags: &[flag!("request", "request", Str, "duplicate-key-safe proof request JSON")],
+        help: "Drive a bounded, model-free external proof session",
+    },
+    CommandSpec {
         path: &["cu", "task"],
         lane: RiskLane::Act,
         tool: "run_bounded_cu_task",

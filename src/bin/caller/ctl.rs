@@ -1372,6 +1372,55 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
             print_tool_response(response, config, output)?;
         }
+        "proof" => {
+            let args = parse_command_args(&raw[1..], &["--request"], &[])?;
+            if !args.positional.is_empty() {
+                return Err("cu proof only accepts --request JSON|@file|-".into());
+            }
+            let input = args
+                .one("--request")
+                .ok_or("cu proof requires --request JSON|@file|-")?;
+            let mut request = String::new();
+            if input == "-" {
+                std::io::stdin()
+                    .take(98_305)
+                    .read_to_string(&mut request)
+                    .map_err(|e| e.to_string())?;
+            } else if let Some(path) = input.strip_prefix('@') {
+                let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+                if !meta.is_file() || meta.file_type().is_symlink() {
+                    return Err("proof request must be a regular non-symlink file".into());
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                }
+                let file = options.open(path).map_err(|e| e.to_string())?;
+                if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+                    return Err("proof request is not a file".into());
+                }
+                file.take(98_305)
+                    .read_to_string(&mut request)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                request = input.to_owned();
+            }
+            if request.len() > 98_304 {
+                return Err("proof request exceeds 96 KiB".into());
+            }
+            // Keep raw JSON intact: the daemon rejects duplicate keys before projection.
+            let response = call_tool(
+                client,
+                config,
+                "external_cu_proof",
+                serde_json::json!({"request":request}),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
         "task" | "bounded" => {
             ensure_help(&raw[1..], help_cu_task)?;
             let args = parse_command_args(
@@ -6167,6 +6216,7 @@ fn help_cu() {
     println!(
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu proof --request JSON|@file|- (begin/actions/freeze/observe/finish/close/abort/status; no model)\n\
   intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\

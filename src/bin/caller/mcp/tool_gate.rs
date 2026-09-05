@@ -93,13 +93,14 @@ pub(crate) fn fission_tool(name: &str) -> bool {
 /// codex thread-action waits (20 s) and the remaining peer round
 /// trips (sub-second lookups under `PEER_MCP_TIMEOUT`'s transport
 /// bound — a bound is not a hold).
-pub(crate) const MCP_HELD_POST_TOOLS: [&str; 9] = [
+pub(crate) const MCP_HELD_POST_TOOLS: [&str; 10] = [
     "ask_user",
     "request_user_display",
     "spawn_live_audio",
     "fission_control",
     "execute_cu_actions",
     "run_bounded_cu_task",
+    "external_cu_proof",
     "peer_execute_cu_actions",
     "events",
     "remote_command",
@@ -457,7 +458,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "revoke_user_display"
         | "request_shared_view_input"
         | "execute_cu_actions"
-        | "run_bounded_cu_task" => PeerOperation::DisplayInput,
+        | "run_bounded_cu_task"
+        | "external_cu_proof" => PeerOperation::DisplayInput,
         // Browser workspaces, live audio, autonomy/verbosity, lifecycle, and
         // controller-restart orchestration are runtime-control surfaces.
         "create_browser_workspace"
@@ -900,6 +902,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             DestroyVirtualDisplayParams
         ),
     );
+    push("external_cu_proof", manual_http_tool_definition!("external_cu_proof", "Drive an owner-bound proof session using explicit actions, with no model calls. The duplicate-key-safe request commands are begin/actions/freeze/observe/finish/close/abort/status. Sessions retain exact display exclusion, limits, actor binding and cleanup across calls. finish records external claims, never independent policy approval. Returns private PNG observations and a versioned execution receipt.", ExternalCuProofParams));
     push(
         "run_bounded_cu_task",
         manual_http_tool_definition!(

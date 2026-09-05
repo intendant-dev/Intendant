@@ -95,6 +95,53 @@ element): multi-line/control text (Return may submit, Tab may move focus),
 secure fields, and elements without an AX-readable value stay `injected`
 with the reason in the result detail.
 
+### Externally driven proof sessions (no internal model)
+
+Ordinary `ctl cu actions` never needs a model provider. For evidence work,
+`ctl cu proof --request JSON|@file|-` adds an owner-bound, multi-call recording
+session without delegating to another model. The current external agent sends
+explicit actions and receives private PNG observations. No provider selection
+or LLM request exists in this path; `cu task` below remains an optional
+model-backed orchestration convenience.
+
+The request is bounded, duplicate-key-safe JSON. `begin` pins the job digest,
+attempt, ready local CDP workspace, leased display and exact display generation.
+The daemon records the actor resolved by the authenticating control surface;
+request fields cannot substitute that identity. Continuations require the same
+actor, opaque proof ID and exact sequence. `status` reconciles a lost response;
+replayed or out-of-order mutations do not repeat input.
+
+The phase sequence is `begin -> actions -> freeze -> observe -> finish -> close`.
+The worker owns the display lock across all calls. Stage is limited to 180
+seconds, 64 total actions and 16 actions per batch. Clipboard paste, split
+mouse edges and cropped frames are forbidden. Freeze permanently disables
+further actions and starts a 45-second completion deadline. Observe binds one
+full-display PNG to the caller's pre-capture observation digest. Finish records
+the external caller's claims about exactly that image; it does not independently
+validate those claims or authorize a CDN submission. The lock remains held until
+close, so a caller can verify post-capture browser state before releasing it.
+
+Every native operation uses the same generation, lease, input-sealing, private
+scratch and cancellation-safe executor as the bounded task. Disconnecting an
+HTTP call does not discard the worker's fence while OS input is in flight;
+unattended sessions expire. Close is acknowledged only after executor cleanup.
+The owner-side caller still closes its browser, destroys its exact display
+generation and removes its private profile.
+
+The separate v2 external receipt identifies `external-actions`, reports zero
+internal model calls, and binds the authenticated actor, action/frame transcript,
+external claim bytes and frozen PNG. Typed text and key values (including their
+hashes) are excluded from the public action projection. Receipt hashes provide
+content integrity, not independent authentication or policy approval: consumers
+must retain their pinned authenticated transport and require the matching close
+acknowledgement. They must not relabel this receipt as a legacy model attestation.
+
+`python3 scripts/test-external-cu-proof.py --bin /absolute/intendant --evidence
+/private/new-directory` exercises real native input, PNG changes, replay and
+freeze refusal, exact closure, idle expiry, and foreign-Xvfb/CI isolation on Linux.
+It starts a separate credential-free loopback daemon and never uses the user's
+physical display.
+
 ### Bounded proof tasks
 
 `intendant ctl cu task` is the owner-only orchestration lane for evidence

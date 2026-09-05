@@ -73,6 +73,7 @@ pub(crate) use tools_ask::{
 #[cfg(test)]
 pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_bounded_cu;
+pub(crate) use tools_bounded_cu::ExternalCuProofParams;
 mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
@@ -998,6 +999,13 @@ impl IntendantServer {
                 let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
                     self.release_browser_workspace(params).await,
+                ))
+            }
+            "external_cu_proof" => {
+                let Parameters(params) = parse_params::<ExternalCuProofParams>(args)?;
+                Ok(text_tool_result(
+                    self.external_cu_proof_as_caller(params, caller, &actor)
+                        .await,
                 ))
             }
             "run_bounded_cu_task" => {
