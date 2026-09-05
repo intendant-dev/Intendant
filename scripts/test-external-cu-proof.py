@@ -66,7 +66,9 @@ def main():
     os.umask(0o077)
     out.mkdir(mode=0o700, parents=True)
     runners = cutover.runner_snapshot()
-    require(not any(r['comm'] == 'Runner.Worker' for r in runners), 'CI has priority')
+    # Standalone rehearsal yields to CI; a CI job may run its own isolated test.
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        require(not any(r['comm'] == 'Runner.Worker' for r in runners), 'CI has priority')
     root = Path(tempfile.mkdtemp(prefix='intendant-external-cu-'))
     home = root / 'home'
     home.mkdir(mode=0o700)

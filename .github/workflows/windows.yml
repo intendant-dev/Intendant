@@ -666,6 +666,24 @@ jobs:
           retention-days: 14
           overwrite: true
 
+      - name: Provider-free external CU proof acceptance
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          bin="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
+          evidence="${{ steps.daemon.outputs.rig }}/artifacts/external-cu-proof"
+          python3 scripts/test-external-cu-proof.py --bin "$bin" --evidence "$evidence"
+
+      - name: Upload external CU proof evidence
+        if: always() && runner.os == 'Linux' && steps.daemon.outputs.rig != '' && steps.relevance_unix.outputs.relevant != 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned
+        with:
+          name: external-cu-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.daemon.outputs.rig }}/artifacts/external-cu-proof/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
         shell: bash

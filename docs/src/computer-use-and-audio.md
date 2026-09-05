@@ -142,6 +142,8 @@ freeze refusal, exact closure, idle expiry, and foreign-Xvfb/CI isolation on Lin
 It starts a separate credential-free loopback daemon and never uses the user's
 physical display.
 
+See [Externally driven CU proof sessions](./external-cu-proof.md) for the complete provider-free protocol.
+
 ### Bounded proof tasks
 
 `intendant ctl cu task` is the owner-only orchestration lane for evidence
