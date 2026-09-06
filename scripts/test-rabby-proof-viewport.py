@@ -5,9 +5,10 @@ import argparse, fcntl, hashlib, json, os, pathlib, shutil, socket, subprocess, 
 ARCHIVE_SHA = 'daf7819d7371a67ef447c788e899b1df628f95e380a460c6e5dd3b86bbe09e4f'
 ARCHIVE_BYTES = 16216742
 METRICS_JS = r'''
-const [port,id]=process.argv.slice(1);
+const [port,id,runtime]=process.argv.slice(1);
 const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),3000);
 const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`,{signal:controller.signal})).json();clearTimeout(timer);
+if(targets.some(p=>p.url?.startsWith('chrome-extension://')&&!p.url.startsWith(`chrome-extension://${runtime}/`)))throw Error('unapproved extension target present');
 const page=targets.find(p=>p.id===id && p.type==='page');if(!page)throw Error('bound page missing');
 if(page.url.startsWith('chrome-extension:'))throw Error('onboarding selected instead of application');
 const endpoint=new URL(page.webSocketDebuggerUrl);
@@ -67,7 +68,7 @@ def main():
                 '--session',f'viewport-rabby-{n}','--profile-dir',str(parent/'browser-profile'),'--viewport','1024x768',
                 '--extension-archive',str(archive),'--extension-sha256',ARCHIVE_SHA,'--extension-bytes',str(ARCHIVE_BYTES),
                 '--extension-manifest-version','3','--extension-version','0.94.6')
-            p=subprocess.run([node,'--input-type=module','-e',METRICS_JS,str(browser['debugging_port']),browser['active_target_id']],stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10)
+            p=subprocess.run([node,'--input-type=module','-e',METRICS_JS,str(browser['debugging_port']),browser['active_target_id'],browser['extension']['runtime_id']],stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10)
             if p.returncode:raise RuntimeError('independent CDP metrics check failed')
             metrics=json.loads(p.stdout);css=metrics['cssLayoutViewport']
             if (css['clientWidth'],css['clientHeight'])!=(1024,768):raise RuntimeError('native viewport mismatch')
