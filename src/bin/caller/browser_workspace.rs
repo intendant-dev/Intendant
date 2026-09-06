@@ -2150,6 +2150,7 @@ async fn launch_cdp_browser(
 fn browser_extension_launch_flags(extension: Option<&BrowserWorkspaceExtension>) -> Vec<String> {
     match extension {
         Some(extension) => vec![
+            "--disable-component-extensions-with-background-pages".to_string(),
             format!("--disable-extensions-except={}", extension.load_path),
             format!("--load-extension={}", extension.load_path),
         ],
@@ -3868,6 +3869,7 @@ mod tests {
         assert_eq!(
             browser_extension_launch_flags(Some(&extension)),
             vec![
+                "--disable-component-extensions-with-background-pages",
                 "--disable-extensions-except=/private/profile/intendant-extension",
                 "--load-extension=/private/profile/intendant-extension"
             ]
