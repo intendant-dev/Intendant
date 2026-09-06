@@ -78,16 +78,21 @@ def main():
             if not ctl('display','destroy',str(display['display_id']),display['capture_generation'],'--note','viewport-regression')['ok']:raise RuntimeError('exact teardown failed')
             display=None
             if (parent/'browser-profile').exists():shutil.rmtree(parent/'browser-profile')
-        if ctl('display','list')!=baseline:raise RuntimeError('display leaked')
+        if ctl('display','list')!=baseline:
+            clean=False
+            raise RuntimeError('display leaked')
         result={'passed':True,'attempts':results,'privateKeysGenerated':False,'transactionsRequested':False,
                 'binarySha256':hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()}
         (out/'RESULT.json').write_text(json.dumps(result));print(json.dumps(result),flush=True)
+    except BaseException:
+        clean=False
+        raise
     finally:
         if browser:
-            try:ctl('browser','close',browser['id'],'--reason','viewport-failed-cleanup')
+            try:clean = (ctl('browser','close',browser['id'],'--reason','viewport-failed-cleanup').get('status')=='closed') and clean
             except Exception:clean=False
         if display:
-            try:ctl('display','destroy',str(display['display_id']),display['capture_generation'],'--note','viewport-failed-cleanup')
+            try:clean = (ctl('display','destroy',str(display['display_id']),display['capture_generation'],'--note','viewport-failed-cleanup').get('ok') is True) and clean
             except Exception:clean=False
         daemon.terminate()
         try:daemon.wait(timeout=15)
