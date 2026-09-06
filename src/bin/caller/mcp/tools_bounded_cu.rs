@@ -2,7 +2,10 @@
 //! proof capture. This is intentionally separate from general task dispatch.
 
 use super::*;
+
+mod external;
 use async_trait::async_trait;
+pub use external::ExternalCuProofParams;
 
 use crate::bounded_cu_task::{
     remember_issued_stage_receipt, run_bounded_cu_task_until as execute_bounded_cu_task_until,
@@ -387,29 +390,20 @@ impl IntendantServer {
         }
     }
 
-    async fn run_bounded_cu_task_inner(
+    async fn prepare_proof_executor(
         &self,
-        params: RunBoundedCuTaskParams,
-        deadline: tokio::time::Instant,
-    ) -> Result<crate::bounded_cu_task::BoundedCuTaskReceipt, BoundedCuTaskError> {
-        let request = BoundedCuTaskRequest {
-            mode: params.mode,
-            attempt_id: params.attempt_id.clone(),
-            workspace_id: params.workspace_id.clone(),
-            display_id: params.display_id,
-            display_target: params.display_target.clone(),
-            capture_generation: params.capture_generation.clone(),
-            task: params.task.clone(),
-            prior_receipt_id: params.prior_receipt_id.clone(),
-            prior_transcript_event_count: None,
-            prior_transcript_sha256: None,
-            observation_sha256: None,
-            prior_completed_at: None,
-        };
-        validate_bounded_cu_task_request(&request)?;
+        params: &RunBoundedCuTaskParams,
+    ) -> Result<
+        (
+            NativeBoundedCuExecutor,
+            crate::project::ComputerUseConfig,
+            std::sync::Arc<tempfile::TempDir>,
+        ),
+        BoundedCuTaskError,
+    > {
         let display_access =
             crate::computer_use::acquire_virtual_display_exclusive(params.display_id).await;
-        validate_resource_binding(&params, &self.bus).await?;
+        validate_resource_binding(params, &self.bus).await?;
         let (cu_config, session_registry, action_counter) = {
             let state = self.state.read().await;
             (
@@ -479,14 +473,9 @@ impl IntendantServer {
                 false,
             ));
         }
-        let mut provider =
-            crate::provider::select_bounded_cu_provider(&cu_config).map_err(|error| {
-                BoundedCuTaskError::new("bounded-cu-provider-unavailable", error.to_string(), true)
-            })?;
-        provider.set_cu_display(dimensions);
         let scratch = std::sync::Arc::new(create_private_scratch()?);
         validate_private_scratch(scratch.path())?;
-        let mut executor = NativeBoundedCuExecutor {
+        let executor = NativeBoundedCuExecutor {
             target,
             backend: DisplayBackend::from_config(&cu_config.backend),
             scratch_dir: scratch.path().to_path_buf(),
@@ -501,6 +490,35 @@ impl IntendantServer {
             pending_safety_releases: Vec::new(),
             in_flight_action: None,
         };
+        Ok((executor, cu_config, scratch))
+    }
+
+    async fn run_bounded_cu_task_inner(
+        &self,
+        params: RunBoundedCuTaskParams,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::bounded_cu_task::BoundedCuTaskReceipt, BoundedCuTaskError> {
+        let request = BoundedCuTaskRequest {
+            mode: params.mode,
+            attempt_id: params.attempt_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            display_id: params.display_id,
+            display_target: params.display_target.clone(),
+            capture_generation: params.capture_generation.clone(),
+            task: params.task.clone(),
+            prior_receipt_id: params.prior_receipt_id.clone(),
+            prior_transcript_event_count: None,
+            prior_transcript_sha256: None,
+            observation_sha256: None,
+            prior_completed_at: None,
+        };
+        validate_bounded_cu_task_request(&request)?;
+        let (mut executor, cu_config, scratch) = self.prepare_proof_executor(&params).await?;
+        let mut provider =
+            crate::provider::select_bounded_cu_provider(&cu_config).map_err(|error| {
+                BoundedCuTaskError::new("bounded-cu-provider-unavailable", error.to_string(), true)
+            })?;
+        provider.set_cu_display(executor.proof_session.resolution());
         let task_result =
             execute_bounded_cu_task_until(provider.as_ref(), &mut executor, request, deadline)
                 .await;

@@ -750,7 +750,7 @@ async fn apply_cu_calls(
     Ok(())
 }
 
-fn validate_bounded_action(action: &CuAction) -> Result<(), BoundedCuTaskError> {
+pub(crate) fn validate_bounded_action(action: &CuAction) -> Result<(), BoundedCuTaskError> {
     let invalid = match action {
         CuAction::Type { text } => text.len() > BOUNDED_CU_MAX_TYPE_BYTES,
         CuAction::Key { key } => key.is_empty() || key.len() > BOUNDED_CU_MAX_KEY_BYTES,
@@ -975,7 +975,7 @@ fn parse_result(raw: &str) -> Result<(serde_json::Value, String), BoundedCuTaskE
     Ok((value, sha256(&canonical)))
 }
 
-struct UniqueJsonValueSeed;
+pub(crate) struct UniqueJsonValueSeed;
 
 impl<'de> de::DeserializeSeed<'de> for UniqueJsonValueSeed {
     type Value = serde_json::Value;
@@ -1099,7 +1099,7 @@ fn receipt_id(receipt: &BoundedCuTaskReceipt) -> Result<String, BoundedCuTaskErr
     Ok(format!("bcu-{:x}", hasher.finalize()))
 }
 
-fn action_kind(action: &CuAction) -> &'static str {
+pub(crate) fn action_kind(action: &CuAction) -> &'static str {
     match action {
         CuAction::Click { .. } => "click",
         CuAction::DoubleClick { .. } => "double_click",
@@ -1189,7 +1189,7 @@ fn redacted_action_projection(action: &CuAction) -> RedactedActionProjection<'_>
     }
 }
 
-fn action_projection_sha256(actions: &[CuAction]) -> Result<String, BoundedCuTaskError> {
+pub(crate) fn action_projection_sha256(actions: &[CuAction]) -> Result<String, BoundedCuTaskError> {
     let projection = actions
         .iter()
         .map(redacted_action_projection)
@@ -1207,7 +1207,7 @@ fn action_projection_sha256(actions: &[CuAction]) -> Result<String, BoundedCuTas
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn is_input(action: &CuAction) -> bool {
+pub(crate) fn is_input(action: &CuAction) -> bool {
     !matches!(
         action,
         CuAction::Screenshot | CuAction::Zoom { .. } | CuAction::Wait { .. }
@@ -1226,7 +1226,7 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn image_sha256(image: &ImageData) -> Result<String, BoundedCuTaskError> {
+pub(crate) fn image_sha256(image: &ImageData) -> Result<String, BoundedCuTaskError> {
     if image.media_type != "image/png" {
         return Err(BoundedCuTaskError::new(
             "bounded-cu-frame-media-type-invalid",

@@ -356,15 +356,17 @@ where
 // ── Low-level XTest primitives (blocking) ────────────────────────────────────
 
 fn fake_motion(dc: &DisplayConn, x: i32, y: i32) -> Result<(), OpError> {
-    dc.conn.xtest_fake_input(
-        xproto::MOTION_NOTIFY_EVENT,
-        0, // absolute
-        x11rb::CURRENT_TIME,
-        dc.root,
-        x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        0,
-    )?;
+    dc.conn
+        .xtest_fake_input(
+            xproto::MOTION_NOTIFY_EVENT,
+            0, // absolute
+            x11rb::CURRENT_TIME,
+            dc.root,
+            x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            0,
+        )?
+        .check()?;
     Ok(())
 }
 
@@ -375,7 +377,8 @@ fn fake_button(dc: &DisplayConn, button: u8, press: bool) -> Result<(), OpError>
         xproto::BUTTON_RELEASE_EVENT
     };
     dc.conn
-        .xtest_fake_input(kind, button, x11rb::CURRENT_TIME, x11rb::NONE, 0, 0, 0)?;
+        .xtest_fake_input(kind, button, x11rb::CURRENT_TIME, x11rb::NONE, 0, 0, 0)?
+        .check()?;
     Ok(())
 }
 
@@ -386,7 +389,8 @@ fn fake_key(dc: &DisplayConn, keycode: u8, press: bool) -> Result<(), OpError> {
         xproto::KEY_RELEASE_EVENT
     };
     dc.conn
-        .xtest_fake_input(kind, keycode, x11rb::CURRENT_TIME, x11rb::NONE, 0, 0, 0)?;
+        .xtest_fake_input(kind, keycode, x11rb::CURRENT_TIME, x11rb::NONE, 0, 0, 0)?
+        .check()?;
     Ok(())
 }
 
