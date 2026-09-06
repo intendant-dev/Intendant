@@ -54,11 +54,29 @@ class Page(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def resolve_browser(explicit=None, environ=None, which=None):
+    """Resolve a test browser without assuming a distribution's package layout."""
+    environ = os.environ if environ is None else environ
+    which = shutil.which if which is None else which
+    override = explicit or environ.get('INTENDANT_BROWSER_WORKSPACE_EXECUTABLE')
+    if override:
+        path = Path(override).expanduser()
+        require(path.is_absolute() and path.is_file() and os.access(path, os.X_OK),
+                'explicit browser must be an absolute executable file')
+        return str(path.resolve())
+    for name in ('google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser'):
+        located = which(name)
+        if located and Path(located).is_file() and os.access(located, os.X_OK):
+            return str(Path(located).resolve())
+    raise RuntimeError('Chrome/Chromium unavailable; supply --browser-bin ABSOLUTE_PATH')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bin', required=True, type=Path)
     parser.add_argument('--evidence', required=True, type=Path)
     parser.add_argument('--skip-expiry', action='store_true')
+    parser.add_argument('--browser-bin', type=Path)
     args = parser.parse_args()
     binary, out = args.bin.resolve(), args.evidence.resolve()
     require(sys.platform.startswith('linux'), 'Linux required')
@@ -74,7 +92,7 @@ def main():
     home.mkdir(mode=0o700)
     env = {'HOME': str(home), 'INTENDANT_HOME': str(home / '.intendant'),
            'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'LANG': 'C.UTF-8',
-           'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE': '/usr/lib/chromium/chromium',
+           'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE': resolve_browser(args.browser_bin),
            'INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER': '1'}
     require(Path(env['INTENDANT_BROWSER_WORKSPACE_EXECUTABLE']).is_file(), 'native Chromium missing')
     daemon = foreign = server = workspace = display = proof = None

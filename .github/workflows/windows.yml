@@ -673,6 +673,7 @@ jobs:
         run: |
           bin="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
           evidence="${{ steps.daemon.outputs.rig }}/artifacts/external-cu-proof"
+          python3 scripts/test-external-cu-proof-discovery.py
           python3 scripts/test-external-cu-proof.py --bin "$bin" --evidence "$evidence"
 
       - name: Upload external CU proof evidence

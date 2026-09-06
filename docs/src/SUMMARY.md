@@ -19,6 +19,7 @@
 - [Trust Architecture](./trust-architecture.md)
 - [Trust Tiers](./trust-tiers.md)
 - [Computer Use & Live Audio](./computer-use-and-audio.md)
+- [Externally driven CU proof sessions](./external-cu-proof.md)
 - [Presence Layer](./presence.md)
 - [Autonomy & Approvals](./autonomy.md)
 - [Web Dashboard](./web-dashboard.md)
