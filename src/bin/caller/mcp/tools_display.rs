@@ -162,6 +162,8 @@ impl IntendantServer {
                 request_id: Some(request_id.clone()),
                 width: params.width,
                 height: params.height,
+                minimum_display_id: params.minimum_display_id,
+                maximum_display_id: params.maximum_display_id,
             }));
         match waiter.wait(std::time::Duration::from_secs(20)).await {
             Ok(crate::event::VirtualDisplayCreateOutcome::Created {
@@ -1848,6 +1850,8 @@ mod tests {
                     request_id: Some(request_id),
                     width,
                     height,
+                    minimum_display_id: None,
+                    maximum_display_id: None,
                 }))) => return (request_id, width, height),
                 Ok(Ok(_)) => continue,
                 other => panic!("expected correlated create command, got {other:?}"),
@@ -1867,6 +1871,8 @@ mod tests {
                 .create_virtual_display(Parameters(CreateVirtualDisplayParams {
                     width: Some(800),
                     height: Some(600),
+                    minimum_display_id: None,
+                    maximum_display_id: None,
                 }))
                 .await
         });
@@ -1876,6 +1882,8 @@ mod tests {
                 .create_virtual_display(Parameters(CreateVirtualDisplayParams {
                     width: Some(1000),
                     height: Some(700),
+                    minimum_display_id: None,
+                    maximum_display_id: None,
                 }))
                 .await
         });

@@ -3371,14 +3371,20 @@ pub fn spawn_user_display_listener(
                     request_id,
                     width,
                     height,
+                    minimum_display_id,
+                    maximum_display_id,
                 }) => {
                     virtual_display::create_virtual_display(
                         &bus,
                         &session_registry,
                         frame_registry.clone(),
                         &mut virtual_display_guards,
-                        width,
-                        height,
+                        virtual_display::VirtualDisplayCreateOptions {
+                            width,
+                            height,
+                            minimum_display_id,
+                            maximum_display_id,
+                        },
                         request_id,
                     )
                     .await;

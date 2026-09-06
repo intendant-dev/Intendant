@@ -990,10 +990,21 @@ async fn run_display(
             print_tool_response(response, config, None)?;
         }
         "create" => {
-            let args = parse_command_args(&raw[1..], &["--width", "--height"], &[])?;
+            let args = parse_command_args(
+                &raw[1..],
+                &[
+                    "--width",
+                    "--height",
+                    "--min-display-id",
+                    "--max-display-id",
+                ],
+                &[],
+            )?;
             let mut map = Map::new();
             insert_u32(&mut map, "width", args.one("--width"))?;
             insert_u32(&mut map, "height", args.one("--height"))?;
+            insert_u32(&mut map, "minimum_display_id", args.one("--min-display-id"))?;
+            insert_u32(&mut map, "maximum_display_id", args.one("--max-display-id"))?;
             let response =
                 call_tool(client, config, "create_virtual_display", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
@@ -6121,7 +6132,7 @@ fn help_display() {
     println!(
         "Usage:\n\
   intendant ctl display list\n\
-  intendant ctl display create [--width N] [--height N]\n\
+  intendant ctl display create [--width N] [--height N] [--min-display-id N --max-display-id N]\n\
   intendant ctl display destroy DISPLAY_ID CAPTURE_GENERATION [--note TEXT]\n\
   intendant ctl display status [--target TARGET]\n\
   intendant ctl display frames [--stream NAME] [--count N]\n\

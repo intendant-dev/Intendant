@@ -182,6 +182,34 @@ pub(crate) fn virtual_display_dimensions(
     Ok((width & !1, height & !1))
 }
 
+/// Optional creation policy. Omitted pool bounds preserve the generic allocator.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VirtualDisplayCreateOptions {
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+    pub(crate) minimum_display_id: Option<u32>,
+    pub(crate) maximum_display_id: Option<u32>,
+}
+
+fn constrain_display_pool(
+    exclude: &mut Vec<u32>,
+    minimum: Option<u32>,
+    maximum: Option<u32>,
+) -> Result<(), String> {
+    match (minimum, maximum) {
+        (None, None) => Ok(()),
+        (Some(minimum), Some(maximum)) if minimum >= vision::PREFERRED_DISPLAY && maximum < vision::VIRTUAL_DISPLAY_END && minimum <= maximum => {
+            // Reuse the allocator's ordinary exclusion semantics. No display is
+            // created, reclaimed or touched merely to reserve a lower number.
+            exclude.extend((vision::PREFERRED_DISPLAY..vision::VIRTUAL_DISPLAY_END).filter(|id| *id < minimum || *id > maximum));
+            exclude.sort_unstable();
+            exclude.dedup();
+            Ok(())
+        }
+        _ => Err("virtual display pool requires both inclusive bounds with 99 <= minimum <= maximum <= 199".to_owned()),
+    }
+}
+
 /// Handle `ControlMsg::CreateVirtualDisplay`: launch an Xvfb at a free
 /// display number and register its capture session so every dashboard gets
 /// a streaming tile. Pre-activation failures report through
@@ -192,8 +220,7 @@ pub(crate) async fn create_virtual_display(
     session_registry: &display::SharedSessionRegistry,
     frame_registry: Option<Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
     guards: &mut VirtualDisplayGuards,
-    width: Option<u32>,
-    height: Option<u32>,
+    options: VirtualDisplayCreateOptions,
     request_id: Option<String>,
 ) {
     // The lossless intent lane can outlive its synchronous caller. Refuse an
@@ -229,7 +256,15 @@ pub(crate) async fn create_virtual_display(
         }
     }
 
-    let (width, height) = match virtual_display_dimensions(width, height) {
+    if let Err(reason) = constrain_display_pool(
+        &mut exclude,
+        options.minimum_display_id,
+        options.maximum_display_id,
+    ) {
+        report_virtual_display_create_failed(bus, request_id.as_deref(), reason);
+        return;
+    }
+    let (width, height) = match virtual_display_dimensions(options.width, options.height) {
         Ok(dims) => dims,
         Err(reason) => {
             report_virtual_display_create_failed(bus, request_id.as_deref(), reason);
@@ -757,6 +792,58 @@ mod tests {
         sender: Mutex<Option<mpsc::Sender<Frame>>>,
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requested_pool_allocator_uses_only_eligible_absent_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".X120-lock"), b"foreign-test-marker").unwrap();
+        let mut excluded = vec![];
+        constrain_display_pool(&mut excluded, Some(120), Some(121)).unwrap();
+        let config = vision::virtual_display_config_in(temp.path(), 800, 600, &excluded).unwrap();
+        assert_eq!(virtual_target_id(&config), Some(121));
+        excluded.push(121);
+        assert!(vision::virtual_display_config_in(temp.path(), 800, 600, &excluded).is_none());
+        assert_eq!(
+            std::fs::read(temp.path().join(".X120-lock")).unwrap(),
+            b"foreign-test-marker"
+        );
+    }
+
+    #[test]
+    fn requested_pool_preserves_default_and_existing_exclusions() {
+        let mut excluded = vec![121, 155];
+        constrain_display_pool(&mut excluded, None, None).unwrap();
+        assert_eq!(excluded, vec![121, 155]);
+        constrain_display_pool(&mut excluded, Some(120), Some(159)).unwrap();
+        let remaining: Vec<_> = (vision::PREFERRED_DISPLAY..vision::VIRTUAL_DISPLAY_END)
+            .filter(|id| !excluded.contains(id))
+            .collect();
+        assert_eq!(remaining.len(), 38);
+        assert!(remaining.iter().all(|id| (120..=159).contains(id)));
+        assert!(!remaining.contains(&121));
+    }
+    #[test]
+    fn requested_pool_rejects_partial_inverted_and_outside_bounds() {
+        for pair in [
+            (None, Some(159)),
+            (Some(120), None),
+            (Some(0), Some(159)),
+            (Some(120), Some(200)),
+            (Some(159), Some(120)),
+        ] {
+            let mut excluded = vec![140];
+            assert!(constrain_display_pool(&mut excluded, pair.0, pair.1).is_err());
+            assert_eq!(excluded, vec![140]);
+        }
+    }
+    #[test]
+    fn exhausted_requested_pool_cannot_fall_back_outside_it() {
+        let mut excluded: Vec<_> = (120..=159).collect();
+        constrain_display_pool(&mut excluded, Some(120), Some(159)).unwrap();
+        assert!((vision::PREFERRED_DISPLAY..vision::VIRTUAL_DISPLAY_END)
+            .all(|id| excluded.contains(&id)));
+    }
+
     #[async_trait::async_trait]
     impl DisplayBackend for TestCaptureBackend {
         async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -1057,8 +1144,11 @@ mod tests {
             &registry,
             None,
             &mut guards,
-            Some(1280),
-            Some(720),
+            VirtualDisplayCreateOptions {
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            },
             Some("vdc-no-longer-pending".to_string()),
         )
         .await;
