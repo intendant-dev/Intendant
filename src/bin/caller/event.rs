@@ -5989,6 +5989,7 @@ mod tests {
                 owner_session_id: Some("session-1".to_string()),
                 display_target: None,
                 profile_dir: None,
+                viewport: None,
                 extension_archive_path: None,
                 extension_archive_sha256: None,
                 extension_archive_byte_length: None,
