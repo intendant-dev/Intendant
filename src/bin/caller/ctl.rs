@@ -1203,6 +1203,7 @@ async fn run_browser(
                     "--session",
                     "--display-target",
                     "--profile-dir",
+                    "--viewport",
                     "--extension-archive",
                     "--extension-sha256",
                     "--extension-bytes",
@@ -1222,6 +1223,7 @@ async fn run_browser(
             insert_string(&mut map, "owner_session_id", args.one("--session"));
             insert_string(&mut map, "display_target", args.one("--display-target"));
             insert_string(&mut map, "profile_dir", args.one("--profile-dir"));
+            insert_string(&mut map, "viewport", args.one("--viewport"));
             insert_string(
                 &mut map,
                 "extension_archive_path",

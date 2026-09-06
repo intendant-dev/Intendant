@@ -1033,6 +1033,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "daemon-created virtual display"
             ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
+            flag!("viewport", "viewport", Str, "exact proof CSS viewport WIDTHxHEIGHT"),
             flag!(
                 "extension-archive",
                 "extension_archive_path",

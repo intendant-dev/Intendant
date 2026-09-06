@@ -871,6 +871,9 @@ pub struct CreateBrowserWorkspaceParams {
     pub extension_manifest_version: Option<u32>,
     #[serde(default)]
     pub extension_version: Option<String>,
+    /// Exact CSS viewport WIDTHxHEIGHT on a fresh Linux proof display.
+    #[serde(default)]
+    pub viewport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -39,6 +39,7 @@ impl IntendantServer {
             owner_session_id: params.owner_session_id,
             display_target: params.display_target,
             profile_dir: params.profile_dir,
+            viewport: params.viewport,
             extension_archive_path: params.extension_archive_path,
             extension_archive_sha256: params.extension_archive_sha256,
             extension_archive_byte_length: params.extension_archive_byte_length,

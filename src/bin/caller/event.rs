@@ -2858,6 +2858,8 @@ pub enum ControlMsg {
         extension_manifest_version: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extension_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport: Option<String>,
     },
     CloseBrowserWorkspace {
         workspace_id: String,
