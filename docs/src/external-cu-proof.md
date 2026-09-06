@@ -97,3 +97,10 @@ redacts typed text and key values. It records this interface's execution, not a
 claim that the external agent performed no unrelated operations anywhere else.
 Sealing, timestamp verification, policy review and owner submission approval
 remain separate boundaries.
+
+For Scout, allocate directly from its reserved pool: `intendant ctl display
+create --min-display-id 120 --max-display-id 159`. Both bounds are required
+when either is supplied, must be an inclusive subset of Intendant’s managed
+99–199 pool, and exhaustion fails without spilling into another pool. Ordinary
+callers omitting both bounds retain the existing allocator. No filler displays
+are created and foreign sockets remain excluded.

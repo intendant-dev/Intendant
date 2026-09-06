@@ -884,6 +884,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         flags: &[
             flag!("width", "width", U64, "width px (default 1920)"),
             flag!("height", "height", U64, "height px (default 1080)"),
+            flag!("min-display-id", "minimum_display_id", U64, "inclusive allocation pool minimum (99..199; supply both bounds)"),
+            flag!("max-display-id", "maximum_display_id", U64, "inclusive allocation pool maximum (99..199)"),
         ],
         help: "Create a virtual display",
     },

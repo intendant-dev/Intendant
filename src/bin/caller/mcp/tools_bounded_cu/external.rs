@@ -285,7 +285,7 @@ impl Proof {
     }
     fn snapshot(&self) -> Value {
         json!({"ok":true,"profile":PROFILE,"proofId":self.id,"sequence":self.sequence,"binding":self.binding,"actor":self.actor,
-            "phase":self.phase.name(),"frame":self.frame,"receipt":self.receipt})
+            "phase":self.phase.name(),"startedAt":self.started_at,"frozenAt":self.frozen_at,"observedAt":self.observed_at,"actionCount":self.action_count,"inputEventCount":self.input_count,"frame":self.frame,"receipt":self.receipt})
     }
     fn check_sequence(&self, request: &Request) -> Result<(), BoundedCuTaskError> {
         if request.sequence().is_some_and(|seq| seq != self.sequence) {

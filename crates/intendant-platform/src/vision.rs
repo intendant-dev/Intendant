@@ -124,14 +124,12 @@ pub fn display_resolution_for_provider(provider_name: &str) -> (u32, u32) {
 // ── Display allocation ──────────────────────────────────────────────────────
 
 /// Preferred display number.
-#[cfg(target_os = "linux")]
-const PREFERRED_DISPLAY: u32 = 99;
+pub const PREFERRED_DISPLAY: u32 = 99;
 
 /// One past the last display number [`find_free_display`] will allocate.
 /// `:99..:199` is the agent virtual-display range; sockets outside it are
 /// treated as user/session X servers, never as reclaimable Xvfb instances.
-#[cfg(target_os = "linux")]
-const VIRTUAL_DISPLAY_END: u32 = 200;
+pub const VIRTUAL_DISPLAY_END: u32 = 200;
 
 #[cfg(target_os = "linux")]
 static OWNED_XVFB_PROCESSES: OnceLock<Mutex<HashMap<u32, OwnedXvfbProcess>>> = OnceLock::new();

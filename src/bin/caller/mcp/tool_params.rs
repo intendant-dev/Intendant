@@ -629,6 +629,11 @@ pub struct CreateVirtualDisplayParams {
     /// Optional height in pixels (default 1080; same clamping).
     #[serde(default)]
     pub height: Option<u32>,
+    /// Inclusive subset of the managed pool (99..199). Supply both bounds or neither.
+    #[serde(default)]
+    pub minimum_display_id: Option<u32>,
+    #[serde(default)]
+    pub maximum_display_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

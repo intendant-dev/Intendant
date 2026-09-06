@@ -2753,6 +2753,11 @@ pub enum ControlMsg {
         width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         height: Option<u32>,
+        /// Optional inclusive allocation pool; both bounds must be present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_display_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum_display_id: Option<u32>,
     },
     /// Destroy one exact daemon-owned virtual-display generation. Numeric
     /// X11 display ids can be reused, so both the id and the opaque
@@ -5314,6 +5319,8 @@ mod tests {
             request_id: Some("vdc-lossless".to_string()),
             width: Some(1280),
             height: Some(720),
+            minimum_display_id: None,
+            maximum_display_id: None,
         }));
         bus.send(AppEvent::DisplayCaptureLost {
             display_id: 99,
@@ -5332,13 +5339,15 @@ mod tests {
             Some(AppEvent::UserDisplayGranted { display_id: 99, .. })
         ));
         assert!(matches!(
-            intents.recv().await,
-            Some(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
-                request_id: Some(request_id),
-                width: Some(1280),
-                height: Some(720),
-            })) if request_id == "vdc-lossless"
-        ));
+                    intents.recv().await,
+                    Some(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
+                        request_id: Some(request_id),
+                        width: Some(1280),
+                        height: Some(720),
+                    minimum_display_id: None,
+                    maximum_display_id: None,
+        })) if request_id == "vdc-lossless"
+                ));
         assert!(matches!(
             intents.recv().await,
             Some(AppEvent::DisplayCaptureLost { display_id: 99, .. })
@@ -6973,7 +6982,9 @@ mod tests {
             ControlMsg::CreateVirtualDisplay {
                 request_id: None,
                 width: None,
-                height: None
+                height: None,
+                minimum_display_id: None,
+                maximum_display_id: None,
             }
         ));
 
@@ -6984,20 +6995,24 @@ mod tests {
             ControlMsg::CreateVirtualDisplay {
                 request_id: None,
                 width: Some(1280),
-                height: Some(800)
+                height: Some(800),
+                minimum_display_id: None,
+                maximum_display_id: None,
             }
         ));
 
         let json = r#"{"action":"create_virtual_display","request_id":"vdc-abc","width":1024,"height":768}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         assert!(matches!(
-            msg,
-            ControlMsg::CreateVirtualDisplay {
-                request_id: Some(ref request_id),
-                width: Some(1024),
-                height: Some(768)
-            } if request_id == "vdc-abc"
-        ));
+                    msg,
+                    ControlMsg::CreateVirtualDisplay {
+                        request_id: Some(ref request_id),
+                        width: Some(1024),
+                        height: Some(768),
+                    minimum_display_id: None,
+                    maximum_display_id: None,
+        } if request_id == "vdc-abc"
+                ));
         let serialized = serde_json::to_value(&msg).unwrap();
         assert_eq!(serialized["request_id"], "vdc-abc");
     }

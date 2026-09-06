@@ -1848,6 +1848,8 @@ mod tests {
                 request_id: None,
                 width: Some(1280),
                 height: Some(800),
+                minimum_display_id: None,
+                maximum_display_id: None,
             },
         )
         .await;
