@@ -134,6 +134,11 @@ async fn configure_inner(
         next: 0,
         total: 0,
     };
+    // A pinned extension can open its first-run tab while CDP is becoming
+    // ready. Background tabs retain stale layout metrics when the OS window
+    // resizes. Activate only this already-authenticated page during pre-publication
+    // geometry setup; do not emulate a viewport or mutate page content.
+    client.call("Page.bringToFront", json!({})).await?;
     let window = client
         .call("Browser.getWindowForTarget", json!({"targetId":target}))
         .await?;
@@ -149,9 +154,12 @@ async fn configure_inner(
         .await?;
     let mut width = i64::from(want.width);
     let mut height = i64::from(want.height) + 120;
-    for _ in 0..8 {
+    let mut samples = Vec::new();
+    for _ in 0..20 {
         if !(256..=4096).contains(&width) || !(144..=2304).contains(&height) {
-            return Err(error("proof viewport outer window exceeded bounds"));
+            return Err(error(format!(
+                "proof viewport outer window exceeded bounds: {samples:?}"
+            )));
         }
         client
             .call(
@@ -159,7 +167,8 @@ async fn configure_inner(
                 json!({"windowId":id,"bounds":{"left":0,"top":0,"width":width,"height":height}}),
             )
             .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        client.call("Page.bringToFront", json!({})).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let metrics = client.call("Page.getLayoutMetrics", json!({})).await?;
         let css = &metrics["cssLayoutViewport"];
         let device = &metrics["layoutViewport"];
@@ -169,6 +178,29 @@ async fn configure_inner(
         let actual_height = css["clientHeight"]
             .as_i64()
             .ok_or_else(|| error("proof viewport CSS height missing"))?;
+        let bounds = client
+            .call("Browser.getWindowBounds", json!({"windowId":id}))
+            .await?;
+        let outer_width = bounds["bounds"]["width"]
+            .as_i64()
+            .ok_or_else(|| error("proof outer width missing"))?;
+        let outer_height = bounds["bounds"]["height"]
+            .as_i64()
+            .ok_or_else(|| error("proof outer height missing"))?;
+        if !(256..=4096).contains(&outer_width) || !(144..=2304).contains(&outer_height) {
+            return Err(error("proof window reported invalid outer bounds"));
+        }
+        samples.push((
+            width,
+            height,
+            actual_width,
+            actual_height,
+            outer_width,
+            outer_height,
+        ));
+        if actual_width <= 0 || actual_height <= 0 {
+            continue;
+        }
         if actual_width == i64::from(want.width) && actual_height == i64::from(want.height) {
             if device["clientWidth"] != css["clientWidth"]
                 || device["clientHeight"] != css["clientHeight"]
@@ -177,8 +209,11 @@ async fn configure_inner(
             }
             return Ok(());
         }
-        width += i64::from(want.width) - actual_width;
-        height += i64::from(want.height) - actual_height;
+        // Resize acknowledgement and tab layout are asynchronous. Use the
+        // observed outer geometry, not the prior requested bounds: accumulating
+        // deltas from a background tab can otherwise grow the window endlessly.
+        width = outer_width + i64::from(want.width) - actual_width;
+        height = outer_height + i64::from(want.height) - actual_height;
     }
     Err(error(
         "browser did not reach the exact requested proof viewport",
@@ -210,5 +245,74 @@ mod tests {
                 height: 768
             })
         );
+    }
+    #[tokio::test]
+    async fn activates_only_the_bound_page_before_measuring_native_geometry() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut activations = 0;
+            let mut methods = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                let method = v["method"].as_str().unwrap();
+                methods.push(method.to_owned());
+                let result = match method {
+                    "Page.bringToFront" => {
+                        activations += 1;
+                        json!({})
+                    }
+                    "Browser.getWindowForTarget" => {
+                        assert!(activations > 0);
+                        assert_eq!(v["params"]["targetId"], "owned-target");
+                        json!({"windowId":7})
+                    }
+                    "Browser.getWindowBounds" => {
+                        assert_eq!(v["params"]["windowId"], 7);
+                        json!({"bounds":{"width":1024,"height":888}})
+                    }
+                    "Browser.setWindowBounds" => {
+                        assert_eq!(v["params"]["windowId"], 7);
+                        json!({})
+                    }
+                    "Page.getLayoutMetrics" => {
+                        assert!(activations >= 2);
+                        json!({"layoutViewport":{"clientWidth":1024,"clientHeight":768},
+                            "cssLayoutViewport":{"clientWidth":1024,"clientHeight":768}})
+                    }
+                    other => panic!("unexpected geometry operation: {other}"),
+                };
+                ws.send(Message::Text(
+                    json!({"id":v["id"],"result":result}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+                if method == "Browser.getWindowBounds" {
+                    break;
+                }
+            }
+            assert_eq!(
+                methods.first().map(String::as_str),
+                Some("Page.bringToFront")
+            );
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            configure_inner(
+                &format!("ws://127.0.0.1:{port}/devtools/page/owned-target"),
+                "owned-target",
+                Viewport {
+                    width: 1024,
+                    height: 768,
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

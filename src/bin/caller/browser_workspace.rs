@@ -2500,6 +2500,39 @@ fn validated_page_target(value: &serde_json::Value, port: u16) -> Option<(String
     })
 }
 
+// An extension's onboarding page may be first in /json/list. Never bind the
+// application's lease or geometry to that internal page. A fresh launch has
+// exactly one non-extension page; ambiguous application surfaces fail closed.
+fn select_launch_page_target(
+    value: &serde_json::Value,
+    port: u16,
+    extension_required: bool,
+) -> Option<(String, String)> {
+    if !extension_required {
+        return validated_page_target(value, port);
+    }
+    let pages: Vec<_> = value
+        .as_array()?
+        .iter()
+        .filter(|target| {
+            target.get("type").and_then(serde_json::Value::as_str) == Some("page")
+                && target
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| {
+                        url.starts_with("https://")
+                            || url.starts_with("http://")
+                            || url == "about:blank"
+                    })
+        })
+        .cloned()
+        .collect();
+    if pages.len() != 1 {
+        return None;
+    }
+    validated_page_target(&serde_json::Value::Array(pages), port)
+}
+
 async fn wait_for_cdp_target(
     child: &mut Child,
     profile_dir: &Path,
@@ -2570,7 +2603,11 @@ async fn wait_for_cdp_target_until(
                         {
                             Ok(targets) => {
                                 let extension_runtime_id = active_extension_runtime_id(&targets);
-                                match validated_page_target(&targets, endpoint.port) {
+                                match select_launch_page_target(
+                                    &targets,
+                                    endpoint.port,
+                                    extension_required,
+                                ) {
                                     Some((ws, id))
                                         if !extension_required
                                             || extension_runtime_id.is_some() =>
@@ -4282,5 +4319,30 @@ mod tests {
         let found = find_executable_under(temp.path(), &["Google Chrome for Testing"], 6)
             .expect("managed browser executable should be found");
         assert_eq!(found, executable);
+    }
+    #[test]
+    fn extension_launch_never_selects_onboarding_or_ambiguous_apps() {
+        let page = |id: &str, url: &str| {
+            serde_json::json!({"type":"page","id":id,"url":url,
+            "webSocketDebuggerUrl":format!("ws://127.0.0.1:9222/devtools/page/{id}")})
+        };
+        let onboarding = page(
+            "onboarding",
+            "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.html",
+        );
+        let app = page("application", "https://example.org/");
+        let pages = serde_json::json!([onboarding.clone(), app.clone()]);
+        assert_eq!(
+            select_launch_page_target(&pages, 9222, true).unwrap().1,
+            "application"
+        );
+        assert!(select_launch_page_target(&serde_json::json!([onboarding]), 9222, true).is_none());
+        assert!(select_launch_page_target(
+            &serde_json::json!([app.clone(), page("second", "https://other.example/")]),
+            9222,
+            true
+        )
+        .is_none());
+        assert!(select_launch_page_target(&serde_json::json!([app]), 9999, true).is_none());
     }
 }
