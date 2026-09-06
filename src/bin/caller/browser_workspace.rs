@@ -3182,7 +3182,9 @@ mod tests {
 
     #[test]
     fn recorded_launch_arguments_are_bounded() {
-        assert!(recorded_browser_launch_arguments(&tokio::process::Command::new("browser")).is_err());
+        assert!(
+            recorded_browser_launch_arguments(&tokio::process::Command::new("browser")).is_err()
+        );
         let mut command = tokio::process::Command::new("browser");
         command.args(std::iter::repeat_n("--flag", 65));
         assert!(recorded_browser_launch_arguments(&command).is_err());
