@@ -3335,7 +3335,12 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("timed out waiting for a profile-bound CDP endpoint"));
         assert!(
-            error.contains("profile-bound CDP endpoint changed during readiness"),
+            // The same absolute deadline may expire between completed probes
+            // or inside a later probe. Scheduler timing must not dictate which
+            // honest terminal observation accompanies the required refusal.
+            error.contains("profile-bound CDP endpoint changed during readiness")
+                || error.contains("CDP target list exceeded the fixed CDP startup deadline")
+                || error.contains("CDP version endpoint exceeded the fixed CDP startup deadline"),
             "unexpected terminal observation: {error}"
         );
         assert!(
