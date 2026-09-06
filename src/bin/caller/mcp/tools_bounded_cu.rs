@@ -807,6 +807,7 @@ mod tests {
             extension: None,
             browser_executable: Some("/usr/bin/chromium".to_string()),
             browser_executable_source: Some("managed".to_string()),
+            launch_arguments: None,
             process_id: Some(10),
             debugging_port: Some(9222),
             cdp_http_url: Some("http://127.0.0.1:9222".to_string()),

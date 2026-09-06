@@ -176,6 +176,10 @@ pub struct BrowserWorkspace {
     pub browser_executable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_executable_source: Option<String>,
+    /// Exact argv passed by this daemon to its browser child (excluding argv[0]).
+    /// Private runtime provenance, not caller input or a parsed process title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_arguments: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,6 +912,7 @@ pub async fn create_workspace(
         extension: None,
         browser_executable: None,
         browser_executable_source: None,
+        launch_arguments: None,
         process_id: None,
         debugging_port: None,
         cdp_http_url: None,
@@ -990,6 +995,7 @@ pub async fn create_workspace(
     }
     workspace.browser_executable = Some(cdp.executable.path.display().to_string());
     workspace.browser_executable_source = Some(cdp.executable.source);
+    workspace.launch_arguments = Some(cdp.launch_arguments);
     workspace.process_id = cdp.process_id;
     workspace.debugging_port = Some(cdp.port);
     workspace.cdp_http_url = Some(format!("http://127.0.0.1:{}", cdp.port));
@@ -1390,6 +1396,7 @@ fn terminate_workspace_process(process_id: Option<u32>, mut child: Option<Child>
 
 struct CdpLaunch {
     executable: ChromiumExecutable,
+    launch_arguments: Vec<String>,
     process_id: Option<u32>,
     port: u16,
     web_socket_debugger_url: Option<String>,
@@ -1988,6 +1995,29 @@ fn cleanup_extension_workspace(workspace: &BrowserWorkspace) {
     cleanup_extension_workspace_paths(profile_dir, extension_root);
 }
 
+// Chromium's Linux setproctitle joins argv with spaces. Consumers must compare
+// that title against these original argument boundaries, never split it again.
+fn recorded_browser_launch_arguments(
+    command: &tokio::process::Command,
+) -> Result<Vec<String>, BrowserWorkspaceError> {
+    let arguments = command
+        .as_std()
+        .get_args()
+        .map(|arg| {
+            arg.to_str().map(str::to_owned).ok_or_else(|| {
+                BrowserWorkspaceError::Launch("browser launch arguments must be exact UTF-8".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total: usize = arguments.iter().map(String::len).sum();
+    if arguments.is_empty() || arguments.len() > 64 || total > 16 * 1024 {
+        return Err(BrowserWorkspaceError::Launch(
+            "browser launch argument bounds exceeded".into(),
+        ));
+    }
+    Ok(arguments)
+}
+
 async fn launch_cdp_browser(
     workspace: &BrowserWorkspace,
     profile_dir: &Path,
@@ -2069,6 +2099,7 @@ async fn launch_cdp_browser(
     } else {
         command.arg("about:blank");
     }
+    let launch_arguments = recorded_browser_launch_arguments(&command)?;
     let mut child = command.spawn().map_err(|e| {
         BrowserWorkspaceError::Launch(format!(
             "failed to launch {}: {e}",
@@ -2098,6 +2129,7 @@ async fn launch_cdp_browser(
                 child,
                 CdpLaunch {
                     executable,
+                    launch_arguments,
                     process_id,
                     port,
                     web_socket_debugger_url: ws,
@@ -3133,6 +3165,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn recorded_launch_arguments_preserve_spaces_as_one_argument() {
+        let mut command = tokio::process::Command::new("/test/browser");
+        command
+            .arg("--user-data-dir=/test/profile with spaces")
+            .arg("--disable-sync");
+        assert_eq!(
+            recorded_browser_launch_arguments(&command).unwrap(),
+            vec![
+                "--user-data-dir=/test/profile with spaces",
+                "--disable-sync"
+            ]
+        );
+    }
+
+    #[test]
+    fn recorded_launch_arguments_are_bounded() {
+        assert!(
+            recorded_browser_launch_arguments(&tokio::process::Command::new("browser")).is_err()
+        );
+        let mut command = tokio::process::Command::new("browser");
+        command.args(std::iter::repeat_n("--flag", 65));
+        assert!(recorded_browser_launch_arguments(&command).is_err());
+    }
+
     fn sample_workspace(id: &str) -> BrowserWorkspace {
         BrowserWorkspace {
             id: id.to_string(),
@@ -3149,6 +3206,7 @@ mod tests {
             extension: None,
             browser_executable: None,
             browser_executable_source: None,
+            launch_arguments: None,
             process_id: None,
             debugging_port: None,
             cdp_http_url: None,

@@ -108,3 +108,13 @@ are created and foreign sockets remain excluded.
 ## Exact browser viewport
 
 `ctl browser create --viewport 1024x768` creates a Linux display-bound browser with device scale one, then sizes the native browser window until CDP reports the exact CSS viewport. This occurs before workspace readiness; no page script, DOM edits, or device emulation is used. Invalid dimensions, non-owned displays, or failure to settle within ten seconds reject creation and clean up the owned browser. Capture controllers must independently recheck viewport metrics before and after the frozen screenshot.
+
+## Browser launch provenance
+
+The private workspace response includes `launch_arguments`, the exact original
+argument vector captured from the daemon's launch command before spawning.
+It is not accepted from create-workspace input. On Linux Chromium rewrites its
+process title into a space-joined string. A verifier must compare that string
+against the recorded vector; it must not split the title on whitespace and
+mistake text inside a path or another argument for an effective browser flag.
+The vector remains private host/runtime metadata and grants no filing authority.
