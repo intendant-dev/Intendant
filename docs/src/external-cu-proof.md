@@ -104,3 +104,7 @@ when either is supplied, must be an inclusive subset of Intendant’s managed
 99–199 pool, and exhaustion fails without spilling into another pool. Ordinary
 callers omitting both bounds retain the existing allocator. No filler displays
 are created and foreign sockets remain excluded.
+
+## Exact browser viewport
+
+`ctl browser create --viewport 1024x768` creates a Linux display-bound browser with device scale one, then sizes the native browser window until CDP reports the exact CSS viewport. This occurs before workspace readiness; no page script, DOM edits, or device emulation is used. Invalid dimensions, non-owned displays, or failure to settle within ten seconds reject creation and clean up the owned browser. Capture controllers must independently recheck viewport metrics before and after the frozen screenshot.

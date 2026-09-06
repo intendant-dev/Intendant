@@ -129,7 +129,7 @@ def main():
         require(120 <= display['display_id'] <= 159, 'display escaped reserved capture pool')
         attempt = 'cdn-external-test-' + uuid.uuid4().hex
         workspace = call('browser', 'create', f'http://127.0.0.1:{server.server_port}/', '--provider', 'cdp',
-                         '--display-target', display['display_target'], '--profile-dir', str(root / ('profile-' + attempt)),
+                         '--display-target', display['display_target'], '--viewport', '1024x768', '--profile-dir', str(root / ('profile-' + attempt)),
                          '--session', attempt)
         require(workspace.get('status') == 'ready', f'browser create: {workspace}')
         workspace = call('browser', 'acquire', workspace['id'], '--holder', attempt,

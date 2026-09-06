@@ -1,3 +1,4 @@
+mod proof_viewport;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -276,6 +277,9 @@ pub struct CreateBrowserWorkspaceRequest {
     pub extension_manifest_version: Option<u32>,
     #[serde(default)]
     pub extension_version: Option<String>,
+    /// Optional exact CSS viewport WIDTHxHEIGHT; Linux display-bound profiles only.
+    #[serde(default)]
+    pub viewport: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -785,6 +789,10 @@ pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
     bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let viewport = proof_viewport::parse(
+        request.viewport.as_deref(),
+        request.display_target.is_some(),
+    )?;
     let requested_provider = BrowserWorkspaceProvider::parse(request.provider.as_deref());
     let placement = match request
         .peer_id
@@ -967,7 +975,7 @@ pub async fn create_workspace(
         }
     }
 
-    let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir).await {
+    let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir, viewport).await {
         Ok(launched) => launched,
         Err(error) => {
             reservation.cleanup(&error.to_string()).await;
@@ -1983,6 +1991,7 @@ fn cleanup_extension_workspace(workspace: &BrowserWorkspace) {
 async fn launch_cdp_browser(
     workspace: &BrowserWorkspace,
     profile_dir: &Path,
+    viewport: Option<proof_viewport::Viewport>,
 ) -> Result<(Child, CdpLaunch), BrowserWorkspaceError> {
     let extension_required = workspace.extension.is_some();
     let executable = resolve_chromium_executable(
@@ -2007,6 +2016,9 @@ async fn launch_cdp_browser(
     // If the async create request is cancelled while CDP readiness is being
     // awaited, dropping its future must also terminate the spawned browser.
     command.kill_on_drop(true);
+    if viewport.is_some() {
+        command.arg("--force-device-scale-factor=1");
+    }
     #[cfg(target_os = "linux")]
     if let Some(binding) = display_binding.as_ref() {
         let authorization = crate::vision::virtual_display_x11_authorization(binding.display_id)
@@ -2065,17 +2077,35 @@ async fn launch_cdp_browser(
     })?;
     let process_id = child.id();
     match wait_for_cdp_target(&mut child, profile_dir, extension_required).await {
-        Ok((port, ws, target_id, extension_runtime_id)) => Ok((
-            child,
-            CdpLaunch {
-                executable,
-                process_id,
-                port,
-                web_socket_debugger_url: ws,
-                target_id,
-                extension_runtime_id,
-            },
-        )),
+        Ok((port, ws, target_id, extension_runtime_id)) => {
+            if let Some(viewport) = viewport {
+                let setup = match (ws.as_deref(), target_id.as_deref()) {
+                    (Some(ws), Some(target)) => {
+                        proof_viewport::configure(port, ws, target, viewport).await
+                    }
+                    _ => Err(BrowserWorkspaceError::Launch(
+                        "proof viewport needs a page endpoint".into(),
+                    )),
+                };
+                if let Err(error) = setup {
+                    if let Some(pid) = process_id {
+                        let _ = crate::platform::terminate_process_tree_now(pid);
+                    }
+                    return Err(error);
+                }
+            }
+            Ok((
+                child,
+                CdpLaunch {
+                    executable,
+                    process_id,
+                    port,
+                    web_socket_debugger_url: ws,
+                    target_id,
+                    extension_runtime_id,
+                },
+            ))
+        }
         Err(err) => {
             if let Some(pid) = process_id {
                 let _ = crate::platform::terminate_process_tree_now(pid);
@@ -3140,6 +3170,7 @@ mod tests {
             owner_session_id: Some("attempt-1".to_string()),
             display_target: None,
             profile_dir: None,
+            viewport: None,
             extension_archive_path: None,
             extension_archive_sha256: None,
             extension_archive_byte_length: None,
