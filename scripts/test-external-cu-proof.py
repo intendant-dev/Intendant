@@ -123,8 +123,10 @@ def main():
 
     def create_owned_browser():
         nonlocal workspace, display
-        display = call('display', 'create', '--width', '1280', '--height', '900')
+        display = call('display', 'create', '--width', '1280', '--height', '900',
+                       '--minimum-display-id', '120', '--maximum-display-id', '159')
         require(display.get('ok') is True, 'display create')
+        require(120 <= display['display_id'] <= 159, 'display escaped reserved capture pool')
         attempt = 'cdn-external-test-' + uuid.uuid4().hex
         workspace = call('browser', 'create', f'http://127.0.0.1:{server.server_port}/', '--provider', 'cdp',
                          '--display-target', display['display_target'], '--profile-dir', str(root / ('profile-' + attempt)),

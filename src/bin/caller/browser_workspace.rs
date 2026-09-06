@@ -770,6 +770,17 @@ pub async fn ensure_managed_chromium(
     })
 }
 
+fn create_private_browser_profile(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
     bus: &EventBus,
@@ -932,7 +943,7 @@ pub async fn create_workspace(
             }
         }
         None => {
-            if let Err(error) = fs::create_dir_all(&profile_dir) {
+            if let Err(error) = create_private_browser_profile(&profile_dir) {
                 let message = format!(
                     "failed to create browser workspace profile {}: {error}",
                     profile_dir.display()
@@ -3077,6 +3088,19 @@ fn now_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn new_browser_profiles_are_private_without_changing_existing_modes() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("parent").join("profile");
+        create_private_browser_profile(&profile).unwrap();
+        assert_eq!(fs::metadata(&profile).unwrap().mode() & 0o777, 0o700);
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o750)).unwrap();
+        create_private_browser_profile(&profile).unwrap();
+        assert_eq!(fs::metadata(&profile).unwrap().mode() & 0o777, 0o750);
+    }
+
     use super::*;
 
     fn sample_workspace(id: &str) -> BrowserWorkspace {
