@@ -1998,7 +1998,7 @@ fn cleanup_extension_workspace(workspace: &BrowserWorkspace) {
 // Chromium's Linux setproctitle joins argv with spaces. Consumers must compare
 // that title against these original argument boundaries, never split it again.
 fn recorded_browser_launch_arguments(
-    command: &Command,
+    command: &tokio::process::Command,
 ) -> Result<Vec<String>, BrowserWorkspaceError> {
     let arguments = command
         .as_std()
@@ -3167,7 +3167,7 @@ mod tests {
 
     #[test]
     fn recorded_launch_arguments_preserve_spaces_as_one_argument() {
-        let mut command = Command::new("/test/browser");
+        let mut command = tokio::process::Command::new("/test/browser");
         command
             .arg("--user-data-dir=/test/profile with spaces")
             .arg("--disable-sync");
@@ -3182,8 +3182,8 @@ mod tests {
 
     #[test]
     fn recorded_launch_arguments_are_bounded() {
-        assert!(recorded_browser_launch_arguments(&Command::new("browser")).is_err());
-        let mut command = Command::new("browser");
+        assert!(recorded_browser_launch_arguments(&tokio::process::Command::new("browser")).is_err());
+        let mut command = tokio::process::Command::new("browser");
         command.args(std::iter::repeat_n("--flag", 65));
         assert!(recorded_browser_launch_arguments(&command).is_err());
     }
