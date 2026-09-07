@@ -434,7 +434,8 @@ are never included in workspace records or portable evidence receipts.
 |-------------------------------|-------------|--------|
 | `browser_workspace_providers` | Report available workspace providers. | — |
 | `list_browser_workspaces`     | List active browser workspaces and leases. | — |
-| `create_browser_workspace`    | Launch/register a workspace. The compiled-approved proof-extension lane requires a fresh absolute profile and its complete pinned archive tuple. | `url?`, `label?`, `provider?`, `peer_id?`, `owner_session_id?`, `display_target?`, `profile_dir?`, `extension_archive_path?`, `extension_archive_sha256?`, `extension_archive_byte_length?`, `extension_manifest_version?`, `extension_version?` |
+| `external_cu_session` | Owner-bound explicit CU session with no model; see [protocol and migration](./external-cu-session.md). `external_cu_proof` is a deprecated alias through the same authorization and executor. | `request` (duplicate-key-safe JSON string) |
+| `create_browser_workspace`    | Launch/register a workspace. Extensions require immutable startup-policy approval, a fresh absolute profile and the complete pinned archive tuple; caller hashes never confer approval. | `url?`, `label?`, `provider?`, `peer_id?`, `owner_session_id?`, `display_target?`, `profile_dir?`, `extension_archive_path?`, `extension_archive_sha256?`, `extension_archive_byte_length?`, `extension_manifest_version?`, `extension_version?` |
 | `acquire_browser_workspace`   | Acquire a workspace lease. | `workspace_id`, `holder_id`, `holder_kind?`, `note?`, `force?` |
 | `release_browser_workspace`   | Release a workspace lease. | `workspace_id`, `holder_id?`, `note?` |
 | `close_browser_workspace`     | Close a workspace and terminate its local browser process when owned here. | `workspace_id`, `reason?` |

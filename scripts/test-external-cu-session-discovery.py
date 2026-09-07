@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-spec = importlib.util.spec_from_file_location('external_proof_test', Path(__file__).with_name('test-external-cu-proof.py'))
+spec = importlib.util.spec_from_file_location('external_proof_test', Path(__file__).with_name('test-external-cu-session.py'))
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)

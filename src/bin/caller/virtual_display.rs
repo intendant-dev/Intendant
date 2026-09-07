@@ -796,40 +796,40 @@ mod tests {
     #[test]
     fn requested_pool_allocator_uses_only_eligible_absent_slots() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join(".X120-lock"), b"foreign-test-marker").unwrap();
+        std::fs::write(temp.path().join(".X170-lock"), b"foreign-test-marker").unwrap();
         let mut excluded = vec![];
-        constrain_display_pool(&mut excluded, Some(120), Some(121)).unwrap();
+        constrain_display_pool(&mut excluded, Some(170), Some(171)).unwrap();
         let config = vision::virtual_display_config_in(temp.path(), 800, 600, &excluded).unwrap();
-        assert_eq!(virtual_target_id(&config), Some(121));
-        excluded.push(121);
+        assert_eq!(virtual_target_id(&config), Some(171));
+        excluded.push(171);
         assert!(vision::virtual_display_config_in(temp.path(), 800, 600, &excluded).is_none());
         assert_eq!(
-            std::fs::read(temp.path().join(".X120-lock")).unwrap(),
+            std::fs::read(temp.path().join(".X170-lock")).unwrap(),
             b"foreign-test-marker"
         );
     }
 
     #[test]
     fn requested_pool_preserves_default_and_existing_exclusions() {
-        let mut excluded = vec![121, 155];
+        let mut excluded = vec![171, 175];
         constrain_display_pool(&mut excluded, None, None).unwrap();
-        assert_eq!(excluded, vec![121, 155]);
-        constrain_display_pool(&mut excluded, Some(120), Some(159)).unwrap();
+        assert_eq!(excluded, vec![171, 175]);
+        constrain_display_pool(&mut excluded, Some(170), Some(179)).unwrap();
         let remaining: Vec<_> = (vision::PREFERRED_DISPLAY..vision::VIRTUAL_DISPLAY_END)
             .filter(|id| !excluded.contains(id))
             .collect();
-        assert_eq!(remaining.len(), 38);
-        assert!(remaining.iter().all(|id| (120..=159).contains(id)));
-        assert!(!remaining.contains(&121));
+        assert_eq!(remaining.len(), 8);
+        assert!(remaining.iter().all(|id| (170..=179).contains(id)));
+        assert!(!remaining.contains(&171));
     }
     #[test]
     fn requested_pool_rejects_partial_inverted_and_outside_bounds() {
         for pair in [
-            (None, Some(159)),
-            (Some(120), None),
-            (Some(0), Some(159)),
-            (Some(120), Some(200)),
-            (Some(159), Some(120)),
+            (None, Some(179)),
+            (Some(170), None),
+            (Some(0), Some(179)),
+            (Some(170), Some(200)),
+            (Some(179), Some(170)),
         ] {
             let mut excluded = vec![140];
             assert!(constrain_display_pool(&mut excluded, pair.0, pair.1).is_err());
@@ -838,8 +838,8 @@ mod tests {
     }
     #[test]
     fn exhausted_requested_pool_cannot_fall_back_outside_it() {
-        let mut excluded: Vec<_> = (120..=159).collect();
-        constrain_display_pool(&mut excluded, Some(120), Some(159)).unwrap();
+        let mut excluded: Vec<_> = (170..=179).collect();
+        constrain_display_pool(&mut excluded, Some(170), Some(179)).unwrap();
         assert!((vision::PREFERRED_DISPLAY..vision::VIRTUAL_DISPLAY_END)
             .all(|id| excluded.contains(&id)));
     }

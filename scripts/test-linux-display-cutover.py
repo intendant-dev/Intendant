@@ -592,7 +592,7 @@ def main() -> int:
         require(shutil.which(command) is not None, f"missing executable: {command}")
     require(args.binary.is_file() and os.access(args.binary, os.X_OK), f"bad binary: {args.binary}")
 
-    artifact_dir = args.rig / "artifacts" / "cdn-linux-cutover"
+    artifact_dir = args.rig / "artifacts" / "browser-linux-isolation"
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(mode=0o700, parents=True)
@@ -895,12 +895,12 @@ def main() -> int:
         receipt["runnerSentinelsAfter"] = runners_after
         receipt["passed"] = True
         receipt["finishedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        print("CDN Linux two-display cutover: PASS")
+        print("Browser Linux two-display isolation: PASS")
         return 0
     except Exception as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         receipt["finishedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        print(f"CDN Linux two-display cutover: FAIL: {error}", file=sys.stderr)
+        print(f"Browser Linux two-display isolation: FAIL: {error}", file=sys.stderr)
         return 1
     finally:
         for index, display in enumerate(displays):

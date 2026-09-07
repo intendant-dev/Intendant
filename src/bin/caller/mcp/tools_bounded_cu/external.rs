@@ -1,4 +1,4 @@
-//! Provider-free, owner-bound proof sessions. The worker, not an HTTP request,
+//! Provider-free, owner-bound CU sessions. The worker, not an HTTP request,
 //! owns display exclusion and cancellation cleanup across external agent turns.
 use super::*;
 use crate::access::actor::{ActorBinding, ActorKind};
@@ -22,7 +22,7 @@ const FROZEN_SECONDS: u64 = 45;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExternalCuProofParams {
+pub struct CuSessionParams {
     /// Duplicate-key-safe JSON command. Operations: begin, actions, freeze,
     /// observe, finish, close, abort, status. No provider or model is selected.
     pub request: String,
@@ -228,7 +228,7 @@ impl Phase {
         }
     }
 }
-struct Proof {
+struct CuSession {
     id: String,
     binding: Value,
     actor: Value,
@@ -246,7 +246,7 @@ struct Proof {
     pre_observation: Option<String>,
     receipt: Option<Value>,
 }
-impl Proof {
+impl CuSession {
     fn new(
         id: String,
         binding: Value,
@@ -357,7 +357,7 @@ async fn cleanup(executor: NativeBoundedCuExecutor) -> Result<(), BoundedCuTaskE
     let mut executor = executor;
     let release = executor.release_pending_input_edges().await;
     let bound = validate_resource_binding(&executor.params, &executor.bus).await;
-    let live = executor.validate_proof_session_liveness().await;
+    let live = executor.validate_capture_liveness().await;
     let scratch = std::sync::Arc::clone(&executor.scratch_guard);
     drop(executor);
     let scratch_result = std::sync::Arc::try_unwrap(scratch)
@@ -379,7 +379,10 @@ async fn cleanup(executor: NativeBoundedCuExecutor) -> Result<(), BoundedCuTaskE
     live?;
     scratch_result
 }
-fn validate_step(proof: &Proof, request: &Request) -> Result<Vec<CuAction>, BoundedCuTaskError> {
+fn validate_step(
+    proof: &CuSession,
+    request: &Request,
+) -> Result<Vec<CuAction>, BoundedCuTaskError> {
     proof.check_sequence(request)?;
     match request {
         Request::Actions { actions_json, .. } => {
@@ -439,7 +442,7 @@ fn validate_step(proof: &Proof, request: &Request) -> Result<Vec<CuAction>, Boun
     }
 }
 async fn step(
-    proof: &mut Proof,
+    proof: &mut CuSession,
     executor: &mut NativeBoundedCuExecutor,
     request: &Request,
     actions: Vec<CuAction>,
@@ -489,7 +492,7 @@ async fn step(
         _ => {}
     }
     validate_resource_binding(&executor.params, &executor.bus).await?;
-    executor.validate_proof_session_liveness().await?;
+    executor.validate_capture_liveness().await?;
     if !matches!(request, Request::Status { .. }) {
         proof.sequence += 1;
     }
@@ -542,7 +545,7 @@ async fn worker(
             return;
         }
     };
-    let mut proof = Proof::new(
+    let mut proof = CuSession::new(
         id,
         binding(&params, &job),
         actor_record(&actor),
@@ -628,31 +631,31 @@ async fn worker(
 }
 impl IntendantServer {
     #[tool(
-        description = "Drive an owner-bound proof session using explicit actions, with no model calls. The duplicate-key-safe request commands are begin/actions/freeze/observe/finish/close/abort/status. Sessions retain exact display exclusion, limits, actor binding and cleanup across calls. finish records external claims, never independent policy approval. Returns private PNG observations and a versioned execution receipt."
+        description = "Drive an owner-bound CU session using explicit actions, with no model calls. The duplicate-key-safe request commands are begin/actions/freeze/observe/finish/close/abort/status. Sessions retain exact display exclusion, limits, actor binding and cleanup across calls. finish records external claims, never independent policy approval. Returns private PNG observations and a versioned execution receipt."
     )]
-    pub(crate) async fn external_cu_proof(
+    pub(crate) async fn external_cu_session(
         &self,
-        Parameters(params): Parameters<ExternalCuProofParams>,
+        Parameters(params): Parameters<CuSessionParams>,
     ) -> String {
-        self.external_cu_proof_as_caller(
+        self.external_cu_session_as_caller(
             params,
             ToolCallerTrust::OwnerSurface,
             &ActorBinding::local_process(None),
         )
         .await
     }
-    pub(crate) async fn external_cu_proof_as_caller(
+    pub(crate) async fn external_cu_session_as_caller(
         &self,
-        params: ExternalCuProofParams,
+        params: CuSessionParams,
         caller: ToolCallerTrust,
         actor: &ActorBinding,
     ) -> String {
-        let result = self.external_proof_dispatch(params, caller, actor).await;
+        let result = self.external_session_dispatch(params, caller, actor).await;
         match result {Ok(value)=>value.to_string(),Err(error)=>json!({"ok":false,"error":{"code":error.code,"message":error.message,"retryable":error.retryable}}).to_string()}
     }
-    async fn external_proof_dispatch(
+    async fn external_session_dispatch(
         &self,
-        params: ExternalCuProofParams,
+        params: CuSessionParams,
         caller: ToolCallerTrust,
         actor: &ActorBinding,
     ) -> Result<Value, BoundedCuTaskError> {
@@ -776,8 +779,8 @@ impl IntendantServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn proof() -> Proof {
-        Proof::new(
+    fn proof() -> CuSession {
+        CuSession::new(
             "ecup-test".into(),
             json!({"jobSha256":"a".repeat(64)}),
             actor_record(&ActorBinding::local_process(Some("principal:test".into()))),
@@ -977,6 +980,54 @@ mod tests {
         proof.phase = Phase::Finished;
         assert!(validate_step(&proof, &close).is_ok());
     }
+    #[tokio::test]
+    async fn canonical_and_deprecated_tools_share_authenticated_dispatch() {
+        use crate::mcp::tests::{test_server, test_state};
+        let (_home, server) = test_server(test_state(), crate::event::EventBus::new());
+        for (trust, actor, expected) in [
+            (
+                ToolCallerTrust::Scoped,
+                ActorBinding::local_process(None),
+                "bounded-cu-owner-surface-required",
+            ),
+            (
+                ToolCallerTrust::OwnerSurface,
+                ActorBinding::unattributed(),
+                "external-proof-actor",
+            ),
+            (
+                ToolCallerTrust::OwnerSurface,
+                ActorBinding::local_process(None),
+                "external-proof-not-found",
+            ),
+        ] {
+            let caller = ToolCaller {
+                trust,
+                actor,
+                fs_scope: None,
+            };
+            let args = json!({"request":r#"{"op":"status","proof_id":"ecup-absent"}"#});
+            let canonical = server
+                .call_tool_by_name_as_caller(
+                    "external_cu_session",
+                    args.clone(),
+                    None,
+                    None,
+                    caller.clone(),
+                )
+                .await
+                .unwrap();
+            let alias = server
+                .call_tool_by_name_as_caller("external_cu_proof", args, None, None, caller)
+                .await
+                .unwrap();
+            let canonical = serde_json::to_value(canonical).unwrap();
+            assert_eq!(canonical, serde_json::to_value(alias).unwrap());
+            let response: Value =
+                serde_json::from_str(canonical["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(response["error"]["code"], expected);
+        }
+    }
     #[test]
     fn external_tool_is_not_advertised_to_scoped_profiles() {
         for profile in [
@@ -989,21 +1040,24 @@ mod tests {
             Some("managed"),
             Some("facade"),
         ] {
-            assert!(!tool_allowed_for_profile(
-                "external_cu_proof",
-                false,
-                profile
-            ));
+            for name in ["external_cu_session", "external_cu_proof"] {
+                assert!(!tool_allowed_for_profile(name, false, profile));
+                assert_eq!(
+                    mcp_tool_operation(name),
+                    crate::peer::access_policy::PeerOperation::DisplayInput
+                );
+                assert!(mcp_held_post_tool(name));
+            }
         }
         let mut manual = Vec::new();
         append_manual_http_tool_definitions(&mut manual, false, None);
         let tool = manual
             .iter()
-            .find(|tool| tool["name"] == "external_cu_proof")
+            .find(|tool| tool["name"] == "external_cu_session")
             .expect("external proof manual definition");
         assert_eq!(
             tool["description"].as_str(),
-            IntendantServer::external_cu_proof_tool_attr()
+            IntendantServer::external_cu_session_tool_attr()
                 .description
                 .as_deref()
         );

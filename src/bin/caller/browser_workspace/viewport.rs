@@ -1,4 +1,4 @@
-//! One-time browser geometry setup before publishing a proof workspace.
+//! One-time browser geometry setup before publishing a browser workspace.
 //! No page script evaluation, DOM mutation, emulation, or user input is exposed.
 use super::BrowserWorkspaceError;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -26,7 +26,7 @@ pub(super) fn parse(
     };
     if !cfg!(target_os = "linux") || !bound {
         return Err(error(
-            "explicit proof viewport requires a daemon-created Linux display",
+            "explicit browser viewport requires a daemon-created Linux display",
         ));
     }
     let Some((w, h)) = raw.split_once('x') else {
@@ -64,42 +64,42 @@ impl Client {
                     .into(),
             ))
             .await
-            .map_err(|_| error("proof viewport CDP send failed"))?;
+            .map_err(|_| error("browser viewport CDP send failed"))?;
         for _ in 0..64 {
             let message = self
                 .socket
                 .next()
                 .await
-                .ok_or_else(|| error("proof viewport CDP closed"))?
-                .map_err(|_| error("proof viewport CDP receive failed"))?;
+                .ok_or_else(|| error("browser viewport CDP closed"))?
+                .map_err(|_| error("browser viewport CDP receive failed"))?;
             match message {
                 Message::Text(text) => {
                     self.total = self.total.saturating_add(text.len());
                     if self.total > 4 * 1024 * 1024 {
-                        return Err(error("proof viewport CDP exceeded total byte limit"));
+                        return Err(error("browser viewport CDP exceeded total byte limit"));
                     }
                     let value: Value = serde_json::from_str(&text)
-                        .map_err(|_| error("invalid proof viewport CDP JSON"))?;
+                        .map_err(|_| error("invalid browser viewport CDP JSON"))?;
                     if value.get("id").is_none() {
                         continue;
                     }
                     if value["id"] != self.next || value.get("error").is_some() {
-                        return Err(error("proof viewport CDP request failed or mismatched"));
+                        return Err(error("browser viewport CDP request failed or mismatched"));
                     }
                     return value
                         .get("result")
                         .cloned()
-                        .ok_or_else(|| error("proof viewport CDP result missing"));
+                        .ok_or_else(|| error("browser viewport CDP result missing"));
                 }
                 Message::Ping(bytes) => self
                     .socket
                     .send(Message::Pong(bytes))
                     .await
-                    .map_err(|_| error("proof viewport CDP pong failed"))?,
-                _ => return Err(error("unexpected proof viewport CDP frame")),
+                    .map_err(|_| error("browser viewport CDP pong failed"))?,
+                _ => return Err(error("unexpected browser viewport CDP frame")),
             }
         }
-        Err(error("proof viewport CDP message limit exceeded"))
+        Err(error("browser viewport CDP message limit exceeded"))
     }
 }
 pub(super) async fn configure(
@@ -109,14 +109,16 @@ pub(super) async fn configure(
     viewport: Viewport,
 ) -> Result<(), BrowserWorkspaceError> {
     if !super::exact_loopback_websocket_url(url, port, &format!("/devtools/page/{target}")) {
-        return Err(error("proof viewport endpoint is not the exact owned page"));
+        return Err(error(
+            "browser viewport endpoint is not the exact owned page",
+        ));
     }
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         configure_inner(url, target, viewport),
     )
     .await
-    .map_err(|_| error("proof viewport setup exceeded 10 seconds"))?
+    .map_err(|_| error("browser viewport setup exceeded 10 seconds"))?
 }
 async fn configure_inner(
     url: &str,
@@ -128,7 +130,7 @@ async fn configure_inner(
         .max_frame_size(Some(1024 * 1024));
     let (socket, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), true)
         .await
-        .map_err(|_| error("proof viewport CDP connect failed"))?;
+        .map_err(|_| error("browser viewport CDP connect failed"))?;
     let mut client = Client {
         socket,
         next: 0,
@@ -145,7 +147,7 @@ async fn configure_inner(
     let id = window["windowId"]
         .as_i64()
         .filter(|n| *n >= 0)
-        .ok_or_else(|| error("proof viewport window missing"))?;
+        .ok_or_else(|| error("browser viewport window missing"))?;
     client
         .call(
             "Browser.setWindowBounds",
@@ -158,7 +160,7 @@ async fn configure_inner(
     for _ in 0..20 {
         if !(256..=4096).contains(&width) || !(144..=2304).contains(&height) {
             return Err(error(format!(
-                "proof viewport outer window exceeded bounds: {samples:?}"
+                "browser viewport outer window exceeded bounds: {samples:?}"
             )));
         }
         client
@@ -174,21 +176,21 @@ async fn configure_inner(
         let device = &metrics["layoutViewport"];
         let actual_width = css["clientWidth"]
             .as_i64()
-            .ok_or_else(|| error("proof viewport CSS width missing"))?;
+            .ok_or_else(|| error("browser viewport CSS width missing"))?;
         let actual_height = css["clientHeight"]
             .as_i64()
-            .ok_or_else(|| error("proof viewport CSS height missing"))?;
+            .ok_or_else(|| error("browser viewport CSS height missing"))?;
         let bounds = client
             .call("Browser.getWindowBounds", json!({"windowId":id}))
             .await?;
         let outer_width = bounds["bounds"]["width"]
             .as_i64()
-            .ok_or_else(|| error("proof outer width missing"))?;
+            .ok_or_else(|| error("browser outer width missing"))?;
         let outer_height = bounds["bounds"]["height"]
             .as_i64()
-            .ok_or_else(|| error("proof outer height missing"))?;
+            .ok_or_else(|| error("browser outer height missing"))?;
         if !(256..=4096).contains(&outer_width) || !(144..=2304).contains(&outer_height) {
-            return Err(error("proof window reported invalid outer bounds"));
+            return Err(error("browser window reported invalid outer bounds"));
         }
         samples.push((
             width,
@@ -205,7 +207,7 @@ async fn configure_inner(
             if device["clientWidth"] != css["clientWidth"]
                 || device["clientHeight"] != css["clientHeight"]
             {
-                return Err(error("proof viewport requires device scale one"));
+                return Err(error("browser viewport requires device scale one"));
             }
             return Ok(());
         }
@@ -216,7 +218,7 @@ async fn configure_inner(
         height = outer_height + i64::from(want.height) - actual_height;
     }
     Err(error(
-        "browser did not reach the exact requested proof viewport",
+        "browser did not reach the exact requested browser viewport",
     ))
 }
 #[cfg(test)]

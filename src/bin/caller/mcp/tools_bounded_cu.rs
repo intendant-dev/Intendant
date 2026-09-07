@@ -1,11 +1,11 @@
-//! The synchronous, exact-resource-bound computer-use lane used by Scout CDN
-//! proof capture. This is intentionally separate from general task dispatch.
+//! Exact-resource-bound computer use for model-backed tasks and external sessions.
+//! This is intentionally separate from general task dispatch.
 
 use super::*;
 
 mod external;
 use async_trait::async_trait;
-pub use external::ExternalCuProofParams;
+pub use external::CuSessionParams;
 
 use crate::bounded_cu_task::{
     remember_issued_stage_receipt, run_bounded_cu_task_until as execute_bounded_cu_task_until,
@@ -22,7 +22,7 @@ use crate::computer_use::{
 };
 use crate::conversation::ImageData;
 
-const SCOUT_CDN_LEASE_KIND: &str = "scout_cdn_capture";
+const BOUNDED_CU_LEASE_KIND: &str = "bounded_cu";
 
 type NativeActionJoinHandle = tokio::task::JoinHandle<(crate::computer_use::CuBatchOutcome, u64)>;
 
@@ -54,7 +54,7 @@ struct NativeBoundedCuExecutor {
     params: RunBoundedCuTaskParams,
     bus: crate::event::EventBus,
     display_access: Option<VirtualDisplayExclusiveAccess>,
-    proof_session: std::sync::Arc<crate::display::DisplaySession>,
+    capture_session: std::sync::Arc<crate::display::DisplaySession>,
     scratch_guard: std::sync::Arc<tempfile::TempDir>,
     initial_frame_not_before: Option<std::time::Instant>,
     pending_safety_releases: Vec<crate::display::InputEvent>,
@@ -62,13 +62,13 @@ struct NativeBoundedCuExecutor {
 }
 
 impl NativeBoundedCuExecutor {
-    async fn validate_proof_session_liveness(&self) -> Result<(), BoundedCuTaskError> {
-        if self.proof_session.capture_bridge_running().await {
+    async fn validate_capture_liveness(&self) -> Result<(), BoundedCuTaskError> {
+        if self.capture_session.capture_bridge_running().await {
             Ok(())
         } else {
             Err(BoundedCuTaskError::new(
                 "bounded-cu-capture-session-unavailable",
-                "bound display capture stopped during the proof task",
+                "bound display capture stopped during bounded CU execution",
                 false,
             ))
         }
@@ -89,7 +89,7 @@ impl NativeBoundedCuExecutor {
             errors.push(error.message.clone());
         }
         for release in releases {
-            if let Err(error) = self.proof_session.inject_input(release).await {
+            if let Err(error) = self.capture_session.inject_input(release).await {
                 errors.push(error.to_string());
             }
         }
@@ -141,7 +141,7 @@ impl NativeBoundedCuExecutor {
             return Ok(());
         };
         let frame = self
-            .proof_session
+            .capture_session
             .fresh_frame(not_before, std::time::Duration::from_secs(1))
             .await
             .map_err(|error| {
@@ -230,7 +230,7 @@ impl Drop for NativeBoundedCuExecutor {
         let Some(display_access) = self.display_access.take() else {
             return;
         };
-        let session = std::sync::Arc::clone(&self.proof_session);
+        let session = std::sync::Arc::clone(&self.capture_session);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             eprintln!("[bounded-cu] no Tokio runtime was available for cancellation cleanup");
             // Fail closed during runtime teardown: do not make the display
@@ -273,11 +273,11 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
                 }
                 self.require_post_seal_initial_frame().await?;
             }
-            self.validate_proof_session_liveness().await?;
+            self.validate_capture_liveness().await?;
             validate_resource_binding(&self.params, &self.bus).await?;
             self.pending_safety_releases = bounded_action_safety_releases(
                 action,
-                self.proof_session.resolution(),
+                self.capture_session.resolution(),
             )
             .map_err(|error| {
                 BoundedCuTaskError::new("bounded-cu-input-safety-plan-invalid", error, false)
@@ -295,7 +295,7 @@ impl BoundedCuActionExecutor for NativeBoundedCuExecutor {
             screenshot = Some(action_screenshot);
             results.push(action_result);
             validate_resource_binding(&self.params, &self.bus).await?;
-            self.validate_proof_session_liveness().await?;
+            self.validate_capture_liveness().await?;
             self.pending_safety_releases.clear();
         }
         let screenshot = screenshot.ok_or_else(|| {
@@ -417,7 +417,7 @@ impl IntendantServer {
         let target = DisplayTarget::Virtual {
             id: params.display_id,
         };
-        let proof_session = match session_registry.as_ref() {
+        let capture_session = match session_registry.as_ref() {
             Some(registry) => registry.read().await.get(params.display_id),
             None => None,
         }
@@ -428,7 +428,7 @@ impl IntendantServer {
                 false,
             )
         })?;
-        if !proof_session.capture_bridge_running().await {
+        if !capture_session.capture_bridge_running().await {
             return Err(BoundedCuTaskError::new(
                 "bounded-cu-capture-session-unavailable",
                 "bound display capture was not live before proof automation",
@@ -441,7 +441,7 @@ impl IntendantServer {
         // of the exclusive display fence until the seal has actually completed.
         // This mirrors the detached native-action boundary below and prevents a
         // timed-out proof request from overlapping lingering browser input.
-        let sealing_session = std::sync::Arc::clone(&proof_session);
+        let sealing_session = std::sync::Arc::clone(&capture_session);
         run_with_display_fence(display_access.clone(), async move {
             sealing_session
                 .seal_browser_interactive_for_automation(
@@ -484,7 +484,7 @@ impl IntendantServer {
             params: params.clone(),
             bus: self.bus.clone(),
             display_access: Some(display_access),
-            proof_session,
+            capture_session,
             scratch_guard: std::sync::Arc::clone(&scratch),
             initial_frame_not_before: Some(initial_frame_not_before),
             pending_safety_releases: Vec::new(),
@@ -518,13 +518,13 @@ impl IntendantServer {
             crate::provider::select_bounded_cu_provider(&cu_config).map_err(|error| {
                 BoundedCuTaskError::new("bounded-cu-provider-unavailable", error.to_string(), true)
             })?;
-        provider.set_cu_display(executor.proof_session.resolution());
+        provider.set_cu_display(executor.capture_session.resolution());
         let task_result =
             execute_bounded_cu_task_until(provider.as_ref(), &mut executor, request, deadline)
                 .await;
         let safety_release = executor.release_pending_input_edges().await;
         let final_binding = validate_resource_binding(&params, &self.bus).await;
-        let final_session_liveness = executor.validate_proof_session_liveness().await;
+        let final_session_liveness = executor.validate_capture_liveness().await;
         drop(executor);
         let cleanup = match std::sync::Arc::try_unwrap(scratch) {
             Ok(scratch) => scratch.close().map_err(|error| {
@@ -662,7 +662,7 @@ fn exclusive_workspace_on_display<'a>(
     if active_on_display.next().is_some() || workspace.id != params.workspace_id {
         return Err(BoundedCuTaskError::new(
             "bounded-cu-display-workspace-not-exclusive",
-            "the proof display was not exclusively bound to the selected browser workspace",
+            "the bound display was not exclusively bound to the selected browser workspace",
             false,
         ));
     }
@@ -674,7 +674,7 @@ fn validate_workspace(
     params: &RunBoundedCuTaskParams,
 ) -> Result<(), BoundedCuTaskError> {
     let exact_lease = workspace.lease.as_ref().is_some_and(|lease| {
-        lease.holder_id == params.attempt_id && lease.holder_kind == SCOUT_CDN_LEASE_KIND
+        lease.holder_id == params.attempt_id && lease.holder_kind == BOUNDED_CU_LEASE_KIND
     });
     if workspace.status != BrowserWorkspaceStatus::Ready
         || !workspace.placement.is_local()
@@ -815,7 +815,7 @@ mod tests {
             active_target_id: Some("page-1".to_string()),
             lease: Some(crate::browser_workspace::BrowserWorkspaceLease {
                 holder_id: "attempt-1".to_string(),
-                holder_kind: SCOUT_CDN_LEASE_KIND.to_string(),
+                holder_kind: BOUNDED_CU_LEASE_KIND.to_string(),
                 acquired_at: "2026-09-01T00:00:00Z".to_string(),
                 note: None,
             }),
@@ -839,7 +839,21 @@ mod tests {
     }
 
     #[test]
-    fn proof_display_rejects_every_second_active_browser_workspace() {
+    fn bounded_cu_accepts_only_its_exact_lease_kind_and_session() {
+        let params = params();
+        let mut workspace = workspace();
+        for kind in ["", "owner", "privileged", "bounded_cu_other", "BOUNDED_CU"] {
+            workspace.lease.as_mut().unwrap().holder_kind = kind.into();
+            assert!(validate_workspace(&workspace, &params).is_err());
+        }
+        workspace.lease.as_mut().unwrap().holder_kind = BOUNDED_CU_LEASE_KIND.into();
+        validate_workspace(&workspace, &params).unwrap();
+        workspace.owner_session_id = Some("another-attempt".into());
+        assert!(validate_workspace(&workspace, &params).is_err());
+    }
+
+    #[test]
+    fn bound_display_rejects_every_second_active_browser_workspace() {
         let params = params();
         let selected = workspace();
         assert_eq!(
@@ -1041,7 +1055,7 @@ mod tests {
         let backend = std::sync::Arc::new(OrderedReleaseBackend {
             events: std::sync::Arc::clone(&events),
         });
-        let proof_session =
+        let capture_session =
             std::sync::Arc::new(crate::display::DisplaySession::new(DISPLAY_ID, backend));
         let scratch_guard = std::sync::Arc::new(tempfile::tempdir().unwrap());
         let display_access =
@@ -1050,7 +1064,7 @@ mod tests {
             target: DisplayTarget::Virtual { id: DISPLAY_ID },
             backend: DisplayBackend::X11,
             display_access: Some(display_access),
-            proof_session,
+            capture_session,
             bus: crate::event::EventBus::new(),
             params: params(),
             session_registry: None,
@@ -1104,7 +1118,7 @@ mod tests {
         let backend = std::sync::Arc::new(OrderedReleaseBackend {
             events: std::sync::Arc::clone(&events),
         });
-        let proof_session =
+        let capture_session =
             std::sync::Arc::new(crate::display::DisplaySession::new(DISPLAY_ID, backend));
         let scratch_guard = std::sync::Arc::new(tempfile::tempdir().unwrap());
         let display_access =
@@ -1113,7 +1127,7 @@ mod tests {
             target: DisplayTarget::Virtual { id: DISPLAY_ID },
             backend: DisplayBackend::X11,
             display_access: Some(display_access),
-            proof_session,
+            capture_session,
             bus: crate::event::EventBus::new(),
             params: params(),
             session_registry: None,

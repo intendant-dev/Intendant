@@ -110,7 +110,7 @@ def main():
         return json.loads(done.stdout)
 
     def request(body, okay=True):
-        result = call('cu', 'proof', '--request', json.dumps(body, separators=(',', ':')))
+        result = call('cu', 'session', '--request', json.dumps(body, separators=(',', ':')))
         require(result.get('ok') is okay, f'proof result: {str(result)[:300]}')
         return result
 
@@ -124,20 +124,20 @@ def main():
     def create_owned_browser():
         nonlocal workspace, display
         display = call('display', 'create', '--width', '1280', '--height', '900',
-                       '--min-display-id', '120', '--max-display-id', '159')
+                       '--min-display-id', '170', '--max-display-id', '179')
         require(display.get('ok') is True, 'display create')
-        require(120 <= display['display_id'] <= 159, 'display escaped reserved capture pool')
-        attempt = 'cdn-external-test-' + uuid.uuid4().hex
+        require(170 <= display['display_id'] <= 179, 'display escaped requested display pool')
+        attempt = 'cu-session-test-' + uuid.uuid4().hex
         workspace = call('browser', 'create', f'http://127.0.0.1:{server.server_port}/', '--provider', 'cdp',
                          '--display-target', display['display_target'], '--viewport', '1024x768', '--profile-dir', str(root / ('profile-' + attempt)),
                          '--session', attempt)
         require(workspace.get('status') == 'ready', f'browser create: {workspace}')
         workspace = call('browser', 'acquire', workspace['id'], '--holder', attempt,
-                         '--holder-kind', 'scout_cdn_capture', '--note', 'external proof acceptance')
+                         '--holder-kind', 'bounded_cu', '--note', 'external proof acceptance')
         return {'op': 'begin', 'attempt_id': attempt, 'workspace_id': workspace['id'],
                 'display_id': display['display_id'], 'display_target': display['display_target'],
                 'capture_generation': display['capture_generation'],
-                'job_sha256': hashlib.sha256(b'acceptance fixture, not candidate qualification').hexdigest()}
+                'job_sha256': hashlib.sha256(b'acceptance fixture, local session fixture').hexdigest()}
 
     def destroy_owned():
         nonlocal workspace, display
@@ -251,7 +251,7 @@ def main():
         require(cutover.runner_snapshot() == runners, 'CI runner identities changed')
         checks.extend(['foreign Xvfb preserved', 'CI runner identities preserved'])
         require(call('display','list') == display_baseline, 'managed display inventory changed after cleanup')
-        result = {'passed': input_effect_verified, 'inputEffectVerified': input_effect_verified, 'test': 'external-cu-proof-real-linux-v1', 'binarySha256': cutover.sha256_file(binary),
+        result = {'passed': input_effect_verified, 'inputEffectVerified': input_effect_verified, 'test': 'external-cu-session-real-linux-v1', 'binarySha256': cutover.sha256_file(binary),
                   'checks': checks, 'runners': runners, 'foreign': foreign_id, 'pngSamples': samples, 'commands': commands}
         save(out / 'acceptance.json', result)
         print(json.dumps({key: value for key, value in result.items() if key != 'commands'}, indent=2))

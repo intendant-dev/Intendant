@@ -844,9 +844,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Execute a JSON array of computer-use actions",
     },
     CommandSpec {
-        path: &["cu", "proof"], lane: RiskLane::Act, tool: "external_cu_proof", seed: "{}",
-        positionals: &[], flags: &[flag!("request", "request", Str, "duplicate-key-safe proof request JSON")],
-        help: "Drive a bounded, model-free external proof session",
+        path: &["cu", "session"], lane: RiskLane::Act, tool: "external_cu_session", seed: "{}",
+        positionals: &[], flags: &[flag!("request", "request", Str, "duplicate-key-safe CU session request JSON")],
+        help: "Drive a bounded, model-free external CU session",
     },
     CommandSpec {
         path: &["cu", "task"],
@@ -856,7 +856,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         positionals: &[p_str("TASK", "task", true, true)],
         flags: &[
             flag!("mode", "mode", Str, "stage or attest"),
-            flag!("attempt", "attempt_id", Str, "exact Scout attempt id"),
+            flag!("attempt", "attempt_id", Str, "exact application attempt id"),
             flag!("workspace", "workspace_id", Str, "exact browser workspace id"),
             flag!("display-id", "display_id", U64, "daemon virtual display id"),
             flag!("target", "display_target", Str, "canonical display_N target"),
@@ -1033,7 +1033,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "daemon-created virtual display"
             ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
-            flag!("viewport", "viewport", Str, "exact proof CSS viewport WIDTHxHEIGHT"),
+            flag!("viewport", "viewport", Str, "exact CSS viewport WIDTHxHEIGHT"),
             flag!(
                 "extension-archive",
                 "extension_archive_path",
@@ -2389,6 +2389,8 @@ pub(crate) const COMMAND_ALIASES: &[(&[&str], &[&str])] = &[
     (&["browser", "open"], &["browser", "create"]),
     (&["browser", "take"], &["browser", "acquire"]),
     (&["cu", "exec"], &["cu", "actions"]),
+    // Deprecated name: one canonical vocabulary, permission lane and executor.
+    (&["cu", "proof"], &["cu", "session"]),
     (&["cu", "read-screen"], &["cu", "elements"]),
     (&["cu", "screenshot"], &["display", "screenshot"]),
     (&["display", "frame"], &["display", "read-frame"]),

@@ -290,6 +290,9 @@ struct CliFlags {
     task: Option<String>,
     /// --task-file <PATH>: Read the initial task from a file instead of argv.
     task_file: Option<String>,
+    /// Immutable owner approval: explicit process argv only, never env/config.
+    browser_extension_policy: Option<String>,
+    browser_extension_policy_sha256: Option<String>,
     provider: Option<String>,
     /// --openai-auth <MODE>: OpenAI credential/transport selection
     /// (`auto`, `api-key`, or `chatgpt`).
@@ -402,6 +405,11 @@ impl CliFlags {
                 args.push(value.clone());
             }
         };
+        valued("--browser-extension-policy", &self.browser_extension_policy);
+        valued(
+            "--browser-extension-policy-sha256",
+            &self.browser_extension_policy_sha256,
+        );
         valued("--provider", &self.provider);
         valued("--openai-auth", &self.openai_auth);
         valued("--model", &self.model);
@@ -477,6 +485,10 @@ fn print_help() {
     println!("    --no-sandbox          Disable the runtime write sandbox (Landlock/Seatbelt/restricted token)");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --takeover            Ask the current scheduler-lease holder to drain, then acquire the lease (daemon handover)");
+    println!(
+        "    --browser-extension-policy PATH  Startup-only extension approvals (default: deny all)"
+    );
+    println!("    --browser-extension-policy-sha256 HEX  Required exact raw policy SHA256 pin");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
@@ -577,6 +589,8 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
     let mut flags = CliFlags {
         task: None,
         task_file: None,
+        browser_extension_policy: None,
+        browser_extension_policy_sha256: None,
         provider: None,
         openai_auth: None,
         model: None,
@@ -625,6 +639,25 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
             "--version" | "-V" => {
                 println!("{}", build_info::version_line("intendant"));
                 std::process::exit(0);
+            }
+            "--browser-extension-policy" | "--browser-extension-policy-sha256" => {
+                let field = if args[i] == "--browser-extension-policy" {
+                    &mut flags.browser_extension_policy
+                } else {
+                    &mut flags.browser_extension_policy_sha256
+                };
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                    .ok_or_else(|| CallerError::Config(format!("Missing value for {}", args[i])))?;
+                if field.is_some() {
+                    return Err(CallerError::Config(format!(
+                        "Duplicate startup flag {}",
+                        args[i]
+                    )));
+                }
+                *field = Some(value.clone());
+                i += 2;
             }
             "--provider" => {
                 if i + 1 < args.len() {
@@ -912,6 +945,9 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         return Err(CallerError::Config(
             "`--task-file` cannot be combined with a positional task".to_string(),
         ));
+    }
+    if flags.browser_extension_policy.is_some() != flags.browser_extension_policy_sha256.is_some() {
+        return Err(CallerError::Config("--browser-extension-policy and --browser-extension-policy-sha256 must be supplied together".into()));
     }
     validate_tls_cli_flags(&flags)?;
 
@@ -2238,6 +2274,8 @@ Also: {"source": "bare"}"#;
         CliFlags {
             task: None,
             task_file: None,
+            browser_extension_policy: None,
+            browser_extension_policy_sha256: None,
             provider: None,
             openai_auth: None,
             model: None,
@@ -2272,6 +2310,49 @@ Also: {"source": "bare"}"#;
             no_web: false,
             advertise_urls: Vec::new(),
         }
+    }
+
+    #[test]
+    fn extension_policy_cli_pair_is_explicit_unique_and_replayed() {
+        for args in [
+            vec!["--browser-extension-policy", "/policy.json"],
+            vec!["--browser-extension-policy-sha256", "abc"],
+            vec!["--browser-extension-policy"],
+            vec![
+                "--browser-extension-policy",
+                "/a",
+                "--browser-extension-policy",
+                "/b",
+                "--browser-extension-policy-sha256",
+                "abc",
+            ],
+        ] {
+            assert!(parse_cli_flags_from(cli(&args)).is_err());
+        }
+        let pin = "a".repeat(64);
+        let parsed = parse_cli_flags_from(cli(&[
+            "--browser-extension-policy",
+            "/policy.json",
+            "--browser-extension-policy-sha256",
+            &pin,
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.browser_extension_policy.as_deref(),
+            Some("/policy.json")
+        );
+        let successor = parse_cli_flags_from(parsed.successor_replay_args()).unwrap();
+        assert_eq!(
+            successor.browser_extension_policy,
+            parsed.browser_extension_policy
+        );
+        assert_eq!(
+            successor.browser_extension_policy_sha256,
+            parsed.browser_extension_policy_sha256
+        );
+        let default = parse_cli_flags_from(Vec::new()).unwrap();
+        assert!(default.browser_extension_policy.is_none());
+        assert!(default.browser_extension_policy_sha256.is_none());
     }
 
     /// Successor replay (the successor-exec lane): explicitly passed
@@ -2554,6 +2635,8 @@ Also: {"source": "bare"}"#;
         let flags = CliFlags {
             task: None,
             task_file: None,
+            browser_extension_policy: None,
+            browser_extension_policy_sha256: None,
             provider: None,
             openai_auth: None,
             model: None,
@@ -2613,6 +2696,8 @@ Also: {"source": "bare"}"#;
         let flags = CliFlags {
             task: None,
             task_file: None,
+            browser_extension_policy: None,
+            browser_extension_policy_sha256: None,
             provider: None,
             openai_auth: None,
             model: None,
@@ -2659,6 +2744,8 @@ Also: {"source": "bare"}"#;
         let flags = CliFlags {
             task: None,
             task_file: None,
+            browser_extension_policy: None,
+            browser_extension_policy_sha256: None,
             provider: None,
             openai_auth: None,
             model: None,
@@ -3983,6 +4070,16 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
+    // Seal extension authority from explicit argv before reading any project
+    // environment or starting any frontend/MCP listener. Successors replay both
+    // pins; a changed file refuses startup instead of silently changing authority.
+    let flags = parse_cli_flags()?;
+    browser_workspace::initialize_extension_policy(
+        flags.browser_extension_policy.as_deref(),
+        flags.browser_extension_policy_sha256.as_deref(),
+    )
+    .map_err(|error| CallerError::Config(error.to_string()))?;
+
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     // — recorded so credential errors can name the concrete paths searched
     // (under a daemon, "project root" is the launch dir, not the project a
@@ -4011,7 +4108,6 @@ async fn main() -> Result<(), CallerError> {
     });
 
     // Override env vars from CLI flags before provider selection
-    let flags = parse_cli_flags()?;
     if let Some(ref p) = flags.provider {
         env::set_var("PROVIDER", p);
     }

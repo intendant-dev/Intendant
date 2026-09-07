@@ -653,7 +653,7 @@ pub struct RunBoundedCuTaskParams {
     /// `stage` permits bounded native computer input; `attest` is strictly
     /// observation-only after its internally captured initial frame.
     pub mode: crate::bounded_cu_task::BoundedCuTaskMode,
-    /// Exact Scout attempt that owns the browser-workspace lease.
+    /// Exact application attempt that owns the browser-workspace lease.
     pub attempt_id: String,
     /// Exact ready, local CDP workspace created for this attempt.
     pub workspace_id: String,
@@ -858,7 +858,7 @@ pub struct CreateBrowserWorkspaceParams {
     /// Explicit browser profile directory. If omitted, Intendant creates one under its data dir.
     #[serde(default)]
     pub profile_dir: Option<String>,
-    /// Absolute path to a compiled-approved immutable extension zip. The archive identity,
+    /// Absolute path to a startup-policy-approved immutable extension zip. The archive identity,
     /// byte length, manifest version, and extension version fields are
     /// required together and are accepted only with provider=cdp.
     #[serde(default)]
@@ -871,7 +871,7 @@ pub struct CreateBrowserWorkspaceParams {
     pub extension_manifest_version: Option<u32>,
     #[serde(default)]
     pub extension_version: Option<String>,
-    /// Exact CSS viewport WIDTHxHEIGHT on a fresh Linux proof display.
+    /// Exact CSS viewport WIDTHxHEIGHT on a fresh daemon-created Linux display.
     #[serde(default)]
     pub viewport: Option<String>,
 }
