@@ -1,0 +1,20 @@
+{
+  "case_kind": "verify-fixed",
+  "expected": {
+    "result": {
+      "valid": true
+    }
+  },
+  "family": 3,
+  "inputs": {
+    "msg": "74686520706c616e652061636365707473206f6e6c792077686174206576657279207265706c6963612072652d64657269766573",
+    "pk": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+    "sig": "8b97be2e69c39d45d22ef08c33fd6da22ae530c50b3e3f79af272959323b06d05fbb072642c0ab7a25db5e890d7bc0b921fa335ae924a02f127667ec1d4bed0b"
+  },
+  "name": "ed25519-verify-valid",
+  "source": "2.3",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

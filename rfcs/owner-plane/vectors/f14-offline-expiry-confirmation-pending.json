@@ -1,0 +1,20 @@
+{
+  "case_kind": "offline-confirmation",
+  "expected": {
+    "result": {
+      "recorded": "PENDING: the §4.5 working position stands unconfirmed; the run's result enters the §15 decision record when performed (Gate-A audit tracks the open item)"
+    }
+  },
+  "family": 14,
+  "inputs": {
+    "params": {
+      "working_position": "acceptance/witness-deadline expiry + online-only leases for high-impact capabilities + epoch/sequence budgets for offline writers"
+    },
+    "procedure": "umbrella App C #2: offline expiry rule confirmation against real offline usage"
+  },
+  "name": "offline-expiry-confirmation-pending",
+  "source": "13.3",
+  "surfaces": [
+    "core"
+  ]
+}

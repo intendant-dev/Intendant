@@ -1,0 +1,23 @@
+{
+  "case_kind": "rewrap-idempotence",
+  "expected": {
+    "result": {
+      "identical": true,
+      "wrapper": "0c8c19c8761dbec46241a005520d343cf8550d1b3a9b7fc8218d369f62ce1464896822ec230421ed2e9bb17b78ad178a"
+    }
+  },
+  "family": 5,
+  "inputs": {
+    "dek": "7272727272727272727272727272727272727272727272727272727272727272",
+    "item_addr": "0b8e6bd03310b2b0287a85b35fa1f9ea22dbdc5d58beca9ef0b574eefca1bc34",
+    "kek": "7171717171717171717171717171717171717171717171717171717171717171",
+    "kek_epoch": 1
+  },
+  "name": "rewrap-byte-idempotence",
+  "source": "5.3",
+  "surfaces": [
+    "core",
+    "native-crypto",
+    "browser"
+  ]
+}

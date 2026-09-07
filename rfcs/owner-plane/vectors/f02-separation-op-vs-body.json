@@ -1,0 +1,20 @@
+{
+  "case_kind": "separation-negative",
+  "expected": {
+    "result": {
+      "distinct": true
+    }
+  },
+  "family": 2,
+  "inputs": {
+    "preimage": "73616d652d6279746573",
+    "tag_a": "op",
+    "tag_b": "body"
+  },
+  "name": "separation-op-vs-body",
+  "source": "2.2",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

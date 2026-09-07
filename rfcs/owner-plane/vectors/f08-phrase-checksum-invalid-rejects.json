@@ -1,0 +1,17 @@
+{
+  "case_kind": "phrase-derive",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "key-malformed"
+  },
+  "family": 8,
+  "inputs": {
+    "phrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ability"
+  },
+  "name": "phrase-checksum-invalid-rejects",
+  "source": "2.4",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

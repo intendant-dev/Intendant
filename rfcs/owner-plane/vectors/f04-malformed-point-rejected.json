@@ -1,0 +1,20 @@
+{
+  "case_kind": "hpke-negative",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "key-malformed"
+  },
+  "family": 4,
+  "inputs": {
+    "aad": "636f727075732f616164",
+    "ct": "56b630a24db72813252eacff2819cb558d583547f60475f879a8dcd4c63ea981f8eccfab273fe5cc5323a1e55a60fc80",
+    "enc": "0401010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+    "recipient_sk": "c4ac1d615a42b8455586ebbfae9e6bb38592ae72ebdbd1fb34a906b8ac4327f6"
+  },
+  "name": "malformed-point-rejected",
+  "source": "2.1",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}
