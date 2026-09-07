@@ -1638,6 +1638,17 @@ mod tests {
     }
 
     #[test]
+    fn cu_session_and_deprecated_proof_share_the_raw_request_plan() {
+        let raw = r#"{"op":"status","proof_id":"ecup-test","op":"abort"}"#;
+        let canonical = plan_for_meta("act", &argv(&["cu", "session", "--request", raw])).unwrap();
+        let alias = plan_for_meta("act", &argv(&["cu", "proof", "--request", raw])).unwrap();
+        assert_eq!(canonical.tool, "external_cu_session");
+        assert_eq!(canonical.tool, alias.tool);
+        assert_eq!(canonical.args, alias.args);
+        assert_eq!(canonical.args["request"], raw); // duplicates reach daemon validation unchanged
+    }
+
+    #[test]
     fn plan_builds_seeded_tagged_args() {
         let planned = plan_for_meta(
             "act",
@@ -2455,26 +2466,29 @@ mod tests {
                 "--profile-dir",
                 "/private/profile",
                 "--extension-archive",
-                "/private/rabby.zip",
+                "/private/fixture-extension.zip",
                 "--extension-sha256",
-                "daf7819d7371a67ef447c788e899b1df628f95e380a460c6e5dd3b86bbe09e4f",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--extension-bytes",
-                "16216742",
+                "512",
                 "--extension-manifest-version",
                 "3",
                 "--extension-version",
-                "0.94.6",
+                "1.0.0",
             ]),
         )
         .unwrap();
-        assert_eq!(planned.args["extension_archive_path"], "/private/rabby.zip");
+        assert_eq!(
+            planned.args["extension_archive_path"],
+            "/private/fixture-extension.zip"
+        );
         assert_eq!(
             planned.args["extension_archive_sha256"],
-            "daf7819d7371a67ef447c788e899b1df628f95e380a460c6e5dd3b86bbe09e4f"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        assert_eq!(planned.args["extension_archive_byte_length"], 16_216_742);
+        assert_eq!(planned.args["extension_archive_byte_length"], 512);
         assert_eq!(planned.args["extension_manifest_version"], 3);
-        assert_eq!(planned.args["extension_version"], "0.94.6");
+        assert_eq!(planned.args["extension_version"], "1.0.0");
         let planned = plan_for_meta("act", &argv(&["browser", "take", "ws-1"])).unwrap();
         assert_eq!(planned.tool, "acquire_browser_workspace");
         // Round 31: the alias TABLES — family spellings and ctl's

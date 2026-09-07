@@ -73,7 +73,7 @@ pub(crate) use tools_ask::{
 #[cfg(test)]
 pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_bounded_cu;
-pub(crate) use tools_bounded_cu::ExternalCuProofParams;
+pub(crate) use tools_bounded_cu::CuSessionParams;
 mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
@@ -1001,10 +1001,11 @@ impl IntendantServer {
                     self.release_browser_workspace(params).await,
                 ))
             }
-            "external_cu_proof" => {
-                let Parameters(params) = parse_params::<ExternalCuProofParams>(args)?;
+            // Deprecated wire alias shares actor resolution, authorization and executor.
+            "external_cu_session" | "external_cu_proof" => {
+                let Parameters(params) = parse_params::<CuSessionParams>(args)?;
                 Ok(text_tool_result(
-                    self.external_cu_proof_as_caller(params, caller, &actor)
+                    self.external_cu_session_as_caller(params, caller, &actor)
                         .await,
                 ))
             }

@@ -1385,14 +1385,15 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
             print_tool_response(response, config, output)?;
         }
-        "proof" => {
+        "session" | "proof" => {
+            ensure_help(&raw[1..], help_cu_session)?;
             let args = parse_command_args(&raw[1..], &["--request"], &[])?;
             if !args.positional.is_empty() {
-                return Err("cu proof only accepts --request JSON|@file|-".into());
+                return Err("cu session only accepts --request JSON|@file|-".into());
             }
             let input = args
                 .one("--request")
-                .ok_or("cu proof requires --request JSON|@file|-")?;
+                .ok_or("cu session requires --request JSON|@file|-")?;
             let mut request = String::new();
             if input == "-" {
                 std::io::stdin()
@@ -1402,7 +1403,7 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
             } else if let Some(path) = input.strip_prefix('@') {
                 let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
                 if !meta.is_file() || meta.file_type().is_symlink() {
-                    return Err("proof request must be a regular non-symlink file".into());
+                    return Err("CU session request must be a regular non-symlink file".into());
                 }
                 let mut options = std::fs::OpenOptions::new();
                 options.read(true);
@@ -1413,7 +1414,7 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 }
                 let file = options.open(path).map_err(|e| e.to_string())?;
                 if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-                    return Err("proof request is not a file".into());
+                    return Err("CU session request is not a file".into());
                 }
                 file.take(98_305)
                     .read_to_string(&mut request)
@@ -1422,13 +1423,13 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 request = input.to_owned();
             }
             if request.len() > 98_304 {
-                return Err("proof request exceeds 96 KiB".into());
+                return Err("CU session request exceeds 96 KiB".into());
             }
             // Keep raw JSON intact: the daemon rejects duplicate keys before projection.
             let response = call_tool(
                 client,
                 config,
-                "external_cu_proof",
+                "external_cu_session",
                 serde_json::json!({"request":request}),
             )
             .await?;
@@ -6229,11 +6230,12 @@ fn help_cu() {
     println!(
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
-  intendant ctl cu proof --request JSON|@file|- (begin/actions/freeze/observe/finish/close/abort/status; no model)\n\
+  intendant ctl cu session --request JSON|@file|- (begin/actions/freeze/observe/finish/close/abort/status; no model)\n\
   intendant ctl cu task TASK --mode stage|attest --attempt ID --workspace ID --display-id N --target display_N --capture-generation ID [--prior-receipt ID]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
+`cu proof` is a deprecated alias for `cu session` with identical authorization and execution.\n\
 Run `intendant ctl cu actions --help` for the action JSON shapes.\n\
 `cu elements` reads the frontmost app's UI element tree (roles, labels, values, frames) — \n\
 cheap textual grounding: click the center of a reported frame. Long values/titles are\n\
@@ -6243,6 +6245,16 @@ Targets: user_session (needs display grant), 99/display_99 (virtual).\n\
 Omit to auto-detect: a live agent virtual display when one exists, else the user session.\n\
 If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
 (grant, OS permissions, display, input) with fixes."
+    );
+}
+
+fn help_cu_session() {
+    println!(
+        "Usage: intendant ctl cu session --request JSON|@file|-\n\
+Provider-free, owner-bound CU: begin/actions/freeze/observe/finish/close/abort/status.\n\
+Requires an exact bounded_cu browser lease, attempt owner and live display generation.\n\
+`cu proof` is a deprecated alias with the same authorization and executor.\n\
+The versioned receipt retains proof_id/proofId and the v1 profile/hash domains for replay."
     );
 }
 

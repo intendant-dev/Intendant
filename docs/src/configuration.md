@@ -137,6 +137,13 @@ managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
 
+Browser extensions default to **deny all**. Approval is not an environment or
+`intendant.toml` setting. Supply both `--browser-extension-policy PATH` and
+`--browser-extension-policy-sha256 HEX` on daemon startup; see
+[Browser extension approval](./browser-extensions.md). The exact snapshot is
+immutable for that process, including every frontend/MCP path. Settings, tasks,
+and callers cannot add approval; a restart must revalidate the pinned bytes.
+
 ### Display diagnostics
 
 | Variable | Default | Description |
