@@ -1,6 +1,12 @@
 mod extension_policy;
 mod viewport;
 
+pub(crate) mod launch_policy;
+
+pub(crate) fn initialize_testing_notice_policy() -> Result<(), BrowserWorkspaceError> {
+    launch_policy::initialize().map_err(|error| BrowserWorkspaceError::Launch(error.into()))
+}
+
 pub(crate) fn initialize_extension_policy(
     path: Option<&str>,
     sha256: Option<&str>,
@@ -795,6 +801,10 @@ pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
     bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    // Validate navigation before display leases, registry reservations or filesystem effects.
+    let launch_url = launch_policy::navigation(request.url.as_deref())
+        .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?
+        .map(str::to_owned);
     let viewport = viewport::parse(
         request.viewport.as_deref(),
         request.display_target.is_some(),
@@ -892,12 +902,7 @@ pub async fn create_workspace(
             .filter(|s| !s.is_empty())
             .unwrap_or("Browser workspace")
             .to_string(),
-        url: request
-            .url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        url: launch_url,
         provider,
         requested_provider,
         placement,
@@ -1979,6 +1984,8 @@ async fn launch_cdp_browser(
     profile_dir: &Path,
     viewport: Option<viewport::Viewport>,
 ) -> Result<(Child, CdpLaunch), BrowserWorkspaceError> {
+    let navigation = launch_policy::navigation(workspace.url.as_deref())
+        .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?;
     let extension_required = workspace.extension.is_some();
     let executable = resolve_chromium_executable(
         matches!(workspace.provider, BrowserWorkspaceProvider::SystemCdp),
@@ -2002,6 +2009,11 @@ async fn launch_cdp_browser(
     // If the async create request is cancelled while CDP readiness is being
     // awaited, dropping its future must also terminate the spawned browser.
     command.kill_on_drop(true);
+    launch_policy::apply_testing_notice_policy(
+        command.as_std_mut(),
+        &executable.source,
+        launch_policy::current(),
+    );
     if viewport.is_some() {
         command.arg("--force-device-scale-factor=1");
     }
@@ -2050,11 +2062,8 @@ async fn launch_cdp_browser(
         .arg("--password-store=basic");
     #[cfg(target_os = "macos")]
     command.arg("--use-mock-keychain");
-    if let Some(url) = workspace.url.as_ref() {
-        command.arg(url);
-    } else {
-        command.arg("about:blank");
-    }
+    launch_policy::append_navigation(command.as_std_mut(), navigation)
+        .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?;
     let launch_arguments = recorded_browser_launch_arguments(&command)?;
     let mut child = command.spawn().map_err(|e| {
         BrowserWorkspaceError::Launch(format!(
@@ -2720,11 +2729,8 @@ fn resolve_chromium_executable(
     }
 
     if !allow_system_for_request {
-        if let Some(path) = find_managed_chromium_executable() {
-            return Ok(ChromiumExecutable {
-                path,
-                source: "managed-cache".to_string(),
-            });
+        if let Some(executable) = find_managed_chromium_with_source() {
+            return Ok(executable);
         }
     }
 
@@ -3004,9 +3010,21 @@ fn cft_platform() -> Result<&'static str, String> {
 }
 
 fn find_managed_chromium_executable() -> Option<PathBuf> {
+    find_managed_chromium_with_source().map(|executable| executable.path)
+}
+
+fn find_managed_chromium_with_source() -> Option<ChromiumExecutable> {
     for root in managed_browser_roots() {
         if let Some(path) = find_executable_under(&root, managed_browser_executable_names(), 8) {
-            return Some(path);
+            return Some(ChromiumExecutable {
+                path,
+                source: if root == managed_browser_install_root() {
+                    "intendant-managed-cache"
+                } else {
+                    "managed-cache"
+                }
+                .to_string(),
+            });
         }
     }
     None

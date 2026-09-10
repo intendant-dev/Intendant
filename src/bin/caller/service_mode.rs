@@ -176,6 +176,39 @@ fn carried_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Owner-only booleans must be captured before dotenv and persisted even when
+/// absent, so a service manager's environment cannot change the owner's default.
+const OWNER_BOOL_ENV_KEYS: &[&str] = &["INTENDANT_BROWSER_WORKSPACE_HIDE_TESTING_NOTICE"];
+
+fn seal_owner_env(
+    envs: &mut Vec<(String, String)>,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), String> {
+    for &key in OWNER_BOOL_ENV_KEYS {
+        let invalid = || format!("{key} must be unset, 0, or 1");
+        // Command::envs gives the last explicit assignment precedence. Validate
+        // every explicit value, but do not replace a valid override with inheritance.
+        for (_, value) in envs.iter().filter(|(k, _)| k == key) {
+            if value != "0" && value != "1" {
+                return Err(invalid());
+            }
+        }
+        let explicit = envs.iter().rev().find(|(k, _)| k == key);
+        let raw = explicit
+            .map(|(_, v)| std::ffi::OsString::from(v))
+            .or_else(|| get(key));
+        let value = match raw.as_deref() {
+            None => "0",
+            Some(v) if v == "0" => "0",
+            Some(v) if v == "1" => "1",
+            _ => return Err(invalid()),
+        };
+        envs.retain(|(k, _)| k != key);
+        envs.push((key.to_string(), value.to_string()));
+    }
+    Ok(())
+}
+
 /* ── Quoting (each format has its own rules; get them right once) ── */
 
 fn sh_quote(value: &str) -> String {
@@ -451,6 +484,9 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
     }
     validate_daemon_args(&daemon_args)?;
 
+    // The service subcommand runs before main loads any project dotenv files.
+    let mut envs = carried_env(|key| std::env::var(key).ok());
+    seal_owner_env(&mut envs, |key| std::env::var_os(key))?;
     let backend = detect_backend()?;
     let exe = current_exe()?.display().to_string();
     let home = crate::platform::home_dir();
@@ -461,7 +497,6 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create log directory {}: {e}", parent.display()))?;
     }
-    let envs = carried_env(|key| std::env::var(key).ok());
     // Captured before any backend starts the daemon, so the first-boot
     // probe scans only log bytes this run produced (a reinstall over an
     // old crash log must not false-positive).
@@ -1050,6 +1085,10 @@ fn cli_run(rest: &[String]) -> i32 {
         eprintln!("error: {error}");
         return 2;
     }
+    if let Err(error) = seal_owner_env(&mut envs, |key| std::env::var_os(key)) {
+        eprintln!("error: {error}");
+        return 2;
+    }
     let exe = match current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -1368,6 +1407,105 @@ mod tests {
             next_backoff(60, BACKOFF_RESET_UPTIME_SECS),
             BACKOFF_START_SECS
         );
+    }
+
+    #[test]
+    fn owner_env_is_canonical_in_every_service_definition() {
+        let key = OWNER_BOOL_ENV_KEYS[0];
+        for (owner, expected) in [(None, "0"), (Some("0"), "0"), (Some("1"), "1")] {
+            let mut envs = carried_env(|_| Some("connect-value".into()));
+            seal_owner_env(&mut envs, |_| owner.map(Into::into)).unwrap();
+            assert_eq!(envs.len(), CARRIED_ENV_KEYS.len() + 1);
+            let daemon = args(&["--no-tui"]);
+            for system in [false, true] {
+                assert!(
+                    systemd_unit("/bin/intendant", &daemon, &envs, "/home/test", system)
+                        .contains(&format!("Environment=\"{key}={expected}\""))
+                );
+            }
+            assert!(
+                launchd_plist("/bin/intendant", &daemon, &envs, "/home/test", "/tmp/log").contains(
+                    &format!("<key>{key}</key>\n    <string>{expected}</string>")
+                )
+            );
+            let run = supervisor_run_args("/tmp/log", &envs, &daemon);
+            for boot in [false, true] {
+                assert!(schtasks_xml("intendant.exe", &run, "test", boot)
+                    .contains(&format!("--env {key}={expected}")));
+            }
+            assert!(
+                cron_line("/bin/intendant", &run).contains(&format!("'--env' '{key}={expected}'"))
+            );
+            // Round-trip the generated supervisor --env pairs. Explicit values
+            // win even if the service manager supplies a conflicting environment.
+            let mut replay: Vec<_> = run
+                .windows(2)
+                .filter(|w| w[0] == "--env")
+                .map(|w| {
+                    let (k, v) = w[1].split_once('=').unwrap();
+                    (k.into(), v.into())
+                })
+                .collect();
+            seal_owner_env(&mut replay, |_| Some("invalid-inherited".into())).unwrap();
+            assert_eq!(replay, envs);
+        }
+    }
+
+    #[test]
+    fn owner_env_rejects_invalid_without_echo_and_preserves_explicit_precedence() {
+        let key = OWNER_BOOL_ENV_KEYS[0];
+        for bad in ["", "true", "false", " 1", "1 ", "2", "secret\ninput"] {
+            let error = seal_owner_env(&mut Vec::new(), |_| Some(bad.into())).unwrap_err();
+            assert_eq!(error, format!("{key} must be unset, 0, or 1"));
+            let mut explicit = vec![(key.into(), bad.into())];
+            assert_eq!(
+                seal_owner_env(&mut explicit, |_| Some("1".into())),
+                Err(error)
+            );
+        }
+        for value in ["0", "1"] {
+            let mut explicit = vec![
+                ("OTHER".into(), "untouched".into()),
+                (key.into(), "0".into()),
+                (key.into(), value.into()),
+            ];
+            seal_owner_env(&mut explicit, |_| panic!("explicit value must win")).unwrap();
+            assert_eq!(
+                explicit,
+                vec![
+                    ("OTHER".into(), "untouched".into()),
+                    (key.into(), value.into())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_env_rejects_non_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(
+            seal_owner_env(&mut Vec::new(), |_| Some(std::ffi::OsString::from_vec(
+                vec![255]
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn service_run_rejects_invalid_explicit_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("must-not-exist/log");
+        assert_eq!(
+            cli_run(&args(&[
+                "--log",
+                log.to_str().unwrap(),
+                "--env",
+                "INTENDANT_BROWSER_WORKSPACE_HIDE_TESTING_NOTICE=invalid-private-value"
+            ])),
+            2
+        );
+        assert!(!log.parent().unwrap().exists());
     }
 
     #[test]

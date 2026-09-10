@@ -605,6 +605,9 @@ impl SuccessorExecLane {
         // against this and says the verdict out loud (the drainer's own
         // report can die with the drainer's prompt zero-session exit).
         cmd.env(OFFERED_SHA_ENV, expected_sha);
+        // Project dotenv may have filled an originally absent owner setting.
+        // Export sealed authority, never the now-ambient value, on every hop.
+        crate::browser_workspace::launch_policy::preserve_for_successor(&mut cmd);
         cmd.stdin(std::process::Stdio::null());
         let log_path = successor_log_path(state_root);
         match std::fs::OpenOptions::new()
