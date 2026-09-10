@@ -120,7 +120,7 @@ precedence is **explicit config > env var > auto-detect**.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_BROWSER_WORKSPACE_HIDE_TESTING_NOTICE` | unset (off) | Owner startup opt-in: `1` adds `--test-type=gpu` only to Intendant-managed Chrome for Testing; `0` disables it; other values reject startup. See test-mode effects below. |
+| `INTENDANT_BROWSER_WORKSPACE_HIDE_TESTING_NOTICE` | unset (off) | Owner startup opt-in: `1` adds `--test-type=gpu` only to Intendant-managed Chrome for Testing; `0` disables it; other values reject startup. `service install` captures the owner environment before dotenv and persists canonical `0` (including unset) or `1` on all service backends. `service run --env` overrides inheritance with a valid explicit value; invalid values reject before service side effects. See test-mode effects below. |
 | `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` | managed browser cache | Explicit Chromium/Chrome-for-Testing executable for CDP browser workspaces |
 | `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER` | `false` on macOS, `true` elsewhere | On macOS, explicitly permit CDP workspaces to launch system Chrome/Chromium apps such as `/Applications/Google Chrome.app` |
 
