@@ -4074,6 +4074,8 @@ async fn main() -> Result<(), CallerError> {
     // environment or starting any frontend/MCP listener. Successors replay both
     // pins; a changed file refuses startup instead of silently changing authority.
     let flags = parse_cli_flags()?;
+    browser_workspace::initialize_testing_notice_policy()
+        .map_err(|error| CallerError::Config(error.to_string()))?;
     browser_workspace::initialize_extension_policy(
         flags.browser_extension_policy.as_deref(),
         flags.browser_extension_policy_sha256.as_deref(),

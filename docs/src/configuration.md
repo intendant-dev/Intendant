@@ -120,6 +120,7 @@ precedence is **explicit config > env var > auto-detect**.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `INTENDANT_BROWSER_WORKSPACE_HIDE_TESTING_NOTICE` | unset (off) | Owner startup opt-in: `1` adds `--test-type=gpu` only to Intendant-managed Chrome for Testing; `0` disables it; other values reject startup. See test-mode effects below. |
 | `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` | managed browser cache | Explicit Chromium/Chrome-for-Testing executable for CDP browser workspaces |
 | `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER` | `false` on macOS, `true` elsewhere | On macOS, explicitly permit CDP workspaces to launch system Chrome/Chromium apps such as `/Applications/Google Chrome.app` |
 
@@ -136,6 +137,44 @@ Run `intendant setup browsers` to download Chrome for Testing into Intendant's
 managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
+
+The testing-notice option is captured from the owner's process environment before
+project `.env` files load. Daemon successor launches explicitly carry that sealed
+boolean as `0` or `1`, including when originally unset, overriding inherited
+project values (even invalid ones) across repeated handovers. Changing it requires
+a fresh owner launch with the new environment, not a successor handover. It adds exactly
+`--test-type=gpu` to browsers resolved from the cache populated by
+`intendant setup browsers` (`intendant-managed-cache`), including approved
+extension workspaces. Other managed caches, explicit executable overrides, and
+system browsers receive no added flag. Discovery order is unchanged; the source label records discovery provenance,
+not cryptographic verification of the executable. The launch URL is validated
+before allocating workspace resources: omitted/empty means `about:blank`, while
+switch-shaped input, control characters and invalid absolute URLs are rejected.
+Valid custom schemes and query strings are preserved without a scheme allowlist.
+A `--` terminator separates fixed Chromium switches from the single positional
+navigation argument. There is no arbitrary Chromium-argument API. This boundary
+prevents launch navigation from supplying switches; it does not constrain what
+an owner-selected executable does or certify a URL's content. Recorded launch
+arguments include the actual flag and terminator passed to the child.
+
+This selects **real Chromium test mode**, not a notice-only cosmetic switch.
+In Chromium 152.0.7977.82, [startup infobar code](https://github.com/chromium/chromium/blob/152.0.7977.82/chrome/browser/ui/startup/infobar_utils.cc)
+checks the exact `gpu` value to omit the Chrome for Testing notice. Any test-type
+also skips later startup prompts, including bad-command-line-flag, missing API
+key, unsupported OS, and OSCrypt availability warnings; automation and crash
+handling occur before that early return. This does not change the
+`CommandLineFlagSecurityWarningsEnabled` policy. Additional verified effects:
+[macOS Finder reveal](https://github.com/chromium/chromium/blob/152.0.7977.82/chrome/browser/platform_util_mac.mm)
+is skipped;
+[extension test APIs](https://github.com/chromium/chromium/blob/152.0.7977.82/extensions/renderer/script_context.cc)
+pass their test-mode availability gate; and
+[extension content-capability matching](https://github.com/chromium/chromium/blob/152.0.7977.82/extensions/common/manifest_handlers/content_capabilities_handler.cc)
+accepts HTTP as well as HTTPS patterns. Chromium
+[propagates test-type to renderers](https://github.com/chromium/chromium/blob/152.0.7977.82/content/browser/renderer_host/render_process_host_impl.cc).
+These are verified effects, not an exhaustive or cross-version guarantee. This
+option adds no Safe Browsing, certificate-validation, or wallet-warning bypass;
+it leaves existing launcher flags and extension approval requirements unchanged.
+Use it only when these test-mode effects are acceptable.
 
 Browser extensions default to **deny all**. Approval is not an environment or
 `intendant.toml` setting. Supply both `--browser-extension-policy PATH` and
