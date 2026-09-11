@@ -1,0 +1,21 @@
+{
+  "case_kind": "crypto-negative",
+  "expected": {
+    "disposition": "storage-quarantine",
+    "outcome": "aead-fail"
+  },
+  "family": 5,
+  "inputs": {
+    "core": "a4617601626374583a9500f7e6bad683f49bdfb9249a4be67e3a2f865fbb598ca40dd07681cb693e7fd0584502d034114ad94528eba5992dbcb8150ecd45b89675d5b66461656164676132353667636d656e6f6e63654c737373737373737373737373",
+    "kek": "7171717171717171717171717171717171717171717171717171717171717171",
+    "kek_epoch": 1,
+    "wrap": "a4617601696974656d5f6164647258202418be8dc705cec3add66fd1be529cb8f037138fc0232943cb8c8d4a8c60edfb6b777261707065645f64656b58306fb66f7c1ca89a159cad4a35a19c1ffe00a91a96c4b32270961ae5441dc65658e9a5454766fc883c91767f3e22fa4ed56e6b65795f777261705f65706f636801"
+  },
+  "name": "item-aead-tamper",
+  "source": "5.3",
+  "surfaces": [
+    "core",
+    "native-crypto",
+    "browser"
+  ]
+}

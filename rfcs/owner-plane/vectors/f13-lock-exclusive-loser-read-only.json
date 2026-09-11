@@ -1,0 +1,47 @@
+{
+  "case_kind": "lock-matrix",
+  "expected": {
+    "result": {
+      "outcomes": [
+        {
+          "disposition": "edge-deny",
+          "outcome": "lock-denied",
+          "step": 1
+        }
+      ]
+    }
+  },
+  "family": 13,
+  "inputs": {
+    "script": [
+      {
+        "action": "acquire",
+        "actor": "A",
+        "target": "plane-store"
+      },
+      {
+        "action": "acquire",
+        "actor": "B",
+        "target": "plane-store"
+      },
+      {
+        "action": "release",
+        "actor": "A",
+        "target": "plane-store"
+      },
+      {
+        "action": "acquire",
+        "actor": "B",
+        "target": "plane-store"
+      }
+    ]
+  },
+  "name": "lock-exclusive-loser-read-only",
+  "source": "6.2",
+  "surfaces": [
+    "browser",
+    "storage-macos",
+    "storage-linux",
+    "storage-windows"
+  ]
+}

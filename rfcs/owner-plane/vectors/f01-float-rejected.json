@@ -1,0 +1,17 @@
+{
+  "case_kind": "canonical-reject",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "malformed"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "f93c00"
+  },
+  "name": "float-rejected",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "case_kind": "canonical-reject",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "depth"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "81818181818181818101"
+  },
+  "name": "depth-nine",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

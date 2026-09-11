@@ -1,0 +1,19 @@
+{
+  "case_kind": "sign-then-verify",
+  "expected": {
+    "result": {
+      "low_s": true,
+      "valid": true
+    }
+  },
+  "family": 3,
+  "inputs": {
+    "msg": "74686520706c616e652061636365707473206f6e6c792077686174206576657279207265706c6963612072652d64657269766573",
+    "sk": "5151515151515151515151515151515151515151515151515151515151515151"
+  },
+  "name": "ed25519-sign-then-verify",
+  "source": "2.3",
+  "surfaces": [
+    "native-crypto"
+  ]
+}

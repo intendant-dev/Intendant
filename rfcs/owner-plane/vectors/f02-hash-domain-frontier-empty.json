@@ -1,0 +1,17 @@
+{
+  "case_kind": "hash-domain",
+  "expected": {
+    "bytes": "93c98ad5f36682c4b42a128501a1e9a8e38b2176b50bcedb04c1e21c5a9f2a96"
+  },
+  "family": 2,
+  "inputs": {
+    "preimage": "",
+    "tag": "frontier"
+  },
+  "name": "hash-domain-frontier-empty",
+  "source": "2.2",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "owner-plane-core"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A reference core: canonical CBOR (E1-E10 writer side), hash domains (§2), vector RNG (§13.1). Fixture-minting implementation — the independent reducer must NOT share this code."
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+chacha20 = "0.9"
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
+rand_core = "0.10"
+bip39 = "2"
+# The §13.1 vector emitter; tests also parse ../d0a-vector-cases.v1.json
+# (the companion drift gate and the mint-time vocabulary checks).
+serde_json = "1"
+
+# Standalone: deliberately NOT a member of the intendant workspace —
+# the reference core lives and versions with the spec, not the daemon.
+[workspace]
