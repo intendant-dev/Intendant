@@ -10,6 +10,8 @@
 
 use super::*;
 
+mod skills_over_mcp;
+
 impl IntendantServer {
     /// Resolve the identity report for the gate-resolved `actor`. Persisted
     /// lookups (wrapper index, session log dirs) go through `self.home` so
