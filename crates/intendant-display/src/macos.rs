@@ -728,6 +728,11 @@ impl DisplayBackend for MacOSBackend {
         let resolved = resolve_capture_target(&content, self.target)?;
         let width = resolved.width;
         let height = resolved.height;
+        if self.background && u64::from(width) * u64::from(height) > 33_554_432 {
+            return Err(CallerError::Display(
+                "background capture exceeds 32 megapixels".into(),
+            ));
+        }
         self.width.store(width, Ordering::SeqCst);
         self.height.store(height, Ordering::SeqCst);
         set_input_geometry(&self.input_geometry, resolved.input_geometry);
@@ -766,7 +771,7 @@ impl DisplayBackend for MacOSBackend {
         // depth buys stall tolerance, not latency — overflow (counted via
         // the drop counter) now means a genuinely wedged consumer, not a
         // busy scheduler tick.
-        let (tx, rx) = mpsc::channel::<Frame>(8);
+        let (tx, rx) = mpsc::channel::<Frame>(if self.background { 1 } else { 8 });
         let frame_slot = Arc::new(StdMutex::new(Some(tx)));
 
         // Per-session teardown state (see `CaptureState` for why these must
@@ -792,6 +797,12 @@ impl DisplayBackend for MacOSBackend {
         let is_window_capture = resolved.is_window;
         let dirty_rects_enabled = sck_dirty_rects_enabled();
 
+        let config = if self.background {
+            background::check_capture_os()?;
+            config.with_ignores_shadows_single_window(true)
+        } else {
+            config
+        };
         let mut stream = SCStream::new(&resolved.filter, &config);
         stream.add_output_handler(
             move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {

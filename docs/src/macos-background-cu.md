@@ -52,6 +52,8 @@ independent requirements.
 
 ## Coordinates and observations
 
+Window-only pixel capture requires macOS 14 or newer for shadow-free capture.
+
 Pixels and AX frames use **window-local logical points**, with the selected
 window's top-left as `(0,0)`. The PNG is resized to those logical dimensions so
 Retina pixels do not introduce a factor-of-two mismatch. `normalized_1000` maps

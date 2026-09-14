@@ -36,3 +36,27 @@ pub async fn capture_window_png(
     .await
     .map_err(|e| CallerError::Display(format!("window capture worker: {e}")))?
 }
+
+/// The shadow-free coordinate contract needs the macOS 14 SCK property.
+pub(super) fn check_capture_os() -> Result<(), CallerError> {
+    static CHECK: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECK
+        .get_or_init(|| {
+            let out = std::process::Command::new("/usr/bin/sw_vers")
+                .arg("-productVersion")
+                .output()
+                .map_err(|e| e.to_string())?;
+            let major = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
+            if out.status.success() && major.is_some_and(|v| v >= 14) {
+                Ok(())
+            } else {
+                Err("background window capture requires macOS 14 or newer".into())
+            }
+        })
+        .clone()
+        .map_err(CallerError::Display)
+}

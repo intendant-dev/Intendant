@@ -838,3 +838,7 @@ language = "en"              # optional ISO-639-1 hint
 ```
 
 Requires `OPENAI_API_KEY` (or a custom `endpoint`).
+
+## Background native-window control
+
+The controller supports opt-in experimental macOS window targets without a global HID fallback. See [macOS background computer use](macos-background-cu.md) for the MCP facade, permissions, coordinates and explicit limitations.

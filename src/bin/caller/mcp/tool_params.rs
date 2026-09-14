@@ -805,6 +805,7 @@ pub struct TakeScreenshotParams {
     /// omitted: a live agent virtual display when one exists, else the
     /// user session.
     #[serde(default)]
+    /// Explicit macos_window selectors from cu windows select background, window-local CU; no foreground fallback.
     pub display_target: Option<String>,
 }
 
@@ -814,6 +815,7 @@ pub struct ReadScreenParams {
     /// supported platform: macOS AX, Linux AT-SPI, and Windows UIA.
     /// Defaults to the user session.
     #[serde(default)]
+    /// Explicit macos_window selectors from cu windows select background, window-local CU; no foreground fallback.
     pub display_target: Option<String>,
     /// "text" (default) for the compact indented tree, or "json".
     #[serde(default)]
@@ -913,6 +915,7 @@ pub struct ExecuteCuActionsParams {
     /// Display target. Auto-detects if omitted: a live agent virtual
     /// display when one exists, else the user session.
     #[serde(default)]
+    /// Explicit macos_window selectors from cu windows select background, window-local CU; no foreground fallback.
     pub display_target: Option<String>,
     /// Coordinate space for click/scroll/move coordinates. Default: "pixel"
     /// (coordinates are in display logical points). Set to "normalized_1000"

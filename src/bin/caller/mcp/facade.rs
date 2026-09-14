@@ -1620,6 +1620,16 @@ pub(crate) fn render_docs(args: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_facade_preserves_target_and_lanes() {
+        let p = plan_for_meta("inspect", &argv(&["cu", "windows"])).unwrap();
+        assert_eq!(p.tool, "read_screen");
+        assert_eq!(p.args["display_target"], "macos_windows");
+        let args = argv(&["cu", "actions", "[]", "--target", "macos_window:1:2:3:4"]);
+        assert!(plan_for_meta("inspect", &args).is_err());
+        let p = plan_for_meta("act", &args).unwrap();
+        assert_eq!(p.args["display_target"], "macos_window:1:2:3:4");
+    }
     use super::*;
 
     fn argv(parts: &[&str]) -> serde_json::Value {

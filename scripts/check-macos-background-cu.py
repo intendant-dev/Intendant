@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import shutil
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +43,7 @@ version = "0.0.0"
 edition = "2021"
 [workspace]
 [dependencies]
-core-graphics = { version = "0.25", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
 accessibility-sys = "0.2"
 libc = "0.2"
@@ -81,7 +82,12 @@ pub mod macos_input {
         "platform": ROOT / "crates/intendant-platform/src/platform/macos_process.rs",
     }
     source = '#![allow(dead_code)]\nmod computer_use {\n' + '\n'.join(types) + support + '\n}\n'
-    source += '\n'.join(f'#[path = {json.dumps(str(path))}] mod {name};' for name, path in paths.items())
+    for name, path in paths.items():
+        shutil.copyfile(path, fixture / "src" / f"{name}.rs")
+        child = path.with_suffix("")
+        if child.is_dir():
+            shutil.copytree(child, fixture / "src" / name, dirs_exist_ok=True)
+    source += chr(10).join(f"mod {name};" for name in paths)
     source += '''
 mod display { pub mod macos { pub mod background {
     pub async fn capture_window_png(_:u32,_:u32,_:u32)->Result<Vec<u8>,String> {
@@ -90,7 +96,7 @@ mod display { pub mod macos { pub mod background {
 }}}
 '''
     (fixture / "src/lib.rs").write_text(source)
-    command = ["cargo", "test", "--offline", "--manifest-path", str(fixture / "Cargo.toml"), "--", "--skip", "live_read_frontmost"]
+    command = ["cargo", "test", "--manifest-path", str(fixture / "Cargo.toml"), "--", "--skip", "live_read_frontmost"]
     print("Checking production native modules; capture and MCP transport are outside this component harness.", flush=True)
     return subprocess.run(command, cwd=ROOT, env=os.environ.copy(), check=False).returncode
 

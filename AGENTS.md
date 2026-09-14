@@ -245,7 +245,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   namespace.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
-  identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`
+  identity queries in `platform.rs` and its private `platform/macos_process.rs` submodule (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs` and its private `ax/background.rs` submodule
   (raw `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
   without dragging in a duplicate `core-graphics`/legacy `objc` stack); and the
   Vortex direct POSIX shared-memory bridge in `live_audio.rs` (`shm_open`,
@@ -253,8 +253,8 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   Every unsafe block must be type-checked, `// SAFETY:`-commented, and kept as
   small as the FFI call or raw-pointer access it wraps; AX object lifetimes are
   RAII-managed via `core-foundation` `TCFType` wrappers. Do not add AX `unsafe`
-  outside `ax.rs`, Vortex-shm `unsafe` outside `live_audio.rs`, or small OS
-  probes/signals outside `platform.rs`. The Windows backends are the other
+  outside that AX module, Vortex-shm `unsafe` outside `live_audio.rs`, or small OS
+  probes/signals outside that platform module. The Windows backends are the other
   deliberate exception: capture,
   input injection, and H.264 encoding necessarily go through Win32/COM/Media
   Foundation FFI (`crates/intendant-display/src/windows.rs`,

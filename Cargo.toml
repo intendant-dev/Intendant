@@ -185,7 +185,7 @@ atspi = { version = "0.30", features = ["tokio"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # (screencapturekit moved to crates/intendant-display with the display
 # pipeline — macos.rs there is its only user in the workspace.)
-core-graphics = { version = "0.25", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
 accessibility-sys = "0.2"
 

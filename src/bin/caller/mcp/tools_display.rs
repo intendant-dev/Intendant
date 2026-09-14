@@ -1883,6 +1883,7 @@ fn attach_settle_json(
 
 #[cfg(test)]
 mod tests {
+    mod background;
     use super::*;
     use crate::mcp::tests::{
         test_session_registry_with_display, test_state, test_state_with_log_dir,

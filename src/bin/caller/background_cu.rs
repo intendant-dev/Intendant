@@ -1,6 +1,8 @@
 //! Opt-in native-window computer use. A window is a USER resource, never a
 //! virtual display. The MCP ingress authorizes before calling this module.
 //! No foreground fallback, cursor warp/restoration, activation, or clipboard use.
+// Native-only implementation data remains visible to cross-platform tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use crate::computer_use::{CuAction, ObserveMode};
 use serde::Serialize;
 
@@ -149,6 +151,24 @@ pub use native::run;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_driver_has_no_global_transport() {
+        let code = include_str!("background_cu/native.rs");
+        for forbidden in [
+            ".post(",
+            "CGEventTapLocation",
+            "CGWarpMouseCursorPosition",
+            "pbcopy",
+            "pbpaste",
+            "NSPasteboard",
+            "activateWithOptions",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "forbidden global transport: {forbidden}"
+            );
+        }
+    }
     use super::*;
     #[test]
     fn selectors_are_strict_and_generation_bound() {
