@@ -9,6 +9,8 @@
 mod cache_relay;
 mod scheduler;
 pub(crate) mod source;
+#[cfg(test)]
+mod task_lifecycle_tests;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -442,6 +444,9 @@ impl RemoteCommandCaller {
 }
 
 struct StoredRemoteCommandJob {
+    // Serialize dispatch with cancellation, without holding the registry lock
+    // over I/O. A queued job cannot be declared cancelled after its Start frame.
+    dispatch_gate: Arc<tokio::sync::Mutex<()>>,
     view: RemoteCommandJobView,
     owner_session_id: Option<String>,
     updates: watch::Sender<RemoteCommandJobView>,
@@ -487,6 +492,7 @@ fn insert_home_job(
     registry.jobs.insert(
         view.job_id.clone(),
         StoredRemoteCommandJob {
+            dispatch_gate: Arc::new(tokio::sync::Mutex::new(())),
             view,
             owner_session_id,
             updates,
@@ -540,6 +546,19 @@ fn read_home_job(
         return Err("remote command job was not found".to_string());
     }
     Ok(job.view.clone())
+}
+
+fn home_job_dispatch_gate(
+    job_id: &str,
+    caller: &RemoteCommandCaller,
+) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let registry = home_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let job = registry
+        .jobs
+        .get(job_id)
+        .filter(|job| caller.may_access(job.owner_session_id.as_deref()))
+        .ok_or_else(|| "remote command job was not found".to_string())?;
+    Ok(job.dispatch_gate.clone())
 }
 
 fn subscribe_home_job(
@@ -687,13 +706,18 @@ async fn prepare_and_dispatch(
         return Ok(());
     }
     update_home_job(&job_id, |job| {
-        job.host = host.clone();
-        job.state = if snapshot.is_some() {
-            RemoteCommandState::Preparing
-        } else {
-            RemoteCommandState::Queued
-        };
+        if !job.state.is_terminal() {
+            job.host = host.clone();
+            job.state = if snapshot.is_some() {
+                RemoteCommandState::Preparing
+            } else {
+                RemoteCommandState::Queued
+            };
+        }
     });
+    if !home_job_is_active(&job_id) {
+        return Ok(());
+    }
 
     if let Some(snapshot) = snapshot.as_ref() {
         spec.source_id = Some(source::transfer_snapshot(&host, snapshot).await?);
@@ -721,29 +745,8 @@ async fn prepare_and_dispatch(
         "id": job_id,
         "command": &spec,
     });
-    if send_home_frame(&to_worker, frame.to_string())
-        .await
-        .is_err()
-    {
-        return Err(format!(
-            "remote host {host} detached or stopped accepting commands before the command started"
-        ));
-    }
-    if !home_job_is_active(&job_id) {
-        let _ = send_home_frame(
-            &to_worker,
-            serde_json::json!({
-                "t": REMOTE_COMMAND_CANCEL_KIND,
-                "host_id": host,
-                "id": job_id,
-            })
-            .to_string(),
-        )
-        .await;
-    } else {
-        update_home_job(&job_id, |job| {
-            job.state = RemoteCommandState::Running;
-        });
+    if !dispatch_home_command(&job_id, &to_worker, frame.to_string()).await? {
+        return Ok(());
     }
 
     tokio::spawn(async move {
@@ -759,6 +762,30 @@ async fn prepare_and_dispatch(
         .await;
     });
     Ok(())
+}
+
+/// Queue Start and publish Running under the same per-job gate that Cancel
+/// takes. A cancellation during a backpressured send cannot claim terminal
+/// Cancelled before the worker's result arrives.
+async fn dispatch_home_command(
+    job_id: &str,
+    to_worker: &mpsc::Sender<String>,
+    frame: String,
+) -> Result<bool, String> {
+    let gate = home_job_dispatch_gate(job_id, &RemoteCommandCaller::Unrestricted)?;
+    let _dispatch = gate.lock().await;
+    if !home_job_is_active(job_id) {
+        return Ok(false);
+    }
+    send_home_frame(to_worker, frame).await.map_err(|()| {
+        "remote host detached or stopped accepting commands before the command started".to_string()
+    })?;
+    update_home_job(job_id, |job| {
+        if !job.state.is_terminal() {
+            job.state = RemoteCommandState::Running;
+        }
+    });
+    Ok(true)
 }
 
 fn home_job_is_active(job_id: &str) -> bool {
@@ -908,6 +935,9 @@ pub(crate) async fn cancel_remote_command(
     job_id: &str,
     caller: &RemoteCommandCaller,
 ) -> Result<RemoteCommandJobView, String> {
+    let dispatch_gate = home_job_dispatch_gate(job_id, caller)?;
+    let _dispatch = dispatch_gate.lock().await;
+    // Re-read after admission: dispatch may have completed while we waited.
     let current = read_home_job(job_id, caller)?;
     if current.state.is_terminal() {
         return Ok(current);

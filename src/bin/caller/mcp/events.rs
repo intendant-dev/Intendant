@@ -172,7 +172,7 @@ async fn flush_resource_notifications(
         };
         for uri in subscribed {
             let _ = p
-                .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
                 .await;
         }
     };
