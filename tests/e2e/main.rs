@@ -4750,14 +4750,28 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
 async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
     use futures_util::SinkExt;
 
-    // A real directory outside every default grant: CARGO_TARGET_TMPDIR
-    // sits under the workspace target/, not under the daemon's temp dir,
-    // its HOME, or the session project.
-    let denied_zone = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("sandbox-consent-{}", std::process::id()));
-    std::fs::create_dir_all(&denied_zone).expect("create denied zone");
+    // On macOS the checkout (and CARGO_TARGET_TMPDIR) may itself be under
+    // /private/tmp, which Seatbelt always grants. Put the denied fixture in
+    // the runner's per-user temp directory instead, and give only the child
+    // daemon a different, private scratch root. Both are owned TempDirs;
+    // neither machine configuration nor the sandbox policy is changed.
+    #[cfg(target_os = "macos")]
+    let denied_fixture = tempfile::tempdir().expect("denied fixture outside literal /tmp");
+    #[cfg(not(target_os = "macos"))]
+    let denied_fixture = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("denied fixture outside the daemon's grants");
+    let denied_zone = denied_fixture
+        .path()
+        .canonicalize()
+        .expect("canonical denied zone");
+    #[cfg(target_os = "macos")]
+    assert!(
+        !denied_zone.starts_with("/private/tmp") && !denied_zone.starts_with("/private/var/tmp"),
+        "the consent fixture must be outside Seatbelt's literal scratch grants: {}",
+        denied_zone.display(),
+    );
+    let scratch = tempfile::tempdir().expect("daemon scratch root");
     let target = denied_zone.join("probe.txt");
-    let _ = std::fs::remove_file(&target);
     // Shell write (not a structured file tool): exercises the exec
     // extraction lane of the denial classifier end to end. Quoting keeps
     // Windows PowerShell and POSIX shells on the same one-liner.
@@ -4799,6 +4813,9 @@ async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
 
     let mut cmd = rig.command();
     cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .env("TMPDIR", scratch.path())
+        .env("TMP", scratch.path())
+        .env("TEMP", scratch.path())
         // --sandbox explicitly: the write sandbox is the mechanism under
         // test, and Windows defaults it off (ACE-propagation cost) — the
         // flag makes the denial real on all three platforms.
@@ -5006,7 +5023,6 @@ async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
     assert_eq!(written.trim_end(), "granted!");
 
     let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&denied_zone);
 }
 
 /// Shared assertions for the message-search wire contract (plan §4/§11):

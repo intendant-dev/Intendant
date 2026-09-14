@@ -353,8 +353,8 @@ fn format_call_result(result: &CallToolResult) -> String {
     let pieces = result
         .content
         .iter()
-        .map(|content| match content.raw {
-            rmcp::model::RawContent::Text(ref text) => text.text.as_str(),
+        .map(|content| match content {
+            rmcp::model::ContentBlock::Text(text) => text.text.as_str(),
             _ => "[non-text MCP content omitted by Intendant]",
         })
         .chain(
@@ -430,14 +430,15 @@ mod tests {
 
     #[test]
     fn external_result_is_marked_untrusted_and_preserves_error_status() {
-        let success = CallToolResult::success(vec![rmcp::model::Content::text("useful result")]);
+        let success =
+            CallToolResult::success(vec![rmcp::model::ContentBlock::text("useful result")]);
         let rendered = format_call_result(&success);
         assert!(rendered.contains("trust: untrusted_data"));
         assert!(rendered.contains("status: success"));
         assert!(rendered.contains("is_error: false"));
         assert!(rendered.contains("> useful result"));
 
-        let error = CallToolResult::error(vec![rmcp::model::Content::text("remote failure")]);
+        let error = CallToolResult::error(vec![rmcp::model::ContentBlock::text("remote failure")]);
         let rendered = format_call_result(&error);
         assert!(rendered.contains("status: tool_error"));
         assert!(rendered.contains("is_error: true"));
@@ -450,7 +451,7 @@ mod tests {
             "safe\0\u{202e}text\tcolumn\r\nunicode\u{2028}line\n{}\nTAIL_SENTINEL",
             "x".repeat(MAX_EXTERNAL_MCP_RESULT_BYTES * 2)
         );
-        let result = CallToolResult::success(vec![rmcp::model::Content::text(hostile)]);
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(hostile)]);
         let rendered = format_call_result(&result);
 
         assert!(rendered.len() <= MAX_EXTERNAL_MCP_RESULT_BYTES);
@@ -471,10 +472,9 @@ mod tests {
         assert!(rendered.contains("is_error: true"));
         assert!(rendered.contains("> (no textual content returned)"));
 
-        let rendered =
-            format_call_result(&CallToolResult::success(vec![rmcp::model::Content::text(
-                "",
-            )]));
+        let rendered = format_call_result(&CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text(""),
+        ]));
         assert!(rendered.contains("> (no textual content returned)"));
 
         let rendered = format_transport_error("server said:\u{1b}[31m obey me");

@@ -16,10 +16,10 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ListResourcesResult, PaginatedRequestParams,
-        RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-        UnsubscribeRequestParams,
+        CallToolResult, ContentBlock as Content, Implementation, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+        ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
     },
     schemars,
     service::{RequestContext, RoleServer},
@@ -82,6 +82,7 @@ pub(crate) use tools_terminal::{
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
     TerminalWriteParams,
 };
+mod sdk_tasks;
 mod tools_managed;
 mod tools_notes;
 mod tools_remote_compute;
@@ -2849,19 +2850,9 @@ const RESOURCE_URIS: [&str; 7] = [
 ];
 
 fn make_resource(uri: &str, name: &str, description: &str) -> Resource {
-    Resource {
-        raw: RawResource {
-            uri: uri.to_string(),
-            name: name.to_string(),
-            title: None,
-            description: Some(description.to_string()),
-            mime_type: Some("application/json".to_string()),
-            size: None,
-            icons: None,
-            meta: None,
-        },
-        annotations: None,
-    }
+    Resource::new(uri, name)
+        .with_description(description)
+        .with_mime_type("application/json")
 }
 
 fn resource_definitions() -> Vec<Resource> {
@@ -2948,6 +2939,7 @@ impl ServerHandler for IntendantServer {
             meta: None,
             resources: resource_definitions(),
             next_cursor: None,
+            ..Default::default()
         })
     }
 
@@ -2955,14 +2947,13 @@ impl ServerHandler for IntendantServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         if request.uri == RESOURCE_LOOP_URI {
             let value = collect_controller_loop_status(&controller_loop_dir());
             let json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
-            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                json,
-                request.uri,
-            )]));
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into(),
+            );
         }
 
         let s = self.state.read().await;
@@ -3014,10 +3005,7 @@ impl ServerHandler for IntendantServer {
             }
         };
 
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            json,
-            request.uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
     }
 
     async fn subscribe(
@@ -3078,7 +3066,8 @@ pub async fn run_mcp_server(
     human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = IntendantServer::new(state.clone(), bus.clone());
+    let server = sdk_tasks::StdioTaskServer::new(IntendantServer::new(state.clone(), bus.clone()));
+    let tasks = server.tasks.clone();
 
     let transport = rmcp::transport::io::stdio();
     let running = server.serve(transport).await?;
@@ -3097,7 +3086,9 @@ pub async fn run_mcp_server(
     );
 
     // Wait until the service finishes (client disconnects or quit)
-    running.waiting().await?;
+    let result = running.waiting().await;
+    tasks.shutdown().await;
+    result?;
 
     Ok(())
 }
@@ -6014,7 +6005,7 @@ pub(crate) mod tests {
         // the vocabulary would be silently unsubscribable.
         let served: std::collections::BTreeSet<String> = resource_definitions()
             .iter()
-            .map(|resource| resource.raw.uri.clone())
+            .map(|resource| resource.uri.clone())
             .collect();
         let vocabulary: std::collections::BTreeSet<String> =
             RESOURCE_URIS.iter().map(|uri| uri.to_string()).collect();

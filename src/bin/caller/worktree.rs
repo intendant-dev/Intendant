@@ -686,11 +686,19 @@ mod tests {
         let dir = init_test_repo();
         let repo = dir.path();
         create(repo, "tagged", "HEAD").unwrap();
-        Command::new("git")
-            .args(["tag", "tagged"])
+        // A host's tag.gpgSign=true turns this into an annotated tag and
+        // opens its editor. The fixture needs only a lightweight tag and
+        // must never invoke a developer's editor or signing credentials.
+        let tag = Command::new("git")
+            .args(["-c", "tag.gpgSign=false", "tag", "tagged"])
             .current_dir(repo)
             .output()
             .unwrap();
+        assert!(
+            tag.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tag.stderr)
+        );
         assert_eq!(unique_branch_name(repo, "tagged"), "tagged-2");
     }
 

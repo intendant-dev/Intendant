@@ -175,6 +175,9 @@ pub struct FollowUpCodexCloudTaskParams {
 /// concepts beyond that opaque host locator.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
+// Every internally tagged variant is an object. rmcp 3 validates the root
+// before transport-specific schema normalization, so declare that here too.
+#[schemars(extend("type" = "object"))]
 pub enum RemoteCommandParams {
     /// Start a non-interactive argv command and return its job id immediately.
     Start {

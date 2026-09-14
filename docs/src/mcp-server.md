@@ -132,11 +132,12 @@ the CLI leg of the `events` verb (client-side ≤60s chunking over a
 `--for` budget, NDJSON on stdout, cursor on stderr).
 
 The tables below describe the full daemon HTTP MCP surface. Bare `--mcp`
-stdio mode serves only the thirteen `#[tool]`-router tools — `get_status`,
+stdio mode serves the thirteen `#[tool]`-router tools — `get_status`,
 `get_logs`, `get_pending_approval`, `get_pending_input`, `approve`, `deny`,
 `skip`, `approve_all`, `respond`, `set_autonomy`, `set_verbosity`, `quit`,
-and `start_task`. It does not carry the daemon's Agenda or Memory service
-handles; everything else below is served by the wired daemon `/mcp` surface.
+and `start_task` — plus `remote_command` on its SDK-backed owner surface.
+It does not carry the daemon's Agenda or Memory service handles; the remaining
+tools below are served by the wired daemon `/mcp` surface.
 
 ### /mcp authorization
 
@@ -496,6 +497,90 @@ in the unscoped/full listing. All four stay callable by name.
 | `list_codex_cloud_workers` | Refresh Codex Cloud tasks into the local worker-lease store and list them, including tracked leases with live attachments outside the provider window; never modifies a Cloud task. | `environment_id?`, `limit?` |
 | `submit_codex_cloud_task` | Submit a new Codex Cloud task and track it as an ephemeral Intendant worker lease. | `environment_id`, `prompt`, `branch?`, `attempts?`, `title?` |
 | `follow_up_codex_cloud_task` | Send a follow-up turn into an existing Cloud task, reusing its warm worker and incremental build state; refuses tasks with an active turn and fails closed on schema drift. | `task_id`, `prompt` |
+
+### Remote-command Tasks on stdio
+
+The SDK-backed `--mcp` owner surface uses **rmcp 3.3** and implements the
+**SEP-2663 Tasks extension**, `io.modelcontextprotocol/tasks`, for
+`remote_command` **`start` only**. This is an adapter over the existing
+`remote_compute` job registry and executor, not another command runner.
+Remote-host configuration and availability requirements are unchanged.
+For Codex Cloud execution, run the stdio instance with its existing authenticated
+web gateway (`--mcp --web`) and point `INTENDANT_CODEX_CLOUD_HOME_URL` at
+**that instance's** reachable WSS listener. Automatic acquisition also requires
+`INTENDANT_CODEX_CLOUD_ENVIRONMENT` and the existing enrollment/TLS setup.
+Workers attached to a different daemon process are not visible to this
+in-process executor; this adapter does not silently forward owner commands
+or import another process's job registry. Enabling Tasks does not itself
+start or widen an HTTP listener, and the gateway still does not serve Tasks.
+`working_tree` source still needs a recorded project root; the adapter does
+not manufacture one or relax revision, environment, or workspace validation.
+
+The server advertises the extension. A client opts in with this capability:
+
+```json
+{
+  "extensions": {
+    "io.modelcontextprotocol/tasks": {}
+  }
+}
+```
+
+Once the existing executor admits a command, a Tasks-capable client receives
+`resultType: "task"` with a protocol `taskId`, TTL, and polling interval.
+The protocol task ID is distinct from the underlying remote job ID.
+`tasks/get` returns the current task with its terminal payload **inlined**:
+a successful task contains the ordinary `CallToolResult` with the final
+`{"ok":true,"job":...}` remote-command result; failed or timed-out jobs
+produce a failed task with error detail and the job view. Start validation
+errors before a job exists remain ordinary tool errors. There is no
+`tasks/result` endpoint in this extension.
+
+`tasks/cancel` acknowledges cancellation intent, then calls the existing
+remote cancellation operation with the creator's caller scope. A running
+job remains a working protocol task while its remote state is `cancelling`;
+the adapter reports `cancelled` only after the existing lifecycle reports
+that terminal state. Completion or failure can win a cancellation race and
+remains completion or failure. `tasks/update` accepts the extension's input
+response map; remote commands do not request input, so unmatched responses
+are ignored by the SDK.
+
+Clients that do not declare Tasks keep the legacy immediate job-view response
+and explicit `status` / `wait` / `cancel` workflow. Those three operations
+also retain their legacy responses for Tasks-capable clients. Ordinary tools
+continue through the existing router.
+
+**Ownership and transport scope.** Each stdio connection has a fresh,
+non-cloneable Tasks wrapper and its own task store. Stdio is the trusted owner
+surface: its underlying remote caller is unrestricted. A task ID from another
+connection grants no inspection, update, or cancellation rights. Agent-session
+and daemon HTTP principals are not added to this task store. The hand-written
+HTTP `/mcp` gateway does **not** advertise Tasks; its principal binding,
+per-call IAM, tool filtering, and supported revisions remain unchanged.
+
+**Retention and cleanup.** The task TTL is three hours and the suggested poll
+interval is one second. At most 32 active or retained tasks can occupy a
+connection; admission fails before starting another remote job when full.
+The SDK sweeps opportunistically on task operations and new task creation:
+over-TTL active tasks become failed, and terminal tasks are retained for one
+additional TTL window after their terminal transition before eviction.
+Clients must not rely on availability after the advertised creation-based TTL.
+An idle connection does not run a background TTL sweep. Existing remote
+execution, acquisition, and watchdog limits remain authoritative.
+
+SDK TTL expiry or shutdown may abort the SDK's result future, but a separately
+tracked observer requests cancellation of the real job and continues watching
+its authoritative lifecycle. Capacity is held while that cleanup is pending,
+even if the protocol task has been evicted. Normal stdio disconnect/shutdown
+requests cancellation and waits for cleanup. Task handles are in-memory and
+are not resumable after process restart; they add no new crash-durability
+promise beyond the existing remote worker lifecycle.
+
+The stdio server deliberately preserves its `2024-11-05`, `2025-03-26`, and
+`2025-06-18` protocol revisions. Upgrading the SDK does not opt Intendant into the
+`2026-07-28` base protocol's new `subscriptions/listen` contract; existing
+resource subscriptions remain available on the negotiated legacy revisions.
+Tasks support is negotiated separately as the explicit extension above.
 
 ### Live audio
 

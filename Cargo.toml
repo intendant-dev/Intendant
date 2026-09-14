@@ -91,7 +91,7 @@ intendant-core = { path = "crates/intendant-core" }
 intendant-custody = { path = "crates/intendant-custody" }
 intendant-display = { path = "crates/intendant-display" }
 intendant-platform = { path = "crates/intendant-platform" }
-rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }
+rmcp = { version = "3.3.0", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
 # Offset-mapped canonical folding for message-search matching (already a

@@ -39,6 +39,33 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def process_ancestors(pid, proc_root=Path('/proc')):
+    """Read the owning process chain, including commands with spaces or ')'."""
+    ancestors = set()
+    while pid:
+        require(pid not in ancestors, 'cycle in process ancestry')
+        ancestors.add(pid)
+        stat = (proc_root / str(pid) / 'stat').read_text()
+        close = stat.rfind(')')
+        fields = stat[close + 1:].split()
+        require(close > 0 and len(fields) >= 2, f'malformed process stat for {pid}')
+        pid = int(fields[1])
+        require(pid >= 0, 'invalid parent process id')
+    return ancestors
+
+
+def protected_runner_snapshot(runners, ancestors):
+    # Outside CI, retain the whole-host guard. Inside CI, sibling jobs can
+    # start or finish; pin the listeners and our own worker's full identity.
+    if ancestors is None:
+        return runners
+    protected = [runner for runner in runners
+                 if runner['comm'] == 'Runner.Listener' or runner['pid'] in ancestors]
+    require(any(runner['comm'] == 'Runner.Worker' for runner in protected),
+            'owning CI worker missing from runner snapshot')
+    return protected
+
+
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = b'''<!doctype html><meta charset="utf-8"><title>EXTERNAL CU KEYLESS TEST</title>
@@ -85,8 +112,15 @@ def main():
     out.mkdir(mode=0o700, parents=True)
     runners = cutover.runner_snapshot()
     # Standalone rehearsal yields to CI; a CI job may run its own isolated test.
-    if os.environ.get('GITHUB_ACTIONS') != 'true':
+    in_ci = os.environ.get('GITHUB_ACTIONS') == 'true'
+    ancestors = process_ancestors(os.getpid()) if in_ci else None
+    if not in_ci:
         require(not any(r['comm'] == 'Runner.Worker' for r in runners), 'CI has priority')
+    runner_evidence = {'before': runners}
+    save(out / 'runners.json', runner_evidence)
+    protected_runners = protected_runner_snapshot(runners, ancestors)
+    runner_evidence['protectedBefore'] = protected_runners
+    save(out / 'runners.json', runner_evidence)
     root = Path(tempfile.mkdtemp(prefix='intendant-external-cu-'))
     home = root / 'home'
     home.mkdir(mode=0o700)
@@ -248,8 +282,16 @@ def main():
             proof = None
             destroy_owned()
         require(cutover.signature_live(foreign_id), 'foreign Xvfb changed')
-        require(cutover.runner_snapshot() == runners, 'CI runner identities changed')
-        checks.extend(['foreign Xvfb preserved', 'CI runner identities preserved'])
+        runners_after = cutover.runner_snapshot()
+        runner_evidence['after'] = runners_after
+        save(out / 'runners.json', runner_evidence)
+        protected_after = protected_runner_snapshot(runners_after, ancestors)
+        runner_evidence['protectedAfter'] = protected_after
+        save(out / 'runners.json', runner_evidence)
+        require(protected_after == protected_runners, 'protected CI runner identities changed')
+        checks.extend(['foreign Xvfb preserved',
+                       'CI runner listeners and owning worker preserved' if in_ci
+                       else 'CI runner identities preserved'])
         require(call('display','list') == display_baseline, 'managed display inventory changed after cleanup')
         result = {'passed': input_effect_verified, 'inputEffectVerified': input_effect_verified, 'test': 'external-cu-session-real-linux-v1', 'binarySha256': cutover.sha256_file(binary),
                   'checks': checks, 'runners': runners, 'foreign': foreign_id, 'pngSamples': samples, 'commands': commands}
