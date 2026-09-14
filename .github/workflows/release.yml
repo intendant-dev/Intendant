@@ -152,7 +152,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Full history so dispatch dry-runs can stamp a `git describe
@@ -235,7 +235,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Full history so dispatch dry-runs can stamp a `git describe
@@ -341,7 +341,7 @@ jobs:
             echo "::warning::Missing on this runner:$missing — tolerable for a dry-run, but a tag release will fail this preflight. Install on the runner account: brew install$missing"
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The default persisted token grants every later step push access;
           # nothing in these jobs pushes.
