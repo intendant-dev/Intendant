@@ -77,6 +77,8 @@ pub(crate) use tools_bounded_cu::CuSessionParams;
 mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
+mod tools_feedback;
+pub(crate) use tools_feedback::DogfoodReportParams;
 mod tools_terminal;
 pub(crate) use tools_terminal::{
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
@@ -700,6 +702,13 @@ impl IntendantServer {
             }
             "help" => Ok(text_tool_result(facade::render_help(&args))),
             "docs" => Ok(text_tool_result(facade::render_docs(&args))),
+            "report" => {
+                let Parameters(params) = parse_params::<DogfoodReportParams>(args)?;
+                Ok(match self.report_dogfood_inner(params, &actor).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("report failed: {message}")),
+                })
+            }
             "events" => {
                 let Parameters(params) = parse_params::<tools_events::EventsParams>(args)?;
                 Ok(text_tool_result(
