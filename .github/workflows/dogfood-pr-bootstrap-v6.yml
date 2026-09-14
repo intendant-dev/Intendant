@@ -1,0 +1,144 @@
+name: Dogfood PR bootstrap v6
+
+on:
+  push:
+    branches:
+      - agent/dogfood-report
+    paths:
+      - ".github/workflows/dogfood-pr-bootstrap-v6.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: agent/dogfood-report
+
+      - name: Apply product slice from validated bootstrap
+        shell: python
+        run: |
+          from pathlib import Path
+          import textwrap
+
+          # v5 is the first bootstrap whose guarded source patch applied cleanly.
+          workflow = Path('.github/workflows/dogfood-pr-bootstrap-v5.yml').read_text(encoding='utf-8')
+          start = workflow.index('      - name: Apply product slice from guarded bootstrap\n')
+          run = workflow.index('        run: |\n', start) + len('        run: |\n')
+          end = workflow.index('      - name: Format\n', run)
+          outer = textwrap.dedent(workflow[run:end])
+          exec(compile(outer, '<dogfood-bootstrap-v5>', 'exec'), {'__name__': '__main__'})
+
+          # role:operator is the ordinary supervised-agent IAM role. It should
+          # explicitly gain the narrow feedback permission just as the separate
+          # agent-operator profile gains the new PeerOperation through its
+          # operation ceiling.
+          path = Path('src/bin/caller/access/iam.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''                "agenda.read".to_string(),
+                          "agenda.write".to_string(),
+                          "memory.read".to_string(),'''
+          new = '''                "agenda.read".to_string(),
+                          "agenda.write".to_string(),
+                          "feedback.write".to_string(),
+                          "memory.read".to_string(),'''
+          if text.count(old) != 1:
+              raise SystemExit(f'operator permission block matches: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # The Access dashboard fallback mirrors the builtin role table. v5
+          # already patched root; the one remaining sequence is operator.
+          path = Path('static/app/42b-access-model.js')
+          text = path.read_text(encoding='utf-8')
+          old = "'agenda.read', 'agenda.write', 'memory.read', 'memory.write'"
+          new = "'agenda.read', 'agenda.write', 'feedback.write', 'memory.read', 'memory.write'"
+          if text.count(old) != 1:
+              raise SystemExit(f'operator dashboard permission block matches: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # Pin the central security property where the report implementation
+          # lives: the tool resolves to feedback.write, not agenda.write; both
+          # the agent-client profile and ordinary operator role can use it.
+          path = Path('src/bin/caller/mcp/tools_feedback.rs')
+          text = path.read_text(encoding='utf-8')
+          marker = '''    #[test]
+              fn repeated_report_merges_into_one_open_agenda_item() {'''
+          test = '''    #[test]
+              fn dogfood_report_uses_narrow_feedback_operation() {
+                  use crate::peer::access_policy::PeerOperation;
+
+                  assert_eq!(
+                      crate::mcp::mcp_tool_operation("report"),
+                      PeerOperation::FeedbackWrite
+                  );
+                  assert_ne!(
+                      crate::mcp::mcp_tool_operation("report"),
+                      PeerOperation::AgendaWrite
+                  );
+                  assert!(crate::peer::access_policy::profile_allows_operation(
+                      crate::peer::access_policy::AGENT_OPERATOR_PROFILE,
+                      PeerOperation::FeedbackWrite
+                  ));
+
+                  let roles = crate::access::iam::builtin_role_templates();
+                  let permissions = |role_id: &str| {
+                      roles
+                          .iter()
+                          .find(|role| role.id == role_id)
+                          .unwrap_or_else(|| panic!("{role_id} missing"))
+                          .permissions
+                          .as_slice()
+                  };
+                  assert!(permissions("role:operator")
+                      .iter()
+                      .any(|permission| permission == "feedback.write"));
+                  assert!(!permissions("role:observer")
+                      .iter()
+                      .any(|permission| permission == "feedback.write"));
+              }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f'dogfood test marker matches: {text.count(marker)}')
+          path.write_text(text.replace(marker, test + marker, 1), encoding='utf-8')
+
+          # All bootstrap workflows are branch-only scaffolding, not product.
+          for name in [
+              'dogfood-pr-bootstrap.yml',
+              'dogfood-pr-bootstrap-v2.yml',
+              'dogfood-pr-bootstrap-v3.yml',
+              'dogfood-pr-bootstrap-v4.yml',
+              'dogfood-pr-bootstrap-v5.yml',
+              'dogfood-pr-bootstrap-v6.yml',
+          ]:
+              Path('.github/workflows', name).unlink(missing_ok=True)
+
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Targeted dogfood tests
+        run: cargo test -p intendant dogfood
+
+      - name: Facade and access regression tests
+        run: |
+          cargo test -p intendant facade_profile_lists_only_facade_meta_tools
+          cargo test -p intendant facade_listing
+          cargo test -p intendant normalize_refreshes_stale_builtin_roles_but_not_user_roles
+
+      - name: Commit product slice
+        run: |
+          git config user.name "Intendant dogfood bootstrap"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "mcp: add narrow dogfood feedback reporting"
+          git push origin HEAD:agent/dogfood-report
