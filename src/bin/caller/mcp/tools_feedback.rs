@@ -105,7 +105,9 @@ fn required_text(name: &str, value: String, max_chars: usize) -> Result<String, 
     }
     let chars = value.chars().count();
     if chars > max_chars {
-        return Err(format!("{name} is too long ({chars} chars; max {max_chars})"));
+        return Err(format!(
+            "{name} is too long ({chars} chars; max {max_chars})"
+        ));
     }
     Ok(value)
 }
@@ -223,11 +225,8 @@ impl IntendantServer {
             params.recommendation,
             MAX_RECOMMENDATION_CHARS,
         )?;
-        let evidence_ref = optional_text(
-            "evidence_ref",
-            params.evidence_ref,
-            MAX_EVIDENCE_REF_CHARS,
-        )?;
+        let evidence_ref =
+            optional_text("evidence_ref", params.evidence_ref, MAX_EVIDENCE_REF_CHARS)?;
         let client_context = optional_text(
             "client_context",
             params.client_context,
@@ -296,6 +295,40 @@ mod tests {
             fingerprint(DogfoodReportKind::Issue, "facade", "extra calls"),
             fingerprint(DogfoodReportKind::Efficiency, "facade", "extra calls")
         );
+    }
+
+    #[test]
+    fn dogfood_report_uses_narrow_feedback_operation() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert_eq!(
+            crate::mcp::mcp_tool_operation("report"),
+            PeerOperation::FeedbackWrite
+        );
+        assert_ne!(
+            crate::mcp::mcp_tool_operation("report"),
+            PeerOperation::AgendaWrite
+        );
+        assert!(crate::peer::access_policy::profile_allows_operation(
+            crate::peer::access_policy::AGENT_OPERATOR_PROFILE,
+            PeerOperation::FeedbackWrite
+        ));
+
+        let roles = crate::access::iam::builtin_role_templates();
+        let permissions = |role_id: &str| {
+            roles
+                .iter()
+                .find(|role| role.id == role_id)
+                .unwrap_or_else(|| panic!("{role_id} missing"))
+                .permissions
+                .as_slice()
+        };
+        assert!(permissions("role:operator")
+            .iter()
+            .any(|permission| permission == "feedback.write"));
+        assert!(!permissions("role:observer")
+            .iter()
+            .any(|permission| permission == "feedback.write"));
     }
 
     #[test]

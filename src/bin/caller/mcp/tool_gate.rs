@@ -177,6 +177,9 @@ pub(crate) fn tool_allowed_for_profile(
                     // `ctl notify`).
                     | "ask_user"
                     | "notify_user"
+                    // Exception-only product feedback is a core collaboration
+                    // primitive with its own narrow feedback.write gate.
+                    | "report"
                     // Self-identity for provenance: memory and agenda
                     // writes cite the ids whoami reports (also reachable
                     // as `intendant ctl whoami`).
@@ -289,7 +292,7 @@ pub(crate) enum ToolProfileFamily {
     Core,
     Screen,
     Managed,
-    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): six tools,
+    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): seven tools,
     /// everything else discovered lazily through help/docs.
     Facade,
 }
@@ -358,6 +361,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "inspect" | "act" | "authorize" | "help" | "docs" | "events" => {
             PeerOperation::RuntimeControl
         }
+        // First-class dogfood intake: deliberately not agenda.write.
+        "report" => PeerOperation::FeedbackWrite,
         // The terminal family (owner-ruled 2026-08-28: controlling agents
         // get terminal access, R2 tentatively at Operate). Reads ride
         // terminal.view; input/resize/close ride terminal.write; open is
@@ -605,7 +610,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     // The facade meta-tools (`tool_profile=facade`): a CLI-shaped,
     // context-efficient control surface — three risk-lane argv executors
     // plus lazy discovery. Kept deliberately lean: the whole facade
-    // listing is budget-pinned in tests (the point is that these five
+    // listing is budget-pinned in tests (the point is that these seven
     // definitions replace dozens of typed schemas).
     push(
         "inspect",
@@ -647,6 +652,15 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             crate::mcp::facade::FacadeDocsParams
         ),
     );
+    push(
+    "report",
+    manual_http_tool_definition!(
+        "report",
+        "Report one exceptional Intendant-specific issue or concrete efficiency opportunity. Do not report routine success or paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets. The daemon stamps trusted provenance/build metadata and atomically creates or merges the Agenda-backed report under the narrow feedback.write permission.",
+        DogfoodReportParams
+    ),
+);
+
     push(
         "events",
         manual_http_tool_definition!(
@@ -1093,7 +1107,7 @@ mod tests {
         }
     }
 
-    /// The facade profile advertises exactly the five meta-tools, and the
+    /// The facade profile advertises exactly the seven meta-tools, and the
     /// whole serialized listing stays inside the context budget — the
     /// facade's reason to exist (design doc M1 acceptance).
     #[test]

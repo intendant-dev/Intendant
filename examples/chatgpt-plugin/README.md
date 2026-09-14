@@ -16,3 +16,7 @@ python3 examples/chatgpt-plugin/configure_plugin.py \
 The generated directory contains `.app.json`; the template does not. Never add
 a runtime API key, Intendant loopback token, or live tunnel profile to either
 directory.
+
+The package also includes the `intendant-dogfood` skill: it teaches the host to
+use Intendant's narrow `report` tool for exceptional product friction and
+concrete efficiency recommendations while keeping routine success silent.

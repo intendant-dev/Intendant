@@ -73,7 +73,7 @@ served display/CU and shared-view set — its allowlist also names the
 browser-workspace and raw frame tools, which currently have no served
 `tools/list` definitions anywhere and are reachable only by direct call;
 `managed` (alias `managed-context`) advertises `get_status` plus the managed
-rewind/fission set; `facade` advertises only the six meta-tools of the
+rewind/fission set; `facade` advertises only the seven meta-tools of the
 CLI-shaped facade (next section); `full` — or omitting `tool_profile` —
 keeps the whole
 list, and unknown profile names fall back to the `core` bootstrap set (the
@@ -85,7 +85,7 @@ hidden HTTP tools remain callable (the lazy `ctl tools call` path).
 ### The facade profile
 
 `tool_profile=facade` is the context-efficient control surface: instead of a
-typed schema per capability, it advertises six meta-tools and everything
+typed schema per capability, it advertises seven meta-tools and everything
 else is discovered lazily. `inspect`, `act`, and `authorize` each execute
 one registered command per call, named as an argv array
 (`{"argv":["agenda","list","--status","open"]}`) — risk-split so MCP hosts
@@ -103,7 +103,16 @@ already serve, so the stream is push semantics over existing authority,
 never new authority — and delivery is session-scoped for agent-session
 callers (a supervised backend on its session-bound token sees only its
 own session's events, sessionless events withheld, matching the scoped
-approval reads). A facade call is authorized as the **resolved** command's
+approval reads).
+
+`report` is the exception-only dogfood intake. It accepts one bounded structured
+issue or efficiency opportunity, stamps the gate-resolved actor and daemon build
+out of band, derives its own dedupe fingerprint, and atomically creates or
+annotates an open Agenda-backed feedback item. It is authorized as
+`feedback.write`, deliberately not `agenda.write`: a client may be allowed to
+report friction without receiving general ledger mutation authority. Routine
+success is not feedback; callers must not attach transcripts, prompts,
+environment dumps, raw tool arguments/output, credentials, or secrets. A facade call is authorized as the **resolved** command's
 operation against the caller's principal, at every ingress, before any side
 effect — a parse failure never dispatches, and a command invoked through the
 wrong lane is redirected to the right tool by name. Argv values are literal

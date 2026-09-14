@@ -315,6 +315,8 @@ pub enum PeerOperation {
     AgendaRead,
     /// Park, patch, and transition agenda items.
     AgendaWrite,
+    /// Submit bounded, exception-only product dogfood feedback.
+    FeedbackWrite,
     /// Search and read Memory claims (bounded, provenance-labeled).
     MemoryRead,
     /// Propose Memory claims (the candidate lane).
@@ -348,7 +350,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 26] = [
+pub const ALL_OPERATIONS: [PeerOperation; 27] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -373,6 +375,7 @@ pub const ALL_OPERATIONS: [PeerOperation; 26] = [
     PeerOperation::FilesystemWrite,
     PeerOperation::AgendaRead,
     PeerOperation::AgendaWrite,
+    PeerOperation::FeedbackWrite,
     PeerOperation::MemoryRead,
     PeerOperation::MemoryWrite,
 ];
