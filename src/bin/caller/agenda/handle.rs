@@ -486,6 +486,8 @@ impl AgendaHandle {
     /// select an existing item id or gain generic agenda-write authority through
     /// this seam. Only OPEN feedback items dedupe — a repeated report after the
     /// owner completed/retired an item is a new occurrence worth re-triage.
+    /// Saturated items stay intact; the next report creates a successor instead
+    /// of exceeding the annotation cap or requiring a second durable operation.
     pub(crate) fn apply_dogfood_report(
         &self,
         fingerprint_tag: String,
@@ -503,6 +505,7 @@ impl AgendaHandle {
                 .into_iter()
                 .find(|item| {
                     item.status == super::types::AgendaStatus::Open
+                        && item.annotations.len() < super::types::MAX_ANNOTATIONS_PER_ITEM
                         && item.tags.iter().any(|tag| tag == "dogfood-feedback")
                         && item.tags.iter().any(|tag| tag == &fingerprint_tag)
                 })
@@ -1470,6 +1473,76 @@ fn truncate(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::super::types::{AgendaKind, BindingRef};
     use super::*;
+
+    #[test]
+    fn dogfood_report_rolls_over_saturated_items_with_one_op_per_call() {
+        use super::super::types::{AgendaStatus, MAX_ANNOTATIONS_PER_ITEM};
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            EventBus::new(),
+            dir.path(),
+        );
+        let fingerprint = "dogfood-fp-0123456789abcdef";
+        let report = || {
+            handle
+                .apply_dogfood_report(
+                    fingerprint.into(),
+                    "facade: recurring friction".into(),
+                    "first body".into(),
+                    "another occurrence".into(),
+                    vec!["dogfood-feedback".into(), fingerprint.into()],
+                    None,
+                )
+                .expect("report")
+        };
+        let first = report();
+        let first_id = first["item_id"].as_str().unwrap().to_string();
+        {
+            let mut store = handle.lock();
+            // Owner discussion consumes capacity too, not just report occurrences.
+            for _ in 0..MAX_ANNOTATIONS_PER_ITEM - 1 {
+                store
+                    .apply_command(
+                        AgendaCommand::Annotate {
+                            id: first_id.clone(),
+                            text: "owner triage".into(),
+                            source: Some("owner-triage".into()),
+                        },
+                        None,
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let before = handle.lock().seq();
+        let last_slot = report();
+        assert_eq!(last_slot["status"], "merged");
+        assert_eq!(last_slot["item_id"], first["item_id"]);
+        assert_eq!(last_slot["occurrences"], 2);
+        assert_eq!(handle.lock().seq(), before + 1);
+        let saturated_seq = handle.lock().item_seq(&first_id);
+
+        let successor = report();
+        assert_eq!(successor["status"], "created");
+        assert_ne!(successor["item_id"], first["item_id"]);
+        assert_eq!(successor["fingerprint"], first["fingerprint"]);
+        assert_eq!(successor["occurrences"], 1);
+        assert_eq!(handle.lock().seq(), before + 2);
+
+        let repeated = report();
+        assert_eq!(repeated["status"], "merged");
+        assert_eq!(repeated["item_id"], successor["item_id"]);
+        assert_eq!(repeated["occurrences"], 2);
+        assert_eq!(handle.lock().seq(), before + 3);
+        assert_eq!(handle.lock().item_seq(&first_id), saturated_seq);
+        let items = handle.snapshot();
+        assert_eq!(items.len(), 2);
+        let saturated = items.iter().find(|item| item.id == first_id).unwrap();
+        assert_eq!(saturated.status, AgendaStatus::Open);
+        assert_eq!(saturated.annotations.len(), MAX_ANNOTATIONS_PER_ITEM);
+    }
 
     /// The grid-envelope composition: a fired session resolves to its
     /// source item, occurrence state, title, and the sealed inputs of
