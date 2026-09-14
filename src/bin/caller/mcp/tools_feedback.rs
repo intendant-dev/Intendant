@@ -168,6 +168,7 @@ fn surface_tag(surface: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the validated report vocabulary
 fn render_occurrence(
     kind: DogfoodReportKind,
     surface: &str,
