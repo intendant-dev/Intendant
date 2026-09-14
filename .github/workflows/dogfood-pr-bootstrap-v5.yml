@@ -1,0 +1,144 @@
+name: Dogfood PR bootstrap v5
+
+on:
+  push:
+    branches:
+      - agent/dogfood-report
+    paths:
+      - ".github/workflows/dogfood-pr-bootstrap-v5.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: agent/dogfood-report
+      - name: Apply product slice from guarded bootstrap
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          import textwrap
+
+          workflow = Path('.github/workflows/dogfood-pr-bootstrap.yml').read_text(encoding='utf-8')
+          start = workflow.index('      - name: Apply dogfood report product slice\n')
+          run = workflow.index('        run: |\n', start) + len('        run: |\n')
+          end = workflow.index('      - name: Format\n', run)
+          script = textwrap.dedent(workflow[run:end])
+
+          dashboard_pattern = re.compile(
+              r"# Dashboard fallback mirrors root's permission vocabulary\.\n"
+              r"path = \"static/app/42b-access-model\.js\"\n"
+              r"text = read\(path\)\n"
+              r"text = once\(\n.*?\n\)\n"
+              r"write\(path, text\)\n",
+              re.S,
+          )
+          dashboard_replacement = '''# Dashboard fallback mirrors root's permission vocabulary.
+          path = "static/app/42b-access-model.js"
+          text = read(path)
+          old_permissions = "'agenda.read', 'agenda.write', 'memory.read', 'memory.write'"
+          new_permissions = "'agenda.read', 'agenda.write', 'feedback.write', 'memory.read', 'memory.write'"
+          root_start = text.index("function accessFallbackIamRoles() {")
+          root_end = text.index("return [{", root_start)
+          root_prefix = text[root_start:root_end]
+          if root_prefix.count(old_permissions) != 1:
+              raise SystemExit("dashboard root fallback permission vocabulary drifted")
+          root_prefix = root_prefix.replace(old_permissions, new_permissions, 1)
+          text = text[:root_start] + root_prefix + text[root_end:]
+          write(path, text)
+          '''
+          script, count = dashboard_pattern.subn(dashboard_replacement, script, count=1)
+          if count != 1:
+              raise SystemExit(f'dashboard bootstrap block matches: {count}')
+
+          report_pattern = re.compile(
+              r"report_def = '''    push\(\n.*?"
+              r"text = text\.replace\(needle, report_def \+ \"\\n\" \+ needle, 1\)\n",
+              re.S,
+          )
+          report_replacement = '''report_def = """    push(
+              \"report\",
+              manual_http_tool_definition!(
+                  \"report\",
+                  \"Report one exceptional Intendant-specific issue or concrete efficiency opportunity. Do not report routine success or paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets. The daemon stamps trusted provenance/build metadata and atomically creates or merges the Agenda-backed report under the narrow feedback.write permission.\",
+                  DogfoodReportParams
+              ),
+          );
+          """
+          event_push = '    push(\\n        "events",\\n        manual_http_tool_definition!('
+          if text.count(event_push) != 1:
+              raise SystemExit(f"report definition insertion: expected one events push, found {text.count(event_push)}")
+          text = text.replace(event_push, report_def + "\\n" + event_push, 1)
+          '''
+          script, count = report_pattern.subn(lambda _m: report_replacement, script, count=1)
+          if count != 1:
+              raise SystemExit(f'report bootstrap block matches: {count}')
+
+          builtin_pattern = re.compile(
+              r"# --- Builtin skill \+ parity with the ChatGPT package copy\. ---\n.*?"
+              r"# --- Product docs: seven-tool facade \+ narrow permission/provenance\. ---\n",
+              re.S,
+          )
+          builtin_replacement = '''# --- Builtin skill + parity with the ChatGPT package copy. ---
+          path = "src/bin/caller/builtin_skills.rs"
+          text = read(path)
+          cli_row = '    BuiltinSkill {\\n        name: "intendant-cli",\\n'
+          dogfood_row = ''' + "'''" + '''    BuiltinSkill {
+              name: "intendant-dogfood",
+              skill_md: include_str!("../../../skills/intendant-dogfood/SKILL.md"),
+              support_files: &[],
+          },
+          ''' + "'''" + '''
+          if text.count(cli_row) != 1:
+              raise SystemExit(f"builtin intendant-cli row matches: {text.count(cli_row)}")
+          text = text.replace(cli_row, dogfood_row + cli_row, 1)
+          embedded_marker = "    fn embedded(name: &str) -> &'static BuiltinSkill {\\n"
+          parity_test = ''' + "'''" + '''    #[test]
+          fn chatgpt_dogfood_skill_matches_builtin() {
+              assert_eq!(
+                  embedded("intendant-dogfood").skill_md,
+                  include_str!(
+                      "../../../examples/chatgpt-plugin/plugin-template/skills/intendant-dogfood/SKILL.md"
+                  ),
+                  "ChatGPT plugin dogfood teaching drifted from the shared builtin skill"
+              );
+          }
+
+          ''' + "'''" + '''
+          if text.count(embedded_marker) != 1:
+              raise SystemExit(f"builtin embedded helper matches: {text.count(embedded_marker)}")
+          text = text.replace(embedded_marker, parity_test + embedded_marker, 1)
+          write(path, text)
+
+          # --- Product docs: seven-tool facade + narrow permission/provenance. ---
+          '''
+          script, count = builtin_pattern.subn(lambda _m: builtin_replacement, script, count=1)
+          if count != 1:
+              raise SystemExit(f'builtin bootstrap section matches: {count}')
+
+          script = script.replace(
+              'Path(".github/workflows/dogfood-pr-bootstrap.yml").unlink()',
+              'Path(".github/workflows/dogfood-pr-bootstrap.yml").unlink()\n'
+              'Path(".github/workflows/dogfood-pr-bootstrap-v2.yml").unlink()\n'
+              'Path(".github/workflows/dogfood-pr-bootstrap-v3.yml").unlink()\n'
+              'Path(".github/workflows/dogfood-pr-bootstrap-v4.yml").unlink()\n'
+              'Path(".github/workflows/dogfood-pr-bootstrap-v5.yml").unlink()',
+              1,
+          )
+          exec(compile(script, '<dogfood-bootstrap>', 'exec'), {'__name__': '__main__'})
+      - name: Format
+        run: cargo fmt --all
+      - name: Targeted tests
+        run: cargo test -p intendant dogfood
+      - name: Commit product slice
+        run: |
+          git config user.name "Intendant dogfood bootstrap"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "mcp: add narrow dogfood feedback reporting"
+          git push origin HEAD:agent/dogfood-report
