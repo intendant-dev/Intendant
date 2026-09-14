@@ -445,6 +445,66 @@ pub(crate) fn negotiated_mcp_protocol_version(requested: Option<&str>) -> &'stat
         .unwrap_or(SUPPORTED_MCP_PROTOCOL_VERSIONS[0])
 }
 
+fn http_client_supports_tasks(request: &McpHttpRequest) -> bool {
+    if request.method != "initialize" {
+        return false;
+    }
+    request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("capabilities"))
+        .cloned()
+        .and_then(|caps| serde_json::from_value::<rmcp::model::ClientCapabilities>(caps).ok())
+        .is_some_and(|caps| caps.supports_tasks())
+}
+
+fn mcp_error_data_to_http(error: rmcp::ErrorData) -> McpHttpError {
+    McpHttpError {
+        code: i64::from(error.code.0),
+        message: error.message.into_owned(),
+    }
+}
+
+fn serialize_call_tool_response(response: rmcp::model::CallToolResponse) -> serde_json::Value {
+    let serialized = match response {
+        rmcp::model::CallToolResponse::Complete(result) => serde_json::to_value(result),
+        rmcp::model::CallToolResponse::InputRequired(result) => serde_json::to_value(result),
+        rmcp::model::CallToolResponse::Task(result) => serde_json::to_value(result),
+        _ => {
+            return serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Unsupported MCP tool response variant",
+                }],
+                "isError": true,
+            });
+        }
+    };
+    serialized.unwrap_or_else(|error| {
+        serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": format!("Failed to serialize MCP tool response: {error}"),
+            }],
+            "isError": true,
+        })
+    })
+}
+
+fn remote_task_permission_error(
+    principal: &crate::access::iam::AccessPrincipal,
+    decision: &crate::access::iam::AccessDecision,
+) -> McpHttpError {
+    McpHttpError {
+        code: -32603,
+        message: format!(
+            "Permission denied for remote task operation: {} (principal {}, permission {}). \
+             The daemon owner can adjust this principal's IAM grant under Access.",
+            decision.reason, principal.id, decision.permission,
+        ),
+    }
+}
+
 /// Parse one wire body into its JSON-RPC request, or into the
 /// `-32700` response the wire expects for malformed JSON. The POST
 /// handler parses ONCE and shares the request between the SSE
@@ -473,6 +533,7 @@ pub(crate) async fn handle_mcp_parsed_request(
     codex_managed_context: Option<bool>,
     tool_profile: Option<&str>,
     access: &HttpAccessContext,
+    task_session: Option<&HttpTaskSession>,
     // The session identity the token binding itself named (never a bare
     // query echo) — see `mcp_gate_session`. Feeds actor attribution and
     // the daemon-side serve status lines.
@@ -496,9 +557,15 @@ pub(crate) async fn handle_mcp_parsed_request(
                 .as_ref()
                 .and_then(|params| params.get("protocolVersion"))
                 .and_then(serde_json::Value::as_str);
+            let mut capabilities = serde_json::json!({ "tools": {} });
+            if task_session.is_some() {
+                capabilities["extensions"] = serde_json::json!({
+                    rmcp::model::TASKS_EXTENSION_ID: {}
+                });
+            }
             Ok(serde_json::json!({
                 "protocolVersion": negotiated_mcp_protocol_version(requested),
-                "capabilities": { "tools": {} },
+                "capabilities": capabilities,
                 "serverInfo": {
                     "name": "intendant",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -554,32 +621,142 @@ pub(crate) async fn handle_mcp_parsed_request(
                     error: None,
                 });
             }
-            match server
-                .call_tool_by_name_as_caller(
-                    name,
-                    args,
-                    session_id,
-                    codex_managed_context,
-                    crate::mcp::ToolCaller::from_gate(&access.principal, gate_session.clone())
-                        .with_fs_scope(access.fs_scope()),
-                )
-                .await
-            {
-                Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": format!("Failed to serialize MCP tool result: {}", e),
-                        }],
-                        "isError": true,
+            let caller = crate::mcp::ToolCaller::from_gate(&access.principal, gate_session.clone())
+                .with_fs_scope(access.fs_scope());
+            let task_start = task_session.and_then(|_| {
+                (name == "remote_command")
+                    .then(|| {
+                        serde_json::from_value::<crate::mcp::RemoteCommandParams>(args.clone()).ok()
                     })
-                })),
-                Err(e) => Err(McpHttpError {
-                    code: -32603,
-                    message: e,
-                }),
+                    .flatten()
+                    .filter(|params| {
+                        matches!(params, crate::mcp::RemoteCommandParams::Start { .. })
+                    })
+            });
+            if let (Some(task_session), Some(params)) = (task_session, task_start) {
+                if let Some(preflight) = server
+                    .remote_command_task_preflight(session_id, codex_managed_context)
+                    .await
+                {
+                    Ok(serde_json::to_value(preflight).unwrap_or_default())
+                } else {
+                    match server.remote_command_context_for_actor(&caller.actor).await {
+                        Ok((remote_caller, project_root)) => match task_session
+                            .tasks()
+                            .start_as(params, remote_caller, project_root)
+                            .await
+                        {
+                            Ok(response) => Ok(serialize_call_tool_response(response)),
+                            Err(error) => Err(mcp_error_data_to_http(error)),
+                        },
+                        Err(error) => Ok(serde_json::to_value(
+                            rmcp::model::CallToolResult::success(vec![
+                                rmcp::model::ContentBlock::text(
+                                    serde_json::json!({"ok": false, "error": error}).to_string(),
+                                ),
+                            ]),
+                        )
+                        .unwrap_or_default()),
+                    }
+                }
+            } else {
+                match server
+                    .call_tool_by_name_as_caller(
+                        name,
+                        args,
+                        session_id,
+                        codex_managed_context,
+                        caller,
+                    )
+                    .await
+                {
+                    Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {
+                        serde_json::json!({
+                            "content": [{
+                                "type": "text",
+                                "text": format!("Failed to serialize MCP tool result: {}", e),
+                            }],
+                            "isError": true,
+                        })
+                    })),
+                    Err(e) => Err(McpHttpError {
+                        code: -32603,
+                        message: e,
+                    }),
+                }
             }
         }
+        "tasks/get" => (|| -> Result<serde_json::Value, McpHttpError> {
+            let task_session = task_session.ok_or_else(|| McpHttpError {
+                code: -32601,
+                message: "Method not found: tasks/get".to_string(),
+            })?;
+            let decision = access.decision(crate::mcp::mcp_tool_operation("remote_command"));
+            if !decision.allowed {
+                return Err(remote_task_permission_error(&access.principal, &decision));
+            }
+            let params = serde_json::from_value::<rmcp::model::GetTaskParams>(
+                request.params.unwrap_or_default(),
+            )
+            .map_err(|error| McpHttpError {
+                code: -32602,
+                message: error.to_string(),
+            })?;
+            task_session
+                .tasks()
+                .get(&params.task_id)
+                .map(rmcp::model::GetTaskResult::new)
+                .map(|result| serde_json::to_value(result).unwrap_or_default())
+                .map_err(mcp_error_data_to_http)
+        })(),
+        "tasks/update" => (|| -> Result<serde_json::Value, McpHttpError> {
+            let task_session = task_session.ok_or_else(|| McpHttpError {
+                code: -32601,
+                message: "Method not found: tasks/update".to_string(),
+            })?;
+            let decision = access.decision(crate::mcp::mcp_tool_operation("remote_command"));
+            if !decision.allowed {
+                return Err(remote_task_permission_error(&access.principal, &decision));
+            }
+            let params = serde_json::from_value::<rmcp::model::UpdateTaskParams>(
+                request.params.unwrap_or_default(),
+            )
+            .map_err(|error| McpHttpError {
+                code: -32602,
+                message: error.to_string(),
+            })?;
+            task_session
+                .tasks()
+                .update(&params.task_id, params.input_responses)
+                .map(|()| {
+                    serde_json::to_value(rmcp::model::TaskAckResult::new()).unwrap_or_default()
+                })
+                .map_err(mcp_error_data_to_http)
+        })(),
+        "tasks/cancel" => (|| -> Result<serde_json::Value, McpHttpError> {
+            let task_session = task_session.ok_or_else(|| McpHttpError {
+                code: -32601,
+                message: "Method not found: tasks/cancel".to_string(),
+            })?;
+            let decision = access.decision(crate::mcp::mcp_tool_operation("remote_command"));
+            if !decision.allowed {
+                return Err(remote_task_permission_error(&access.principal, &decision));
+            }
+            let params = serde_json::from_value::<rmcp::model::CancelTaskParams>(
+                request.params.unwrap_or_default(),
+            )
+            .map_err(|error| McpHttpError {
+                code: -32602,
+                message: error.to_string(),
+            })?;
+            task_session
+                .tasks()
+                .cancel(&params.task_id)
+                .map(|()| {
+                    serde_json::to_value(rmcp::model::TaskAckResult::new()).unwrap_or_default()
+                })
+                .map_err(mcp_error_data_to_http)
+        })(),
         other => {
             // Unknown notification (no id): accept silently per spec.
             if is_notification {
@@ -824,9 +1001,71 @@ pub(crate) async fn handle_mcp_post(
         // denial simply arrives as the stream's only message. The body
         // is decoded exactly once — the SSE decision and dispatch
         // share the parse.
+        let mut response_task_session_id: Option<String> = None;
         let outcome = match parse_mcp_http_request(&body_text) {
             Err(outcome) => outcome,
             Ok(request) => {
+                let gate_session = mcp_gate_session(header_text);
+                let presented_task_session_id = http_header_value(header_text, "mcp-session-id");
+                let task_session = if http_client_supports_tasks(&request) {
+                    match create_http_task_session(&mcp_access, gate_session.as_deref()) {
+                        Ok(session) => {
+                            response_task_session_id = Some(session.id().to_string());
+                            Some(session)
+                        }
+                        Err(message) => {
+                            let response = HttpResponse::with_content(
+                                "503 Service Unavailable",
+                                "application/json",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request.id,
+                                    "error": { "code": -32603, "message": message },
+                                })
+                                .to_string(),
+                            )
+                            .header_segment(&mcp_cors)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    }
+                } else if let Some(session_id) = presented_task_session_id {
+                    match resolve_http_task_session(
+                        session_id,
+                        &mcp_access,
+                        gate_session.as_deref(),
+                    ) {
+                        Some(session) => {
+                            response_task_session_id = Some(session.id().to_string());
+                            Some(session)
+                        }
+                        None => {
+                            let response = HttpResponse::with_content(
+                                "404 Not Found",
+                                "application/json",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request.id,
+                                    "error": { "code": -32600, "message": "MCP session not found" },
+                                })
+                                .to_string(),
+                            )
+                            .header_segment(&mcp_cors)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 if let Some(plan) = mcp_sse_plan(header_text, &request) {
                     let call = handle_mcp_parsed_request(
                         request,
@@ -835,7 +1074,8 @@ pub(crate) async fn handle_mcp_post(
                         codex_managed_context,
                         tool_profile.as_deref(),
                         &mcp_access,
-                        mcp_gate_session(header_text),
+                        task_session.as_ref(),
+                        gate_session.clone(),
                         &bus,
                     );
                     tokio::pin!(call);
@@ -928,7 +1168,8 @@ pub(crate) async fn handle_mcp_post(
                     codex_managed_context,
                     tool_profile.as_deref(),
                     &mcp_access,
-                    mcp_gate_session(header_text),
+                    task_session.as_ref(),
+                    gate_session,
                     &bus,
                 )
                 .await
@@ -943,16 +1184,22 @@ pub(crate) async fn handle_mcp_post(
         let http_response = match outcome {
             McpHttpOutcome::Response(resp) => {
                 let json = serde_json::to_string(&resp).unwrap_or_default();
-                HttpResponse::with_content("200 OK", "application/json", json)
-                    .header_segment(&mcp_cors)
-                    .connection_reuse(reuse)
-                    .into_string()
+                let mut response = HttpResponse::with_content("200 OK", "application/json", json)
+                    .header_segment(&mcp_cors);
+                if let Some(session_id) = response_task_session_id.as_deref() {
+                    response = response.header("Mcp-Session-Id", session_id);
+                }
+                response.connection_reuse(reuse).into_string()
             }
-            McpHttpOutcome::Accepted => HttpResponse::new("202 Accepted")
-                .header_segment(&mcp_cors)
-                .header("Content-Length", "0")
-                .connection_reuse(reuse)
-                .into_string(),
+            McpHttpOutcome::Accepted => {
+                let mut response = HttpResponse::new("202 Accepted")
+                    .header_segment(&mcp_cors)
+                    .header("Content-Length", "0");
+                if let Some(session_id) = response_task_session_id.as_deref() {
+                    response = response.header("Mcp-Session-Id", session_id);
+                }
+                response.connection_reuse(reuse).into_string()
+            }
         };
         let write_ok = stream.write_all(http_response.as_bytes()).await.is_ok();
         if reuse && write_ok {
@@ -969,23 +1216,112 @@ pub(crate) async fn handle_mcp_post(
     finalize_http_stream(&mut stream).await;
 }
 
-pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str, is_tls: bool) {
-    // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
-    // are not supported by our stateless endpoint.  Return 405 so rmcp
-    // gracefully falls back (skips SSE / ignores session delete).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream cleanup reuses the POST authentication inputs; request-context bundling is separate cleanup"
+)]
+pub(crate) async fn handle_mcp_stream(
+    mut stream: DemuxStream,
+    header_text: &str,
+    req_method: &str,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    is_tls: bool,
+    tls_client_cert_present: bool,
+    tls_client_cert_fingerprint: Option<String>,
+    peer_addr: std::net::SocketAddr,
+    session_token_only: bool,
+) {
     use tokio::io::AsyncWriteExt;
-    let reuse = stream.exchange_reusable();
-    let http = HttpResponse::new("405 Method Not Allowed")
-        .header_segment(&mcp_cors_header_segment(header_text, is_tls))
-        .header("Content-Length", "0")
-        .connection_reuse(reuse)
-        .into_string();
-    let write_ok = stream.write_all(http.as_bytes()).await.is_ok();
-    if reuse && write_ok {
-        stream.park().await;
-    } else {
-        finalize_http_stream(&mut stream).await;
+    let mcp_cors = mcp_cors_header_segment(header_text, is_tls);
+
+    // GET remains unsupported: Tasks are polled through POST tasks/get, and
+    // this endpoint still offers no server-push SSE stream.
+    if req_method != "DELETE" {
+        let reuse = stream.exchange_reusable();
+        let http = HttpResponse::new("405 Method Not Allowed")
+            .header_segment(&mcp_cors)
+            .header("Content-Length", "0")
+            .connection_reuse(reuse)
+            .into_string();
+        let write_ok = stream.write_all(http.as_bytes()).await.is_ok();
+        if reuse && write_ok {
+            stream.park().await;
+        } else {
+            finalize_http_stream(&mut stream).await;
+        }
+        return;
     }
+
+    // DELETE is meaningful only for a negotiated Tasks session. Re-run the
+    // same authentication ladder as POST before looking up the opaque session
+    // id; possession of Mcp-Session-Id alone is never authority.
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let access = match if session_token_only {
+        session_only_mcp_access_context(&cert_dir, header_text)
+    } else {
+        mcp_http_access_context(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+            is_tls,
+            peer_addr,
+            header_text,
+        )
+    } {
+        Ok(access) => access,
+        Err((status, message)) => {
+            let reason = match status {
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                _ => "Error",
+            };
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": serde_json::Value::Null,
+                "error": { "code": -32600, "message": message },
+            })
+            .to_string();
+            let response =
+                HttpResponse::with_content(format!("{status} {reason}"), "application/json", body)
+                    .header_segment(&mcp_cors)
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "close")
+                    .into_string();
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    };
+
+    let session_id = http_header_value(header_text, "mcp-session-id").unwrap_or("");
+    let closed = close_http_task_session(
+        session_id,
+        &access,
+        mcp_gate_session(header_text).as_deref(),
+    )
+    .await;
+    let response = if closed {
+        HttpResponse::new("202 Accepted")
+            .header_segment(&mcp_cors)
+            .header("Content-Length", "0")
+            .header("Connection", "close")
+            .into_string()
+    } else {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": { "code": -32600, "message": "MCP session not found" },
+        })
+        .to_string();
+        HttpResponse::with_content("404 Not Found", "application/json", body)
+            .header_segment(&mcp_cors)
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "close")
+            .into_string()
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
 }
 
 /// The session-MCP ingress access ladder: exactly one rung. A
@@ -1250,6 +1586,7 @@ mod tests {
                     codex_managed_context,
                     tool_profile,
                     access,
+                    None,
                     gate_session,
                     bus,
                 )
@@ -1548,7 +1885,122 @@ mod tests {
                         .is_some(),
                     "capabilities must stay tools-only-shaped (requested {requested})"
                 );
+                assert!(
+                    result
+                        .get("capabilities")
+                        .and_then(|c| c.get("extensions"))
+                        .is_none(),
+                    "legacy initialize must not advertise extensions (requested {requested})"
+                );
             }
+        });
+    }
+
+    #[test]
+    fn tasks_initialize_advertises_extension_and_task_methods_are_session_gated() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let loopback: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\nx-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            );
+            let access =
+                mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &request)
+                    .unwrap();
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            let bus = EventBus::new();
+            let task_session = create_http_task_session(&access, None).unwrap();
+
+            let initialize = parse_req(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {
+                        "extensions": {
+                            "io.modelcontextprotocol/tasks": {}
+                        }
+                    },
+                    "clientInfo": {"name": "tasks-test", "version": "0"},
+                },
+            }));
+            assert!(http_client_supports_tasks(&initialize));
+            let outcome = handle_mcp_parsed_request(
+                initialize,
+                &server,
+                None,
+                None,
+                None,
+                &access,
+                Some(&task_session),
+                None,
+                &bus,
+            )
+            .await;
+            let McpHttpOutcome::Response(resp) = outcome else {
+                panic!("initialize must answer")
+            };
+            let result = resp.result.unwrap();
+            assert!(result["capabilities"]["extensions"]
+                .get(rmcp::model::TASKS_EXTENSION_ID)
+                .is_some());
+
+            let get_without_session = parse_req(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tasks/get",
+                "params": {"taskId": "unknown"},
+            }));
+            let outcome = handle_mcp_parsed_request(
+                get_without_session,
+                &server,
+                None,
+                None,
+                None,
+                &access,
+                None,
+                None,
+                &bus,
+            )
+            .await;
+            let McpHttpOutcome::Response(resp) = outcome else {
+                panic!("tasks/get must answer")
+            };
+            assert_eq!(resp.error.unwrap().code, -32601);
+
+            let get_with_session = parse_req(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tasks/get",
+                "params": {"taskId": "unknown"},
+            }));
+            let outcome = handle_mcp_parsed_request(
+                get_with_session,
+                &server,
+                None,
+                None,
+                None,
+                &access,
+                Some(&task_session),
+                None,
+                &bus,
+            )
+            .await;
+            let McpHttpOutcome::Response(resp) = outcome else {
+                panic!("tasks/get must answer")
+            };
+            assert_eq!(resp.error.unwrap().code, -32602);
+
+            assert!(close_http_task_session(task_session.id(), &access, None).await);
         });
     }
 

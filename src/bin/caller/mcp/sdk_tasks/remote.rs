@@ -53,10 +53,9 @@ impl RemoteOperations for ExistingRemoteOperations {
     }
 }
 
-pub(in crate::mcp) struct RemoteTasks {
+pub(crate) struct RemoteTasks {
     manager: TaskManager,
     backend: Arc<dyn RemoteOperations>,
-    caller: RemoteCommandCaller,
     admission: tokio::sync::Mutex<()>,
     capacity: Arc<Semaphore>,
     slots: Mutex<HashMap<String, Arc<OwnedSemaphorePermit>>>,
@@ -65,7 +64,7 @@ pub(in crate::mcp) struct RemoteTasks {
     ttl_ms: u64,
 }
 impl RemoteTasks {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_backend(
             Arc::new(ExistingRemoteOperations),
             TASK_TTL_MS,
@@ -80,8 +79,6 @@ impl RemoteTasks {
         Self {
             manager: TaskManager::new(),
             backend,
-            // This store is installed only on a trusted stdio owner transport.
-            caller: RemoteCommandCaller::Unrestricted,
             admission: tokio::sync::Mutex::new(()),
             capacity: Arc::new(Semaphore::new(capacity)),
             slots: Mutex::new(HashMap::new()),
@@ -101,26 +98,36 @@ impl RemoteTasks {
         params: RemoteCommandParams,
         project_root: Option<PathBuf>,
     ) -> Result<CallToolResponse, McpError> {
+        self.start_as(params, RemoteCommandCaller::Unrestricted, project_root)
+            .await
+    }
+
+    pub(crate) async fn start_as(
+        &self,
+        params: RemoteCommandParams,
+        caller: RemoteCommandCaller,
+        project_root: Option<PathBuf>,
+    ) -> Result<CallToolResponse, McpError> {
         // Serialize shutdown with admission. The existing executor inserts,
         // spawns and returns a job without yielding; registration below does
         // not await, so cancellation of this request cannot lose that job.
         let _admission = self.admission.lock().await;
         if self.stop.is_cancelled() {
             return Err(McpError::internal_error(
-                "stdio task service is shutting down",
+                "MCP task service is shutting down",
                 None,
             ));
         }
         self.sweep();
         let slot = Arc::new(self.capacity.clone().try_acquire_owned().map_err(|_| {
             McpError::internal_error(
-                "stdio task capacity reached; retained tasks still occupy slots",
+                "MCP task capacity reached; retained tasks still occupy slots",
                 None,
             )
         })?);
         let job = match self
             .backend
-            .execute(params, self.caller.clone(), project_root)
+            .execute(params, caller.clone(), project_root)
             .await
         {
             Ok(job) => job,
@@ -132,7 +139,6 @@ impl RemoteTasks {
             }
         };
         let backend = self.backend.clone();
-        let caller = self.caller.clone();
         let stop = self.stop.clone();
         let observer_slot = slot.clone();
         let task = self.manager.spawn(
@@ -171,7 +177,7 @@ impl RemoteTasks {
     ) -> Result<CallToolResponse, McpError> {
         let outcome = self
             .backend
-            .execute(params, self.caller.clone(), project_root)
+            .execute(params, RemoteCommandCaller::Unrestricted, project_root)
             .await;
         // Preserve the existing String-tool envelope, including its legacy
         // error representation. Legacy Start remains a job-id workflow.
@@ -182,27 +188,27 @@ impl RemoteTasks {
         .to_string();
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
-    pub(super) fn get(&self, id: &str) -> Result<DetailedTask, McpError> {
+    pub(crate) fn get(&self, id: &str) -> Result<DetailedTask, McpError> {
         let result = self.manager.get_task(id);
         self.sweep();
         result
     }
-    pub(super) fn update(&self, id: &str, responses: InputResponses) -> Result<(), McpError> {
+    pub(crate) fn update(&self, id: &str, responses: InputResponses) -> Result<(), McpError> {
         let result = self.manager.update_task(id, responses);
         self.sweep();
         result
     }
-    pub(super) fn cancel(&self, id: &str) -> Result<(), McpError> {
+    pub(crate) fn cancel(&self, id: &str) -> Result<(), McpError> {
         let result = self.manager.cancel_task(id);
         self.sweep();
         result
     }
-    pub(super) fn request_shutdown(&self) {
+    pub(crate) fn request_shutdown(&self) {
         self.stop.cancel();
         self.manager.shutdown();
         self.observers.close();
     }
-    pub(in crate::mcp) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let admission = self.admission.lock().await;
         self.request_shutdown();
         drop(admission);

@@ -12,7 +12,7 @@ use rmcp::{
 use std::sync::Arc;
 
 mod remote;
-use remote::RemoteTasks;
+pub(crate) use remote::RemoteTasks;
 
 pub(super) struct StdioTaskServer {
     inner: IntendantServer,

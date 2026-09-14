@@ -83,6 +83,7 @@ pub(crate) use tools_terminal::{
     TerminalWriteParams,
 };
 mod sdk_tasks;
+pub(crate) use sdk_tasks::RemoteTasks;
 mod tools_managed;
 mod tools_notes;
 mod tools_remote_compute;

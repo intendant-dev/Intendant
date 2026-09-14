@@ -247,7 +247,8 @@ pub(crate) async fn serve_http_request(
         // it on every post-initialize request — the app-scheme origin is a
         // real cross-origin /mcp caller, and a preflight that omits the
         // header would block every request after the handshake.
-        const PREFLIGHT_ALLOW_HEADERS: &str = "Content-Type, Authorization, MCP-Protocol-Version";
+        const PREFLIGHT_ALLOW_HEADERS: &str =
+            "Content-Type, Authorization, MCP-Protocol-Version, Mcp-Session-Id";
         let response = if own_origin_scoped {
             // Own-origin APIs (and /mcp) are same-origin (or
             // app-scheme) only; a cross-origin preflight gets
@@ -2511,7 +2512,18 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::McpStream => {
-                return handle_mcp_stream(stream, header_text, is_tls).await;
+                return handle_mcp_stream(
+                    stream,
+                    header_text,
+                    req_method,
+                    peer_connection_identity,
+                    is_tls,
+                    tls_client_cert_present,
+                    tls_client_cert_fingerprint,
+                    peer_addr,
+                    gateway_ingress.is_session_mcp(),
+                )
+                .await;
             }
         }
     } else if let Some(allow) = crate::gateway_routes::allowed_methods_for_path(req_path) {

@@ -137,6 +137,22 @@ The tunnel does not weaken Intendant's call-time MCP authorization. The relay
 authenticates as the local-process principal; configure Intendant IAM for that
 principal to the least role the private plugin needs.
 
+### Long-running MCP Tasks
+
+When ChatGPT/Codex negotiates `io.modelcontextprotocol/tasks`, the daemon's HTTP
+`/mcp` endpoint returns an opaque `Mcp-Session-Id`. The relay forwards that
+header in both directions, so `remote_command start` can return a Task and the
+plugin can poll `tasks/get` or request `tasks/cancel` through the same private
+tunnel. The session ID is not a bearer credential: Intendant re-authenticates
+every request, binds the Tasks session to that authenticated identity, and
+re-checks IAM for every task operation. Legacy clients that do not negotiate
+Tasks remain sessionless and keep the original synchronous job-handle workflow.
+
+An MCP client may explicitly `DELETE /mcp` with its session ID when it is done;
+the relay forwards the DELETE and Intendant cancels/awaits any real remote work
+owned by that Tasks session. The protocol session and task handles are in-memory
+and do not survive a daemon restart.
+
 ## Verification and troubleshooting
 
 Run the secret-free local tests:
