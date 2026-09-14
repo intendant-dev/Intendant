@@ -112,7 +112,9 @@ annotates an open Agenda-backed feedback item. It is authorized as
 `feedback.write`, deliberately not `agenda.write`: a client may be allowed to
 report friction without receiving general ledger mutation authority. Routine
 success is not feedback; callers must not attach transcripts, prompts,
-environment dumps, raw tool arguments/output, credentials, or secrets. A facade call is authorized as the **resolved** command's
+environment dumps, raw tool arguments/output, credentials, or secrets.
+
+A facade call is authorized as the **resolved** command's
 operation against the caller's principal, at every ingress, before any side
 effect — a parse failure never dispatches, and a command invoked through the
 wrong lane is redirected to the right tool by name. Argv values are literal
