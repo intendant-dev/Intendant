@@ -21,6 +21,11 @@ pub(crate) const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         support_files: &[],
     },
     BuiltinSkill {
+        name: "intendant-dogfood",
+        skill_md: include_str!("../../../skills/intendant-dogfood/SKILL.md"),
+        support_files: &[],
+    },
+    BuiltinSkill {
         name: "intendant-cli",
         skill_md: include_str!("../../../skills/intendant-cli/SKILL.md"),
         support_files: &[],
@@ -182,6 +187,17 @@ mod tests {
                 "frontmatter name must match the directory"
             );
         }
+    }
+
+    #[test]
+    fn chatgpt_dogfood_skill_matches_builtin() {
+        assert_eq!(
+            embedded("intendant-dogfood").skill_md,
+            include_str!(
+            "../../../examples/chatgpt-plugin/plugin-template/skills/intendant-dogfood/SKILL.md"
+        ),
+            "ChatGPT plugin dogfood teaching drifted from the shared builtin skill"
+        );
     }
 
     fn embedded(name: &str) -> &'static BuiltinSkill {

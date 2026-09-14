@@ -480,6 +480,81 @@ impl AgendaHandle {
         Ok(item)
     }
 
+    /// Exception-only product dogfood intake: decide create-vs-merge while
+    /// holding the Agenda writer lock, then append exactly ONE validated op.
+    /// The fingerprint is daemon-derived by the MCP report tool; callers cannot
+    /// select an existing item id or gain generic agenda-write authority through
+    /// this seam. Only OPEN feedback items dedupe — a repeated report after the
+    /// owner completed/retired an item is a new occurrence worth re-triage.
+    pub(crate) fn apply_dogfood_report(
+        &self,
+        fingerprint_tag: String,
+        title: String,
+        first_body: String,
+        occurrence: String,
+        tags: Vec<String>,
+        actor: Option<AgendaActor>,
+    ) -> Result<serde_json::Value, AgendaError> {
+        let (mut item, counts, seq, status) = {
+            let mut store = self.lock();
+            store.refresh_if_stale()?;
+            let existing = store
+                .snapshot()
+                .into_iter()
+                .find(|item| {
+                    item.status == super::types::AgendaStatus::Open
+                        && item.tags.iter().any(|tag| tag == "dogfood-feedback")
+                        && item.tags.iter().any(|tag| tag == &fingerprint_tag)
+                })
+                .map(|item| item.id);
+            let (cmd, status) = match existing {
+                Some(id) => (
+                    AgendaCommand::Annotate {
+                        id,
+                        text: occurrence,
+                        source: Some("dogfood-report".to_string()),
+                    },
+                    "merged",
+                ),
+                None => (
+                    AgendaCommand::Add {
+                        kind: super::types::AgendaKind::Note,
+                        title,
+                        body: first_body,
+                        tags,
+                        due_ms: None,
+                        source: Some("dogfood-report".to_string()),
+                        refs: Vec::new(),
+                    },
+                    "created",
+                ),
+            };
+            let item = store.apply_command(cmd, actor, now_ms())?;
+            let counts = store.counts();
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq, status)
+        };
+        self.decorate_item(&mut item);
+        let occurrences = item
+            .annotations
+            .iter()
+            .filter(|annotation| annotation.source.as_deref() == Some("dogfood-report"))
+            .count()
+            .saturating_add(1);
+        self.bus.send(AppEvent::AgendaChanged {
+            item: item.clone(),
+            counts,
+            seq,
+        });
+        self.reminder_nudge.notify_waiters();
+        Ok(serde_json::json!({
+            "status": status,
+            "item_id": item.id,
+            "occurrences": occurrences,
+            "fingerprint": fingerprint_tag.strip_prefix("dogfood-fp-").unwrap_or(&fingerprint_tag),
+        }))
+    }
+
     /// Stamp an automation definition (Track AW): the graph-shaped twin
     /// of [`Self::apply`] for the `stamp` command. Parks and proposes
     /// only — approval stays the owner's per-effect act (the workflow
