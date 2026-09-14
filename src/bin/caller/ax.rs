@@ -378,6 +378,7 @@ fn element_frame(element: &AXUIElement) -> Option<(i32, i32, u32, u32)> {
 // ── Window enumeration (CGWindowList) ────────────────────────────────────────
 
 struct WindowInfo {
+    window_id: u32,
     pid: i32,
     owner: String,
     title: Option<String>,
@@ -402,8 +403,12 @@ impl WindowInfo {
 
 /// On-screen, layer-0 (normal) windows, front-to-back.
 fn on_screen_windows() -> Vec<WindowInfo> {
+    window_list(kCGWindowListOptionOnScreenOnly)
+}
+
+fn window_list(options: u32) -> Vec<WindowInfo> {
     let Some(list) = copy_window_info(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        options | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID,
     ) else {
         return Vec::new();
@@ -443,6 +448,7 @@ fn on_screen_windows() -> Vec<WindowInfo> {
                 ))
             });
         windows.push(WindowInfo {
+            window_id: dict_i64(&dict, "kCGWindowNumber").unwrap_or(0) as u32,
             pid: pid as i32,
             owner,
             title,
@@ -488,3 +494,5 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod background;

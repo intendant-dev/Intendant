@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 type Gate = tokio::sync::Mutex<()>;
 static GATES: OnceLock<Mutex<HashMap<i32, Weak<Gate>>>> = OnceLock::new();
 fn gate(pid: i32) -> Arc<Gate> {
-    let mut gates = GATES.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut gates = GATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     gates.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(existing) = gates.get(&pid).and_then(Weak::upgrade) { return existing; }
+    if let Some(existing) = gates.get(&pid).and_then(Weak::upgrade) {
+        return existing;
+    }
     let gate = Arc::new(Gate::new(()));
     gates.insert(pid, Arc::downgrade(&gate));
     gate
@@ -99,99 +104,257 @@ pub async fn run(spec: String, request: Request) -> Result<Reply, String> {
 }
 
 async fn capture(target: WindowTarget, bounds: Bounds) -> Result<Vec<u8>, String> {
-    let current = tokio::task::spawn_blocking(move || ax::validate(target)).await.map_err(|e| e.to_string())??;
-    if current.bounds != bounds { return Err("window moved/resized; use a fresh capture request".into()); }
-    let png = crate::display::macos::background::capture_window_png(target.window_id, bounds.width, bounds.height).await.map_err(|e| e.to_string())?;
-    let current = tokio::task::spawn_blocking(move || ax::validate(target)).await.map_err(|e| e.to_string())??;
-    if current.bounds != bounds { return Err("window changed during capture; frame discarded".into()); }
+    let current = tokio::task::spawn_blocking(move || ax::validate(target))
+        .await
+        .map_err(|e| e.to_string())??;
+    if current.bounds != bounds {
+        return Err("window moved/resized; use a fresh capture request".into());
+    }
+    let png = crate::display::macos::background::capture_window_png(
+        target.window_id,
+        bounds.width,
+        bounds.height,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let current = tokio::task::spawn_blocking(move || ax::validate(target))
+        .await
+        .map_err(|e| e.to_string())??;
+    if current.bounds != bounds {
+        return Err("window changed during capture; frame discarded".into());
+    }
     Ok(png)
 }
 
 fn preflight(action: &CuAction, bounds: Bounds, normalized: bool) -> Result<(), String> {
     match action {
-        CuAction::Click { x,y,.. } | CuAction::DoubleClick { x,y,.. } | CuAction::TripleClick { x,y,.. }
-        | CuAction::MoveMouse {x,y} | CuAction::Scroll {x,y,..} => { bounds.point(*x,*y,normalized)?; },
-        CuAction::Drag {start_x,start_y,end_x,end_y} => { bounds.point(*start_x,*start_y,normalized)?; bounds.point(*end_x,*end_y,normalized)?; },
-        CuAction::Key {key} => { crate::computer_use::macos_input::parse_key(key)?; },
-        _ => {},
+        CuAction::Click { x, y, .. }
+        | CuAction::DoubleClick { x, y, .. }
+        | CuAction::TripleClick { x, y, .. }
+        | CuAction::MoveMouse { x, y }
+        | CuAction::Scroll { x, y, .. } => {
+            bounds.point(*x, *y, normalized)?;
+        }
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
+            bounds.point(*start_x, *start_y, normalized)?;
+            bounds.point(*end_x, *end_y, normalized)?;
+        }
+        CuAction::Key { key } => {
+            crate::computer_use::macos_input::parse_key(key)?;
+        }
+        _ => {}
     }
     Ok(())
 }
 fn source() -> Result<CGEventSource, String> {
-    CGEventSource::new(CGEventSourceStateID::Private).map_err(|_| "cannot create private event source".into())
+    CGEventSource::new(CGEventSourceStateID::Private)
+        .map_err(|_| "cannot create private event source".into())
 }
-fn mouse(target: WindowTarget, bounds: Bounds, kind: CGEventType, point: (i32,i32), button: CGMouseButton, clicks: i64) -> Result<(), String> {
-    let event = CGEvent::new_mouse_event(source()?, kind,
-        CGPoint::new(f64::from(bounds.x)+f64::from(point.0), f64::from(bounds.y)+f64::from(point.1)), button)
-        .map_err(|_| "cannot create process-local mouse event")?;
+fn mouse(
+    target: WindowTarget,
+    bounds: Bounds,
+    kind: CGEventType,
+    point: (i32, i32),
+    button: CGMouseButton,
+    clicks: i64,
+) -> Result<(), String> {
+    let event = CGEvent::new_mouse_event(
+        source()?,
+        kind,
+        CGPoint::new(
+            f64::from(bounds.x) + f64::from(point.0),
+            f64::from(bounds.y) + f64::from(point.1),
+        ),
+        button,
+    )
+    .map_err(|_| "cannot create process-local mouse event")?;
     event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, clicks);
-    event.set_integer_value_field(EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER, i64::from(target.window_id));
-    event.set_integer_value_field(EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER_THAT_CAN_HANDLE_THIS_EVENT, i64::from(target.window_id));
+    event.set_integer_value_field(
+        EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER,
+        i64::from(target.window_id),
+    );
+    event.set_integer_value_field(
+        EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER_THAT_CAN_HANDLE_THIS_EVENT,
+        i64::from(target.window_id),
+    );
     event.post_to_pid(target.pid);
     Ok(())
 }
-fn input(target: WindowTarget, bounds: Bounds, action: &CuAction, normalized: bool, deadline: Instant) -> Result<String, String> {
-    if let CuAction::Wait {ms} = action { std::thread::sleep(Duration::from_millis(*ms)); return Ok("ok: wait completed".into()); }
-    let point = |x,y| bounds.point(x,y,normalized);
-    if let CuAction::Click { x,y,button: MouseButton::Left } = action {
-        let p = point(*x,*y)?;
-        if ax::press(target,bounds,p.0,p.1)? { return Ok("injected: AXPress dispatched to selected-window element (effect unverified)".into()); }
+fn input(
+    target: WindowTarget,
+    bounds: Bounds,
+    action: &CuAction,
+    normalized: bool,
+    deadline: Instant,
+) -> Result<String, String> {
+    if let CuAction::Wait { ms } = action {
+        std::thread::sleep(Duration::from_millis(*ms));
+        return Ok("ok: wait completed".into());
+    }
+    let point = |x, y| bounds.point(x, y, normalized);
+    if let CuAction::Click {
+        x,
+        y,
+        button: MouseButton::Left,
+    } = action
+    {
+        let p = point(*x, *y)?;
+        if ax::press(target, bounds, p.0, p.1)? {
+            return Ok(
+                "injected: AXPress dispatched to selected-window element (effect unverified)"
+                    .into(),
+            );
+        }
     }
     // Raw events address a PROCESS, not a guaranteed window. Require an exact
     // match to its internally focused window; never activate or switch it.
-    ax::assert_background(target,bounds,true)?;
+    ax::assert_background(target, bounds, true)?;
     match action {
-        CuAction::Click {x,y,button} | CuAction::DoubleClick {x,y,button} | CuAction::TripleClick {x,y,button} => {
-            let (down,up,button) = match button {
-                MouseButton::Left => (CGEventType::LeftMouseDown,CGEventType::LeftMouseUp,CGMouseButton::Left),
-                MouseButton::Right => (CGEventType::RightMouseDown,CGEventType::RightMouseUp,CGMouseButton::Right),
-                MouseButton::Middle => (CGEventType::OtherMouseDown,CGEventType::OtherMouseUp,CGMouseButton::Center),
+        CuAction::Click { x, y, button }
+        | CuAction::DoubleClick { x, y, button }
+        | CuAction::TripleClick { x, y, button } => {
+            let (down, up, button) = match button {
+                MouseButton::Left => (
+                    CGEventType::LeftMouseDown,
+                    CGEventType::LeftMouseUp,
+                    CGMouseButton::Left,
+                ),
+                MouseButton::Right => (
+                    CGEventType::RightMouseDown,
+                    CGEventType::RightMouseUp,
+                    CGMouseButton::Right,
+                ),
+                MouseButton::Middle => (
+                    CGEventType::OtherMouseDown,
+                    CGEventType::OtherMouseUp,
+                    CGMouseButton::Center,
+                ),
             };
-            let clicks = match action { CuAction::DoubleClick{..} => 2, CuAction::TripleClick{..} => 3, _=>1 };
+            let clicks = match action {
+                CuAction::DoubleClick { .. } => 2,
+                CuAction::TripleClick { .. } => 3,
+                _ => 1,
+            };
             for state in 1..=clicks {
-                ax::assert_background(target,bounds,true)?;
-                mouse(target,bounds,down,point(*x,*y)?,button,state)?;
-                mouse(target,bounds,up,point(*x,*y)?,button,state)?;
+                ax::assert_background(target, bounds, true)?;
+                mouse(target, bounds, down, point(*x, *y)?, button, state)?;
+                mouse(target, bounds, up, point(*x, *y)?, button, state)?;
                 std::thread::sleep(Duration::from_millis(30));
             }
-        },
-        CuAction::MoveMouse{x,y} => mouse(target,bounds,CGEventType::MouseMoved,point(*x,*y)?,CGMouseButton::Left,0)?,
-        CuAction::Key {key} => {
-            let (code,flags) = crate::computer_use::macos_input::parse_key(key)?;
-            let down = CGEvent::new_keyboard_event(source()?,code,true).map_err(|_| "cannot create key-down")?;
-            let up = CGEvent::new_keyboard_event(source()?,code,false).map_err(|_| "cannot create key-up")?;
-            down.set_flags(flags); up.set_flags(flags);
-            down.post_to_pid(target.pid); up.post_to_pid(target.pid);
-        },
-        CuAction::Type {text} => {
+        }
+        CuAction::MoveMouse { x, y } => mouse(
+            target,
+            bounds,
+            CGEventType::MouseMoved,
+            point(*x, *y)?,
+            CGMouseButton::Left,
+            0,
+        )?,
+        CuAction::Key { key } => {
+            let (code, flags) = crate::computer_use::macos_input::parse_key(key)?;
+            let down = CGEvent::new_keyboard_event(source()?, code, true)
+                .map_err(|_| "cannot create key-down")?;
+            let up = CGEvent::new_keyboard_event(source()?, code, false)
+                .map_err(|_| "cannot create key-up")?;
+            down.set_flags(flags);
+            up.set_flags(flags);
+            down.post_to_pid(target.pid);
+            up.post_to_pid(target.pid);
+        }
+        CuAction::Type { text } => {
             for ch in text.chars() {
-                if Instant::now() >= deadline { return Err("typing deadline reached; prefix may have been delivered".into()); }
-                ax::assert_background(target,bounds,true)?;
-                let code = match ch { '\n'|'\r' => 36, '\t'=>48, _=>0 };
-                let down = CGEvent::new_keyboard_event(source()?,code,true).map_err(|_| "cannot create text key-down")?;
-                let up = CGEvent::new_keyboard_event(source()?,code,false).map_err(|_| "cannot create text key-up")?;
-                if code == 0 {
-                    let mut units = [0u16;2]; let encoded = ch.encode_utf16(&mut units);
-                    down.set_string_from_utf16_unchecked(encoded); up.set_string_from_utf16_unchecked(encoded);
+                if Instant::now() >= deadline {
+                    return Err("typing deadline reached; prefix may have been delivered".into());
                 }
-                down.post_to_pid(target.pid); up.post_to_pid(target.pid);
+                ax::assert_background(target, bounds, true)?;
+                let code = match ch {
+                    '\n' | '\r' => 36,
+                    '\t' => 48,
+                    _ => 0,
+                };
+                let down = CGEvent::new_keyboard_event(source()?, code, true)
+                    .map_err(|_| "cannot create text key-down")?;
+                let up = CGEvent::new_keyboard_event(source()?, code, false)
+                    .map_err(|_| "cannot create text key-up")?;
+                if code == 0 {
+                    let mut units = [0u16; 2];
+                    let encoded = ch.encode_utf16(&mut units);
+                    down.set_string_from_utf16_unchecked(encoded);
+                    up.set_string_from_utf16_unchecked(encoded);
+                }
+                down.post_to_pid(target.pid);
+                up.post_to_pid(target.pid);
                 std::thread::sleep(Duration::from_millis(8));
             }
-        },
-        CuAction::Scroll {x,y,direction,amount} => {
-            let (vertical,horizontal) = match direction { ScrollDirection::Up=>(*amount,0), ScrollDirection::Down=>(-*amount,0), ScrollDirection::Left=>(0,*amount), ScrollDirection::Right=>(0,-*amount) };
-            let event = CGEvent::new_scroll_event(source()?,ScrollEventUnit::LINE,2,vertical,horizontal,0).map_err(|_| "cannot create scroll")?;
-            let p=point(*x,*y)?;
-            event.set_location(CGPoint::new(f64::from(bounds.x)+f64::from(p.0),f64::from(bounds.y)+f64::from(p.1)));
+        }
+        CuAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => {
+            let (vertical, horizontal) = match direction {
+                ScrollDirection::Up => (*amount, 0),
+                ScrollDirection::Down => (-*amount, 0),
+                ScrollDirection::Left => (0, *amount),
+                ScrollDirection::Right => (0, -*amount),
+            };
+            let event = CGEvent::new_scroll_event(
+                source()?,
+                ScrollEventUnit::LINE,
+                2,
+                vertical,
+                horizontal,
+                0,
+            )
+            .map_err(|_| "cannot create scroll")?;
+            let p = point(*x, *y)?;
+            event.set_location(CGPoint::new(
+                f64::from(bounds.x) + f64::from(p.0),
+                f64::from(bounds.y) + f64::from(p.1),
+            ));
             event.post_to_pid(target.pid);
-        },
-        CuAction::Drag {start_x,start_y,end_x,end_y} => {
-            let start=point(*start_x,*start_y)?; let end=point(*end_x,*end_y)?;
-            mouse(target,bounds,CGEventType::LeftMouseDown,start,CGMouseButton::Left,1)?;
-            let moved = mouse(target,bounds,CGEventType::LeftMouseDragged,end,CGMouseButton::Left,1);
-            let released = mouse(target,bounds,CGEventType::LeftMouseUp,end,CGMouseButton::Left,1);
-            moved?; released?;
-        },
+        }
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
+            let start = point(*start_x, *start_y)?;
+            let end = point(*end_x, *end_y)?;
+            mouse(
+                target,
+                bounds,
+                CGEventType::LeftMouseDown,
+                start,
+                CGMouseButton::Left,
+                1,
+            )?;
+            let moved = mouse(
+                target,
+                bounds,
+                CGEventType::LeftMouseDragged,
+                end,
+                CGMouseButton::Left,
+                1,
+            );
+            let released = mouse(
+                target,
+                bounds,
+                CGEventType::LeftMouseUp,
+                end,
+                CGMouseButton::Left,
+                1,
+            );
+            moved?;
+            released?;
+        }
         _ => return Err("unsupported background action; no foreground fallback".into()),
     }
     Ok("injected: process-local CGEvent dispatched (app acceptance/effect unverified)".into())
@@ -202,12 +365,20 @@ mod tests {
     use super::*;
     #[test]
     fn per_process_gates_share_only_with_the_same_process() {
-        let a = gate(42); let b = gate(42); let c = gate(43);
-        assert!(Arc::ptr_eq(&a, &b)); assert!(!Arc::ptr_eq(&a, &c));
+        let a = gate(42);
+        let b = gate(42);
+        let c = gate(43);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
     }
     #[test]
     fn out_of_window_actions_fail_in_preflight_without_native_calls() {
-        let b = Bounds { x: 0, y: 0, width: 100, height: 100 };
+        let b = Bounds {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         assert!(preflight(&CuAction::MoveMouse { x: 100, y: 2 }, b, false).is_err());
         assert!(preflight(&CuAction::MoveMouse { x: 1001, y: 2 }, b, true).is_err());
     }

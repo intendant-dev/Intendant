@@ -2,15 +2,25 @@
 
 /// A PID alone is not an identity: reject reuse after an application restarts.
 pub fn macos_process_birth(pid: i32) -> Option<(u64, u64)> {
-    if pid <= 0 { return None; }
+    if pid <= 0 {
+        return None;
+    }
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     // SAFETY: kernel writes at most size bytes into aligned storage. No fields
     // are read unless the complete documented C struct has been returned.
     let written = unsafe {
-        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size as i32)
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
     };
-    if written != size as i32 { return None; }
+    if written != size as i32 {
+        return None;
+    }
     // SAFETY: exact-sized successful read initialized the complete C struct.
     let info = unsafe { info.assume_init() };
     Some((info.pbi_start_tvsec, info.pbi_start_tvusec))

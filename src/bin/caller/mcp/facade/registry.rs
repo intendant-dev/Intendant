@@ -804,6 +804,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         ],
         help: "Back out of a rewind (restore or fork the saved thread)",
     },
+    CommandSpec { path: &["cu", "windows"], lane: RiskLane::Inspect, tool: "read_screen", seed: r#"{"display_target":"macos_windows","format":"json"}"#, positionals: &[], flags: &[], help: "List macOS background window targets (user-display authority required)" },
     CommandSpec {
         path: &["cu", "elements"],
         lane: RiskLane::Inspect,

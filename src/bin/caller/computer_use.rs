@@ -1994,7 +1994,7 @@ fn dom_key_sequence(key: &str) -> Result<Vec<(String, bool)>, String> {
 /// text is read back from the focused element where AX allows so garbled or
 /// dropped delivery is reported instead of assumed.
 #[cfg(target_os = "macos")]
-mod macos_input {
+pub(crate) mod macos_input {
     use super::{CuActionResult, CuActionStatus, MouseButton, ScrollDirection};
     use core_graphics::event::{
         CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
@@ -2517,7 +2517,7 @@ mod macos_input {
 
     /// Parse an xdotool-style key name or `mod+...+key` chord into a virtual
     /// keycode plus modifier flags.
-    fn parse_key(key: &str) -> Result<(CGKeyCode, CGEventFlags), String> {
+    pub(crate) fn parse_key(key: &str) -> Result<(CGKeyCode, CGEventFlags), String> {
         let mut flags = CGEventFlags::CGEventFlagNull;
         let parts: Vec<&str> = key.split('+').collect();
         let (modifiers, base) = parts.split_at(parts.len() - 1);
