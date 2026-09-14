@@ -1,6 +1,6 @@
 ---
 name: intendant-dogfood
-description: Report exceptional Intendant-specific friction or concrete efficiency opportunities through the narrow `report` MCP tool. Use only after something meaningful happened while operating Intendant: a capability was wrong/misleading/missing, forced a workaround, or caused clearly avoidable calls, latency, or context. Never report routine successful use; never paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets.
+description: "Report exceptional Intendant-specific friction or concrete efficiency opportunities through the narrow `report` MCP tool. Use only after something meaningful happened while operating Intendant: a capability was wrong/misleading/missing, forced a workaround, or caused clearly avoidable calls, latency, or context. Never report routine successful use; never paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets."
 ---
 
 # Intendant dogfood feedback
