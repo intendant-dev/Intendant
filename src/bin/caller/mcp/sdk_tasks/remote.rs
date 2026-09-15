@@ -57,6 +57,7 @@ pub(crate) struct RemoteTasks {
     manager: TaskManager,
     backend: Arc<dyn RemoteOperations>,
     admission: tokio::sync::Mutex<()>,
+    lifecycle: Mutex<()>,
     capacity: Arc<Semaphore>,
     slots: Mutex<HashMap<String, Arc<OwnedSemaphorePermit>>>,
     stop: CancellationToken,
@@ -80,6 +81,7 @@ impl RemoteTasks {
             manager: TaskManager::new(),
             backend,
             admission: tokio::sync::Mutex::new(()),
+            lifecycle: Mutex::new(()),
             capacity: Arc::new(Semaphore::new(capacity)),
             slots: Mutex::new(HashMap::new()),
             stop: CancellationToken::new(),
@@ -108,16 +110,22 @@ impl RemoteTasks {
         caller: RemoteCommandCaller,
         project_root: Option<PathBuf>,
     ) -> Result<CallToolResponse, McpError> {
-        // Serialize shutdown with admission. The existing executor inserts,
-        // spawns and returns a job without yielding; registration below does
-        // not await, so cancellation of this request cannot lose that job.
+        // Preparing a working-tree start can yield before a job exists. Count
+        // admission before that await, atomically with shutdown: a closed,
+        // temporarily empty observer tracker must not signal drained cleanup.
+        // Once the executor inserts a job it returns without yielding, and
+        // observer registration below has no await that could lose that job.
         let _admission = self.admission.lock().await;
-        if self.stop.is_cancelled() {
-            return Err(McpError::internal_error(
-                "MCP task service is shutting down",
-                None,
-            ));
-        }
+        let _starting = {
+            let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if self.stop.is_cancelled() {
+                return Err(McpError::internal_error(
+                    "MCP task service is shutting down",
+                    None,
+                ));
+            }
+            self.observers.token()
+        };
         self.sweep();
         let slot = Arc::new(self.capacity.clone().try_acquire_owned().map_err(|_| {
             McpError::internal_error(
@@ -204,16 +212,27 @@ impl RemoteTasks {
         result
     }
     pub(crate) fn request_shutdown(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.stop.cancel();
-        self.manager.shutdown();
         self.observers.close();
     }
+    pub(crate) fn shutdown_complete(&self) -> bool {
+        self.stop.is_cancelled() && self.observers.is_empty()
+    }
     pub(crate) async fn shutdown(&self) {
-        let admission = self.admission.lock().await;
         self.request_shutdown();
-        drop(admission);
         self.observers.wait().await;
+        // In-flight starts have now registered their observers and those
+        // observers have drained. No later start can repopulate the manager.
+        self.manager.shutdown();
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+impl Drop for RemoteTasks {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        self.manager.shutdown();
     }
 }
 

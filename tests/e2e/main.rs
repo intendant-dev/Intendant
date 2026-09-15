@@ -11213,3 +11213,156 @@ async fn backend_auth_failure_classifies_to_the_named_signed_out_state() {
 
     child.kill().await.ok();
 }
+
+/// Exercise real HTTP admission and task serialization against an isolated,
+/// synthetic-display daemon. The explicit unattached host fails locally: no
+/// provider acquisition, remote command execution or external network is used.
+#[tokio::test]
+async fn http_tasks_negotiate_fail_poll_isolate_and_delete_on_the_wire() {
+    use serde_json::{json, Value};
+    let plain = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let mut daemon = spawn_daemon(&plain, &json!({"profiles":[]})).await;
+    let client = daemon.authed_client();
+    let url = format!("http://127.0.0.1:{}/mcp", daemon.port);
+    let post = |method: &str, params: Value, session: Option<&str>| {
+        let request = client
+            .post(&url)
+            .timeout(Duration::from_secs(15))
+            .header("Accept", "application/json")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}));
+        match session {
+            Some(id) => request.header("Mcp-Session-Id", id),
+            None => request,
+        }
+    };
+    let legacy = post("initialize", json!({"protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"wire-fixture","version":"1"}}), None).send().await.unwrap();
+    assert_eq!(legacy.status(), 200);
+    assert!(!legacy.headers().contains_key("mcp-session-id"));
+    let legacy: Value = legacy.json().await.unwrap();
+    assert!(legacy["result"]["capabilities"].get("extensions").is_none());
+
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let response = post("initialize", json!({"protocolVersion":"2025-06-18", "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}, "clientInfo":{"name":"wire-fixture","version":"1"}}), None).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let id = response
+            .headers()
+            .get("mcp-session-id")
+            .expect("negotiated session header")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body: Value = response.json().await.unwrap();
+        assert!(body["result"]["capabilities"]["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_some());
+        assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+        let initialized = client
+            .post(&url)
+            .timeout(Duration::from_secs(15))
+            .header("Mcp-Session-Id", &id)
+            .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), 202);
+        sessions.push(id);
+    }
+    assert_ne!(sessions[0], sessions[1]);
+    let first = sessions[0].as_str();
+    let second = sessions[1].as_str();
+    let started: Value = post("tools/call", json!({"name":"remote_command","arguments":{"op":"start","host":"cloud:wire-fixture-unattached","argv":["fixture-never-executed"],"expected_revision":"0123456","timeout_s":1}}), Some(first)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(started["result"]["resultType"], "task", "{started}");
+    let task_id = started["result"]["taskId"].as_str().expect("task ID");
+    let query = json!({"taskId":task_id});
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let result: Value = post("tasks/get", query.clone(), Some(first))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(result.get("error").is_none(), "{result}");
+        if result["result"]["status"] == "failed" {
+            assert!(result["result"]["error"]["message"].is_string(), "{result}");
+            assert_eq!(result["result"]["error"]["data"]["job"]["state"], "failed");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "task failed to terminate: {result}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let other: Value = post("tasks/get", query.clone(), Some(second))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(other["error"]["code"], -32602, "{other}");
+    let unauthenticated = plain
+        .post(&url)
+        .header("Mcp-Session-Id", first)
+        .json(&json!({"id":2,"method":"tasks/get","params":query}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated.status(),
+        401,
+        "session ID is not a credential"
+    );
+    let legacy_call: Value = post(
+        "tools/call",
+        json!({"name":"remote_command","arguments":{"op":"status","job_id":"not-found"}}),
+        None,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(legacy_call["result"]["resultType"], "complete");
+    assert!(legacy_call["result"].get("taskId").is_none());
+    for session in &sessions {
+        let closed = client
+            .delete(&url)
+            .timeout(Duration::from_secs(15))
+            .header("Mcp-Session-Id", session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), 202);
+        let replay = post("tasks/get", query.clone(), Some(session))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.status(),
+            404,
+            "deleted session is no longer routable"
+        );
+    }
+    let stateless_delete = client
+        .delete(&url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stateless_delete.status(), 405);
+    daemon
+        .child
+        .kill()
+        .await
+        .expect("stop and reap test daemon");
+}

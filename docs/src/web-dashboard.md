@@ -2290,7 +2290,7 @@ response omits the header.
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
 | POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications; held-POST verbs answer as per-request SSE when accepted) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
-| DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
+| DELETE | `/mcp` | MCP token | own origin | none | MCP Tasks session delete (202 for an authenticated negotiated session) |
 <!-- gateway-route-table:end -->
 
 The four signed-organization rows marked `public` are courier/verification

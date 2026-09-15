@@ -16,7 +16,7 @@ use std::{
 
 const HTTP_TASK_SESSION_CAP: usize = 128;
 const HTTP_TASK_SESSION_IDLE_TTL: Duration = Duration::from_secs(3 * 60 * 60);
-const HTTP_TASK_SESSION_ID_MAX_BYTES: usize = 128;
+pub(super) const HTTP_TASK_SESSION_ID_MAX_BYTES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HttpTaskOwner {
@@ -28,6 +28,8 @@ struct HttpTaskOwner {
     authn_kind: Option<String>,
     authn_binding: Option<String>,
     authn_origin: Option<String>,
+    authn: Vec<serde_json::Value>,
+    hosted_connect: bool,
     gate_session: Option<String>,
 }
 
@@ -43,6 +45,11 @@ impl HttpTaskOwner {
             authn_kind: principal.authn_kind.clone(),
             authn_binding: principal.authn_binding.clone(),
             authn_origin: principal.authn_origin.clone(),
+            // Default transport principals still express their binding only
+            // in these statements. Neither these nor hosted provenance may
+            // be shed by replaying a session id through another authn lane.
+            authn: principal.authn.clone(),
+            hosted_connect: principal.hosted_connect,
             gate_session: gate_session.map(str::to_string),
         }
     }
@@ -61,6 +68,14 @@ pub(crate) struct HttpTaskSession {
 }
 
 impl HttpTaskSession {
+    #[cfg(test)]
+    pub(crate) fn with_test_tasks(tasks: Arc<RemoteTasks>) -> Self {
+        Self {
+            id: "hermetic-task-session".into(),
+            tasks,
+        }
+    }
+
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -72,6 +87,7 @@ impl HttpTaskSession {
 
 struct HttpTaskRegistry {
     sessions: HashMap<String, HttpTaskSessionEntry>,
+    retired: Vec<Arc<RemoteTasks>>,
     cap: usize,
     idle_ttl: Duration,
 }
@@ -80,6 +96,7 @@ impl HttpTaskRegistry {
     fn new(cap: usize, idle_ttl: Duration) -> Self {
         Self {
             sessions: HashMap::new(),
+            retired: Vec::new(),
             cap,
             idle_ttl,
         }
@@ -90,14 +107,19 @@ impl HttpTaskRegistry {
             let keep = now.saturating_duration_since(session.last_seen) <= self.idle_ttl;
             if !keep {
                 session.tasks.request_shutdown();
+                self.retired.push(session.tasks.clone());
             }
             keep
         });
+        self.retired.retain(|tasks| !tasks.shutdown_complete());
     }
 
     fn create(&mut self, owner: HttpTaskOwner, now: Instant) -> Result<HttpTaskSession, String> {
         self.sweep(now);
-        if self.sessions.len() >= self.cap {
+        // Retired stores still own real cleanup. Bound the combined set so
+        // repeated DELETE/initialize or idle eviction cannot bypass admission
+        // or grow an unbounded retirement queue.
+        if self.sessions.len() + self.retired.len() >= self.cap {
             return Err(format!(
                 "HTTP MCP Tasks session capacity reached ({})",
                 self.cap
@@ -153,7 +175,10 @@ impl HttpTaskRegistry {
         {
             return None;
         }
-        self.sessions.remove(id).map(|session| session.tasks)
+        let session = self.sessions.remove(id)?;
+        session.tasks.request_shutdown();
+        self.retired.push(session.tasks.clone());
+        Some(session.tasks)
     }
 }
 
@@ -211,6 +236,8 @@ pub(crate) async fn close_http_task_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::task_tests::{start_params, MockRemote};
+    use crate::remote_compute::{RemoteCommandCaller, RemoteCommandState};
 
     fn access(id: &str) -> HttpAccessContext {
         let mut principal = crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http");
@@ -264,5 +291,77 @@ mod tests {
         let mut changed = root.clone();
         changed.principal.role_id = "role:viewer".to_string();
         assert_eq!(owner, HttpTaskOwner::from_access(&changed, None));
+    }
+
+    #[test]
+    fn session_ownership_preserves_authentication_and_hosted_provenance() {
+        let original = access("principal:human");
+        let owner = HttpTaskOwner::from_access(&original, Some("session-a"));
+        let mut variants = Vec::new();
+        let mut hosted = original.clone();
+        hosted.principal.hosted_connect = true;
+        variants.push(hosted);
+        let mut authn = original.clone();
+        authn
+            .principal
+            .authn
+            .push(serde_json::json!({"kind": "agent_session"}));
+        variants.push(authn);
+        let mut cert = original.clone();
+        cert.principal.authn_binding = Some("another-certificate".into());
+        variants.push(cert);
+        let mut grant = original.clone();
+        grant.principal.grant_id = Some("replacement-grant".into());
+        variants.push(grant);
+        let now = Instant::now();
+        let mut registry = HttpTaskRegistry::new(1, Duration::from_secs(60));
+        let session = registry.create(owner.clone(), now).unwrap();
+        for access in variants {
+            let changed = HttpTaskOwner::from_access(&access, Some("session-a"));
+            assert!(registry.resolve(session.id(), &changed, now).is_none());
+            assert!(registry.remove(session.id(), &changed).is_none());
+        }
+        // A wildcard IAM principal can name several gate-bound sessions.
+        let other_session = HttpTaskOwner::from_access(&original, Some("session-b"));
+        assert!(registry
+            .resolve(session.id(), &other_session, now)
+            .is_none());
+        assert!(registry.resolve(session.id(), &owner, now).is_some());
+    }
+
+    #[tokio::test]
+    async fn deletion_and_idle_eviction_hold_global_capacity_until_cleanup_drains() {
+        for expire in [false, true] {
+            let mut registry = HttpTaskRegistry::new(1, Duration::from_millis(10));
+            let now = Instant::now();
+            let owner = HttpTaskOwner::from_access(&access("principal:a"), None);
+            let mut session = registry.create(owner.clone(), now).unwrap();
+            let backend = MockRemote::new();
+            session.tasks = backend.tasks(10_000, 1);
+            registry.sessions.get_mut(session.id()).unwrap().tasks = session.tasks.clone();
+            session
+                .tasks()
+                .start_as(start_params(), RemoteCommandCaller::Unrestricted, None)
+                .await
+                .unwrap();
+            let later = now + Duration::from_millis(11);
+            if expire {
+                assert!(registry.resolve(session.id(), &owner, later).is_none());
+            } else {
+                // Even a disconnected DELETE waiter leaves cleanup accounted for.
+                drop(registry.remove(session.id(), &owner).unwrap());
+            }
+            backend.saw_cancel().await;
+            assert!(registry.resolve(session.id(), &owner, later).is_none());
+            for _ in 0..10 {
+                assert!(registry.create(owner.clone(), later).is_err());
+                assert_eq!(registry.retired.len(), 1);
+            }
+            backend.finish(RemoteCommandState::Cancelled);
+            session.tasks().shutdown().await;
+            let replacement = registry.create(owner, later).unwrap();
+            assert_ne!(session.id(), replacement.id());
+            assert!(registry.retired.is_empty());
+        }
     }
 }

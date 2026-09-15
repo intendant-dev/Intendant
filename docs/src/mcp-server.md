@@ -548,7 +548,10 @@ commands do not request input, so unmatched responses are ignored by the SDK.
 Clients that do not declare Tasks keep the legacy immediate job-view response
 and explicit `status` / `wait` / `cancel` workflow. Those three operations also
 retain their legacy responses for Tasks-capable clients. Ordinary tools continue
-through the existing routing and authorization paths.
+through the existing routing and authorization paths. On HTTP, only the raw
+`remote_command` tool name returns a protocol task. Facade `authorize` calls
+resolving to `remote start` keep the legacy job-view envelope, including on a
+Tasks-negotiated session.
 
 **Stdio ownership.** Each stdio connection has a fresh, non-cloneable Tasks
 wrapper and its own task store. Stdio is the trusted owner surface, so its
@@ -567,10 +570,16 @@ unknown ID. Every task operation also re-runs the current IAM decision for
 relying on the session's creation-time role. GET `/mcp` remains unsupported;
 Tasks are polled with POST. An authenticated `DELETE /mcp` carrying the session
 ID terminates that Tasks session and waits for its real remote-command cleanup.
+Stateless DELETE requests retain their legacy 405 response. Tasks initialization
+requires a string or integer JSON-RPC request ID and no `Mcp-Session-Id` header;
+duplicate or malformed session headers are refused before touching session state.
 
-The HTTP registry is bounded to 128 negotiated Tasks sessions per daemon and
-expires sessions after three hours of inactivity. Expiry requests cancellation
-of any underlying remote work before forgetting the protocol handles. Each
+The HTTP registry is bounded to 128 negotiated Tasks sessions per daemon,
+including retiring sessions whose starts or remote cleanup have not drained.
+It opportunistically expires sessions after three hours of inactivity. Expiry
+and deletion invalidate the protocol handles immediately and request cancellation;
+their capacity is reusable only after in-flight starts and observers drain.
+The same bound covers the retirement queue. Each
 session's task store separately keeps the existing 32-task admission bound,
 three-hour task TTL, and one-second suggested poll interval. SDK sweeping is
 opportunistic on task operations and new task creation: over-TTL active tasks

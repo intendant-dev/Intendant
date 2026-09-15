@@ -360,7 +360,11 @@ pub(crate) fn mcp_cors_header_segment(header_text: &str, is_tls: bool) -> String
     match extract_origin_header(header_text)
         .filter(|origin| is_own_or_app_origin(origin, is_tls, header_text))
     {
-        Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+        // The allowed app-scheme browser must be able to read the negotiated
+        // session id before it can return it on subsequent requests.
+        Some(origin) => format!(
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\nVary: Origin\r\n"
+        ),
         None => "Vary: Origin\r\n".to_string(),
     }
 }
@@ -456,6 +460,47 @@ fn http_client_supports_tasks(request: &McpHttpRequest) -> bool {
         .cloned()
         .and_then(|caps| serde_json::from_value::<rmcp::model::ClientCapabilities>(caps).ok())
         .is_some_and(|caps| caps.supports_tasks())
+}
+
+fn http_task_session_header(header_text: &str) -> Result<Option<&str>, &'static str> {
+    let mut values = http_header_values(header_text, "mcp-session-id");
+    let id = values.next();
+    if values.next().is_some()
+        || id.is_some_and(|id| {
+            id.is_empty()
+                || id.len() > HTTP_TASK_SESSION_ID_MAX_BYTES
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b',')
+        })
+    {
+        return Err("Mcp-Session-Id must be one nonempty session identifier");
+    }
+    Ok(id)
+}
+
+/// Validate before allocating or resolving any Tasks state. An initialize
+/// notification cannot receive the minted id, and an already-sessionful
+/// initialize must not allocate a second store or change its negotiation.
+fn http_task_session_admission<'a>(
+    request: &McpHttpRequest,
+    header_text: &'a str,
+) -> Result<Option<&'a str>, &'static str> {
+    let id = http_task_session_header(header_text)?;
+    if request.method == "initialize" {
+        if id.is_some() {
+            return Err("initialize must not carry Mcp-Session-Id");
+        }
+        if http_client_supports_tasks(request)
+            && !request
+                .id
+                .as_ref()
+                .is_some_and(|id| id.is_string() || id.is_i64() || id.is_u64())
+        {
+            return Err("Tasks initialize requires a string or integer request id");
+        }
+    }
+    Ok(id)
 }
 
 fn mcp_error_data_to_http(error: rmcp::ErrorData) -> McpHttpError {
@@ -940,7 +985,7 @@ pub(crate) async fn handle_mcp_post(
     //   - Requests (has `id`):   200 OK + Content-Type: application/json
     //   - Notifications (no `id`): 202 Accepted + empty body
     //   - GET for SSE stream:    405 Method Not Allowed (we don't support SSE push)
-    //   - DELETE for session:    405 Method Not Allowed (stateless)
+    //   - DELETE for session:    negotiated Tasks cleanup; otherwise 405
     use tokio::io::AsyncWriteExt;
     if let Some(ref mcp) = mcp_server {
         let mcp_cors = mcp_cors_header_segment(header_text, is_tls);
@@ -1006,7 +1051,27 @@ pub(crate) async fn handle_mcp_post(
             Err(outcome) => outcome,
             Ok(request) => {
                 let gate_session = mcp_gate_session(header_text);
-                let presented_task_session_id = http_header_value(header_text, "mcp-session-id");
+                let presented_task_session_id =
+                    match http_task_session_admission(&request, header_text) {
+                        Ok(id) => id,
+                        Err(message) => {
+                            let response = HttpResponse::with_content(
+                                "400 Bad Request",
+                                "application/json",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0", "id": request.id,
+                                    "error": { "code": -32600, "message": message },
+                                })
+                                .to_string(),
+                            )
+                            .header_segment(&mcp_cors)
+                            .header("Connection", "close")
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    };
                 let task_session = if http_client_supports_tasks(&request) {
                     match create_http_task_session(&mcp_access, gate_session.as_deref()) {
                         Ok(session) => {
@@ -1236,7 +1301,7 @@ pub(crate) async fn handle_mcp_stream(
 
     // GET remains unsupported: Tasks are polled through POST tasks/get, and
     // this endpoint still offers no server-push SSE stream.
-    if req_method != "DELETE" {
+    if req_method != "DELETE" || !http_header_present(header_text, "mcp-session-id") {
         let reuse = stream.exchange_reusable();
         let http = HttpResponse::new("405 Method Not Allowed")
             .header_segment(&mcp_cors)
@@ -1294,7 +1359,27 @@ pub(crate) async fn handle_mcp_stream(
         }
     };
 
-    let session_id = http_header_value(header_text, "mcp-session-id").unwrap_or("");
+    let session_id = match http_task_session_header(header_text) {
+        Ok(Some(id)) => id,
+        Ok(None) => unreachable!("stateless DELETE returned above"),
+        Err(message) => {
+            let response = HttpResponse::with_content(
+                "400 Bad Request",
+                "application/json",
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": null,
+                    "error": { "code": -32600, "message": message },
+                })
+                .to_string(),
+            )
+            .header_segment(&mcp_cors)
+            .header("Connection", "close")
+            .into_string();
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    };
     let closed = close_http_task_session(
         session_id,
         &access,
@@ -1823,6 +1908,58 @@ mod tests {
         assert_eq!(negotiated_mcp_protocol_version(None), "2025-06-18");
     }
 
+    #[test]
+    fn tasks_admission_rejects_missing_ids_and_ambiguous_session_headers() {
+        let mut init = serde_json::json!({
+            "jsonrpc": "2.0", "method": "initialize",
+            "params": {"capabilities": {"extensions": {
+                "io.modelcontextprotocol/tasks": {}
+            }}}
+        });
+        let bare = "POST /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert!(http_task_session_admission(&parse_req(init.clone()), bare).is_err());
+        for id in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            init["id"] = id;
+            assert!(http_task_session_admission(&parse_req(init.clone()), bare).is_err());
+        }
+        for id in [serde_json::json!(0), serde_json::json!("initialize-1")] {
+            init["id"] = id;
+            assert_eq!(
+                http_task_session_admission(&parse_req(init.clone()), bare),
+                Ok(None)
+            );
+        }
+        let init = parse_req(init);
+        let call = parse_req(serde_json::json!({"id": 2, "method": "tasks/get"}));
+        for headers in [
+            "Mcp-Session-Id: a\r\nmCp-SeSsIoN-Id: b",
+            "Mcp-Session-Id: a\r\nMcp-Session-Id: a",
+            "Mcp-Session-Id: a,b",
+            "Mcp-Session-Id:",
+        ] {
+            let header = format!("POST /mcp HTTP/1.1\r\n{headers}\r\n\r\n");
+            assert!(http_task_session_admission(&init, &header).is_err());
+            assert!(http_task_session_admission(&call, &header).is_err());
+            assert!(
+                http_task_session_header(&header).is_err(),
+                "DELETE shares validation"
+            );
+        }
+        let header = "POST /mcp HTTP/1.1\r\nMcp-Session-Id: existing\r\n\r\n";
+        assert!(http_task_session_admission(&init, header).is_err());
+        assert_eq!(
+            http_task_session_admission(&call, header),
+            Ok(Some("existing"))
+        );
+        // Legacy initialization has no Tasks admission or new id requirement.
+        let legacy = parse_req(serde_json::json!({"method": "initialize"}));
+        assert_eq!(http_task_session_admission(&legacy, bare), Ok(None));
+    }
+
     /// End-to-end through `handle_mcp_http_request`: the wire response's
     /// `protocolVersion` follows negotiation and capabilities stay
     /// tools-only.
@@ -2002,6 +2139,227 @@ mod tests {
 
             assert!(close_http_task_session(task_session.id(), &access, None).await);
         });
+    }
+
+    #[tokio::test]
+    async fn http_tasks_use_gate_scope_and_preserve_facade_and_legacy_envelopes() {
+        use crate::mcp::task_tests::MockRemote;
+        let home = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(home.path().join("logs"));
+        state.write().await.session_id = "creator".into();
+        let bus = EventBus::new();
+        let server =
+            crate::mcp::IntendantServer::new_with_home(state, bus.clone(), home.path().into());
+        let access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "creator", "http", true,
+            ),
+            iam_state: None,
+            peer_filesystem: None,
+        };
+        let backend = MockRemote::new();
+        let session = HttpTaskSession::with_test_tasks(backend.tasks(10_000, 2));
+        let response = handle_mcp_parsed_request(
+            parse_req(
+                serde_json::json!({"id": 1, "method": "tools/call", "params": {
+                "name": "remote_command", "arguments": {
+                    "op": "start", "argv": ["fixture"], "expected_revision": "0123456"
+                }
+                }}),
+            ),
+            &server,
+            Some("untrusted-query-selection"),
+            None,
+            Some("facade"),
+            &access,
+            Some(&session),
+            Some("creator".into()),
+            &bus,
+        )
+        .await;
+        let McpHttpOutcome::Response(response) = response else {
+            panic!("expected response")
+        };
+        assert_eq!(response.result.unwrap()["resultType"], "task");
+        backend.finish(crate::remote_compute::RemoteCommandState::Succeeded);
+        session.tasks().shutdown().await;
+        backend.assert_callers("AgentSession(\"creator\")");
+
+        // Missing revision fails before real job admission. This exercises the
+        // original dispatcher without cloud/config/credential I/O.
+        for (name, arguments, negotiated) in [
+            (
+                "remote_command",
+                serde_json::json!({"op": "start", "argv": ["fixture"]}),
+                false,
+            ),
+            (
+                "authorize",
+                serde_json::json!({"argv": ["remote", "start", "--", "fixture"]}),
+                false,
+            ),
+            (
+                "authorize",
+                serde_json::json!({"argv": ["remote", "start", "--", "fixture"]}),
+                true,
+            ),
+            (
+                "remote_command",
+                serde_json::json!({"op": "status", "job_id": "http-test-unknown"}),
+                true,
+            ),
+            (
+                "remote_command",
+                serde_json::json!({"op": "wait", "job_id": "http-test-unknown"}),
+                true,
+            ),
+            (
+                "remote_command",
+                serde_json::json!({"op": "cancel", "job_id": "http-test-unknown"}),
+                true,
+            ),
+        ] {
+            let response = handle_mcp_parsed_request(
+                parse_req(
+                    serde_json::json!({"id": 2, "method": "tools/call", "params": {
+                        "name": name, "arguments": arguments
+                    }}),
+                ),
+                &server,
+                None,
+                None,
+                Some("facade"),
+                &access,
+                negotiated.then_some(&session),
+                Some("creator".into()),
+                &bus,
+            )
+            .await;
+            let McpHttpOutcome::Response(response) = response else {
+                panic!("expected response")
+            };
+            assert!(response.error.is_none());
+            let result = response.result.unwrap();
+            assert!(result.get("taskId").is_none());
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(
+                result["isError"], true,
+                "legacy string-tool error envelope: {result}"
+            );
+            let content: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(content["ok"], false);
+            assert!(content["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_tasks_recheck_live_iam_on_get_update_cancel_and_start() {
+        use crate::access::iam;
+        let home = tempfile::tempdir().unwrap();
+        let mut state = iam::LocalIamState::default();
+        let actor = iam::AccessPrincipal::root_dashboard_session("test", "http");
+        let grant = iam::upsert_user_client_grant(
+            &mut state,
+            iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".into(),
+                session_id: Some("creator".into()),
+                role_id: Some("role:root".into()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap()
+        .grant;
+        iam::save_state(home.path(), &state).unwrap();
+        let headers = format!(
+            "POST /mcp?session_id=creator HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+            session_scoped_mcp_token(loopback_mcp_auth_token(), "creator")
+        );
+        let original = session_only_mcp_access_context(home.path(), &headers).unwrap();
+        let session = create_http_task_session(&original, Some("creator")).unwrap();
+        let bus = EventBus::new();
+        let server = crate::mcp::IntendantServer::new_with_home(
+            crate::mcp::tests::test_state_with_log_dir(home.path().join("logs")),
+            bus.clone(),
+            home.path().into(),
+        );
+        for revoked in [false, true] {
+            let stored = state
+                .grants
+                .iter_mut()
+                .find(|row| row.id == grant.id)
+                .unwrap();
+            stored.role_id = if revoked {
+                "role:root"
+            } else {
+                "role:observer"
+            }
+            .into();
+            if revoked {
+                stored.status = "revoked".into();
+            }
+            iam::save_state(home.path(), &state).unwrap();
+            let current = session_only_mcp_access_context(home.path(), &headers).unwrap();
+            // The owner still resolves. Its creation-time root role supplies
+            // no authority, even when a request names an existing session.
+            assert!(resolve_http_task_session(session.id(), &current, Some("creator")).is_some());
+            for method in ["tasks/get", "tasks/update", "tasks/cancel", "tools/call"] {
+                let params = if method == "tools/call" {
+                    serde_json::json!({"name": "remote_command", "arguments": {
+                        "op": "start", "argv": ["fixture"], "expected_revision": "0123456"
+                    }})
+                } else {
+                    serde_json::json!({"taskId": "unknown", "inputResponses": {}})
+                };
+                let response = handle_mcp_parsed_request(
+                    parse_req(serde_json::json!({"id": 1, "method": method, "params": params})),
+                    &server,
+                    None,
+                    None,
+                    None,
+                    &current,
+                    Some(&session),
+                    Some("creator".into()),
+                    &bus,
+                )
+                .await;
+                let McpHttpOutcome::Response(response) = response else {
+                    panic!("expected response")
+                };
+                if method == "tools/call" {
+                    assert_eq!(response.result.unwrap()["isError"], true);
+                } else {
+                    let error = response.error.unwrap();
+                    assert_eq!(error.code, -32603);
+                    assert!(error.message.contains("Permission denied"));
+                }
+            }
+        }
+        assert!(close_http_task_session(session.id(), &original, Some("creator")).await);
+    }
+
+    #[tokio::test]
+    async fn stateless_get_and_delete_keep_legacy_405_without_authentication() {
+        use tokio::io::AsyncReadExt;
+        for method in ["GET", "DELETE"] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            handle_mcp_stream(
+                DemuxStream::new(Box::pin(server)),
+                "GET /mcp HTTP/1.1\r\n\r\n",
+                method,
+                None,
+                false,
+                false,
+                None,
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+            )
+            .await;
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.starts_with(b"HTTP/1.1 405 Method Not Allowed\r\n"));
+        }
     }
 
     /// The mcp_token-less loopback tail of the /mcp ladder mints
@@ -3501,10 +3859,12 @@ mod tests {
             "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n";
         assert_eq!(
             mcp_cors_header_segment(own, false),
-            "Access-Control-Allow-Origin: http://localhost:8765\r\nVary: Origin\r\n"
+            "Access-Control-Allow-Origin: http://localhost:8765\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\nVary: Origin\r\n"
         );
         let app = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: intendant://app\r\n\r\n";
         assert!(mcp_cors_header_segment(app, false).contains("intendant://app"));
+        assert!(mcp_cors_header_segment(app, false)
+            .contains("Access-Control-Expose-Headers: Mcp-Session-Id\r\n"));
         let foreign =
             "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n";
         assert_eq!(mcp_cors_header_segment(foreign, false), "Vary: Origin\r\n");
