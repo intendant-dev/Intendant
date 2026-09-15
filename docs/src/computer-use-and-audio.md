@@ -346,6 +346,107 @@ physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
 
+### Experimental macOS monitor lifecycle (platform primitive only)
+
+`intendant_platform::cgvirtual::VirtualDisplays` is an **unwired experimental
+primitive**, not another `DisplayTarget` backend. `create_virtual_display`,
+dashboard capabilities, capture routing and general CGEvent input do not call
+it. Their existing macOS behavior is unchanged.
+
+**A CGVirtualDisplay monitor shares the logged-in WindowServer session's focus,
+cursor and clipboard. It is not a security sandbox.** Creating a monitor does
+not grant Intendant display authority, bypass TCC, isolate an application, or
+make input safe for an agent. Hotplug/removal can rearrange the user's windows.
+The Xvfb authorization/isolation assumptions must not be carried over to macOS.
+
+The platform-only contract is deliberately narrow:
+
+- `open()` requires the main thread and probes private classes, selectors,
+  argument counts and exact argument/return encodings before native creation.
+  Missing classes/selectors, unfamiliar encodings and non-NSObject ancestry
+  are refused. The probe does not create a monitor or request permissions.
+  Linux and Windows return `UnsupportedPlatform`.
+- One owner per process; at most **two** live monitors, each dimension
+  **64–4096**, with one **1x, 60 Hz** mode. There is no resize, adoption,
+  mirroring, layout assignment, input, clipboard, capture or permission API.
+  `create()` polls only the returned object's ID for online/requested-size
+  observation (two seconds / 100 iterations). This is not capture readiness.
+- Handles bind an owner identity and a non-wrapping generation. Native IDs
+  come only from retained objects' `displayID` getters; they are not Intendant
+  stable display IDs or authorization tokens. Reused native IDs, foreign-owner
+  handles and repeated destruction cannot select a replacement monitor.
+  There is no fallback to any physical/user display.
+- A small Objective-C ARC bridge owns the descriptor, settings, mode and
+  display, including partial-creation rollback. Rust RAII releases the exact
+  object graph on explicit destruction, failure and owner drop. Temporary
+  autorelease references drain **before** waiting for removal. Exceptions are
+  contained at the bridge; creation exceptions conservatively disable further
+  creation because initialization may have performed unobservable partial work.
+- `destroy()` invalidates the generation first, releases its exact objects and
+  polls that native ID's offline status for at most two seconds / 100 iterations.
+  Unconfirmed teardown disables further creation **for the process lifetime**,
+  including after reopening the owner. Drop attempts the same cleanup for each
+  remaining monitor but cannot return errors. No helper monitor, global reset,
+  kill, or destruction by an adopted ID is attempted. Polling is bounded;
+  synchronous private OS calls themselves cannot be interrupted, and process
+  abort/kill does not run Rust destructors.
+
+An independent reference for the private API shape is
+[Chromium's macOS virtual-display test utility](https://chromium.googlesource.com/chromium/src/+/HEAD/ui/display/mac/test/virtual_display_util_mac.mm). This is a small original implementation, with no copied Chromium
+lifecycle/workarounds. Runtime signature checks reject detectable ABI changes;
+they cannot establish semantic compatibility of an undocumented OS API.
+Native OS acceptance is required before integration.
+
+#### Manual native smoke (supervisor only; never a default test)
+
+Run only in a supervisor-approved logged-in macOS session where monitor
+hotplug is acceptable, from an isolated worktree:
+
+```bash
+cargo run -p intendant-platform --example cgvirtual-smoke -- --create-shared-session-monitor
+```
+
+Without that exact argument the example exits with code 2 before any native
+probe. It opens a 1024×768 monitor for three seconds, prints its native ID,
+destroys it with offline observation, creates a replacement, verifies stale
+handle refusal, and drops the owner to exercise RAII removal. Reopening the
+owner verifies that teardown did not latch an uncertainty error. Failure exits
+nonzero and RAII attempts cleanup. It does not start/contact/restart a daemon, install anything,
+read user configuration/auth, write files, request TCC, capture pixels, or inject
+input. The OS can still persist monitor preferences as a consequence of hotplug.
+Record OS/build/architecture, stdout/stderr, exit status, and whether monitors
+visibly appeared/disappeared. Leave any unexpected residual monitor to the
+supervisor; never reset user displays to make the smoke pass.
+
+Default inline tests inject ABI metadata and fake native objects; the macOS
+bridge test inspects public NSObject method metadata only. They never create
+native displays or touch GUI/TCC. `cargo check -p intendant-platform --examples`
+checks the smoke harness without running it. Future slices must separately
+design daemon ownership/generation mapping, exact-ID capture and cancellation,
+capability reporting, and shared-session authority for input/clipboard before
+connecting this primitive to CU or the dashboard.
+
+#### Native lifecycle acceptance on the plugin Mac
+
+Tested on macOS 26.4.1 (25E253), arm64, on 2026-09-15.
+
+The first manual create/destroy pass verified the private classes but caught an
+incorrect `release` ABI expectation: the installed Apple `NSObject.h` declares
+`oneway void`, encoded `Vv`, not plain `v`. The runtime check now preserves that
+qualifier and a hermetic regression pins it.
+
+A second pass created a 1024x768 monitor but `CGDisplayIsOnline` did not confirm
+removal. Polling a fresh `CGGetOnlineDisplayList` instead confirmed explicit
+removal (approximately 84 ms in the successful run), replacement creation,
+stale-generation refusal and RAII cleanup. The existing display inventory and
+primary ID matched before and after. A full or failed enumeration cannot prove
+removal and fails closed. This is lifecycle evidence on one Mac, not a guarantee
+for other macOS releases or of unchanged window placement during hotplug.
+
+No pixels were captured, no input was injected, no TCC prompt was requested, and
+the running daemon was not replaced. Exact-ID capture and authority-preserving
+daemon/plugin integration remain separate slices.
+
 ### CU Readiness Diagnosis (`display_readiness`)
 
 The display grant is **Intendant authority only** — OS-level capability is a

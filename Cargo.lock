@@ -3053,6 +3053,7 @@ dependencies = [
 name = "intendant-platform"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "intendant-core",
  "libc",
  "serde",

@@ -868,6 +868,19 @@ credential locations at the OS-policy layer.
 
 ## Alpha implementation status
 
+### macOS virtual monitors do not confer display authority
+
+The platform crate's [experimental CGVirtualDisplay lifecycle primitive](./computer-use-and-audio.md#experimental-macos-monitor-lifecycle-platform-primitive-only)
+owns native monitor objects, not a separate login or security domain. Its
+monitors share WindowServer focus, cursor and clipboard with the user. A
+generation-safe ownership handle prevents stale lifecycle operations; it does
+not grant user-display access or establish an input/capture sandbox. This slice
+does not connect the primitive to daemon tools, dashboard capabilities or
+CGEvent input. Any later integration must preserve daemon-local display
+authority and independently enforce the shared-session input/clipboard boundary.
+
+### Shipped authentication and identity status
+
 The alpha keeps loopback and direct mTLS first-class while separating shipped
 authentication from staged identity vocabulary:
 
