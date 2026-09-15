@@ -1,8 +1,9 @@
 //! The CLI-shaped MCP facade: a context-efficient control surface.
 //!
 //! Instead of a client swallowing dozens of typed tool schemas up front,
-//! `tool_profile=facade` advertises five meta-tools — `inspect`, `act`, and
-//! `authorize` (risk-split argv executors), plus `help` and `docs` — whose
+//! `tool_profile=facade` advertises seven meta-tools — `inspect`, `act`, and
+//! `authorize` (risk-split argv executors), plus `help`, `docs`, `events`, and
+//! the narrow `report` dogfood intake — whose
 //! grammar is the declarative command registry below. Everything else is
 //! discovered lazily: `help` renders the command map from the registry,
 //! `docs` serves the embedded operate-skills corpus, and each executor call
@@ -33,8 +34,15 @@ mod registry;
 pub(crate) use registry::*;
 
 /// The meta-tool names the facade serves.
-pub(crate) const FACADE_TOOLS: [&str; 6] =
-    ["inspect", "act", "authorize", "help", "docs", "events"];
+pub(crate) const FACADE_TOOLS: [&str; 7] = [
+    "inspect",
+    "act",
+    "authorize",
+    "help",
+    "docs",
+    "events",
+    "report",
+];
 
 /// Params for the three executor meta-tools (`inspect`/`act`/`authorize`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1432,6 +1440,9 @@ pub(crate) fn facade_gate_operation(name: &str, args: &serde_json::Value) -> Opt
         // (the ring's ingest allowlist), i.e. what the session.inspect
         // read tools already serve — push semantics, not new authority.
         "events" => Some(PeerOperation::SessionInspect),
+        // Dogfood reports are a narrow write class of their own: callers do
+        // not need agenda.write merely to report friction.
+        "report" => Some(PeerOperation::FeedbackWrite),
         "inspect" | "act" | "authorize" => Some(
             resolve_meta_argv(name, args)
                 .map(|(_, spec)| crate::mcp::mcp_tool_operation(spec.tool))
@@ -1454,6 +1465,7 @@ pub(crate) fn facade_tool_advertised(
     match name {
         "help" | "docs" => Some(allowed(PeerOperation::StatsRead)),
         "events" => Some(allowed(PeerOperation::SessionInspect)),
+        "report" => Some(allowed(PeerOperation::FeedbackWrite)),
         "inspect" | "act" | "authorize" => Some(
             COMMANDS
                 .iter()

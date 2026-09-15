@@ -1477,7 +1477,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write', 'memory.read', 'memory.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write', 'feedback.write', 'memory.read', 'memory.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -1553,7 +1553,7 @@ function accessFallbackIamRoles() {
     label: 'Operator',
     status: 'enforced',
     summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write', 'memory.read', 'memory.write'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write', 'feedback.write', 'memory.read', 'memory.write'],
     source: 'builtin',
   }];
 }
@@ -1621,6 +1621,7 @@ function accessFallbackPermissions() {
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
     'agenda.read': ['Agenda read', 'agenda', 'Read the daemon\'s agenda ledger (parked items and counts).'],
     'agenda.write': ['Agenda write', 'agenda', 'Park, edit, complete, reopen, and retire agenda items.'],
+    'feedback.write': ['Feedback write', 'feedback', 'Report exceptional Intendant dogfood issues and efficiency opportunities without generic Agenda mutation authority.'],
     'memory.read': ['Memory read', 'memory', 'Search and read Memory claims (bounded, provenance-labeled).'],
     'memory.write': ['Memory propose', 'memory', 'Propose Memory claims (the candidate lane).'],
   };

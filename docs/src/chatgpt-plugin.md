@@ -153,6 +153,16 @@ the relay forwards the DELETE and Intendant cancels/awaits any real remote work
 owned by that Tasks session. The protocol session and task handles are in-memory
 and do not survive a daemon restart.
 
+The generated plugin also carries the `intendant-dogfood` skill. It teaches
+ChatGPT/Codex to call the narrow `report` tool only for exceptional
+Intendant-specific friction or concrete efficiency opportunities, never for
+routine success. Reports remain local and Agenda-backed; the feature does not
+open GitHub issues or publish externally. The `report` call is gated by
+`feedback.write` rather than broad `agenda.write`. Because the Secure MCP relay
+authenticates as the local-process principal, any `client_context` supplied by
+the model is explicitly self-described; only gate-stamped actor provenance is
+trusted.
+
 ## Verification and troubleshooting
 
 Run the secret-free local tests:
