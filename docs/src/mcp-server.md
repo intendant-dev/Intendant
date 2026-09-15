@@ -559,7 +559,8 @@ underlying remote caller is unrestricted. A task ID from another connection
 grants no inspection, update, or cancellation rights.
 
 **HTTP ownership and sessions.** The historical HTTP gateway stays stateless for
-legacy clients. Only a client that declares Tasks receives a standard
+legacy clients. Only a client that declares Tasks and currently has the
+`remote_command` permission receives a standard
 `Mcp-Session-Id` response header; it must return that opaque value on later
 `tools/call` and `tasks/get` / `tasks/update` / `tasks/cancel` POSTs. The daemon
 binds the session to the authenticated principal, authentication binding, and
@@ -569,7 +570,12 @@ unknown ID. Every task operation also re-runs the current IAM decision for
 `remote_command`, so a role reduction or grant revocation takes effect without
 relying on the session's creation-time role. GET `/mcp` remains unsupported;
 Tasks are polled with POST. An authenticated `DELETE /mcp` carrying the session
-ID terminates that Tasks session and waits for its real remote-command cleanup.
+ID also requires the current `remote_command` permission before it terminates
+that Tasks session and waits for its real remote-command cleanup. A role
+reduction, expiry or revocation refuses DELETE with 403 without cancelling jobs.
+Read-only callers can initialize normally, but receive no Tasks capability or
+session allocation. Trusted expiry/shutdown cleanup remains independent of a
+caller's current permissions.
 Stateless DELETE requests retain their legacy 405 response. Tasks initialization
 requires a string or integer JSON-RPC request ID and no `Mcp-Session-Id` header;
 duplicate or malformed session headers are refused before touching session state.

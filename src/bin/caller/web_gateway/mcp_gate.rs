@@ -1072,7 +1072,11 @@ pub(crate) async fn handle_mcp_post(
                             return;
                         }
                     };
-                let task_session = if http_client_supports_tasks(&request) {
+                // Read-only/revoked callers may keep ordinary initialization, but
+                // must not allocate globally counted Tasks state or advertise it.
+                let task_session = if http_client_supports_tasks(&request)
+                    && authorize_http_tasks(&mcp_access).is_ok()
+                {
                     match create_http_task_session(&mcp_access, gate_session.as_deref()) {
                         Ok(session) => {
                             response_task_session_id = Some(session.id().to_string());
@@ -1380,12 +1384,30 @@ pub(crate) async fn handle_mcp_stream(
             return;
         }
     };
-    let closed = close_http_task_session(
+    let closed = match close_http_task_session(
         session_id,
         &access,
         mcp_gate_session(header_text).as_deref(),
     )
-    .await;
+    .await
+    {
+        Ok(closed) => closed,
+        Err(message) => {
+            let response = HttpResponse::with_content(
+                "403 Forbidden",
+                "application/json",
+                serde_json::json!({"jsonrpc":"2.0", "id":null,
+                    "error":{"code":-32603,"message":message}})
+                .to_string(),
+            )
+            .header_segment(&mcp_cors)
+            .header("Connection", "close")
+            .into_string();
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    };
     let response = if closed {
         HttpResponse::new("202 Accepted")
             .header_segment(&mcp_cors)
@@ -2137,7 +2159,9 @@ mod tests {
             };
             assert_eq!(resp.error.unwrap().code, -32602);
 
-            assert!(close_http_task_session(task_session.id(), &access, None).await);
+            assert!(close_http_task_session(task_session.id(), &access, None)
+                .await
+                .unwrap());
         });
     }
 
@@ -2254,7 +2278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tasks_recheck_live_iam_on_get_update_cancel_and_start() {
+    async fn http_tasks_recheck_live_iam_on_allocation_delete_and_job_controls() {
         use crate::access::iam;
         let home = tempfile::tempdir().unwrap();
         let mut state = iam::LocalIamState::default();
@@ -2284,23 +2308,68 @@ mod tests {
             bus.clone(),
             home.path().into(),
         );
-        for revoked in [false, true] {
+        for denial in ["downgraded", "expired", "revoked"] {
             let stored = state
                 .grants
                 .iter_mut()
                 .find(|row| row.id == grant.id)
                 .unwrap();
-            stored.role_id = if revoked {
-                "role:root"
-            } else {
+            stored.role_id = if denial == "downgraded" {
                 "role:observer"
+            } else {
+                "role:root"
             }
             .into();
-            if revoked {
-                stored.status = "revoked".into();
-            }
+            stored.status = if denial == "revoked" {
+                "revoked".into()
+            } else {
+                grant.status.clone()
+            };
+            stored.expires_at_unix_ms = (denial == "expired").then_some(0);
             iam::save_state(home.path(), &state).unwrap();
             let current = session_only_mcp_access_context(home.path(), &headers).unwrap();
+            // Negotiation/allocation and HTTP DELETE are authority-bearing
+            // too. Refusal must leave the existing session routable and alive.
+            assert!(authorize_http_tasks(&current).is_err());
+            let allocation = create_http_task_session(&current, Some("creator"));
+            let error = match allocation {
+                Ok(unexpected) => {
+                    let _ =
+                        close_http_task_session(unexpected.id(), &original, Some("creator")).await;
+                    panic!("{denial} principal allocated a globally counted session")
+                }
+                Err(error) => error,
+            };
+            assert!(error.contains("Permission denied"), "{denial}: {error}");
+            // A denied client still gets ordinary initialization without a
+            // Tasks extension when the HTTP negotiation supplies no session.
+            let initialized = handle_mcp_parsed_request(
+                parse_req(
+                    serde_json::json!({"id": 3, "method":"initialize", "params":{
+                    "protocolVersion":"2025-06-18", "capabilities":{"extensions":{
+                        "io.modelcontextprotocol/tasks":{}}}}}),
+                ),
+                &server,
+                None,
+                None,
+                None,
+                &current,
+                None,
+                Some("creator".into()),
+                &bus,
+            )
+            .await;
+            let McpHttpOutcome::Response(initialized) = initialized else {
+                panic!("initialization must answer")
+            };
+            assert!(initialized.result.unwrap()["capabilities"]
+                .get("extensions")
+                .is_none());
+            assert!(
+                close_http_task_session(session.id(), &current, Some("creator"))
+                    .await
+                    .is_err()
+            );
             // The owner still resolves. Its creation-time root role supplies
             // no authority, even when a request names an existing session.
             assert!(resolve_http_task_session(session.id(), &current, Some("creator")).is_some());
@@ -2336,7 +2405,11 @@ mod tests {
                 }
             }
         }
-        assert!(close_http_task_session(session.id(), &original, Some("creator")).await);
+        assert!(
+            close_http_task_session(session.id(), &original, Some("creator"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

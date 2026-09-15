@@ -193,10 +193,25 @@ fn http_task_sessions() -> &'static Mutex<HttpTaskRegistry> {
     })
 }
 
+/// The current request's IAM snapshot is authoritative even for protocol
+/// allocation and session deletion: both consume/control remote-task resources.
+pub(crate) fn authorize_http_tasks(access: &HttpAccessContext) -> Result<(), String> {
+    let decision = access.decision(crate::mcp::mcp_tool_operation("remote_command"));
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "Permission denied for remote Tasks: {} (permission {})",
+            decision.reason, decision.permission
+        ))
+    }
+}
+
 pub(crate) fn create_http_task_session(
     access: &HttpAccessContext,
     gate_session: Option<&str>,
 ) -> Result<HttpTaskSession, String> {
+    authorize_http_tasks(access)?;
     let owner = HttpTaskOwner::from_access(access, gate_session);
     http_task_sessions()
         .lock()
@@ -220,17 +235,18 @@ pub(crate) async fn close_http_task_session(
     id: &str,
     access: &HttpAccessContext,
     gate_session: Option<&str>,
-) -> bool {
+) -> Result<bool, String> {
+    authorize_http_tasks(access)?;
     let owner = HttpTaskOwner::from_access(access, gate_session);
     let tasks = http_task_sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(id, &owner);
     let Some(tasks) = tasks else {
-        return false;
+        return Ok(false);
     };
     tasks.shutdown().await;
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
