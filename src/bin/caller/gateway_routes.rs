@@ -500,7 +500,7 @@ pub(crate) enum RouteHandlerId {
     PeersSubRouter,
     CoordinatorRoute,
     McpPost,
-    /// Shared by the GET/DELETE /mcp rows (stateless 405 responder).
+    /// Shared by GET /mcp (405) and DELETE /mcp (negotiated Tasks cleanup).
     McpStream,
 }
 
@@ -2987,7 +2987,7 @@ pub(crate) static ROUTES: &[Route] = &[
         cors: CorsPosture::OwnOrigin,
         body: BodyPolicy::None,
         handler: RouteHandlerId::McpStream,
-        doc: "MCP session delete (405: stateless server)",
+        doc: "MCP Tasks session delete (202 for an authenticated negotiated session)",
         tunnel: None,
     },
 ];

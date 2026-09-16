@@ -14,16 +14,50 @@ impl IntendantServer {
             .await
     }
 
-    pub(crate) async fn remote_command_scoped(
+    pub(crate) async fn remote_command_task_preflight(
         &self,
-        params: RemoteCommandParams,
-        scope: McpToolScope<'_>,
-    ) -> String {
-        let project_root = match scope {
-            McpToolScope::Unrestricted => self.state.read().await.project_root.clone(),
-            McpToolScope::AgentSession {
-                session_id: Some(session_id),
-            } => {
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> Option<rmcp::model::CallToolResult> {
+        self.state
+            .read()
+            .await
+            .rewind_only_gate_message_for("remote_command", session_id, managed_context_override)
+            .map(super::text_tool_error)
+    }
+
+    pub(crate) async fn remote_command_context_for_actor(
+        &self,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<
+        (
+            crate::remote_compute::RemoteCommandCaller,
+            Option<std::path::PathBuf>,
+        ),
+        String,
+    > {
+        let agent_session = if actor.kind == crate::access::actor::ActorKind::AgentSession {
+            Some(actor.session_id.as_deref())
+        } else {
+            None
+        };
+        self.remote_command_context_for_agent_session(agent_session)
+            .await
+    }
+
+    async fn remote_command_context_for_agent_session(
+        &self,
+        agent_session: Option<Option<&str>>,
+    ) -> Result<
+        (
+            crate::remote_compute::RemoteCommandCaller,
+            Option<std::path::PathBuf>,
+        ),
+        String,
+    > {
+        let project_root = match agent_session {
+            None => self.state.read().await.project_root.clone(),
+            Some(Some(session_id)) => {
                 let native = {
                     let state = self.state.read().await;
                     (state.session_id == session_id)
@@ -37,17 +71,40 @@ impl IntendantServer {
                     .map(std::path::PathBuf::from)
                 })
             }
-            McpToolScope::AgentSession { session_id: None } => None,
+            Some(None) => None,
         };
-        let caller = match scope {
-            McpToolScope::Unrestricted => crate::remote_compute::RemoteCommandCaller::Unrestricted,
-            McpToolScope::AgentSession {
-                session_id: Some(session_id),
-            } => crate::remote_compute::RemoteCommandCaller::AgentSession(session_id.to_string()),
-            McpToolScope::AgentSession { session_id: None } => {
+        let caller = match agent_session {
+            None => crate::remote_compute::RemoteCommandCaller::Unrestricted,
+            Some(Some(session_id)) => {
+                crate::remote_compute::RemoteCommandCaller::AgentSession(session_id.to_string())
+            }
+            Some(None) => {
+                return Err(
+                    "remote command requires an authenticated supervised session id".to_string(),
+                )
+            }
+        };
+        Ok((caller, project_root))
+    }
+
+    pub(crate) async fn remote_command_scoped(
+        &self,
+        params: RemoteCommandParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
+        let agent_session = match scope {
+            McpToolScope::Unrestricted => None,
+            McpToolScope::AgentSession { session_id } => Some(session_id),
+        };
+        let (caller, project_root) = match self
+            .remote_command_context_for_agent_session(agent_session)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
                 return serde_json::json!({
                     "ok": false,
-                    "error": "remote command requires an authenticated supervised session id",
+                    "error": error,
                 })
                 .to_string()
             }
