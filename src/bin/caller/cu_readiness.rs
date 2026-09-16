@@ -276,6 +276,24 @@ pub(crate) async fn probe_readiness(
     user_display_granted: bool,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> CuReadiness {
+    if crate::macos_monitor::reserved_id(crate::computer_use::display_id_for_target(target)) {
+        let blocked = || {
+            Probe::blocked(
+                crate::macos_monitor::UNSUPPORTED,
+                "Use the opaque generation selector with take_screenshot.",
+            )
+        };
+        return assemble_readiness(
+            target.to_string(),
+            blocked(),
+            OsProbes {
+                capture: blocked(),
+                accessibility: blocked(),
+                display: blocked(),
+                input: blocked(),
+            },
+        );
+    }
     let authority = authority_probe(
         target.is_user_session(),
         user_session_allowed,

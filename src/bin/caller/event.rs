@@ -3061,6 +3061,7 @@ pub type SessionLogLaneItem = (AppEvent, Instant);
 
 #[derive(Clone)]
 pub struct EventBus {
+    pub(crate) macos_monitors: Arc<crate::macos_monitor::Broker>,
     tx: tokio::sync::broadcast::Sender<AppEvent>,
     session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SessionLogLaneItem>>>>,
     intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
@@ -3072,6 +3073,7 @@ impl EventBus {
     pub fn new() -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(4096);
         Self {
+            macos_monitors: Arc::new(crate::macos_monitor::Broker::default()),
             tx,
             session_log_sinks: Arc::new(Mutex::new(Vec::new())),
             intent_sinks: Arc::new(Mutex::new(Vec::new())),

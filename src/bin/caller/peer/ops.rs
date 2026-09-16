@@ -201,6 +201,15 @@ pub async fn take_screenshot(
     peer_id: &str,
     display_target: Option<String>,
 ) -> PeerToolOutput {
+    // Reserved local generation selectors must not reach an older peer parser
+    // that might fall back to its real desktop.
+    if display_target
+        .as_deref()
+        .is_some_and(crate::macos_monitor::reserved)
+    {
+        return PeerToolOutput::error(crate::macos_monitor::UNSUPPORTED.to_string());
+    }
+
     let handle = match peer_handle(registry, peer_id) {
         Ok(handle) => handle,
         Err(error) => return PeerToolOutput::error(error),
@@ -238,6 +247,15 @@ pub async fn execute_cu_actions(
     annotate: Option<bool>,
     settle: Option<serde_json::Value>,
 ) -> PeerToolOutput {
+    // Reserved local generation selectors must not reach an older peer parser
+    // that might fall back to its real desktop.
+    if display_target
+        .as_deref()
+        .is_some_and(crate::macos_monitor::reserved)
+    {
+        return PeerToolOutput::error(crate::macos_monitor::UNSUPPORTED.to_string());
+    }
+
     let handle = match peer_handle(registry, peer_id) {
         Ok(handle) => handle,
         Err(error) => return PeerToolOutput::error(error),

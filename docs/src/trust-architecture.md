@@ -870,14 +870,17 @@ credential locations at the OS-policy layer.
 
 ### macOS virtual monitors do not confer display authority
 
-The platform crate's [experimental CGVirtualDisplay lifecycle primitive](./computer-use-and-audio.md#experimental-macos-monitor-lifecycle-platform-primitive-only)
+The platform crate's [experimental CGVirtualDisplay lifecycle primitive](./computer-use-and-audio.md#experimental-macos-monitor-lifecycle-and-read-only-controller)
 owns native monitor objects, not a separate login or security domain. Its
 monitors share WindowServer focus, cursor and clipboard with the user. A
 generation-safe ownership handle prevents stale lifecycle operations; it does
-not grant user-display access or establish an input/capture sandbox. This slice
-does not connect the primitive to daemon tools, dashboard capabilities or
-CGEvent input. Any later integration must preserve daemon-local display
-authority and independently enforce the shared-session input/clipboard boundary.
+not grant user-display access or establish an input/capture sandbox. The local
+controller's create/capture/destroy tools preserve their original IAM operations
+and additionally require an owner surface or an existing explicit user-display
+grant. A private main-thread helper owns native objects; exact-generation SCK
+screenshots disable input and cursor overlay. The controller publishes no
+stream/dashboard capabilities and enables no CGEvent, AX, browser placement or
+clipboard control. Failed or uncertain cleanup never permits helper respawn.
 
 ### Shipped authentication and identity status
 

@@ -307,8 +307,9 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   `intendant ctl display destroy DISPLAY_ID CAPTURE_GENERATION`; stale
   generations are refused and bound browsers are retired first. Displays are
   also destroyed when their tile is closed (a hard daemon kill leaves the
-  usual orphan for the next allocation to reclaim). Xvfb is Linux-only; other
-  platforms answer the action with a clear error.
+  usual orphan for the next allocation to reclaim). Xvfb is Linux-only. The
+  macOS tool lane described below has separate shared-session authorization and
+  does not register a display tile or streaming session.
 - **`UserSession`** — the user's real desktop. On Linux X11 it resolves the
   login session's `DISPLAY` (falling back to `:0`); on macOS the primary display
   doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the
@@ -346,12 +347,13 @@ physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
 
-### Experimental macOS monitor lifecycle (platform primitive only)
+### Experimental macOS monitor lifecycle and read-only controller
 
-`intendant_platform::cgvirtual::VirtualDisplays` is an **unwired experimental
-primitive**, not another `DisplayTarget` backend. `create_virtual_display`,
-dashboard capabilities, capture routing and general CGEvent input do not call
-it. Their existing macOS behavior is unchanged.
+`intendant_platform::cgvirtual::VirtualDisplays` is an experimental main-thread
+lifecycle primitive. The controller now exposes a deliberately separate local
+MCP lane through `create_virtual_display`, `take_screenshot` and
+`destroy_virtual_display`; it is not a general `DisplayTarget` backend or a
+streaming session. Linux's Xvfb behavior is unchanged.
 
 **A CGVirtualDisplay monitor shares the logged-in WindowServer session's focus,
 cursor and clipboard. It is not a security sandbox.** Creating a monitor does
@@ -359,7 +361,7 @@ not grant Intendant display authority, bypass TCC, isolate an application, or
 make input safe for an agent. Hotplug/removal can rearrange the user's windows.
 The Xvfb authorization/isolation assumptions must not be carried over to macOS.
 
-The platform-only contract is deliberately narrow:
+The underlying platform contract remains narrow:
 
 - `open()` requires the main thread and probes private classes, selectors,
   argument counts and exact argument/return encodings before native creation.
@@ -421,10 +423,8 @@ supervisor; never reset user displays to make the smoke pass.
 Default inline tests inject ABI metadata and fake native objects; the macOS
 bridge test inspects public NSObject method metadata only. They never create
 native displays or touch GUI/TCC. `cargo check -p intendant-platform --examples`
-checks the smoke harness without running it. Future slices must separately
-design daemon ownership/generation mapping, exact-ID capture and cancellation,
-capability reporting, and shared-session authority for input/clipboard before
-connecting this primitive to CU or the dashboard.
+checks the primitive smoke harness without running it. The controller smoke
+below is separate; input/clipboard and dashboard integration remain out of scope.
 
 #### Native lifecycle acceptance on the plugin Mac
 
@@ -446,6 +446,96 @@ for other macOS releases or of unchanged window placement during hotplug.
 No pixels were captured, no input was injected, no TCC prompt was requested, and
 the running daemon was not replaced. Exact-ID capture and authority-preserving
 daemon/plugin integration remain separate slices.
+
+### macOS controller and exact-generation screenshot
+
+`src/bin/caller/macos_monitor/` owns the local tool lane. A lazy broker shared
+by the daemon's EventBus starts **one same-binary private helper**, intercepted
+before runtime, configuration, credentials, logging or network startup. The
+helper retains all native objects on its main thread. Its versioned JSON-line
+protocol uses private stdin/stdout pipes, a 4096-byte line cap and monotonic
+request/handle counters; there is no socket, authentication protocol, PID/native
+ID adoption, or respawn. EOF releases its owned monitors. The parent closes the
+pipe, waits, and if necessary terminates and reaps only the exact retained child.
+Any uncertain protocol/native cleanup permanently retires that broker.
+
+The request queue holds at most eight requests; at most two monitors exist,
+each dimension **even and 64–4096**, rejected before helper startup or native
+effects. `create_virtual_display` rejects Linux display-pool bounds on macOS
+and returns a broker-local `display_id` in `0x20000000..=0x3fffffff` and an opaque
+`macos_virtual:<owner>:<generation>` value as both `display_target` and
+`capture_generation`. Preserve those values verbatim. Creation reports
+`lifecycle_ready: true`, **`capture_ready: false`**, shared-WindowServer isolation,
+and no input/streaming support. It does not publish a dashboard tile or peer
+stream. Only a successful exact screenshot validates capture readiness for that
+request; TCC Screen Recording permission remains separately required. Public
+IDs are distinct from private helper handles and native IDs; numeric aliases
+cannot be used for capture, destruction, input or streaming.
+
+Lifecycle calls keep their existing `DisplayInput` IAM classification and
+screenshots keep `DisplayView`. All three additionally require an owner surface
+or the existing explicit user-display grant, including at dequeue and result
+delivery. Monitor ownership does not grant display access or change the grant.
+
+`take_screenshot` resolves only a live owned generation to the helper-retained
+native ID. Before SCK content enumeration, read-only capture checks existing
+Screen Recording permission with `ScreenCaptureAccess.preflight()`. Missing
+permission and SCK errors return guidance without automatically requesting a
+TCC prompt; ordinary capture keeps its existing permission behavior.
+SCK selects that exact ID with no primary fallback; its backend
+refuses input before any CGEvent call and disables the cursor overlay. The
+five-second first-frame budget includes start time. Stop is driven to completion
+on success, error, deadline or caller cancellation; destruction remains
+serialized through stop and response delivery. Generation, helper identity and
+liveness are rechecked before image delivery. Normal MCP image blocks and compact
+artifact metadata use the existing contracts. Frame dimensions must match the
+owned generation exactly. Complete PNGs are published without overwriting an
+existing artifact, with owner-private file permissions (0600 on Unix).
+
+Synchronous native start/stop calls cannot safely be interrupted. A twenty-second
+frontend deadline cancels its result, **not** the cleanup worker. A stalled
+native call retains the sole worker, backend and helper ownership, admitting no
+further lifecycle operations until cleanup completes. Dropping a create receipt
+before the local tool handler finishes constructing its response rolls back that
+exact generation. **This is not a network or client acknowledgment**: transport
+loss after local commit can leave a live monitor whose handle the client never
+received. No timeout authorizes another helper or assumes cleanup succeeded.
+
+Retain both `display_id` and `capture_generation` from each successful create
+response for exact cleanup. `list_displays` keeps its existing shape and visibility;
+it does not recover broker handles or generation selectors (an OS inventory entry
+is not a lifecycle handle). There is no handle-recovery API in this slice. A lost
+committed handle can occupy capacity until this broker shuts down and closes its
+owned helper; do not adopt numeric/native IDs or reset other displays to recover it.
+
+Reserved selectors, including malformed/case/whitespace variants, are refused
+by input, AX, readiness probes, shared views, browser placement and peer forwarding.
+There is no automatic/default selection of these monitors, global input,
+clipboard isolation, streaming or browser-placement claim.
+
+#### Opt-in controller smoke (supervisor only; not a default test)
+
+After building the controller in this worktree, and only in an approved logged-in
+macOS session where monitor hotplug/removal and capture are acceptable:
+
+```bash
+python3 scripts/macos-monitor-smoke.py --binary ./target/debug/intendant \
+  --accept-shared-session-hotplug
+```
+
+The private smoke entry point loads no daemon configuration and starts no daemon.
+The script requires an already-built binary, never invokes Cargo, and refuses
+native work without the opt-in flag. Screen Recording permission must already exist.
+It creates its own 640×480 monitor, captures and checks its PNG/geometry, destroys
+that exact generation, checks stale capture/destruction refusal, then creates a
+second test-owned monitor and closes the helper pipe to verify EOF cleanup and
+successful child exit. Images are confined to its temporary directory. It never
+adopts, captures or destroys any pre-existing monitor. It can still rearrange the
+login session's windows as a consequence of hotplug. It checks lifecycle, exact
+geometry and PNG encoding; it does not prove which visible pattern was captured.
+The supervisor's independent HTTP pixel fixture supplies that separate evidence.
+**This smoke has not been run for the controller slice.** Default inline tests use fake owners, transports and
+capture backends; the process fixtures are private shell pipes with no GUI calls.
 
 ### CU Readiness Diagnosis (`display_readiness`)
 

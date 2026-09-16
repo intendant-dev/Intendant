@@ -1993,21 +1993,27 @@ impl SessionSupervisor {
             let user_display_granted = supervisor.config.autonomy.read().await.user_display_granted;
             let cu_target = display_target
                 .as_deref()
-                .map(|s| parse_display_target_str(s, user_display_granted));
-            let result = run_cu_task(
-                cu_provider.as_ref(),
-                &task,
-                reference_images,
-                vec![],
-                &session_log,
-                &log_dir,
-                &bus,
-                &cu_config,
-                cu_target,
-                session_registry.as_ref(),
-                user_display_granted,
-            )
-            .await;
+                .map(|s| parse_display_target_str(s, user_display_granted))
+                .transpose();
+            let result = match cu_target {
+                Err(error) => Err(CallerError::Display(error)),
+                Ok(cu_target) => {
+                    run_cu_task(
+                        cu_provider.as_ref(),
+                        &task,
+                        reference_images,
+                        vec![],
+                        &session_log,
+                        &log_dir,
+                        &bus,
+                        &cu_config,
+                        cu_target,
+                        session_registry.as_ref(),
+                        user_display_granted,
+                    )
+                    .await
+                }
+            };
 
             let summary = match result {
                 Ok(CuTaskResult::Completed(stats)) => {

@@ -626,13 +626,13 @@ pub struct GrantUserDisplayParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateVirtualDisplayParams {
     /// Optional width in pixels (default 1920; clamped to sane bounds and
-    /// rounded down to even).
+    /// rounded down to even on Linux; macOS requires even 64..4096 without clamping).
     #[serde(default)]
     pub width: Option<u32>,
     /// Optional height in pixels (default 1080; same clamping).
     #[serde(default)]
     pub height: Option<u32>,
-    /// Inclusive subset of the managed pool (99..199). Supply both bounds or neither.
+    /// Linux only: inclusive subset of the managed pool (99..199). Supply both bounds or neither.
     #[serde(default)]
     pub minimum_display_id: Option<u32>,
     #[serde(default)]
@@ -641,10 +641,10 @@ pub struct CreateVirtualDisplayParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DestroyVirtualDisplayParams {
-    /// Numeric display id returned by `create_virtual_display`.
+    /// Display id returned by `create_virtual_display`. On macOS this is broker-local, never a native ID.
     pub display_id: u32,
     /// Opaque generation returned by the same create call. Both values are
-    /// required so a stale cleanup cannot destroy a replacement display.
+    /// required so a stale cleanup cannot destroy a replacement display. On macOS this is the complete macos_virtual selector.
     pub capture_generation: String,
     /// Optional short lifecycle note included in retirement events.
     #[serde(default)]
@@ -804,6 +804,8 @@ pub(crate) fn default_timeout() -> u64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
+    /// On macOS, also accepts the exact opaque macos_virtual selector from
+    /// create_virtual_display for a read-only, cursor-free owned-monitor frame.
     /// Display target: "user_session", "display_99", etc. Auto-detects if
     /// omitted: a live agent virtual display when one exists, else the
     /// user session.
