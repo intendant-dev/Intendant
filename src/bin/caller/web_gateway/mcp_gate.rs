@@ -1780,6 +1780,101 @@ mod tests {
         assert!(events.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn window_http_dispatch_keeps_iam_and_owner_gate_separate() {
+        use crate::access::iam::{self, AccessPrincipal};
+        use crate::peer::access_policy::PeerOperation::{DisplayInput, DisplayView};
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        state
+            .read()
+            .await
+            .autonomy
+            .write()
+            .await
+            .user_display_granted = true;
+        let bus = EventBus::new();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let owner = AccessPrincipal::root_dashboard_session("window-test", "http");
+        let mut iam = iam::LocalIamState::default();
+        iam::upsert_user_client_grant(
+            &mut iam,
+            iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".into(),
+                session_id: Some("window-reader".into()),
+                role_id: Some("role:session-reader".into()),
+                ..Default::default()
+            },
+            &owner,
+        )
+        .unwrap();
+        let denied = iam::principal_for_agent_session(&iam, "window-reader", "http").unwrap();
+        for principal in [
+            owner,
+            AccessPrincipal::supervised_agent_session_default("window-scoped", "http", true),
+            denied,
+        ] {
+            let access = HttpAccessContext {
+                principal,
+                iam_state: Some(std::sync::Arc::new(iam.clone())),
+                peer_filesystem: None,
+            };
+            let is_owner = crate::mcp::ToolCallerTrust::from_principal(&access.principal)
+                == crate::mcp::ToolCallerTrust::OwnerSurface;
+            for (tool, args, operation, label) in [
+                (
+                    "list_macos_windows",
+                    serde_json::json!({"pid":123}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "place_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1","bounds":{"x":0,"y":0,"width":100,"height":100}}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","windows","123"]}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","unbind-window","macos_window:fixture:1"]}),
+                    DisplayInput,
+                    "display.input",
+                ),
+            ] {
+                let request=serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string();
+                let McpHttpOutcome::Response(response) = handle_mcp_http_request(
+                    &request, &server, None, None, None, &access, None, &bus,
+                )
+                .await
+                else {
+                    panic!("tool response")
+                };
+                let result = response.result.unwrap();
+                let text = result["content"][0]["text"].as_str().unwrap();
+                if !access.decision(operation).allowed {
+                    assert_eq!(result["isError"], true);
+                    assert!(text.contains(label), "{text}");
+                } else if !is_owner {
+                    assert!(text.contains("owner surface"), "{text}");
+                } else {
+                    assert!(
+                        text.contains("no owned macOS monitor generation")
+                            || text.contains("require macOS"),
+                        "{text}"
+                    );
+                }
+                // On macOS the actor may be allocated by an owner request, but
+                // only Create can start a helper. No test invokes native APIs.
+            }
+        }
+    }
+
     /// SSE-plan fixtures arrive pre-parsed, the way the production
     /// path hands them over (one decode, shared with dispatch).
     fn parse_req(value: serde_json::Value) -> McpHttpRequest {

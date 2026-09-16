@@ -1,11 +1,12 @@
-//! Private, versioned pipe protocol. Neither side accepts a PID or an adopted
-//! native display ID. Length limits apply before JSON allocation/deserialization.
+//! Private, versioned pipe protocol. Window identities carry explicit PIDs; monitor selectors never adopt
+//! native display IDs. Length limits apply before JSON allocation/deserialization.
 
+use super::placement::{Bounds, Candidate, PlacementResult, WindowIdentity};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
 pub(super) const HELPER_ARG: &str = "--private-macos-monitor-helper-v1";
-pub(super) const MAX_LINE: usize = 4096;
+pub(super) const MAX_LINE: usize = 16 * 1024;
 pub(super) const VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,9 +19,31 @@ pub(super) struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Operation {
-    Create { width: u32, height: u32 },
-    Resolve { handle: u32 },
-    Destroy { handle: u32 },
+    Create {
+        width: u32,
+        height: u32,
+    },
+    Resolve {
+        handle: u32,
+    },
+    Destroy {
+        handle: u32,
+    },
+    ListWindows {
+        pid: i32,
+    },
+    BindWindow {
+        handle: u32,
+        identity: WindowIdentity,
+        candidate: String,
+    },
+    PlaceWindow {
+        binding: u32,
+        bounds: Bounds,
+    },
+    UnbindWindow {
+        binding: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +67,18 @@ pub(super) enum Outcome {
     },
     Destroyed {
         handle: u32,
+    },
+    Windows {
+        candidates: Vec<Candidate>,
+    },
+    BoundWindow {
+        binding: u32,
+    },
+    PlacedWindow {
+        result: PlacementResult,
+    },
+    UnboundWindow {
+        binding: u32,
     },
     Error {
         message: String,
@@ -107,6 +142,7 @@ mod tests {
         assert!(read_line(&mut &b"{}"[..]).is_err());
         assert!(read_line(&mut &b""[..]).unwrap().is_none());
         for json in [
+            r#"{"seq":1,"op":{"op":"bind_window","handle":1,"identity":{"pid":1,"start_seconds":1,"start_micros":0,"window_id":1}}}"#,
             r#"{"seq":1,"op":{"op":"destroy","handle":1,"pid":42}}"#,
             r#"{"seq":1,"op":{"op":"resolve","native_id":42}}"#,
             r#"{"seq":1,"op":{"op":"create","width":-1,"height":64}}"#,
@@ -124,5 +160,54 @@ mod tests {
         .unwrap();
         let bytes = read_line(&mut encoded.as_slice()).unwrap().unwrap();
         assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap().seq, 1);
+    }
+    #[test]
+    fn window_protocol_has_bounded_candidate_inventory_and_strict_selectors() {
+        let candidates = (0..super::super::placement::MAX_CANDIDATES)
+            .map(|n| Candidate {
+                candidate: format!("macos_candidate:{n:032x}"),
+                identity: WindowIdentity {
+                    pid: i32::MAX,
+                    start_seconds: u64::MAX,
+                    start_micros: 999999,
+                    window_id: n as u32 + 1,
+                },
+                bounds: Bounds {
+                    x: -1_000_000.0,
+                    y: 1_000_000.0,
+                    width: 16384.0,
+                    height: 16384.0,
+                },
+            })
+            .collect();
+        assert!(
+            encode(&Reply {
+                seq: u64::MAX,
+                result: Outcome::Windows { candidates }
+            })
+            .unwrap()
+            .len()
+                < MAX_LINE
+        );
+        for json in [
+            r#"{"seq":1,"op":{"op":"bind_window","native_id":42,"identity":{"pid":1,"start_seconds":1,"start_micros":0,"window_id":1}}}"#,
+            r#"{"seq":1,"op":{"op":"bind_window","handle":1,"identity":{"pid":1,"window_id":1}}}"#,
+            r#"{"seq":1,"op":{"op":"place_window","binding":1,"bounds":{"x":0,"y":0,"width":100,"height":100},"activate":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(json).is_err());
+        }
+        let encoded = encode(&Request {
+            seq: 1,
+            op: Operation::BindWindow {
+                handle: 1,
+                identity: super::super::placement::tests::identity(),
+                candidate: "macos_candidate:00000000000000000000000000000001".into(),
+            },
+        })
+        .unwrap();
+        let decoded = serde_json::from_slice::<Request>(&encoded).unwrap();
+        assert!(
+            matches!(decoded.op, Operation::BindWindow { candidate, .. } if candidate == "macos_candidate:00000000000000000000000000000001")
+        );
     }
 }

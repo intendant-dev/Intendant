@@ -204,3 +204,29 @@ int intendant_cgvirtual_destroy(void *raw_owner) {
         return 2;
     }
 }
+
+// Read-only geometry through the live retained owner. Never adopt a native ID.
+int intendant_cgvirtual_bounds(void *raw_owner, unsigned int expected_id, double *bounds) {
+    @try {
+        @autoreleasepool {
+            if (!raw_owner || !bounds || ![NSThread isMainThread]) return 1;
+            IntendantCGVirtualOwner *owner = (__bridge IntendantCGVirtualOwner *)raw_owner;
+            unsigned int display_id = owner.display.displayID;
+            if (!owner.display || display_id == 0 || display_id != expected_id) return 1;
+            CGDirectDisplayID ids[32];
+            uint32_t count = 0;
+            if (CGGetOnlineDisplayList(32, ids, &count) != kCGErrorSuccess || count >= 32) return 1;
+            BOOL present = NO;
+            for (uint32_t i = 0; i < count; ++i) present |= ids[i] == display_id;
+            if (!present || CGDisplayIsInMirrorSet(display_id) || CGDisplayIsMain(display_id)) return 1;
+            CGRect r = CGDisplayBounds(display_id);
+            if (CGRectIsEmpty(r) || CGRectIsNull(r) || CGRectIsInfinite(r)) return 1;
+            bounds[0] = r.origin.x; bounds[1] = r.origin.y;
+            bounds[2] = r.size.width; bounds[3] = r.size.height;
+            return 0;
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+        return 1;
+    }
+}

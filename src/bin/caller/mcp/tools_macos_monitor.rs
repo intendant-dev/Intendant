@@ -1,12 +1,31 @@
-//! MCP binding for the bounded, read-only macOS monitor lane. Ingress keeps
+//! MCP binding for bounded macOS monitor lifecycle/capture and explicit window
+//! placement. Ingress keeps
 //! the original IAM operations (DisplayInput for lifecycle, DisplayView for
 //! reads); shared WindowServer authority is an additional gate here, with
 //! daemon-wide recovery inventory restricted further to owner surfaces.
 
 use super::*;
-use crate::macos_monitor::{Action, Authority, Inspection, Value};
+use crate::macos_monitor::{Action, Authority, Inspection, Value, WindowAction, WindowValue};
 
 impl IntendantServer {
+    pub(super) async fn macos_window_as_caller(
+        &self,
+        action: WindowAction,
+        caller: ToolCallerTrust,
+    ) -> String {
+        let authority = self.macos_monitor_authority(caller).await;
+        let receipt = match self
+            .bus
+            .macos_monitors
+            .request(Action::Window(action), authority)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => return window_error(error),
+        };
+        window_response(receipt)
+    }
+
     pub(super) async fn list_macos_monitors_as_caller(&self, caller: ToolCallerTrust) -> String {
         let authority = self.macos_monitor_authority(caller).await;
         match self
@@ -85,7 +104,9 @@ impl IntendantServer {
         response["ok"] = true.into();
         response["note"] = "Shares the user's login session; hotplug/removal may rearrange windows. Retain display_id and capture_generation for cleanup; owner surfaces can recover committed handles with list_macos_monitors. Local response construction does not acknowledge transport delivery.".into();
         let response = response.to_string();
-        receipt.commit(); // no await between commit and returning the response
+        if !receipt.commit() {
+            return serde_json::json!({"ok":false,"error":"monitor creation receipt expired; cleanup retained by broker"}).to_string();
+        } // no await between commit and returning the response
         response
     }
 
@@ -111,7 +132,9 @@ impl IntendantServer {
                 let response = serde_json::json!({"ok": true, "display_id": params.display_id,
                     "display_target": params.capture_generation, "capture_generation": params.capture_generation,
                     "closed_browser_workspace_ids": []}).to_string();
-                receipt.commit();
+                if !receipt.commit() {
+                    return serde_json::json!({"ok":false,"error":"monitor destruction response expired; destruction may already have applied"}).to_string();
+                }
                 response
             }
             Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
@@ -156,7 +179,11 @@ impl IntendantServer {
         let response = screenshot_response(screenshot, &selector, compact);
         // No await after receipt delivery: the broker just rechecked authority,
         // generation and child liveness and retains serialization until commit.
-        receipt.commit();
+        if !receipt.commit() {
+            return Ok(text_tool_error(
+                "monitor screenshot receipt expired; artifact discarded",
+            ));
+        }
         Ok(response)
     }
 }
@@ -250,9 +277,119 @@ fn screenshot_response(
     }
 }
 
+fn window_error(error: String) -> String {
+    let mut response = serde_json::json!({"ok":false,"error":error});
+    if error.starts_with(crate::macos_monitor::PLACEMENT_UNCONFIRMED) {
+        response["effects_unconfirmed"] = true.into();
+    }
+    response.to_string()
+}
+
+fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
+    let mut response = match &receipt.value {
+        Value::Window(WindowValue::Candidates(candidates)) => {
+            serde_json::json!({"ok":true,"candidates":candidates})
+        }
+        Value::Window(WindowValue::Bound(binding)) => {
+            serde_json::json!({"ok":true,"bound_window":binding})
+        }
+        Value::Window(WindowValue::Placed(result)) => {
+            serde_json::json!({"ok":result.verified(),"placement":result})
+        }
+        Value::Window(WindowValue::PlacementUnconfirmed { result, error }) => {
+            serde_json::json!({"ok":false,"placement":result,"effects_unconfirmed":true,"error":error})
+        }
+        Value::Window(WindowValue::Unbound) => serde_json::json!({"ok":true,"unbound":true}),
+        _ => return window_error("unexpected window result".into()),
+    };
+    let ready = response.to_string();
+    if !receipt.commit() {
+        // Keep the complete observation, including verified effects. Only the
+        // delivery/commit is unconfirmed; never replace it with a generic error.
+        if response.get("placement").is_some() {
+            response["ok"] = false.into();
+            response["effects_unconfirmed"] = true.into();
+            let expired = "window receipt expired; placement effects may already have applied; no rollback attempted";
+            response["error"] = match response["error"].as_str() {
+                Some(error) => format!("{error}; {expired}"),
+                None => expired.into(),
+            }
+            .into();
+        } else {
+            return window_error("window receipt expired; binding cleanup retained; unbind effects may already have applied".into());
+        }
+        return response.to_string();
+    }
+    ready
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_and_late_failure_responses_keep_partial_and_verified_evidence() {
+        use crate::macos_monitor::{placement::*, Receipt};
+        for verified in [false, true] {
+            let bounds = Bounds {
+                x: -300.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            let result = PlacementResult {
+                status: if verified {
+                    PlacementStatus::Verified
+                } else {
+                    PlacementStatus::Partial
+                },
+                requested_global: bounds,
+                before: Observation {
+                    ax: bounds,
+                    cg: bounds,
+                },
+                after: Some(Observation {
+                    ax: bounds,
+                    cg: bounds,
+                }),
+                writes_attempted: if verified { 2 } else { 1 },
+                focus_interference: Some(false),
+                detail: if verified {
+                    None
+                } else {
+                    Some("stopped after position".into())
+                },
+            };
+            for late_failure in [false, true] {
+                let value = if late_failure {
+                    WindowValue::PlacementUnconfirmed {
+                        result: result.clone(),
+                        error: "helper died".into(),
+                    }
+                } else {
+                    WindowValue::Placed(result.clone())
+                };
+                let (receipt, mut committed) = Receipt::fixture(Value::Window(value));
+                if !late_failure {
+                    committed.close();
+                }
+                let response: serde_json::Value =
+                    serde_json::from_str(&window_response(receipt)).unwrap();
+                assert_eq!(response["ok"], false);
+                assert_eq!(response["effects_unconfirmed"], true);
+                assert_eq!(
+                    response["placement"],
+                    serde_json::to_value(&result).unwrap()
+                );
+            }
+        }
+        let response: serde_json::Value = serde_json::from_str(&window_error(format!(
+            "{}; receipt deadline exceeded",
+            crate::macos_monitor::PLACEMENT_UNCONFIRMED
+        )))
+        .unwrap();
+        assert_eq!(response["effects_unconfirmed"], true);
+    }
 
     #[tokio::test]
     async fn macos_monitor_readiness_retains_common_envelope_without_probes() {
@@ -547,6 +684,10 @@ mod tests {
         for selector in [
             " MACOS_VIRTUAL:malformed ".to_string(),
             "macos_virtual".into(),
+            "macos_window:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1".into(),
+            " MACOS_WINDOW:bad ".into(),
+            "macos_candidate:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "display_macos_candidate:bad".into(),
             crate::macos_monitor::DISPLAY_ID_MIN.to_string(),
             format!("display_{}", crate::macos_monitor::DISPLAY_ID_MAX),
             format!(":{}", crate::macos_monitor::DISPLAY_ID_MIN),
@@ -655,5 +796,82 @@ mod tests {
                 .user_display_granted
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    #[tokio::test]
+    async fn window_typed_and_facade_dispatch_never_elevate_scoped_display_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = super::super::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (_home, server) = super::super::tests::test_server(state, bus.clone());
+        let selector = format!(
+            "macos_virtual:{}:{}",
+            "a".repeat(32),
+            crate::macos_monitor::DISPLAY_ID_MIN
+        );
+        let identity =
+            serde_json::json!({"pid":123,"start_seconds":456,"start_micros":7,"window_id":8});
+        let bounds = serde_json::json!({"x":0,"y":0,"width":100,"height":100});
+        for granted in [false, true] {
+            autonomy.write().await.user_display_granted = granted;
+            for (tool, args) in [
+                ("list_macos_windows", serde_json::json!({"pid":123})),
+                (
+                    "bind_macos_window",
+                    serde_json::json!({"display_target":selector,"candidate":"macos_candidate:00000000000000000000000000000001","identity":identity}),
+                ),
+                (
+                    "place_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1","bounds":bounds}),
+                ),
+                (
+                    "unbind_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","windows","123"]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","bind-window",selector,"macos_candidate:00000000000000000000000000000001",identity.to_string()]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","place-window","macos_window:fixture:1",bounds.to_string()]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","unbind-window","macos_window:fixture:1"]}),
+                ),
+            ] {
+                let result = server
+                    .call_tool_by_name_as_caller(
+                        tool,
+                        args,
+                        None,
+                        None,
+                        ToolCaller {
+                            trust: ToolCallerTrust::Scoped,
+                            actor: crate::access::actor::ActorBinding::unattributed(),
+                            fs_scope: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert!(
+                    result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("owner surface"),
+                    "{result}"
+                );
+                assert!(bus.macos_monitors.not_started());
+                assert_eq!(autonomy.read().await.user_display_granted, granted);
+            }
+        }
+        assert!(events.try_recv().is_err());
     }
 }

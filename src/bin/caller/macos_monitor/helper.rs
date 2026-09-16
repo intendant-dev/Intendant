@@ -2,7 +2,12 @@
 //! EOF (including parent death) drops the retained native owner. No sockets,
 //! runtime, configuration, credentials, dashboard or display-session registry.
 
+#[cfg(not(target_os = "macos"))]
+use super::placement::UnsupportedNative as PlacementNative;
+use super::placement::{Bounds, Native, Windows};
 use super::protocol::*;
+#[cfg(target_os = "macos")]
+use crate::ax::PlacementNative;
 use intendant_platform::cgvirtual::{Dimensions, Handle, VirtualDisplays, MAX_DISPLAYS};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -12,6 +17,9 @@ trait Owner {
     fn create(&mut self, size: Dimensions) -> Result<Self::Handle, String>;
     fn info(&self, handle: &Self::Handle) -> Result<(u32, Dimensions), String>;
     fn destroy(&mut self, handle: &Self::Handle) -> Result<(), String>;
+    fn bounds(&self, _handle: &Self::Handle) -> Result<Bounds, String> {
+        Err("owned monitor geometry unavailable".into())
+    }
 }
 
 impl Owner for VirtualDisplays {
@@ -22,6 +30,16 @@ impl Owner for VirtualDisplays {
     fn info(&self, handle: &Handle) -> Result<(u32, Dimensions), String> {
         self.info(handle)
             .map(|i| (i.native_id, i.dimensions))
+            .map_err(|e| e.to_string())
+    }
+    fn bounds(&self, handle: &Handle) -> Result<Bounds, String> {
+        self.bounds(handle)
+            .map(|(x, y, width, height)| Bounds {
+                x,
+                y,
+                width,
+                height,
+            })
             .map_err(|e| e.to_string())
     }
     fn destroy(&mut self, handle: &Handle) -> Result<(), String> {
@@ -57,7 +75,16 @@ fn bounded_error(message: &str) -> String {
 }
 
 fn serve<O: Owner>(
+    owner: O,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> Result<(), String> {
+    serve_with_windows(owner, Windows::new(PlacementNative), reader, writer)
+}
+
+fn serve_with_windows<O: Owner, N: Native>(
     mut owner: O,
+    mut windows: Windows<N>,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<(), String> {
@@ -114,16 +141,47 @@ fn serve<O: Owner>(
                         fatal: false,
                     },
                 },
-                Operation::Destroy { handle } => match handles.remove(&handle) {
-                    Some(native) => {
-                        owner.destroy(&native)?;
-                        Outcome::Destroyed { handle }
+                Operation::ListWindows { pid } => window_outcome(
+                    windows
+                        .candidates(pid)
+                        .map(|candidates| Outcome::Windows { candidates }),
+                ),
+                Operation::BindWindow {
+                    handle,
+                    identity,
+                    candidate,
+                } => window_outcome(
+                    windows
+                        .bind(handle, identity, &candidate, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|binding| Outcome::BoundWindow { binding }),
+                ),
+                Operation::PlaceWindow { binding, bounds } => window_outcome(
+                    windows
+                        .place(binding, bounds, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|result| Outcome::PlacedWindow { result }),
+                ),
+                Operation::UnbindWindow { binding } => window_outcome(
+                    windows
+                        .unbind(binding)
+                        .map(|()| Outcome::UnboundWindow { binding }),
+                ),
+                Operation::Destroy { handle } => {
+                    windows.destroy_monitor(handle);
+                    match handles.remove(&handle) {
+                        Some(native) => {
+                            owner.destroy(&native)?;
+                            Outcome::Destroyed { handle }
+                        }
+                        None => Outcome::Error {
+                            message: "stale monitor generation".into(),
+                            fatal: false,
+                        },
                     }
-                    None => Outcome::Error {
-                        message: "stale monitor generation".into(),
-                        fatal: false,
-                    },
-                },
+                }
             };
             write_reply(writer, seq, outcome)?;
         }
@@ -139,6 +197,9 @@ fn serve<O: Owner>(
             },
         );
     }
+    // Release AX references before monitor destruction on EVERY exit. Never
+    // close, move, restore or otherwise mutate application windows in cleanup.
+    drop(windows);
     let mut cleanup = Ok(());
     for handle in handles.values() {
         if let Err(e) = owner.destroy(handle) {
@@ -148,6 +209,13 @@ fn serve<O: Owner>(
     // Drop still performs the primitive's final RAII cleanup on this thread.
     drop(owner);
     result.and(cleanup)
+}
+
+fn window_outcome(result: Result<Outcome, String>) -> Outcome {
+    result.unwrap_or_else(|message| Outcome::Error {
+        message: bounded_error(&message),
+        fatal: false,
+    })
 }
 
 #[cfg(test)]
@@ -172,6 +240,9 @@ mod tests {
                 },
             ))
         }
+        fn bounds(&self, _: &u32) -> Result<Bounds, String> {
+            Ok(super::super::placement::tests::monitor())
+        }
         fn destroy(&mut self, _: &u32) -> Result<(), String> {
             self.0.borrow_mut().push("destroy");
             Ok(())
@@ -184,7 +255,7 @@ mod tests {
             "garbage\n",
             "{\"seq\":1,\"op\":{\"op\":\"destroy\",\"handle\":1}}\n",
         ] {
-            let log = Rc::default();
+            let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
             let mut input = encode(&Request {
                 seq: 1,
                 op: Operation::Create {
@@ -205,7 +276,7 @@ mod tests {
     }
     #[test]
     fn capacity_stale_generation_and_order_are_bounded() {
-        let log = Rc::default();
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
         let mut input = Vec::new();
         for (i, op) in [
             Operation::Create {
@@ -259,5 +330,178 @@ mod tests {
         ));
         assert_eq!(log.borrow().iter().filter(|v| **v == "create").count(), 3);
         assert_eq!(log.borrow().iter().filter(|v| **v == "destroy").count(), 3);
+    }
+    #[test]
+    fn window_protocol_refusals_and_all_exit_paths_release_references_and_monitors() {
+        use super::super::placement::tests::{identity, Fake as FakeWindows};
+        for suffix in ["", "broken\n"] {
+            let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+            let native = FakeWindows::default();
+            let mut windows = Windows::new(native.clone());
+            let candidate = windows.candidates(123).unwrap().remove(0).candidate;
+            let mut input = Vec::new();
+            for (n, op) in [
+                Operation::Create {
+                    width: 640,
+                    height: 480,
+                },
+                Operation::BindWindow {
+                    handle: 1,
+                    identity: identity(),
+                    candidate: candidate.clone(),
+                },
+                Operation::PlaceWindow {
+                    binding: 1,
+                    bounds: Bounds {
+                        x: -1.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                Operation::ListWindows { pid: 123 },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                input.extend(
+                    encode(&Request {
+                        seq: n as u64 + 1,
+                        op,
+                    })
+                    .unwrap(),
+                );
+            }
+            input.extend_from_slice(suffix.as_bytes());
+            let mut output = Vec::new();
+            let result = serve_with_windows(
+                Fake(log.clone()),
+                windows,
+                &mut input.as_slice(),
+                &mut output,
+            );
+            assert_eq!(result.is_ok(), suffix.is_empty());
+            assert_eq!(native.0.borrow().retained, 0);
+            assert_eq!(native.0.borrow().writes, 0);
+            assert_eq!(*log.borrow(), vec!["create", "destroy"]);
+            let lines: Vec<Reply> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert!(matches!(
+                lines[2].result,
+                Outcome::BoundWindow { binding: 1 }
+            ));
+            assert!(matches!(
+                lines[3].result,
+                Outcome::Error { fatal: false, .. }
+            ));
+            assert!(matches!(lines[4].result, Outcome::Windows { .. }));
+        }
+    }
+    #[test]
+    fn monitor_destroy_serializes_binding_release_and_stale_placement_refusal() {
+        use super::super::placement::tests::{identity, Fake as FakeWindows};
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let native = FakeWindows::default();
+        let mut windows = Windows::new(native.clone());
+        let candidate = windows.candidates(123).unwrap().remove(0).candidate;
+        let mut input = Vec::new();
+        for (n, op) in [
+            Operation::Create {
+                width: 640,
+                height: 480,
+            },
+            Operation::BindWindow {
+                handle: 1,
+                identity: identity(),
+                candidate: candidate.clone(),
+            },
+            Operation::Destroy { handle: 1 },
+            Operation::PlaceWindow {
+                binding: 1,
+                bounds: Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            input.extend(
+                encode(&Request {
+                    seq: n as u64 + 1,
+                    op,
+                })
+                .unwrap(),
+            );
+        }
+        serve_with_windows(
+            Fake(log.clone()),
+            windows,
+            &mut input.as_slice(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(native.0.borrow().retained, 0);
+        assert_eq!(native.0.borrow().writes, 0);
+        assert_eq!(*log.borrow(), vec!["create", "destroy"]);
+    }
+    #[test]
+    fn lost_output_releases_binding_before_owned_cleanup() {
+        use super::super::placement::tests::{identity, Fake as FakeWindows};
+        struct BrokenWriter(usize);
+        impl Write for BrokenWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                if self.0 >= 3 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let native = FakeWindows::default();
+        let mut windows = Windows::new(native.clone());
+        let candidate = windows.candidates(123).unwrap().remove(0).candidate;
+        let mut input = Vec::new();
+        for (n, op) in [
+            Operation::Create {
+                width: 640,
+                height: 480,
+            },
+            Operation::BindWindow {
+                handle: 1,
+                identity: identity(),
+                candidate: candidate.clone(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            input.extend(
+                encode(&Request {
+                    seq: n as u64 + 1,
+                    op,
+                })
+                .unwrap(),
+            );
+        }
+        assert!(serve_with_windows(
+            Fake(log.clone()),
+            windows,
+            &mut input.as_slice(),
+            &mut BrokenWriter(0)
+        )
+        .is_err());
+        assert_eq!(native.0.borrow().retained, 0);
+        assert_eq!(*log.borrow(), vec!["create", "destroy"]);
     }
 }

@@ -1067,6 +1067,53 @@ impl IntendantServer {
                 ))
             }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
+            "list_macos_windows" => {
+                let Parameters(p) = parse_params::<ListMacosWindowsParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::List { pid: p.pid },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "bind_macos_window" => {
+                let Parameters(p) = parse_params::<BindMacosWindowParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::Bind {
+                            selector: p.display_target,
+                            identity: p.identity,
+                            candidate: p.candidate,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "place_macos_window" => {
+                let Parameters(p) = parse_params::<PlaceMacosWindowParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::Place {
+                            binding: p.binding,
+                            bounds: p.bounds,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "unbind_macos_window" => {
+                let Parameters(p) = parse_params::<UnbindMacosWindowParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::Unbind { binding: p.binding },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "list_macos_monitors" => Ok(text_tool_result(
                 self.list_macos_monitors_as_caller(caller).await,
             )),
@@ -1781,6 +1828,67 @@ fn shared_view_user_display_id(
 
 #[tool_router]
 impl IntendantServer {
+    #[tool(
+        description = "List candidate tokens and macOS AX/CG window identities for one explicit PID, including process start generation. Owner-only DisplayView read; requires an existing monitor helper and existing Accessibility/Screen Recording permissions. One retained inventory of at most 16 windows; any helper listing refresh, including failure, invalidates unbound tokens across callers. No activation or input.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn list_macos_windows(
+        &self,
+        Parameters(p): Parameters<ListMacosWindowsParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::List { pid: p.pid },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Bind a listed opaque candidate token plus its full macOS window identity to an exact existing daemon-owned monitor selector. Owner-only DisplayInput; scoped user-display grants cannot authorize this. Consumes the selected candidate and retains its exact listed AX object, at most 16 bindings. No movement until explicit place_macos_window; retain binding for unbind."
+    )]
+    pub(crate) async fn bind_macos_window(
+        &self,
+        Parameters(p): Parameters<BindMacosWindowParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::Bind {
+                selector: p.display_target,
+                identity: p.identity,
+                candidate: p.candidate,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Place an explicitly bound macOS window at monitor-local logical bounds entirely inside its owned monitor. Owner-only DisplayInput. Rechecks identity, monitor geometry and focus around AX position/size writes; success requires AX/CG readback within one point. Partial application is reported without rollback, retries or focus restoration. No activation, raise, unminimize, input or clipboard APIs."
+    )]
+    pub(crate) async fn place_macos_window(
+        &self,
+        Parameters(p): Parameters<PlaceMacosWindowParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::Place {
+                binding: p.binding,
+                bounds: p.bounds,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Release one exact macOS window binding. Owner-only DisplayInput. Drops retained AX references without moving or closing the application window. Monitor destruction and helper EOF also release bindings."
+    )]
+    pub(crate) async fn unbind_macos_window(
+        &self,
+        Parameters(p): Parameters<UnbindMacosWindowParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::Unbind { binding: p.binding },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+
     #[tool(
         description = "Inspect committed macOS monitor generation handles for recovery and exact cleanup. Owner surfaces only, even with a scoped user-display grant. Never starts a helper or captures pixels; list_displays remains unchanged.",
         annotations(read_only_hint = true)

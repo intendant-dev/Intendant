@@ -464,6 +464,418 @@ fn dict_i64(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<i64> {
         .and_then(|n| n.to_i64().or_else(|| n.to_f64().map(|f| f.round() as i64)))
 }
 
+// Explicit owned-monitor placement. These wrappers are original, narrowly
+// scoped AX/CG observation and position/size setters; no raw input path.
+use crate::macos_monitor::placement::{
+    self, Bounds, ListedWindow, Native, Observation, WindowIdentity,
+};
+use std::time::Instant;
+
+pub(crate) struct PlacementNative;
+pub(crate) struct RetainedWindow {
+    element: AXUIElement,
+    identity: WindowIdentity,
+    // Make thread confinement explicit independently of the CF wrapper traits.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[derive(PartialEq)]
+pub(crate) struct PlacementFocus {
+    element: AXUIElement,
+    pid: i32,
+    birth: (u64, u32),
+}
+
+fn placement_permissions(deadline: Instant) -> Result<(), String> {
+    placement::time_left(deadline)?;
+    if !is_trusted() || !core_graphics::access::ScreenCaptureAccess.preflight() {
+        return Err("window binding/placement requires existing Accessibility and Screen Recording permissions; no permission prompt requested".into());
+    }
+    Ok(())
+}
+fn placement_timeout(element: &AXUIElement, deadline: Instant) -> Result<(), String> {
+    placement::time_left(deadline)?;
+    // SAFETY: live retained object, positive bounded per-IPC timeout. No default
+    // system-wide timeout is changed, and no AX object crosses a thread.
+    let status = unsafe { AXUIElementSetMessagingTimeout(element.as_concrete_TypeRef(), 0.05) };
+    if status != kAXErrorSuccess {
+        return Err("cannot bound AX messaging timeout".into());
+    }
+    Ok(())
+}
+fn placement_app(pid: i32, deadline: Instant) -> Result<AXUIElement, String> {
+    placement_permissions(deadline)?;
+    if pid <= 0 {
+        return Err("invalid PID".into());
+    }
+    // SAFETY: Create-rule API accepts positive PID. Null checked before wrapping.
+    let raw = unsafe { AXUIElementCreateApplication(pid) };
+    if raw.is_null() {
+        return Err("AX application unavailable".into());
+    }
+    // SAFETY: non-null Create-rule object, released by wrapper.
+    let app = unsafe { AXUIElement::wrap_under_create_rule(raw) };
+    placement_timeout(&app, deadline)?;
+    Ok(app)
+}
+fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, String> {
+    placement_timeout(element, deadline)?;
+    type GetWindow = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> i32;
+    // SAFETY: constant C symbol; ApplicationServices remains linked for lifetime
+    // of the helper. Missing SPI is a refusal, never a title/order heuristic.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetWindow".as_ptr()) };
+    if symbol.is_null() {
+        return Err("exact AX window mapping SPI unavailable".into());
+    }
+    // SAFETY: known SPI ABI AXError(AXUIElementRef, CGWindowID*).
+    let get: GetWindow = unsafe { std::mem::transmute(symbol) };
+    let mut id = 0;
+    // SAFETY: retained live element and writable u32 output.
+    let status = unsafe { get(element.as_concrete_TypeRef(), &mut id) };
+    if status != kAXErrorSuccess || id == 0 {
+        return Err("cannot map AX window exactly".into());
+    }
+    Ok(id)
+}
+fn placement_pid(element: &AXUIElement) -> Result<i32, String> {
+    let mut pid = 0;
+    // SAFETY: retained AX object and writable pid_t output.
+    let status =
+        unsafe { accessibility_sys::AXUIElementGetPid(element.as_concrete_TypeRef(), &mut pid) };
+    if status != kAXErrorSuccess || pid <= 0 {
+        return Err("AX process identity unavailable".into());
+    }
+    Ok(pid)
+}
+fn placement_generation(identity: WindowIdentity) -> Result<(), String> {
+    identity.validate()?;
+    if crate::platform::macos_process_birth(identity.pid)
+        != Some((identity.start_seconds, identity.start_micros))
+    {
+        return Err("window process exited or PID generation changed".into());
+    }
+    Ok(())
+}
+fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, String> {
+    let app = placement_app(pid, deadline)?;
+    let key = CFString::new(kAXWindowsAttribute);
+    let mut raw = std::ptr::null();
+    // SAFETY: retained app/key and writable array output; request at most cap+1
+    // objects, so an app with too many windows fails without an unbounded copy.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValues(
+            app.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            0,
+            (placement::MAX_CANDIDATES + 1) as _,
+            &mut raw,
+        )
+    };
+    if raw.is_null() {
+        return Err("application does not expose bounded AX windows".into());
+    }
+    // SAFETY: Copy-rule output is retained even if a malformed provider also
+    // returned an error. Wrapper releases it on all following paths.
+    let array: CFArray = unsafe { CFArray::wrap_under_create_rule(raw) };
+    if status != kAXErrorSuccess || array.len() as usize > placement::MAX_CANDIDATES {
+        return Err("AX window enumeration unavailable or exceeds capacity".into());
+    }
+    let mut windows = Vec::with_capacity(array.len() as usize);
+    for item in array.iter() {
+        placement::time_left(deadline)?;
+        let ptr = *item;
+        if ptr.is_null() {
+            return Err("null AX window".into());
+        }
+        // SAFETY: array retains each live CF item throughout the loop.
+        if unsafe { CFGetTypeID(ptr) } != AXUIElement::type_id() {
+            return Err("invalid AX window type".into());
+        }
+        // SAFETY: dynamic AX type checked, get-rule wrapper retains independently.
+        let window = unsafe { AXUIElement::wrap_under_get_rule(ptr as AXUIElementRef) };
+        placement_timeout(&window, deadline)?;
+        windows.push(window);
+    }
+    Ok(windows)
+}
+fn placement_exact(identity: WindowIdentity, deadline: Instant) -> Result<AXUIElement, String> {
+    placement_generation(identity)?;
+    let mut found = None;
+    for window in placement_roots(identity.pid, deadline)? {
+        if placement_window_id(&window, deadline)? == identity.window_id {
+            if found.is_some() {
+                return Err("ambiguous AX window mapping".into());
+            }
+            found = Some(window);
+        }
+    }
+    placement_generation(identity)?;
+    found.ok_or_else(|| "exact window is destroyed or unavailable".into())
+}
+fn placement_cg(identity: WindowIdentity, deadline: Instant) -> Result<Bounds, String> {
+    placement_permissions(deadline)?;
+    placement_generation(identity)?;
+    let list = copy_window_info(
+        core_graphics::window::kCGWindowListOptionIncludingWindow,
+        identity.window_id,
+    )
+    .ok_or("CG window readback unavailable")?;
+    if list.len() != 1 {
+        return Err("CG window absent or ambiguous".into());
+    }
+    let ptr = *list.get(0).ok_or("CG window missing")?;
+    if ptr.is_null() {
+        return Err("CG window missing".into());
+    }
+    // SAFETY: list retains the CF item, get-rule wrapper retains independently.
+    let cf = unsafe { CFType::wrap_under_get_rule(ptr) };
+    let dict = cf_as_string_dict(&cf).ok_or("CG window metadata invalid")?;
+    if dict_i64(&dict, "kCGWindowNumber") != Some(i64::from(identity.window_id))
+        || dict_i64(&dict, "kCGWindowOwnerPID") != Some(i64::from(identity.pid))
+        || dict_i64(&dict, "kCGWindowLayer") != Some(0)
+        || !dict
+            .find(CFString::new("kCGWindowIsOnscreen"))
+            .and_then(|v| v.downcast::<CFBoolean>())
+            .is_some_and(bool::from)
+    {
+        return Err("CG window identity/visibility changed".into());
+    }
+    let b = dict
+        .find(CFString::new("kCGWindowBounds"))
+        .and_then(|v| cf_as_string_dict(&v))
+        .ok_or("CG bounds unavailable")?;
+    let number = |key: &str| {
+        b.find(CFString::new(key))
+            .and_then(|v| v.downcast::<CFNumber>())
+            .and_then(|n| n.to_f64())
+            .ok_or_else(|| "CG bounds invalid".to_string())
+    };
+    let bounds = Bounds {
+        x: number("X")?,
+        y: number("Y")?,
+        width: number("Width")?,
+        height: number("Height")?,
+    };
+    bounds.validate()?;
+    placement_generation(identity)?;
+    Ok(bounds)
+}
+fn placement_ax(element: &AXUIElement, deadline: Instant) -> Result<Bounds, String> {
+    placement_timeout(element, deadline)?;
+    let position: AXValue = copy_attr(element, kAXPositionAttribute)
+        .and_then(|v| v.downcast_into())
+        .ok_or("AX position unavailable")?;
+    let size: AXValue = copy_attr(element, kAXSizeAttribute)
+        .and_then(|v| v.downcast_into())
+        .ok_or("AX size unavailable")?;
+    let mut point = CGPoint::new(0.0, 0.0);
+    let mut size_out = CGSize::new(0.0, 0.0);
+    // SAFETY: retained AXValue and writable CGPoint matching requested type.
+    let p = unsafe {
+        AXValueGetValue(
+            position.as_concrete_TypeRef(),
+            kAXValueTypeCGPoint,
+            (&mut point as *mut CGPoint).cast(),
+        )
+    };
+    // SAFETY: retained AXValue and writable CGSize matching requested type.
+    let s = unsafe {
+        AXValueGetValue(
+            size.as_concrete_TypeRef(),
+            kAXValueTypeCGSize,
+            (&mut size_out as *mut CGSize).cast(),
+        )
+    };
+    if !p || !s {
+        return Err("AX geometry type mismatch".into());
+    }
+    let bounds = Bounds {
+        x: point.x,
+        y: point.y,
+        width: size_out.width,
+        height: size_out.height,
+    };
+    bounds.validate()?;
+    Ok(bounds)
+}
+fn placement_settable(window: &AXUIElement, attribute: &str) -> Result<(), String> {
+    let key = CFString::new(attribute);
+    let mut settable = 0;
+    // SAFETY: retained window/key and writable C Boolean output.
+    let status = unsafe {
+        accessibility_sys::AXUIElementIsAttributeSettable(
+            window.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut settable,
+        )
+    };
+    if status != kAXErrorSuccess || settable == 0 {
+        return Err(format!("{attribute} is not settable"));
+    }
+    Ok(())
+}
+fn placement_set(
+    retained: &RetainedWindow,
+    target: Bounds,
+    size: bool,
+    deadline: Instant,
+) -> Result<(), String> {
+    placement_permissions(deadline)?;
+    let window = &retained.element;
+    placement_timeout(window, deadline)?;
+    let attribute = if size {
+        kAXSizeAttribute
+    } else {
+        kAXPositionAttribute
+    };
+    placement_settable(window, attribute)?;
+    let point = CGPoint::new(target.x, target.y);
+    let dimensions = CGSize::new(target.width, target.height);
+    let (kind, ptr) = if size {
+        (kAXValueTypeCGSize, (&dimensions as *const CGSize).cast())
+    } else {
+        (kAXValueTypeCGPoint, (&point as *const CGPoint).cast())
+    };
+    // SAFETY: ptr references the stack struct corresponding to kind; AXValueCreate copies it.
+    let raw = unsafe { accessibility_sys::AXValueCreate(kind, ptr) };
+    if raw.is_null() {
+        return Err("AX geometry value allocation failed".into());
+    }
+    // SAFETY: non-null Create-rule AXValue, released on all exits.
+    let value = unsafe { AXValue::wrap_under_create_rule(raw) };
+    let key = CFString::new(attribute);
+    placement::time_left(deadline)?;
+    placement_generation(retained.identity)?;
+    if placement_window_id(window, deadline)? != retained.identity.window_id
+        || placement_pid(window)? != retained.identity.pid
+    {
+        return Err("retained window identity changed immediately before write".into());
+    }
+    // SAFETY: retained exact AX window, key and correctly typed AXValue are live.
+    // These are the only mutation verbs in the placement implementation.
+    let status = unsafe {
+        accessibility_sys::AXUIElementSetAttributeValue(
+            window.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+        )
+    };
+    if status != kAXErrorSuccess {
+        return Err(format!(
+            "AX {attribute} write refused or unconfirmed ({status})"
+        ));
+    }
+    Ok(())
+}
+impl Native for PlacementNative {
+    type Window = RetainedWindow;
+    type Focus = PlacementFocus;
+    fn candidates(
+        &mut self,
+        pid: i32,
+        deadline: Instant,
+    ) -> Result<Vec<ListedWindow<RetainedWindow>>, String> {
+        placement_permissions(deadline)?;
+        let (start_seconds, start_micros) =
+            crate::platform::macos_process_birth(pid).ok_or("process generation unavailable")?;
+        let mut candidates: Vec<ListedWindow<RetainedWindow>> = Vec::new();
+        for element in placement_roots(pid, deadline)? {
+            let identity = WindowIdentity {
+                pid,
+                start_seconds,
+                start_micros,
+                window_id: placement_window_id(&element, deadline)?,
+            };
+            if candidates.iter().any(|c| c.identity == identity) {
+                return Err("ambiguous AX window mapping".into());
+            }
+            let bounds = placement_cg(identity, deadline)?;
+            if !placement_ax(&element, deadline)?.close(bounds) {
+                return Err("candidate AX/CG geometry mismatch".into());
+            }
+            candidates.push(ListedWindow {
+                identity,
+                bounds,
+                window: RetainedWindow {
+                    element,
+                    identity,
+                    _thread: std::marker::PhantomData,
+                },
+            });
+        }
+        placement::time_left(deadline)?;
+        if crate::platform::macos_process_birth(pid) != Some((start_seconds, start_micros)) {
+            return Err("PID generation changed while listing".into());
+        }
+        Ok(candidates)
+    }
+    fn observe(
+        &mut self,
+        window: &RetainedWindow,
+        identity: WindowIdentity,
+        deadline: Instant,
+    ) -> Result<Observation, String> {
+        let exact = placement_exact(identity, deadline)?;
+        // CFEqual tests remote AX object identity, not CGWindowID, title or frame.
+        if exact != window.element
+            || placement_pid(&window.element)? != identity.pid
+            || placement_window_id(&window.element, deadline)? != identity.window_id
+        {
+            return Err("retained AX window destroyed/replaced; refusing reused CGWindowID".into());
+        }
+        if attr_bool(&window.element, "AXMinimized") != Some(false)
+            || attr_bool(&window.element, "AXFullScreen") != Some(false)
+        {
+            return Err("window minimized/fullscreen state unavailable or unsupported".into());
+        }
+        placement_settable(&window.element, kAXPositionAttribute)?;
+        placement_settable(&window.element, kAXSizeAttribute)?;
+        let ax = placement_ax(&window.element, deadline)?;
+        let cg = placement_cg(identity, deadline)?;
+        placement_generation(identity)?;
+        placement::time_left(deadline)?;
+        Ok(Observation { ax, cg })
+    }
+    fn focus(&mut self, deadline: Instant) -> Result<PlacementFocus, String> {
+        placement_permissions(deadline)?;
+        // SAFETY: argument-free Create-rule API; null checked before wrapping.
+        let raw = unsafe { AXUIElementCreateSystemWide() };
+        if raw.is_null() {
+            return Err("focus observation unavailable".into());
+        }
+        // SAFETY: non-null Create-rule result released on drop.
+        let system = unsafe { AXUIElement::wrap_under_create_rule(raw) };
+        placement_timeout(&system, deadline)?;
+        let element: AXUIElement = copy_attr(&system, kAXFocusedUIElementAttribute)
+            .and_then(|v| v.downcast_into())
+            .ok_or("focus observation unavailable; placement refused")?;
+        placement_timeout(&element, deadline)?;
+        let pid = placement_pid(&element)?;
+        let birth = crate::platform::macos_process_birth(pid)
+            .ok_or("focus process identity unavailable")?;
+        Ok(PlacementFocus {
+            element,
+            pid,
+            birth,
+        })
+    }
+    fn position(
+        &mut self,
+        window: &RetainedWindow,
+        target: Bounds,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        placement_set(window, target, false, deadline)
+    }
+    fn size(
+        &mut self,
+        window: &RetainedWindow,
+        target: Bounds,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        placement_set(window, target, true, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
