@@ -1,0 +1,21 @@
+name: Dogfood opt-in workbench
+on:
+  push:
+    branches: [agent/dogfood-dev-opt-in]
+    paths: [.github/workflows/dogfood-opt-in-workbench.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Export tracked source only
+        run: git archive --format=tar.gz HEAD > /tmp/dogfood-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dogfood-source
+          path: /tmp/dogfood-source.tar.gz
+          retention-days: 1
