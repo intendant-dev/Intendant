@@ -301,7 +301,27 @@ mod tests {
 
     #[tokio::test]
     async fn denied_resolution_cannot_refresh_session_activity() {
-        let root = access("principal:activity-test");
+        use crate::access::iam;
+        let mut state = iam::LocalIamState::default();
+        let actor = iam::AccessPrincipal::root_dashboard_session("test", "http");
+        let grant = iam::upsert_user_client_grant(
+            &mut state,
+            iam::UserClientGrantUpsertRequest {
+                kind: "local_process".into(),
+                role_id: Some("role:root".into()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap()
+        .grant;
+        // A transport-default root_session bypasses role checks. Model the
+        // real grant-bound caller so changing its role changes its authority.
+        let root = HttpAccessContext {
+            principal: iam::principal_for_loopback_mcp(&state, "http").unwrap(),
+            iam_state: Some(state),
+            peer_filesystem: None,
+        };
         let session = create_http_task_session(&root, None).unwrap();
         let previous = Instant::now() - Duration::from_secs(1);
         http_task_sessions()
@@ -325,6 +345,21 @@ mod tests {
 
         let mut denied = root.clone();
         denied.principal.role_id = "role:observer".into();
+        let stored = denied
+            .iam_state
+            .as_mut()
+            .unwrap()
+            .grants
+            .iter_mut()
+            .find(|stored| stored.id == grant.id)
+            .unwrap();
+        stored.role_id = "role:observer".into();
+        stored.policy_id = "policy:observer".into();
+        assert_eq!(
+            HttpTaskOwner::from_access(&root, None),
+            HttpTaskOwner::from_access(&denied, None)
+        );
+        assert!(authorize_http_tasks(&denied).is_err());
         for _ in 0..3 {
             assert!(resolve_http_task_session(session.id(), &denied, None).is_err());
             assert_eq!(
