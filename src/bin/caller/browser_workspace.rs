@@ -801,6 +801,8 @@ pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
     bus: &EventBus,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    crate::macos_monitor::reject_unsupported(request.display_target.as_deref(), None)
+        .map_err(BrowserWorkspaceError::Unsupported)?;
     // Validate navigation before display leases, registry reservations or filesystem effects.
     let launch_url = launch_policy::navigation(request.url.as_deref())
         .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?
@@ -3158,6 +3160,8 @@ struct BrowserDisplayBinding {
 fn parse_browser_display_binding(
     raw: &str,
 ) -> Result<BrowserDisplayBinding, BrowserWorkspaceError> {
+    crate::macos_monitor::reject_unsupported(Some(raw), None)
+        .map_err(BrowserWorkspaceError::Unsupported)?;
     let value = raw.trim();
     let digits = value
         .strip_prefix("display_")
@@ -3195,6 +3199,22 @@ fn now_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_monitor_browser_placement_is_always_refused() {
+        for value in [
+            "macos_virtual",
+            "macos_virtual:bad",
+            " MACOS_VIRTUAL:42 ",
+            "display_macos_virtual:1",
+            ":macos_virtual:1",
+            "536870912",
+            ":536870912",
+            "display_1073741823",
+            " DISPLAY_00536870912 ",
+        ] {
+            assert!(super::parse_browser_display_binding(value).is_err());
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn new_browser_profiles_are_private_without_changing_existing_modes() {

@@ -1,4 +1,5 @@
-//! Experimental macOS virtual monitor lifecycle, deliberately unwired from CU.
+//! Experimental macOS virtual monitor lifecycle primitive. The controller
+//! retains this main-thread owner in a private helper for read-only capture.
 //!
 //! A monitor shares WindowServer focus, cursor and clipboard with the login
 //! session. It is **not a security sandbox** and this API grants no authority.

@@ -513,6 +513,7 @@ pub async fn read_screen_elements(
     target: DisplayTarget,
     full_values: bool,
 ) -> Result<ScreenElements, String> {
+    crate::macos_monitor::reject_unsupported(None, Some(display_id_for_target(target)))?;
     let mut snapshot = read_screen_elements_raw(target).await?;
     if !full_values {
         cap_screen_elements_texts(&mut snapshot);
@@ -1130,6 +1131,13 @@ async fn execute_actions_inner(
     observer: Option<&CuActionObserver>,
     options: CuExecOptions,
 ) -> CuBatchOutcome {
+    if crate::macos_monitor::reserved_id(display_id_for_target(target)) {
+        return failed_batch(
+            actions,
+            crate::macos_monitor::UNSUPPORTED,
+            "unsupported monitor target",
+        );
+    }
     if target.is_user_session() && !user_session_allowed {
         // One result per action, like every other outcome of this function
         // (a screenshot-only batch still gets its one denial).

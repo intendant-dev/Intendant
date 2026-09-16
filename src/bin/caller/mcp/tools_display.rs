@@ -134,12 +134,21 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer and survives the calling session (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for this exact request's correlated terminal result and returns JSON with request_id, display id/geometry, and the opaque capture_generation required for exact teardown."
+        description = "Create a daemon-owned display. Linux: Xvfb capture and streaming with dashboard/peer announcement. macOS: at most two owned monitors in the shared WindowServer session, requiring an owner surface or existing user-display grant; returns an opaque macos_virtual selector for read-only take_screenshot and exact destruction, with capture initially unverified. No input, browser placement or streaming. Returns display_id, geometry and capture_generation."
     )]
     pub(crate) async fn create_virtual_display(
         &self,
         Parameters(params): Parameters<CreateVirtualDisplayParams>,
     ) -> String {
+        if cfg!(target_os = "macos") {
+            return self
+                .create_macos_monitor(params, ToolCallerTrust::OwnerSurface)
+                .await;
+        }
+        self.create_xvfb_display(params).await
+    }
+
+    async fn create_xvfb_display(&self, params: CreateVirtualDisplayParams) -> String {
         // Every caller receives a distinct internal terminal result. Public
         // DisplayReady/failure events remain broadcast lifecycle signals and
         // are deliberately not used for synchronous attribution.
@@ -204,12 +213,30 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes every browser bound to that display first, and waits for correlated teardown. A stale generation is refused without touching the live display."
+        description = "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes bound Linux browser workspaces first and waits for teardown. macOS serializes destruction after active read-only capture and requires shared-session authority. A stale generation is refused without touching the live display."
     )]
     pub(crate) async fn destroy_virtual_display(
         &self,
         Parameters(params): Parameters<DestroyVirtualDisplayParams>,
     ) -> String {
+        if cfg!(target_os = "macos") {
+            return self
+                .destroy_macos_monitor(params, ToolCallerTrust::OwnerSurface)
+                .await;
+        }
+        if crate::macos_monitor::reject_unsupported(
+            Some(&params.capture_generation),
+            Some(params.display_id),
+        )
+        .is_err()
+        {
+            return serde_json::json!({"ok": false, "error": crate::macos_monitor::UNSUPPORTED})
+                .to_string();
+        }
+        self.destroy_xvfb_display(params).await
+    }
+
+    async fn destroy_xvfb_display(&self, params: DestroyVirtualDisplayParams) -> String {
         let request_id = format!("vdd-{}", uuid::Uuid::new_v4().simple());
         let waiter = match self
             .bus
@@ -295,6 +322,10 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<TakeDisplayParams>,
     ) -> String {
+        if let Err(error) = crate::macos_monitor::reject_unsupported(None, Some(params.display_id))
+        {
+            return error;
+        }
         self.bus.send(AppEvent::DisplayTaken {
             display_id: params.display_id,
         });
@@ -306,6 +337,10 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ReleaseDisplayParams>,
     ) -> String {
+        if let Err(error) = crate::macos_monitor::reject_unsupported(None, Some(params.display_id))
+        {
+            return error;
+        }
         self.bus.send(AppEvent::DisplayReleased {
             display_id: params.display_id,
             note: params.note.clone(),
@@ -330,6 +365,9 @@ impl IntendantServer {
         params: GrantUserDisplayParams,
         caller: ToolCallerTrust,
     ) -> String {
+        if let Err(error) = crate::macos_monitor::reject_unsupported(None, params.display_id) {
+            return error;
+        }
         // The grant IS the owner's opt-in: only owner surfaces may perform
         // it. (Revoke stays open to everyone — de-escalation is fail-safe.)
         if caller == ToolCallerTrust::Scoped {
@@ -376,6 +414,9 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<RevokeUserDisplayParams>,
     ) -> String {
+        if let Err(error) = crate::macos_monitor::reject_unsupported(None, params.display_id) {
+            return error;
+        }
         let display_id = params.display_id.unwrap_or(0);
         {
             let state = self.state.read().await;
@@ -655,6 +696,11 @@ impl IntendantServer {
         region: Option<crate::types::SharedViewRegion>,
         note: Option<String>,
     ) -> String {
+        if let Err(error) =
+            crate::macos_monitor::reject_unsupported(display_target.as_deref(), display_id)
+        {
+            return error;
+        }
         self.bus.send(AppEvent::SharedView {
             session_id: session_id
                 .map(str::trim)
@@ -761,6 +807,7 @@ impl IntendantServer {
         display_id: Option<u32>,
         caller: ToolCallerTrust,
     ) -> Result<(), String> {
+        crate::macos_monitor::reject_unsupported(display_target, display_id)?;
         let Some(display_id) = shared_view_user_display_id(display_target, display_id) else {
             return Ok(());
         };
@@ -822,17 +869,17 @@ impl IntendantServer {
         &self,
         display_target: Option<String>,
         display_id: Option<u32>,
-    ) -> (Option<String>, Option<u32>) {
+    ) -> Result<(Option<String>, Option<u32>), String> {
         if let Some((display_target, display_id)) =
-            resolve_concrete_shared_view_target(display_target, display_id)
+            resolve_concrete_shared_view_target(display_target, display_id)?
         {
-            return (Some(display_target), Some(display_id));
+            return Ok((Some(display_target), Some(display_id)));
         }
 
         let session_registry = self.state.read().await.session_registry.clone();
         let default_target = crate::computer_use::default_display_target(&session_registry).await;
         let (display_target, display_id) = concrete_shared_view_target(default_target);
-        (Some(display_target), Some(display_id))
+        Ok((Some(display_target), Some(display_id)))
     }
 
     pub(crate) async fn show_shared_view_for_session(
@@ -841,9 +888,13 @@ impl IntendantServer {
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let (display_target, display_id) = self
+        let (display_target, display_id) = match self
             .resolve_shared_view_target(params.display_target, params.display_id)
-            .await;
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
         let region = params.focus_region.map(normalize_shared_view_region);
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
@@ -929,9 +980,13 @@ impl IntendantServer {
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let (display_target, display_id) = self
+        let (display_target, display_id) = match self
             .resolve_shared_view_target(params.display_target, params.display_id)
-            .await;
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -968,9 +1023,13 @@ impl IntendantServer {
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let (display_target, display_id) = self
+        let (display_target, display_id) = match self
             .resolve_shared_view_target(params.display_target, params.display_id)
-            .await;
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -1008,9 +1067,13 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
-        let (display_target, display_id) = self
+        let (display_target, display_id) = match self
             .resolve_shared_view_target(params.display_target, params.display_id)
-            .await;
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => return Ok(text_tool_error(error)),
+        };
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -1068,6 +1131,15 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if params
+            .display_target
+            .as_deref()
+            .is_some_and(crate::macos_monitor::reserved)
+        {
+            return self
+                .screenshot_macos_monitor(params.display_target.unwrap(), compact_output, caller)
+                .await;
+        }
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
         #[cfg(target_os = "linux")]
@@ -1083,7 +1155,10 @@ impl IntendantServer {
         drop(state);
 
         let target = match params.display_target.as_deref() {
-            Some(spec) => resolve_display_target(spec),
+            Some(spec) => match resolve_display_target(spec) {
+                Ok(target) => target,
+                Err(error) => return Ok(text_tool_error(error)),
+            },
             None => crate::computer_use::default_display_target(&session_registry).await,
         };
         let backend = DisplayBackend::detect();
@@ -1180,7 +1255,10 @@ impl IntendantServer {
         // tools do.
         let target = match params.display_target.as_deref() {
             None => crate::computer_use::DisplayTarget::UserSession,
-            Some(spec) => resolve_display_target(spec),
+            Some(spec) => match resolve_display_target(spec) {
+                Ok(target) => target,
+                Err(error) => return Ok(text_tool_error(error)),
+            },
         };
         // The element tree reveals the real session's content (window
         // titles, field values) just as pixels do — and unlike the pixel
@@ -1232,7 +1310,10 @@ impl IntendantServer {
             (state.session_registry.clone(), state.autonomy.clone())
         };
         let target = match params.display_target.as_deref() {
-            Some(spec) => resolve_display_target(spec),
+            Some(spec) => match resolve_display_target(spec) {
+                Ok(target) => target,
+                Err(error) => return Ok(text_tool_error(error)),
+            },
             None => crate::computer_use::default_display_target(&session_registry).await,
         };
         let user_display_granted = autonomy.read().await.user_display_granted;
@@ -1271,6 +1352,13 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if params
+            .display_target
+            .as_deref()
+            .is_some_and(crate::macos_monitor::reserved)
+        {
+            return Ok(text_tool_error(crate::macos_monitor::UNSUPPORTED));
+        }
         use crate::computer_use::{execute_actions, DisplayBackend};
 
         #[cfg(target_os = "linux")]
@@ -1393,7 +1481,10 @@ impl IntendantServer {
         drop(state);
 
         let target = match params.display_target.as_deref() {
-            Some(spec) => resolve_display_target(spec),
+            Some(spec) => match resolve_display_target(spec) {
+                Ok(target) => target,
+                Err(error) => return Ok(text_tool_error(error)),
+            },
             None => crate::computer_use::default_display_target(&session_registry).await,
         };
         let backend = DisplayBackend::detect();
@@ -1869,23 +1960,23 @@ mod tests {
         let first_server = server.clone();
         let first = tokio::spawn(async move {
             first_server
-                .create_virtual_display(Parameters(CreateVirtualDisplayParams {
+                .create_xvfb_display(CreateVirtualDisplayParams {
                     width: Some(800),
                     height: Some(600),
                     minimum_display_id: None,
                     maximum_display_id: None,
-                }))
+                })
                 .await
         });
         let second_server = server.clone();
         let second = tokio::spawn(async move {
             second_server
-                .create_virtual_display(Parameters(CreateVirtualDisplayParams {
+                .create_xvfb_display(CreateVirtualDisplayParams {
                     width: Some(1000),
                     height: Some(700),
                     minimum_display_id: None,
                     maximum_display_id: None,
-                }))
+                })
                 .await
         });
 
@@ -2020,11 +2111,11 @@ mod tests {
         let server = IntendantServer::new(test_state(), bus.clone());
         let destroy = tokio::spawn(async move {
             server
-                .destroy_virtual_display(Parameters(DestroyVirtualDisplayParams {
+                .destroy_xvfb_display(DestroyVirtualDisplayParams {
                     display_id: 99,
                     capture_generation: "vdcg-live".to_string(),
                     note: Some("capture complete".to_string()),
-                }))
+                })
                 .await
         });
 
@@ -2873,13 +2964,13 @@ mod tests {
         // that ":0" gets — a parsed id of 0 IS the user session.
         for spec in [":00", "display_00", "00", ":0", "0", "user_session"] {
             assert_eq!(
-                resolve_display_target(spec),
+                resolve_display_target(spec).unwrap(),
                 DisplayTarget::UserSession,
                 "spec {spec:?}"
             );
         }
         assert_eq!(
-            resolve_display_target(":99"),
+            resolve_display_target(":99").unwrap(),
             DisplayTarget::Virtual { id: 99 }
         );
     }

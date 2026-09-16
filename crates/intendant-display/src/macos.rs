@@ -111,6 +111,10 @@ struct CaptureState {
 /// Uses ScreenCaptureKit (SCStream) for high-performance frame capture and
 /// CoreGraphics CGEvent for input injection.
 pub struct MacOSBackend {
+    /// Exact owned-monitor captures never permit global CGEvent input or a
+    /// shared-session cursor overlay. Enforced in the backend itself.
+    read_only: bool,
+    stop_uncertain: AtomicBool,
     capture: Mutex<Option<CaptureState>>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
@@ -140,6 +144,8 @@ impl MacOSBackend {
 
     fn with_target(target: CaptureTarget) -> Self {
         Self {
+            read_only: false,
+            stop_uncertain: AtomicBool::new(false),
             capture: Mutex::new(None),
             width: Arc::new(AtomicU32::new(0)),
             height: Arc::new(AtomicU32::new(0)),
@@ -152,6 +158,77 @@ impl MacOSBackend {
     /// Create a backend targeting a specific display by its CGDisplayID.
     pub fn with_display_id(display_id: u32) -> Self {
         Self::with_target(CaptureTarget::Display(Some(display_id)))
+    }
+
+    /// Exact-ID, read-only SCK capture. This does not confer display authority;
+    /// the controller must validate ownership and the shared-session grant.
+    pub fn read_only_display(display_id: u32) -> Result<Self, CallerError> {
+        if display_id == 0 {
+            return Err(CallerError::Display(
+                "read-only capture requires a nonzero exact display ID".into(),
+            ));
+        }
+        let mut backend = Self::with_display_id(display_id);
+        backend.read_only = true;
+        Ok(backend)
+    }
+
+    fn capture_start_error(&self, context: &str, err: impl std::fmt::Display) -> CallerError {
+        if self.read_only {
+            CallerError::Display(enrich_sck_capture_error(&format!("{context}: {err}")))
+        } else {
+            sck_capture_error(context, err)
+        }
+    }
+
+    /// Stop and join teardown, surfacing uncertainty to lifecycle owners.
+    /// This future must be driven to completion by its owner.
+    pub async fn stop_capture_checked(&self) -> Result<(), CallerError> {
+        // Double-stop / stop-without-start: nothing registered, no-op.
+        let Some(state) = self.capture.lock().await.take() else {
+            return if self.stop_uncertain.load(Ordering::SeqCst) {
+                Err(CallerError::Display("previous SCK stop unconfirmed".into()))
+            } else {
+                Ok(())
+            };
+        };
+
+        // Quiesce order matters:
+        // 1. Gate first — callbacks that fire from here on return without
+        //    touching pixels, geometry atomics, or the channel.
+        state.shutdown.store(true, Ordering::SeqCst);
+        // 2. Close the frame channel now (contract: bounded channel-close).
+        //    The slot holds the channel's only sender; SCK may keep the
+        //    handler closure — and thus the slot Arc — alive long after
+        //    stop, so waiting for the closure to drop would leave the
+        //    receiver hanging for tens of seconds.
+        state
+            .frame_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // 3. Stop and release the stream off the executor thread —
+        //    SCStream::stop_capture blocks on an SCK completion handler
+        //    (same executor-stall class as the x11 thread-join). A late OS
+        //    callback after this is safe: the crate's Swift bridge keeps the
+        //    handler context ARC-retained until the OS stops calling it
+        //    (screencapturekit 8.0 — the 1.5 free-on-Drop was the 2026-07-08
+        //    daemon segfault), and the callback body hits the gate above.
+        let result = tokio::task::spawn_blocking(move || {
+            let result = state
+                .stream
+                .stop_capture()
+                .map_err(|e| CallerError::Display(format!("SCK stop unconfirmed: {e}")));
+            drop(state);
+            result
+        })
+        .await
+        .map_err(|e| CallerError::Display(format!("SCK stop task failed: {e}")))
+        .and_then(|result| result);
+        if result.is_err() {
+            self.stop_uncertain.store(true, Ordering::SeqCst);
+        }
+        result
     }
 
     /// Create a backend targeting a specific native macOS window by CGWindowID.
@@ -708,12 +785,22 @@ impl DisplayBackend for MacOSBackend {
         // idempotent when nothing's running.
         self.stop_capture().await;
 
+        // The owned-monitor lane only inspects existing permission. Do this
+        // before shareable-content enumeration, which can itself prompt TCC.
+        // Constructors remain free of GUI/TCC calls for hermetic tests.
+        if self.read_only && !core_graphics::access::ScreenCaptureAccess.preflight() {
+            return Err(self.capture_start_error(
+                "preflight",
+                "no shareable content: Screen Recording permission is not granted",
+            ));
+        }
+
         // Get shareable content (triggers TCC permission prompt on first use).
         let content = SCShareableContent::create()
             .with_on_screen_windows_only(matches!(self.target, CaptureTarget::Window(_)))
             .with_exclude_desktop_windows(true)
             .get()
-            .map_err(|e| sck_capture_error("SCShareableContent::get", e))?;
+            .map_err(|e| self.capture_start_error("SCShareableContent::get", e))?;
 
         let resolved = resolve_capture_target(&content, self.target)?;
         let width = resolved.width;
@@ -733,7 +820,7 @@ impl DisplayBackend for MacOSBackend {
             .with_width(width)
             .with_height(height)
             .with_pixel_format(PixelFormat::BGRA)
-            .with_shows_cursor(true)
+            .with_shows_cursor(!self.read_only)
             .with_minimum_frame_interval(&frame_interval)
             // SCK's own delivery queue. At the unset default (3), a brief
             // stall of the callback thread makes ScreenCaptureKit drop
@@ -879,54 +966,41 @@ impl DisplayBackend for MacOSBackend {
             SCStreamOutputType::Screen,
         );
 
-        stream
-            .start_capture()
-            .map_err(|e| sck_capture_error("start_capture", e))?;
-
-        *self.capture.lock().await = Some(CaptureState {
+        // Install ownership before the synchronous native start. There is no
+        // cancellation point between starting SCK and retaining its stream.
+        let mut capture = self.capture.lock().await;
+        *capture = Some(CaptureState {
             stream,
             shutdown: shutdown_flag,
             frame_tx: frame_slot,
         });
+        let started = capture
+            .as_ref()
+            .expect("installed capture")
+            .stream
+            .start_capture()
+            .map_err(|e| self.capture_start_error("start_capture", e));
+        drop(capture);
+        // The start contract leaves no residual state on error. Preserve any
+        // stop uncertainty so the broker's unconditional checked stop sees it.
+        if let Err(error) = started {
+            self.stop_capture().await;
+            return Err(error);
+        }
 
         Ok(rx)
     }
 
     async fn stop_capture(&self) {
-        // Double-stop / stop-without-start: nothing registered, no-op.
-        let Some(state) = self.capture.lock().await.take() else {
-            return;
-        };
-
-        // Quiesce order matters:
-        // 1. Gate first — callbacks that fire from here on return without
-        //    touching pixels, geometry atomics, or the channel.
-        state.shutdown.store(true, Ordering::SeqCst);
-        // 2. Close the frame channel now (contract: bounded channel-close).
-        //    The slot holds the channel's only sender; SCK may keep the
-        //    handler closure — and thus the slot Arc — alive long after
-        //    stop, so waiting for the closure to drop would leave the
-        //    receiver hanging for tens of seconds.
-        state
-            .frame_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        // 3. Stop and release the stream off the executor thread —
-        //    SCStream::stop_capture blocks on an SCK completion handler
-        //    (same executor-stall class as the x11 thread-join). A late OS
-        //    callback after this is safe: the crate's Swift bridge keeps the
-        //    handler context ARC-retained until the OS stops calling it
-        //    (screencapturekit 8.0 — the 1.5 free-on-Drop was the 2026-07-08
-        //    daemon segfault), and the callback body hits the gate above.
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = state.stream.stop_capture();
-            drop(state);
-        })
-        .await;
+        let _ = self.stop_capture_checked().await;
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+        if self.read_only {
+            return Err(CallerError::Display(
+                "input is disabled for read-only macOS monitor capture".into(),
+            ));
+        }
         let geometry = {
             let current = current_input_geometry(&self.input_geometry);
             if current.width > 0.0 && current.height > 0.0 {
@@ -1102,6 +1176,27 @@ fn mouse_button_up(b: u8) -> (CGEventType, CGMouseButton) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_monitor_backend_refuses_input_before_native_calls() {
+        assert!(MacOSBackend::read_only_display(0).is_err());
+        let backend = MacOSBackend::read_only_display(42).unwrap();
+        assert!(backend.read_only);
+        // Error formatting on the read-only lane never requests TCC access.
+        assert!(backend
+            .capture_start_error("fixture", "declined TCC")
+            .to_string()
+            .contains("Screen Recording"));
+        let event: InputEvent =
+            serde_json::from_value(serde_json::json!({"t": "mm", "x": 0.5, "y": 0.5})).unwrap();
+        assert!(backend
+            .inject_input(event)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disabled"));
+        backend.stop_capture_checked().await.unwrap(); // no native state was allocated
+    }
 
     #[test]
     fn window_display_ids_round_trip() {

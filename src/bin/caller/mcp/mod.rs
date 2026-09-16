@@ -78,6 +78,7 @@ mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
 mod tools_feedback;
+mod tools_macos_monitor;
 pub(crate) use tools_feedback::DogfoodReportParams;
 mod tools_terminal;
 pub(crate) use tools_terminal::{
@@ -1065,12 +1066,22 @@ impl IntendantServer {
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
             "create_virtual_display" => {
                 let Parameters(params) = parse_params::<CreateVirtualDisplayParams>(args)?;
+                if cfg!(target_os = "macos") {
+                    return Ok(text_tool_result(
+                        self.create_macos_monitor(params, caller).await,
+                    ));
+                }
                 Ok(text_tool_result(
                     self.create_virtual_display(Parameters(params)).await,
                 ))
             }
             "destroy_virtual_display" => {
                 let Parameters(params) = parse_params::<DestroyVirtualDisplayParams>(args)?;
+                if cfg!(target_os = "macos") {
+                    return Ok(text_tool_result(
+                        self.destroy_macos_monitor(params, caller).await,
+                    ));
+                }
                 Ok(text_tool_result(
                     self.destroy_virtual_display(Parameters(params)).await,
                 ))
@@ -1676,20 +1687,26 @@ pub(crate) fn concrete_shared_view_target(
 pub(crate) fn resolve_concrete_shared_view_target(
     display_target: Option<String>,
     display_id: Option<u32>,
-) -> Option<(String, u32)> {
+) -> Result<Option<(String, u32)>, String> {
+    crate::macos_monitor::reject_unsupported(display_target.as_deref(), display_id)?;
     if let Some(id) = display_id {
         let target = if id == 0 {
             crate::computer_use::DisplayTarget::UserSession
         } else {
             crate::computer_use::DisplayTarget::Virtual { id }
         };
-        return Some(concrete_shared_view_target(target));
+        return Ok(Some(concrete_shared_view_target(target)));
     }
 
-    let target = display_target
+    let Some(target) = display_target
         .map(|target| target.trim().to_string())
-        .filter(|target| !target.is_empty())?;
-    Some(concrete_shared_view_target(resolve_display_target(&target)))
+        .filter(|target| !target.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(concrete_shared_view_target(resolve_display_target(
+        &target,
+    )?)))
 }
 
 pub(crate) fn shared_view_target_label(
@@ -2796,7 +2813,10 @@ impl ToolCaller {
 /// availability-aware, instead of assuming a virtual display exists.
 /// A parsed id of 0 is the user's session, never `Virtual { id: 0 }` —
 /// ":00" must not dodge the user-session gate that ":0" gets.
-fn resolve_display_target(target: &str) -> crate::computer_use::DisplayTarget {
+fn resolve_display_target(target: &str) -> Result<crate::computer_use::DisplayTarget, String> {
+    if crate::macos_monitor::reserved(target) {
+        return Err(crate::macos_monitor::UNSUPPORTED.into());
+    }
     use crate::computer_use::DisplayTarget;
     fn virtual_or_user_session(id: u32) -> crate::computer_use::DisplayTarget {
         if id == 0 {
@@ -2805,7 +2825,7 @@ fn resolve_display_target(target: &str) -> crate::computer_use::DisplayTarget {
             DisplayTarget::Virtual { id }
         }
     }
-    match target {
+    Ok(match target {
         "user_session" | "user" | "primary" | ":0" | "0" | "display_0" => {
             DisplayTarget::UserSession
         }
@@ -2821,7 +2841,7 @@ fn resolve_display_target(target: &str) -> crate::computer_use::DisplayTarget {
             let id: u32 = s.parse().unwrap_or(99);
             virtual_or_user_session(id)
         }
-    }
+    })
 }
 
 fn format_outcome(outcome: ActionOutcome) -> String {
@@ -4173,15 +4193,16 @@ pub(crate) mod tests {
     #[test]
     fn shared_view_target_aliases_resolve_from_one_preferred_field() {
         assert_eq!(
-            resolve_concrete_shared_view_target(Some("user_session".to_string()), Some(99)),
+            resolve_concrete_shared_view_target(Some("user_session".to_string()), Some(99))
+                .unwrap(),
             Some((":99".to_string(), 99))
         );
         assert_eq!(
-            resolve_concrete_shared_view_target(Some(":99".to_string()), Some(0)),
+            resolve_concrete_shared_view_target(Some(":99".to_string()), Some(0)).unwrap(),
             Some(("user_session".to_string(), 0))
         );
         assert_eq!(
-            resolve_concrete_shared_view_target(Some("user".to_string()), None),
+            resolve_concrete_shared_view_target(Some("user".to_string()), None).unwrap(),
             Some(("user_session".to_string(), 0))
         );
     }

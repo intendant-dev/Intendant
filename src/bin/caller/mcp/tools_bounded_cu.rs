@@ -401,6 +401,14 @@ impl IntendantServer {
         ),
         BoundedCuTaskError,
     > {
+        crate::macos_monitor::reject_unsupported(
+            Some(&params.display_target),
+            Some(params.display_id),
+        )
+        .and_then(|()| {
+            crate::macos_monitor::reject_unsupported(Some(&params.capture_generation), None)
+        })
+        .map_err(|error| BoundedCuTaskError::new("bounded-cu-display-unsupported", error, false))?;
         let display_access =
             crate::computer_use::acquire_virtual_display_exclusive(params.display_id).await;
         validate_resource_binding(params, &self.bus).await?;

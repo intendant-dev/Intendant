@@ -906,7 +906,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "create_virtual_display",
         manual_http_tool_definition!(
             "create_virtual_display",
-            "Create a daemon-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer, survives the calling session, and dies with the daemon (closing its dashboard tile reaps it early). Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id, geometry, and opaque capture_generation required for exact teardown.",
+            "Create a daemon-owned display. Linux: Xvfb capture and streaming with dashboard/peer announcement. macOS: at most two owned monitors in the shared WindowServer session, requiring an owner surface or existing user-display grant; returns an opaque macos_virtual selector for read-only take_screenshot and exact destruction, with capture initially unverified. No input, browser placement or streaming. Returns display_id, geometry and capture_generation.",
             CreateVirtualDisplayParams
         ),
     );
@@ -914,7 +914,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "destroy_virtual_display",
         manual_http_tool_definition!(
             "destroy_virtual_display",
-            "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes bound browser workspaces first, and refuses stale generations without touching the live display.",
+            "Destroy one exact daemon-owned virtual-display generation. Requires the display_id and capture_generation returned by create_virtual_display, closes bound Linux browser workspaces first, and refuses stale generations. macOS requires shared-session authority and waits for active read-only capture to stop.",
             DestroyVirtualDisplayParams
         ),
     );

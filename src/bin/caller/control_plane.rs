@@ -902,6 +902,14 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             display_id,
             agent_visible,
         } => {
+            if display_id.is_some_and(crate::macos_monitor::reserved_id) {
+                state.bus.send(AppEvent::PresenceLog {
+                    message: crate::macos_monitor::UNSUPPORTED.into(),
+                    level: Some(crate::types::LogLevel::Error),
+                    turn: None,
+                });
+                return;
+            }
             // Owned here (not by any frontend) so the display-control path
             // never depends on a rendering loop to process revokes/grants.
             // Historically this lived in the TUI's control handler, where a
@@ -939,6 +947,14 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             .await;
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
+            if display_id.is_some_and(crate::macos_monitor::reserved_id) {
+                state.bus.send(AppEvent::PresenceLog {
+                    message: crate::macos_monitor::UNSUPPORTED.into(),
+                    level: Some(crate::types::LogLevel::Error),
+                    turn: None,
+                });
+                return;
+            }
             let did = display_id.unwrap_or(0);
             {
                 // Cleared unconditionally: the grant is a single per-daemon
@@ -1407,6 +1423,22 @@ mod tests {
             bus: bus.clone(),
             project_root: None,
         };
+
+        // A raw broker ID is never a user-display grant or streaming target.
+        handle_control_msg(
+            &ControlMsg::GrantUserDisplay {
+                display_id: Some(crate::macos_monitor::DISPLAY_ID_MIN),
+                agent_visible: Some(true),
+            },
+            &state,
+        )
+        .await;
+        assert!(!autonomy.read().await.user_display_granted);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::PresenceLog { .. })
+        ));
+        assert!(events.try_recv().is_err());
 
         // "View this machine": a private view must never mint agent
         // display authority.

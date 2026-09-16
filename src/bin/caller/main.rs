@@ -117,6 +117,7 @@ mod usage_rail;
 mod user_skills;
 mod user_templates;
 pub(crate) use intendant_core::skills;
+mod macos_monitor;
 mod sub_agent;
 mod task_dispatch;
 mod terminal;
@@ -3799,8 +3800,17 @@ fn run_scoped_shell_exec() -> ! {
     }
 }
 
+fn main() -> Result<(), CallerError> {
+    // Private helper interception precedes even runtime/crypto/panic-hook setup,
+    // config, auth, lease cleanup, logging, sockets and normal argument parsing.
+    if let Some(result) = macos_monitor::intercept_helper() {
+        return result.map_err(CallerError::Display);
+    }
+    normal_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), CallerError> {
+async fn normal_main() -> Result<(), CallerError> {
     // Install the process-wide rustls `CryptoProvider`. **Required
     // by rustls 0.23+**: without this, the first DTLS handshake
     // (typically when the WebRTC driver answers a federated peer's

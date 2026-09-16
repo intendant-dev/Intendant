@@ -644,6 +644,10 @@ async fn activate_user_display_inner(
     capture_generation: Option<String>,
 ) {
     let display_id: u32 = target_display_id;
+    if crate::macos_monitor::reserved_id(display_id) {
+        report_user_display_capture_unavailable(bus, display_id, crate::macos_monitor::UNSUPPORTED);
+        return;
+    }
 
     // Dedupe against ANY live session — a private view is still a live
     // capture. The filtered `get` would miss it and stack a second
@@ -1196,8 +1200,11 @@ pub(crate) fn detect_wayland_socket() -> Option<String> {
 pub(crate) fn parse_display_target_str(
     s: &str,
     user_display_granted: bool,
-) -> computer_use::DisplayTarget {
-    match s.trim() {
+) -> Result<computer_use::DisplayTarget, String> {
+    if crate::macos_monitor::reserved(s) {
+        return Err(crate::macos_monitor::UNSUPPORTED.into());
+    }
+    Ok(match s.trim() {
         "user_session" | "user" | ":0" | "0" => computer_use::DisplayTarget::UserSession,
         other => {
             let num_str = other.trim_start_matches(':');
@@ -1212,7 +1219,7 @@ pub(crate) fn parse_display_target_str(
                 resolve_cu_display_target(user_display_granted)
             }
         }
-    }
+    })
 }
 
 /// Resolve the display target for CU actions.
@@ -1633,16 +1640,22 @@ pub(crate) async fn handle_shared_view_calls(
         // focus_clear) never auto-resolve a display: they retract
         // presentation state wherever it is.
         let user_display_granted = autonomy.read().await.user_display_granted;
-        let resolved =
-            mcp::resolve_concrete_shared_view_target(display_target, None).or_else(|| {
-                if matches!(action, "hide" | "focus_clear") {
-                    None
-                } else {
-                    Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
-                        user_display_granted,
-                    )))
-                }
-            });
+        let resolved = match mcp::resolve_concrete_shared_view_target(display_target, None) {
+            Ok(target) => target,
+            Err(error) => {
+                conversation.add_tool_result(call_id, "shared_view", &error);
+                continue;
+            }
+        }
+        .or_else(|| {
+            if matches!(action, "hide" | "focus_clear") {
+                None
+            } else {
+                Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
+                    user_display_granted,
+                )))
+            }
+        });
         let resolved_target = resolved.as_ref().map(|(target, _)| target.clone());
         let display_id = resolved.map(|(_, id)| id);
         let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
