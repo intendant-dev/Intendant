@@ -4,11 +4,13 @@
 
 mod capture;
 mod helper;
+mod inspection;
 mod process;
 mod protocol;
 mod smoke;
 
 use crate::autonomy::SharedAutonomy;
+pub(crate) use inspection::{exact_selector, Capabilities, Inspection, Snapshot};
 use protocol::{Operation, Outcome};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -19,7 +21,7 @@ const QUEUE_SIZE: usize = 8;
 // Below the macOS window range (0x40000000); never native/helper IDs.
 pub(crate) const DISPLAY_ID_MIN: u32 = 0x2000_0000;
 pub(crate) const DISPLAY_ID_MAX: u32 = 0x3fff_ffff;
-pub(crate) const UNSUPPORTED: &str = "macos_virtual selectors support only exact read-only take_screenshot and destroy_virtual_display; input, AX, browser placement, shared views and streaming are unavailable";
+pub(crate) const UNSUPPORTED: &str = "macos_virtual selectors support only exact read-only take_screenshot, display_readiness and destroy_virtual_display; input, AX, browser placement, shared views and streaming are unavailable";
 
 /// Deliberately broad reservation: malformed/case/whitespace variants must
 /// never fall through an old parser to :99 or the user's primary display.
@@ -125,6 +127,7 @@ pub(crate) enum Value {
     Created(Monitor),
     Destroyed,
     Captured(Screenshot),
+    Inspected(Snapshot),
 }
 
 /// The actor holds serialization until the frontend has synchronously built
@@ -147,6 +150,16 @@ pub(crate) enum Action {
     Create { width: u32, height: u32 },
     Destroy { display_id: u32, selector: String },
     Capture { selector: String, path: PathBuf },
+    Inspect(Inspection),
+}
+
+impl Action {
+    async fn check(&self, authority: &Authority) -> Result<(), String> {
+        match self {
+            Self::Inspect(inspection) => inspection.check(authority).await,
+            _ => authority.check().await,
+        }
+    }
 }
 
 struct Request {
@@ -168,7 +181,11 @@ impl Broker {
         action: Action,
         authority: Authority,
     ) -> Result<Receipt, String> {
-        authority.check().await?;
+        action.check(&authority).await?;
+        // Inspection must use the non-starting entry point, even internally.
+        if matches!(action, Action::Inspect(_)) {
+            return Err("use non-starting monitor inspection".into());
+        }
         if let Action::Create { width, height } = action {
             validate_dimensions(width, height)?;
         }
@@ -295,14 +312,60 @@ where
 {
     let mut factory = Some(factory);
     let mut state = State::new();
-    let mut process = None;
+    let mut process: Option<D> = None;
     let mut retired: Option<String> = None;
     while let Some(mut request) = requests.recv().await {
         if request.reply.is_closed() {
             continue;
         }
-        if let Err(e) = request.authority.check().await {
+        if let Err(e) = request.action.check(&request.authority).await {
             let _ = request.reply.send(Err(e));
+            continue;
+        }
+        if let Action::Inspect(inspection) = &request.action {
+            // Serialized behind every outstanding receipt and cleanup. No
+            // factory access: reads cannot start or replace the owned helper.
+            let mut snapshot = if retired.is_some() {
+                Snapshot::empty(inspection::BrokerState::Retired)
+            } else if let Some(child) = process.as_mut() {
+                match inspection::inspect(&state, child, inspection).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        retired = Some(error);
+                        let _ = child.close().await;
+                        state.monitors.clear();
+                        process = None;
+                        Snapshot::empty(inspection::BrokerState::Retired)
+                    }
+                }
+            } else {
+                Snapshot::empty(inspection::BrokerState::NotStarted)
+            };
+            if let Err(error) = request.action.check(&request.authority).await {
+                let _ = request.reply.send(Err(error));
+            } else {
+                // Match lifecycle delivery's last synchronous liveness check
+                // after the authority await. Failure never releases handles.
+                if let Some(child) = process.as_mut() {
+                    if let Err(error) = child.live() {
+                        retired = Some(error);
+                        let _ = child.close().await;
+                        state.monitors.clear();
+                        process = None;
+                        snapshot = Snapshot::empty(inspection::BrokerState::Retired);
+                        if let Err(error) = request.action.check(&request.authority).await {
+                            let _ = request.reply.send(Err(error));
+                            continue;
+                        }
+                    }
+                }
+                let (commit, committed) = oneshot::channel();
+                let _ = request.reply.send(Ok(Receipt {
+                    value: Value::Inspected(snapshot),
+                    commit,
+                }));
+                let _ = committed.await;
+            }
             continue;
         }
         if let Action::Create { width, height } = request.action {
@@ -534,6 +597,7 @@ async fn execute(
             }
             Ok(Value::Captured(image))
         }
+        Action::Inspect(_) => unreachable!("inspection is handled without starting a helper"),
     }
 }
 
@@ -553,6 +617,10 @@ mod tests {
     struct Fake {
         log: Arc<Mutex<Vec<&'static str>>>,
         destroyed: Arc<Mutex<Vec<u32>>>,
+        resolved: Arc<Mutex<Vec<u32>>>,
+        fail_resolve: Arc<std::sync::atomic::AtomicBool>,
+        resolve_started: Option<oneshot::Sender<()>>,
+        resolve_release: Option<oneshot::Receiver<()>>,
         next: u32,
         fail_destroy: bool,
         dead: bool,
@@ -595,14 +663,29 @@ mod tests {
                         height,
                     })
                 }
-                Operation::Resolve { handle } => Ok(Outcome::Monitor {
-                    handle,
-                    native_id: 42
-                        + handle
-                        + u32::from(self.captured && self.mismatch_after_capture),
-                    width: 640,
-                    height: 480,
-                }),
+                Operation::Resolve { handle } => {
+                    self.resolved.lock().unwrap().push(handle);
+                    if let Some(started) = self.resolve_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.resolve_release.take() {
+                        let _ = release.await;
+                    }
+                    if self.fail_resolve.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(
+                            "private native/helper/path diagnostic must not escape inspection"
+                                .into(),
+                        );
+                    }
+                    Ok(Outcome::Monitor {
+                        handle,
+                        native_id: 42
+                            + handle
+                            + u32::from(self.captured && self.mismatch_after_capture),
+                        width: 640,
+                        height: 480,
+                    })
+                }
                 Operation::Destroy { handle } => {
                     self.log.lock().unwrap().push("destroy");
                     self.destroyed.lock().unwrap().push(handle);
@@ -698,6 +781,366 @@ mod tests {
         let monitor = monitor.clone();
         receipt.commit();
         monitor
+    }
+
+    async fn inspected(
+        tx: &mpsc::Sender<Request>,
+        inspection: Inspection,
+        authority: Authority,
+    ) -> Snapshot {
+        let receipt = send(tx, Action::Inspect(inspection), authority)
+            .await
+            .unwrap()
+            .unwrap();
+        let Value::Inspected(snapshot) = &receipt.value else {
+            panic!("inspection result")
+        };
+        let snapshot = snapshot.clone();
+        receipt.commit();
+        snapshot
+    }
+
+    fn status(selector: &str) -> Inspection {
+        Inspection::Status {
+            selector: selector.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_before_create_never_allocates_actor_or_starts_helper() {
+        let broker = Broker::default();
+        let selector = format!("macos_virtual:{}:{DISPLAY_ID_MIN}", "a".repeat(32));
+        for inspection in [Inspection::Inventory, status(&selector)] {
+            let snapshot = broker.inspect(inspection, authority(true)).await.unwrap();
+            assert_eq!(
+                serde_json::json!(snapshot),
+                serde_json::json!({"broker_state":"not_started", "monitors":[]})
+            );
+            assert_eq!(snapshot.status()["lifecycle_status"], "unknown");
+            assert!(!snapshot.status()["ready"].as_bool().unwrap());
+            assert!(broker.not_started());
+        }
+        let scoped = authority(false);
+        assert!(broker
+            .inspect(status(&selector), scoped.clone())
+            .await
+            .is_err());
+        scoped.autonomy.write().await.user_display_granted = true;
+        assert!(broker
+            .inspect(status(&selector), scoped.clone())
+            .await
+            .is_ok());
+        assert!(broker
+            .inspect(Inspection::Inventory, scoped)
+            .await
+            .unwrap_err()
+            .contains("owner surface"));
+        assert!(broker.not_started());
+
+        // The actor also refuses to invoke its factory if inspected directly.
+        let (tx, rx) = mpsc::channel(QUEUE_SIZE);
+        let worker = tokio::spawn(run_with_factory(rx, || async {
+            Err::<Fake, String>("inspection must not start a helper".into())
+        }));
+        for inspection in [Inspection::Inventory, status(&selector)] {
+            let snapshot = inspected(&tx, inspection, authority(true)).await;
+            assert_eq!(serde_json::json!(snapshot)["broker_state"], "not_started");
+        }
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_response_loss_is_recoverable_and_destroy_uses_exact_recovered_handle() {
+        let fake = Fake {
+            next: 700,
+            ..Default::default()
+        };
+        let destroyed = fake.destroyed.clone();
+        let resolved = fake.resolved.clone();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let broker = Broker::default();
+        assert!(broker.sender.set(Ok(tx.clone())).is_ok());
+        let original = committed_monitor(&tx).await;
+        let inventory = serde_json::json!(broker
+            .inspect(Inspection::Inventory, authority(true))
+            .await
+            .unwrap());
+        let recovered = &inventory["monitors"][0];
+        assert_eq!(inventory["monitors"].as_array().unwrap().len(), 1);
+        assert_eq!(*recovered, serde_json::json!(original.description()));
+        assert_eq!(recovered["width"], 640);
+        assert_eq!(recovered["height"], 480);
+        let scoped = authority(false);
+        scoped.autonomy.write().await.user_display_granted = true;
+        let readiness = broker
+            .inspect(status(&original.selector), scoped)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(readiness["lifecycle_status"], "verified");
+        assert_eq!(readiness["lifecycle_ready"], true);
+        for field in [
+            "ready",
+            "capture_ready",
+            "input_supported",
+            "streaming_supported",
+            "cursor_overlay",
+        ] {
+            assert_eq!(readiness[field], false, "{field}");
+        }
+        assert!(readiness["capture_status"]
+            .as_str()
+            .unwrap()
+            .starts_with("unverified"));
+        assert_eq!(&*log.lock().unwrap(), &["create"]); // no capture/input/create during reads
+        assert_eq!(&*resolved.lock().unwrap(), &[701, 701]);
+        // A whitelist pins every serialized field, including nested descriptions.
+        let mut keys: Vec<_> = recovered
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "display_id",
+            "display_target",
+            "capture_generation",
+            "width",
+            "height",
+            "backend",
+            "lifecycle_ready",
+            "capture_ready",
+            "capture_status",
+            "input_supported",
+            "streaming_supported",
+            "cursor_overlay",
+            "isolation",
+            "ready",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        let encoded = inventory.to_string();
+        for private in ["native_id", "helper_handle", "pid", "path"] {
+            assert!(!encoded.contains(private), "{private}");
+        }
+        send(
+            &tx,
+            Action::Destroy {
+                display_id: recovered["display_id"].as_u64().unwrap() as u32,
+                selector: recovered["capture_generation"].as_str().unwrap().into(),
+            },
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .commit();
+        assert_eq!(&*destroyed.lock().unwrap(), &[701]);
+        let inventory = inspected(&tx, Inspection::Inventory, authority(true)).await;
+        assert_eq!(
+            serde_json::json!(inventory)["monitors"],
+            serde_json::json!([])
+        );
+        let stale = inspected(&tx, status(&original.selector), authority(true))
+            .await
+            .status();
+        assert_eq!(stale["broker_state"], "live");
+        assert_eq!(stale["lifecycle_status"], "unknown");
+        assert!(stale["monitor"].is_null());
+        drop(broker);
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_create_receipt_blocks_inventory_and_rollback_excludes_generation() {
+        let (tx, worker) = runner(Fake::default());
+        let receipt = create(&tx).await.unwrap().unwrap();
+        let mut pending = send(&tx, Action::Inspect(Inspection::Inventory), authority(true));
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            pending.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(receipt);
+        let inventory = pending.await.unwrap().unwrap();
+        let Value::Inspected(snapshot) = &inventory.value else {
+            panic!("inventory")
+        };
+        assert_eq!(
+            serde_json::json!(snapshot)["monitors"],
+            serde_json::json!([])
+        );
+        inventory.commit();
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspection_failure_retires_without_handles_or_respawn() {
+        let fake = Fake::default();
+        let fail = fake.fail_resolve.clone();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let monitor = committed_monitor(&tx).await;
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        for inspection in [
+            Inspection::Inventory,
+            status(&monitor.selector),
+            Inspection::Inventory,
+        ] {
+            let snapshot = inspected(&tx, inspection, authority(true)).await;
+            assert_eq!(
+                serde_json::json!(snapshot),
+                serde_json::json!({"broker_state":"retired", "monitors":[]})
+            );
+            let status = snapshot.status();
+            assert_eq!(status["lifecycle_status"], "retired");
+            assert_eq!(status["lifecycle_ready"], false);
+            assert_eq!(status["capture_ready"], false);
+            assert_eq!(status["ready"], false);
+            assert!(status["monitor"].is_null());
+        }
+        assert!(create(&tx).await.unwrap().is_err());
+        assert_eq!(&*log.lock().unwrap(), &["create", "close"]);
+        drop(tx);
+        assert!(worker.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_owner_and_generation_never_resolve_helper_or_fall_back() {
+        let fake = Fake::default();
+        let resolved = fake.resolved.clone();
+        let (tx, worker) = runner(fake);
+        let monitor = committed_monitor(&tx).await;
+        let other_owner = State::new();
+        let owner = monitor.selector.split(':').nth(1).unwrap();
+        for selector in [
+            other_owner.selector(monitor.display_id),
+            format!("macos_virtual:{owner}:{}", monitor.display_id + 1),
+        ] {
+            let status = inspected(&tx, status(&selector), authority(true))
+                .await
+                .status();
+            assert_eq!(status["broker_state"], "live");
+            assert_eq!(status["lifecycle_status"], "unknown");
+            assert_eq!(status["lifecycle_ready"], false);
+            assert!(status["monitor"].is_null());
+        }
+        for selector in [
+            monitor.display_id.to_string(),
+            format!("display_{}", monitor.display_id),
+            format!(" {}", monitor.selector),
+            monitor.selector.to_uppercase(),
+            format!("macos_virtual:{owner}:0{}", monitor.display_id),
+        ] {
+            assert!(!exact_selector(&selector));
+            assert!(
+                send(&tx, Action::Inspect(status(&selector)), authority(true))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        assert!(resolved.lock().unwrap().is_empty());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_closed_and_failed_brokers_return_no_recovery_handles() {
+        let broker = Broker::default();
+        let (tx, rx) = mpsc::channel(QUEUE_SIZE);
+        assert!(broker.sender.set(Ok(tx.clone())).is_ok());
+        let mut pending = Vec::new();
+        for _ in 0..QUEUE_SIZE {
+            pending.push(send(
+                &tx,
+                Action::Inspect(Inspection::Inventory),
+                authority(true),
+            ));
+        }
+        let snapshot = broker
+            .inspect(Inspection::Inventory, authority(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::json!(snapshot),
+            serde_json::json!({"broker_state":"unavailable", "monitors":[]})
+        );
+        assert_eq!(snapshot.status()["ready"], false);
+        drop(rx);
+        let snapshot = broker
+            .inspect(Inspection::Inventory, authority(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::json!(snapshot),
+            serde_json::json!({"broker_state":"retired", "monitors":[]})
+        );
+        let failed = Broker::default();
+        assert!(failed
+            .sender
+            .set(Err("private startup path".into()))
+            .is_ok());
+        assert_eq!(
+            serde_json::json!(failed
+                .inspect(Inspection::Inventory, authority(true))
+                .await
+                .unwrap()),
+            serde_json::json!({"broker_state":"retired", "monitors":[]})
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_rechecks_owner_grant_at_dequeue_and_after_resolve() {
+        let (started, starting) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let fake = Fake {
+            resolve_started: Some(started),
+            resolve_release: Some(released),
+            ..Default::default()
+        };
+        let resolved = fake.resolved.clone();
+        let (tx, worker) = runner(fake);
+        let receipt = create(&tx).await.unwrap().unwrap();
+        let Value::Created(monitor) = &receipt.value else {
+            panic!("create")
+        };
+        let selector = monitor.selector.clone();
+        let scoped = authority(false);
+        scoped.autonomy.write().await.user_display_granted = true;
+        let inventory = send(&tx, Action::Inspect(Inspection::Inventory), scoped.clone());
+        let queued = send(&tx, Action::Inspect(status(&selector)), scoped.clone());
+        scoped.autonomy.write().await.user_display_granted = false;
+        receipt.commit();
+        assert!(inventory.await.unwrap().is_err());
+        assert!(queued.await.unwrap().is_err());
+        assert!(resolved.lock().unwrap().is_empty());
+        scoped.autonomy.write().await.user_display_granted = true;
+        assert!(
+            send(&tx, Action::Inspect(Inspection::Inventory), scoped.clone())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let pending = send(&tx, Action::Inspect(status(&selector)), scoped.clone());
+        starting.await.unwrap();
+        scoped.autonomy.write().await.user_display_granted = false;
+        release.send(()).unwrap();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(
+            inspected(&tx, status(&selector), authority(true))
+                .await
+                .status()["lifecycle_ready"],
+            true
+        );
+        assert!(!scoped.autonomy.read().await.user_display_granted);
+        drop(tx);
+        worker.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -819,6 +1262,12 @@ mod tests {
         .unwrap();
         assert!(path.exists());
         drop(image);
+        let readiness = inspected(&tx, status(&monitor.selector), authority(true))
+            .await
+            .status();
+        assert_eq!(readiness["lifecycle_ready"], true);
+        assert_eq!(readiness["capture_ready"], false); // A prior screenshot is not current readiness.
+        assert_eq!(readiness["ready"], false);
         // The next actor response is a barrier after receipt rollback.
         let _ = committed_monitor(&tx).await;
         assert!(!path.exists());
@@ -894,6 +1343,11 @@ mod tests {
                 release.send(()).unwrap();
                 drop(result.await.unwrap().unwrap());
             }
+            assert_eq!(
+                serde_json::json!(inspected(&tx, Inspection::Inventory, authority(true)).await)
+                    ["monitors"],
+                serde_json::json!([])
+            );
             let next = committed_monitor(&tx).await;
             assert_eq!(next.display_id, DISPLAY_ID_MIN + 1);
             assert_eq!(next.helper_handle, 42);
@@ -971,6 +1425,10 @@ mod tests {
         let (tx, task) = runner(fake);
         drop(create(&tx).await.unwrap().unwrap()); // rollback fails
         assert!(create(&tx).await.unwrap().is_err());
+        assert_eq!(
+            serde_json::json!(inspected(&tx, Inspection::Inventory, authority(true)).await),
+            serde_json::json!({"broker_state":"retired", "monitors":[]})
+        );
         assert_eq!(&*log.lock().unwrap(), &["create", "destroy", "close"]);
         drop(tx);
         assert!(task.await.unwrap().is_err());

@@ -1289,7 +1289,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready."
+        description = "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready. Exact macos_virtual generations use non-starting lifecycle status only: capture stays unverified, input and streaming unsupported, and overall readiness false."
     )]
     pub(crate) async fn display_readiness(
         &self,
@@ -1305,6 +1305,18 @@ impl IntendantServer {
         Parameters(params): Parameters<DisplayReadinessParams>,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(selector) = params
+            .display_target
+            .as_deref()
+            .filter(|s| crate::macos_monitor::reserved(s))
+        {
+            if !crate::macos_monitor::exact_selector(selector) {
+                return Ok(text_tool_error(crate::macos_monitor::UNSUPPORTED));
+            }
+            return self
+                .macos_monitor_status(selector.to_string(), caller)
+                .await;
+        }
         let (session_registry, autonomy) = {
             let state = self.state.read().await;
             (state.session_registry.clone(), state.autonomy.clone())

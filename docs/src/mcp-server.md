@@ -370,6 +370,7 @@ claim instead.
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
+| `list_macos_monitors` | Owner-surface-only recovery inventory of committed macOS monitor generations (`inspect display monitors`), under `DisplayView` IAM. Never starts a helper or captures; a scoped user-display grant does not authorize enumeration. The legacy `list_displays` shape is unchanged. | — |
 | `create_virtual_display` | Create a daemon-owned virtual display (Xvfb) and activate it for capture and streaming; it announces as `display_ready` to every dashboard and federated peer and returns its id plus an opaque `capture_generation`. On Linux, each dashboard-created display has a fresh daemon-held Xauthority cookie and no X11 TCP listener; capture, input, and its bound browser authenticate explicitly. The display survives the calling session and dies with the daemon; closing its dashboard tile (or revoking its id) reaps it early. Linux hosts only today — other platforms report a clear error. | `width?`, `height?` |
 | `destroy_virtual_display` | Destroy exactly the daemon-owned virtual-display generation returned by `create_virtual_display`. Bound browser workspaces are retired before capture and Xvfb; a stale generation is refused without touching the live display. | `display_id`, `capture_generation`, `note?` |
 | `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
@@ -379,7 +380,7 @@ claim instead.
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
 | `read_screen`        | User session's frontmost-app accessibility tree — macOS AX, Linux AT-SPI, or Windows UIA. | `display_target?`, `format?`, `full_values?` |
-| `display_readiness`  | Probe display authority, capture/accessibility permission, target availability, and input backend live; names each missing layer. | `display_target?` |
+| `display_readiness`  | Probe display authority, capture/accessibility permission, target availability, and input backend live; names each missing layer. Exact `macos_virtual` selectors instead use non-starting lifecycle status with existing shared-session authority: capture stays unverified, input/streaming unsupported, and overall readiness false. | `display_target?` |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
 | `run_bounded_cu_task` | Run an owner-only synchronous, fixed-budget CU-only task on one exact daemon-owned virtual-display generation and attempt-leased local CDP workspace. `stage` permits native CU actions but exposes no function tools or escalation; `attest` supplies one internally captured frame and rejects every subsequent action. The compact receipt binds the exact resources, provider/model, timestamps, task/result hashes, transcript lineage, and action counters. | `mode`, `attempt_id`, `workspace_id`, `display_id`, `display_target`, `capture_generation`, `task`, attestation lineage fields? |
 | `list_frames`        | List captured video frames. | filter params |

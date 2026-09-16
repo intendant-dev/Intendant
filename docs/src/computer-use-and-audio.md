@@ -504,14 +504,33 @@ received. No timeout authorizes another helper or assumes cleanup succeeded.
 Retain both `display_id` and `capture_generation` from each successful create
 response for exact cleanup. `list_displays` keeps its existing shape and visibility;
 it does not recover broker handles or generation selectors (an OS inventory entry
-is not a lifecycle handle). There is no handle-recovery API in this slice. A lost
-committed handle can occupy capacity until this broker shuts down and closes its
-owned helper; do not adopt numeric/native IDs or reset other displays to recover it.
+is not a lifecycle handle). Owner surfaces can recover committed handles using
+`list_macos_monitors` (`inspect display monitors`), under `DisplayView` IAM.
+Scoped callers cannot enumerate this daemon-wide inventory even with a
+user-display grant. The non-starting read returns `not_started` and an empty
+inventory before any create, and queues behind pending receipts and cleanup.
+Live entries are verified against the exact helper-owned objects. Failure
+retires the broker through owned cleanup and removes all usable handles; a busy
+or timed-out inspection reports `unavailable`. Neither outcome permits respawn,
+ID adoption or bypassing cleanup.
 
 Reserved selectors, including malformed/case/whitespace variants, are refused
-by input, AX, readiness probes, shared views, browser placement and peer forwarding.
+by input, AX, shared views, browser placement and peer forwarding. Exact canonical
+selectors alone have a read-only `display_readiness` route: existing `DisplayView`
+and shared-session authority are required, and status uses only broker liveness
+and `Resolve`. It reports lifecycle verification separately from unverified
+capture and unsupported input/streaming; overall CU readiness remains false.
+Unknown/stale/foreign generations are distinct from a retired broker. Malformed
+selectors and raw-ID aliases remain refused, without a physical-display fallback.
 There is no automatic/default selection of these monitors, global input,
 clipboard isolation, streaming or browser-placement claim.
+
+#### Recovery/status validation
+
+The owner-only recovery and read-only status fixture passed on 2026-09-16.
+See `docs/design/macos-monitor-recovery.md` in the source tree for its contract
+and acceptance record. Readiness retains the common target/summary/layers
+shape; unprobed permissions remain unknown and input remains blocked.
 
 #### Opt-in controller smoke (supervisor only; not a default test)
 

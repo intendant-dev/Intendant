@@ -1064,6 +1064,9 @@ impl IntendantServer {
                 ))
             }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
+            "list_macos_monitors" => Ok(text_tool_result(
+                self.list_macos_monitors_as_caller(caller).await,
+            )),
             "create_virtual_display" => {
                 let Parameters(params) = parse_params::<CreateVirtualDisplayParams>(args)?;
                 if cfg!(target_os = "macos") {
@@ -1775,6 +1778,17 @@ fn shared_view_user_display_id(
 
 #[tool_router]
 impl IntendantServer {
+    #[tool(
+        description = "Inspect committed macOS monitor generation handles for recovery and exact cleanup. Owner surfaces only, even with a scoped user-display grant. Never starts a helper or captures pixels; list_displays remains unchanged.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn list_macos_monitors(&self) -> String {
+        // Only the generated stdio router uses this owner entry point. HTTP
+        // dispatch above always passes the gate-resolved ToolCallerTrust.
+        self.list_macos_monitors_as_caller(ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
     #[tool(
         description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens, and any compact lineage/fission ledger derived from the session log. The fission_ledger section carries each fission branch's charter, live status, import/detach markers, and any canonical-continuation claim."
     )]

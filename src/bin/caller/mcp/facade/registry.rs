@@ -590,6 +590,15 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Enumerate displays and their session state",
     },
     CommandSpec {
+        path: &["display", "monitors"],
+        lane: RiskLane::Inspect,
+        tool: "list_macos_monitors",
+        seed: "{}",
+        positionals: &[],
+        flags: &[],
+        help: "Owner-only recovery inventory of committed macOS monitor handles (never starts a helper)",
+    },
+    CommandSpec {
         path: &["display", "screenshot"],
         lane: RiskLane::Inspect,
         tool: "take_screenshot",
