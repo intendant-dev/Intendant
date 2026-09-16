@@ -81,6 +81,8 @@ pub(crate) use routes_codex_auth::*;
 mod routes_kimi_auth;
 pub(crate) use routes_kimi_auth::*;
 
+mod mcp_tasks;
+pub(crate) use mcp_tasks::*;
 mod mcp_gate;
 pub(crate) use mcp_gate::*;
 mod listener;
