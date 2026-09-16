@@ -210,6 +210,7 @@ pub(crate) fn tool_allowed_for_profile(
                     // which only travel well as MCP content blocks. The broad
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
+                    | "list_macos_monitors"
                     | "create_virtual_display"
                     | "destroy_virtual_display"
                     | "grant_user_display"
@@ -247,6 +248,7 @@ pub(crate) fn tool_allowed_for_profile(
                 name,
                 "get_status"
                     | "list_displays"
+                    | "list_macos_monitors"
                     | "list_browser_workspaces"
                     | "browser_workspace_providers"
                     | "create_browser_workspace"
@@ -444,6 +446,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // capability metadata (grant state, OS permission booleans), the
         // same audience and sensitivity as list_displays.
         "list_displays"
+        | "list_macos_monitors"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -903,6 +906,11 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         ),
     );
     push(
+        "list_macos_monitors",
+        serde_json::to_value(IntendantServer::list_macos_monitors_tool_attr())
+            .expect("tool definition"),
+    );
+    push(
         "create_virtual_display",
         manual_http_tool_definition!(
             "create_virtual_display",
@@ -970,11 +978,8 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     );
     push(
         "display_readiness",
-        manual_http_tool_definition!(
-            "display_readiness",
-            "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready.",
-            DisplayReadinessParams
-        ),
+        serde_json::to_value(IntendantServer::display_readiness_tool_attr())
+            .expect("tool definition"),
     );
     push(
         "execute_cu_actions",
@@ -1550,6 +1555,47 @@ mod tests {
             manual_description,
             attr.description.as_deref().unwrap_or_default(),
             "display_readiness manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn macos_inventory_is_typed_display_view_and_keeps_legacy_inventory_contract() {
+        assert_eq!(
+            mcp_tool_operation("list_macos_monitors"),
+            crate::peer::access_policy::PeerOperation::DisplayView
+        );
+        let mut definitions = Vec::new();
+        append_manual_http_tool_definitions(&mut definitions, false, Some("screen"));
+        let inventory = definitions
+            .iter()
+            .find(|tool| tool["name"] == "list_macos_monitors")
+            .unwrap();
+        assert_eq!(
+            *inventory,
+            serde_json::to_value(IntendantServer::list_macos_monitors_tool_attr()).unwrap()
+        );
+        assert_eq!(inventory["inputSchema"]["type"], "object");
+        let legacy = definitions
+            .iter()
+            .find(|tool| tool["name"] == "list_displays")
+            .unwrap();
+        assert_eq!(
+            legacy["description"],
+            "Enumerate available displays with their IDs, names, and resolutions."
+        );
+        assert_eq!(
+            legacy["description"],
+            IntendantServer::list_displays_tool_attr()
+                .description
+                .as_deref()
+                .unwrap()
+        );
+        // The legacy empty-object schema omits properties rather than emitting an empty map.
+        assert_eq!(legacy["inputSchema"]["type"], "object");
+        assert!(legacy["inputSchema"].get("properties").is_none());
+        assert_eq!(
+            mcp_tool_operation("list_displays"),
+            crate::peer::access_policy::PeerOperation::DisplayView
         );
     }
 

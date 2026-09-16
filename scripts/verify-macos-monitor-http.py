@@ -31,6 +31,7 @@ def main():
     parser.add_argument('--fixture', required=True)
     parser.add_argument('--report', required=True)
     parser.add_argument('--allow-shared-session-monitor', action='store_true')
+    parser.add_argument('--check-recovery', action='store_true', help='Verify owner monitor inventory and exact read-only status')
     args = parser.parse_args()
     if not args.allow_shared_session_monitor:
         parser.error('Native monitor hotplug requires explicit opt-in')
@@ -66,6 +67,21 @@ def main():
         try: parsed = json.loads(text)
         except json.JSONDecodeError: parsed = {'text': text}
         return result, parsed
+    def recover():
+        result, data = tool('list_macos_monitors', {})
+        assert not result.get('isError') and isinstance(data.get('monitors'), list), data
+        encoded = json.dumps(data)
+        assert all(key not in encoded for key in ('"native_id"', '"helper_handle"', '"pid"')), data
+        return data['monitors']
+    def readonly_status(monitor):
+        result, data = tool('display_readiness', {'display_target': monitor['display_target']})
+        assert not result.get('isError') and data.get('ready') is False, data
+        assert data.get('capture_ready') is False and data.get('input_supported') is False, data
+        assert data.get('streaming_supported') is False, data
+        assert data.get('target') == monitor['display_target'] and isinstance(data.get('summary'), str), data
+        assert len(data.get('layers', [])) == 5, data
+        assert not any(c.get('type') == 'image' for c in result.get('content', [])), data
+        return data
     def create():
         result, data = tool('create_virtual_display', {'width': 800, 'height': 600})
         assert data.get('ok') is True, data
@@ -103,7 +119,21 @@ def main():
             assert rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'native-monitor-fixture', 'version': '1'}}, False)[0] == 401
             report['checks']['http_auth_required'] = True
             assert rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'native-monitor-fixture', 'version': '1'}})[0] == 200
+            if args.check_recovery:
+                assert recover() == [], 'inventory before creation must be empty'
+                assert inventory() == report['before'], 'inspection changed native display inventory'
+                report['checks']['empty_inventory_before_create'] = True
             first = create(); report['created'] = first
+            if args.check_recovery:
+                listed = recover()
+                assert len(listed) == 1, listed
+                recovered = listed[0]
+                assert all(recovered[k] == first[k] for k in ('display_id', 'display_target', 'capture_generation')), listed
+                # A client discards the create handle; recovery is a new HTTP call.
+                first = recovered
+                active[:] = [recovered]
+                report['checks']['recovered_generation_handle'] = True
+                report['checks']['read_only_status_before_capture'] = readonly_status(first)
             current = inventory(); added = set(current['ids']) - set(report['before']['ids'])
             assert current['primary'] == report['before']['primary'] and len(added) == 1, current
             native_id = added.pop(); assert native_id != current['primary']
@@ -128,12 +158,17 @@ def main():
             report['checks']['capture_metadata'] = metadata
             assert Path(metadata['screenshot_path']).stat().st_mode & 0o777 == 0o600
             report['checks']['artifact_mode_0600'] = True
+            if args.check_recovery:
+                report['checks']['read_only_status_after_capture'] = readonly_status(first)
             for selector in [first['display_target'], ' MACOS_VIRTUAL:bad ', f"display_{first['display_id']}", str(first['display_id'])]:
                 denied, detail = tool('execute_cu_actions', {'display_target': selector, 'actions': [{'type':'wait','ms':0}]})
                 assert denied.get('isError') is True, (selector, detail)
             report['checks']['input_selectors_refused_without_input'] = True
             terminate(fixture); fixture = None
             destroy(first)
+            if args.check_recovery:
+                assert recover() == [], 'destroyed generation was still recoverable'
+                report['checks']['destroyed_generation_removed'] = True
             second = create()
             denied, detail = tool('take_screenshot', {'display_target': first['display_target']})
             assert denied.get('isError') is True, detail

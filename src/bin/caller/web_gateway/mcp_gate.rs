@@ -1681,6 +1681,105 @@ pub(crate) fn mcp_agent_session_context(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn macos_monitor_reads_require_live_display_view_before_dispatch() {
+        use crate::access::iam::{self, AccessPrincipal};
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let owner = AccessPrincipal::root_dashboard_session("test", "http");
+        let mut iam_state = iam::LocalIamState::default();
+        iam::upsert_user_client_grant(
+            &mut iam_state,
+            iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".into(),
+                session_id: Some("monitor-denied".into()),
+                role_id: Some("role:session-reader".into()),
+                ..Default::default()
+            },
+            &owner,
+        )
+        .unwrap();
+        let denied =
+            iam::principal_for_agent_session(&iam_state, "monitor-denied", "http").unwrap();
+        let selector = format!(
+            "macos_virtual:{}:{}",
+            "a".repeat(32),
+            crate::macos_monitor::DISPLAY_ID_MIN
+        );
+        for principal in [
+            owner,
+            AccessPrincipal::supervised_agent_session_default("monitor-scoped", "http", true),
+            denied,
+        ] {
+            let access = HttpAccessContext {
+                principal,
+                iam_state: Some(std::sync::Arc::new(iam_state.clone())),
+                peer_filesystem: None,
+            };
+            let allowed = access
+                .decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed;
+            let owner = crate::mcp::ToolCallerTrust::from_principal(&access.principal)
+                == crate::mcp::ToolCallerTrust::OwnerSurface;
+            assert_eq!(allowed, access.principal.role_id != "role:session-reader");
+            for granted in [false, true] {
+                autonomy.write().await.user_display_granted = granted;
+                for (tool, args, inventory) in [
+                    ("list_macos_monitors", serde_json::json!({}), true),
+                    (
+                        "inspect",
+                        serde_json::json!({"argv":["display","monitors"]}),
+                        true,
+                    ),
+                    (
+                        "display_readiness",
+                        serde_json::json!({"display_target":selector}),
+                        false,
+                    ),
+                    (
+                        "inspect",
+                        serde_json::json!({"argv":["display","status","--target",selector]}),
+                        false,
+                    ),
+                ] {
+                    let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":tool,"arguments":args}}).to_string();
+                    let outcome = handle_mcp_http_request(
+                        &request, &server, None, None, None, &access, None, &bus,
+                    )
+                    .await;
+                    let McpHttpOutcome::Response(response) = outcome else {
+                        panic!("tool response")
+                    };
+                    let result = response.result.unwrap();
+                    let text = result["content"][0]["text"].as_str().unwrap();
+                    if !allowed {
+                        assert_eq!(result["isError"], true);
+                        assert!(text.contains("display.view"), "{text}");
+                    } else if !owner && (inventory || !granted) {
+                        assert!(
+                            text.contains(if inventory {
+                                "requires an owner surface"
+                            } else {
+                                "existing explicit user-display grant"
+                            }),
+                            "{text}"
+                        );
+                    } else {
+                        let snapshot: serde_json::Value = serde_json::from_str(text).unwrap();
+                        assert_eq!(snapshot["broker_state"], "not_started");
+                    }
+                    assert!(bus.macos_monitors.not_started());
+                    assert_eq!(autonomy.read().await.user_display_granted, granted);
+                }
+            }
+        }
+        assert!(events.try_recv().is_err());
+    }
+
     /// SSE-plan fixtures arrive pre-parsed, the way the production
     /// path hands them over (one decode, shared with dispatch).
     fn parse_req(value: serde_json::Value) -> McpHttpRequest {

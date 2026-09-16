@@ -2532,6 +2532,18 @@ mod tests {
         assert_eq!(planned.tool, "memory_read");
         let planned = plan_for_meta("inspect", &argv(&["display", "ready"])).unwrap();
         assert_eq!(planned.tool, "display_readiness");
+        let monitors = argv(&["display", "monitors"]);
+        let planned = plan_for_meta("inspect", &monitors).unwrap();
+        assert_eq!(planned.tool, "list_macos_monitors");
+        assert_eq!(planned.args, serde_json::json!({}));
+        assert_eq!(
+            facade_gate_operation("inspect", &monitors),
+            Some(crate::peer::access_policy::PeerOperation::DisplayView)
+        );
+        assert!(plan_for_meta("act", &monitors).is_err());
+        let legacy = plan_for_meta("inspect", &argv(&["display", "list"])).unwrap();
+        assert_eq!(legacy.tool, "list_displays");
+        assert_eq!(legacy.args, serde_json::json!({}));
         let planned = plan_for_meta("inspect", &argv(&["cu", "screenshot"])).unwrap();
         assert_eq!(planned.tool, "take_screenshot");
         let planned = plan_for_meta("authorize", &argv(&["shared", "request-input"])).unwrap();

@@ -1,11 +1,51 @@
 //! MCP binding for the bounded, read-only macOS monitor lane. Ingress keeps
 //! the original IAM operations (DisplayInput for lifecycle, DisplayView for
-//! screenshot); shared WindowServer authority is an additional gate here.
+//! reads); shared WindowServer authority is an additional gate here, with
+//! daemon-wide recovery inventory restricted further to owner surfaces.
 
 use super::*;
-use crate::macos_monitor::{Action, Authority, Value};
+use crate::macos_monitor::{Action, Authority, Inspection, Value};
 
 impl IntendantServer {
+    pub(super) async fn list_macos_monitors_as_caller(&self, caller: ToolCallerTrust) -> String {
+        let authority = self.macos_monitor_authority(caller).await;
+        match self
+            .bus
+            .macos_monitors
+            .inspect(Inspection::Inventory, authority)
+            .await
+        {
+            Ok(snapshot) => serde_json::json!(snapshot).to_string(),
+            Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+        }
+    }
+
+    pub(super) async fn macos_monitor_status(
+        &self,
+        selector: String,
+        caller: ToolCallerTrust,
+    ) -> Result<CallToolResult, McpError> {
+        let authority = self.macos_monitor_authority(caller).await;
+        Ok(
+            match self
+                .bus
+                .macos_monitors
+                .inspect(
+                    Inspection::Status {
+                        selector: selector.clone(),
+                    },
+                    authority,
+                )
+                .await
+            {
+                Ok(snapshot) => {
+                    text_tool_result(readiness_metadata(&snapshot, &selector).to_string())
+                }
+                Err(error) => text_tool_error(error),
+            },
+        )
+    }
+
     async fn macos_monitor_authority(&self, caller: ToolCallerTrust) -> Authority {
         Authority {
             owner_surface: caller == ToolCallerTrust::OwnerSurface,
@@ -41,21 +81,10 @@ impl IntendantServer {
             return serde_json::json!({"ok": false, "error": "unexpected monitor result"})
                 .to_string();
         };
-        let response = serde_json::json!({
-            "ok": true,
-            "display_id": monitor.display_id,
-            "display_target": monitor.selector,
-            "capture_generation": monitor.selector,
-            "width": monitor.width, "height": monitor.height,
-            "backend": "macos_virtual",
-            "lifecycle_ready": true,
-            "capture_ready": false,
-            "capture_status": "unverified; take_screenshot validates an exact first frame and Screen Recording permission",
-            "input_supported": false, "streaming_supported": false,
-            "cursor_overlay": false,
-            "isolation": "shared_windowserver",
-            "note": "Shares the user's login session; hotplug/removal may rearrange windows. Retain display_id and capture_generation for cleanup: list_displays cannot recover these broker handles. Local response construction does not acknowledge transport delivery."
-        }).to_string();
+        let mut response = serde_json::json!(monitor.description());
+        response["ok"] = true.into();
+        response["note"] = "Shares the user's login session; hotplug/removal may rearrange windows. Retain display_id and capture_generation for cleanup; owner surfaces can recover committed handles with list_macos_monitors. Local response construction does not acknowledge transport delivery.".into();
+        let response = response.to_string();
         receipt.commit(); // no await between commit and returning the response
         response
     }
@@ -132,19 +161,84 @@ impl IntendantServer {
     }
 }
 
+/// Keep the common display_readiness envelope, without probing unrelated
+/// native permissions or treating lifecycle metadata as capture/input readiness.
+fn readiness_metadata(
+    snapshot: &crate::macos_monitor::Snapshot,
+    selector: &str,
+) -> serde_json::Value {
+    use crate::cu_readiness::{
+        CuReadiness, LayerStatus, ReadinessLayer, LAYER_ACCESSIBILITY, LAYER_AUTHORITY,
+        LAYER_CAPTURE, LAYER_DISPLAY, LAYER_INPUT,
+    };
+    let mut metadata = snapshot.status();
+    let verified = metadata["lifecycle_ready"] == true;
+    let broker = metadata["broker_state"].as_str().unwrap_or("unavailable");
+    let readiness = CuReadiness {
+        target: selector.to_string(),
+        ready: false,
+        summary: format!(
+            "Read-only macOS monitor: lifecycle {}; broker {broker}; capture unverified; input and streaming unavailable",
+            if verified { "verified" } else { "not verified" },
+        ),
+        layers: vec![
+            ReadinessLayer {
+                layer: LAYER_AUTHORITY, status: LayerStatus::Ready,
+                detail: "Existing shared-session display authority was checked for this request".into(),
+                fix: None,
+            },
+            ReadinessLayer {
+                layer: LAYER_CAPTURE, status: LayerStatus::Unknown,
+                detail: "Inspection does not probe Screen Recording permission or capture a frame".into(),
+                fix: Some("Use take_screenshot with this exact generation to validate read-only capture".into()),
+            },
+            ReadinessLayer {
+                layer: LAYER_ACCESSIBILITY, status: LayerStatus::Unknown,
+                detail: "Accessibility permission was not probed; AX is unsupported for owned monitor selectors".into(),
+                fix: None,
+            },
+            ReadinessLayer {
+                layer: LAYER_DISPLAY,
+                status: if verified { LayerStatus::Ready } else { LayerStatus::Unknown },
+                detail: if verified {
+                    "Exact generation resolved to its retained helper object; this is not capture readiness".into()
+                } else {
+                    format!("No verified owned generation in broker state {broker}; no display fallback was attempted")
+                },
+                fix: None,
+            },
+            ReadinessLayer {
+                layer: LAYER_INPUT, status: LayerStatus::Blocked,
+                detail: "Input is unsupported for this read-only monitor lane".into(),
+                fix: Some("Do not substitute raw/native IDs or fall back to the user's primary display".into()),
+            },
+        ],
+    };
+    metadata.as_object_mut().expect("capability object").extend(
+        serde_json::json!(readiness)
+            .as_object()
+            .expect("readiness object")
+            .clone(),
+    );
+    metadata
+}
+
 fn screenshot_response(
     screenshot: &crate::macos_monitor::Screenshot,
     selector: &str,
     compact: bool,
 ) -> CallToolResult {
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!(crate::macos_monitor::Capabilities::new(true, true));
+    let fields = serde_json::json!({
         "status": "screenshot captured", "screenshot_path": screenshot.path,
         "width": screenshot.width, "height": screenshot.height,
         "captured_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "display_target": selector, "capture_generation": selector,
-        "capture_ready": true, "input_supported": false, "streaming_supported": false,
-        "cursor_overlay": false, "isolation": "shared_windowserver",
     });
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
     if compact {
         compact_image_tool_result(metadata, "image/png")
     } else {
@@ -159,6 +253,129 @@ fn screenshot_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn macos_monitor_readiness_retains_common_envelope_without_probes() {
+        let broker = crate::macos_monitor::Broker::default();
+        let selector = format!(
+            "macos_virtual:{}:{}",
+            "a".repeat(32),
+            crate::macos_monitor::DISPLAY_ID_MIN
+        );
+        let authority = Authority {
+            owner_surface: true,
+            autonomy: std::sync::Arc::new(tokio::sync::RwLock::new(Default::default())),
+        };
+        let snapshot = broker
+            .inspect(
+                Inspection::Status {
+                    selector: selector.clone(),
+                },
+                authority,
+            )
+            .await
+            .unwrap();
+        let metadata = readiness_metadata(&snapshot, &selector);
+        assert_eq!(metadata["target"], selector);
+        assert_eq!(metadata["ready"], false);
+        assert_eq!(metadata["capture_ready"], false);
+        assert_eq!(metadata["lifecycle_ready"], false);
+        assert!(metadata["summary"].is_string());
+        let layers = metadata["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 5);
+        assert_eq!(layers[1]["status"], "unknown");
+        assert_eq!(layers[4]["status"], "blocked");
+        assert!(broker.not_started());
+    }
+
+    #[tokio::test]
+    async fn inventory_and_status_dispatch_preserve_caller_trust_without_starting_broker() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = super::super::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (_home, server) = super::super::tests::test_server(state, bus.clone());
+        let selector = format!(
+            "macos_virtual:{}:{}",
+            "a".repeat(32),
+            crate::macos_monitor::DISPLAY_ID_MIN
+        );
+        for granted in [false, true] {
+            autonomy.write().await.user_display_granted = granted;
+            for trust in [ToolCallerTrust::OwnerSurface, ToolCallerTrust::Scoped] {
+                for (tool, args) in [
+                    ("list_macos_monitors", serde_json::json!({})),
+                    (
+                        "inspect",
+                        serde_json::json!({"argv":["display", "monitors"]}),
+                    ),
+                    (
+                        "display_readiness",
+                        serde_json::json!({"display_target":selector}),
+                    ),
+                    (
+                        "inspect",
+                        serde_json::json!({"argv":["display", "status", "--target", selector]}),
+                    ),
+                ] {
+                    let result = server
+                        .call_tool_by_name_as_caller(
+                            tool,
+                            args.clone(),
+                            None,
+                            None,
+                            ToolCaller {
+                                trust,
+                                actor: crate::access::actor::ActorBinding::unattributed(),
+                                fs_scope: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let result = serde_json::to_value(result).unwrap();
+                    let text = result["content"][0]["text"].as_str().unwrap();
+                    let inventory = tool == "list_macos_monitors" || args["argv"][1] == "monitors";
+                    if trust == ToolCallerTrust::Scoped && (inventory || !granted) {
+                        assert!(
+                            text.contains(if inventory {
+                                "requires an owner surface"
+                            } else {
+                                "existing explicit user-display grant"
+                            }),
+                            "{text}"
+                        );
+                    } else {
+                        let data: serde_json::Value = serde_json::from_str(text).unwrap();
+                        assert_eq!(data["broker_state"], "not_started");
+                        if inventory {
+                            assert_eq!(data["monitors"], serde_json::json!([]));
+                        } else {
+                            assert_eq!(data["lifecycle_status"], "unknown");
+                            for field in [
+                                "ready",
+                                "lifecycle_ready",
+                                "capture_ready",
+                                "input_supported",
+                                "streaming_supported",
+                            ] {
+                                assert_eq!(data[field], false, "{field}");
+                            }
+                        }
+                    }
+                    assert!(bus.macos_monitors.not_started());
+                    assert_eq!(autonomy.read().await.user_display_granted, granted);
+                }
+            }
+        }
+        // The direct owner entry point uses the same non-starting path.
+        let inventory: serde_json::Value =
+            serde_json::from_str(&server.list_macos_monitors().await).unwrap();
+        assert_eq!(inventory["monitors"], serde_json::json!([]));
+        assert!(bus.macos_monitors.not_started());
+        assert!(events.try_recv().is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[tokio::test]
     async fn macos_monitor_raw_ids_fail_before_native_cu_ax_readiness_or_streaming() {
