@@ -573,9 +573,13 @@ Tasks are polled with POST. An authenticated `DELETE /mcp` carrying the session
 ID also requires the current `remote_command` permission before it terminates
 that Tasks session and waits for its real remote-command cleanup. A role
 reduction, expiry or revocation refuses DELETE with 403 without cancelling jobs.
-Read-only callers can initialize normally, but receive no Tasks capability or
-session allocation. Trusted expiry/shutdown cleanup remains independent of a
-caller's current permissions.
+Session-bound POST requests also require the current `remote_command`
+permission before session lookup or activity refresh. Permission loss returns
+403 even for notifications, so denied requests cannot keep the session's idle
+TTL or its capacity reservation alive. Read-only callers can initialize again
+without `Mcp-Session-Id` and use their permitted stateless tools, but receive no
+Tasks capability or session allocation. Trusted expiry/shutdown cleanup remains
+independent of a caller's current permissions.
 Stateless DELETE requests retain their legacy 405 response. Tasks initialization
 requires a string or integer JSON-RPC request ID and no `Mcp-Session-Id` header;
 duplicate or malformed session headers are refused before touching session state.

@@ -1108,11 +1108,29 @@ pub(crate) async fn handle_mcp_post(
                         &mcp_access,
                         gate_session.as_deref(),
                     ) {
-                        Some(session) => {
+                        Ok(Some(session)) => {
                             response_task_session_id = Some(session.id().to_string());
                             Some(session)
                         }
-                        None => {
+                        Err(message) => {
+                            let response = HttpResponse::with_content(
+                                "403 Forbidden",
+                                "application/json",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0", "id": request.id,
+                                    "error": { "code": -32603, "message": message },
+                                })
+                                .to_string(),
+                            )
+                            .header_segment(&mcp_cors)
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                        Ok(None) => {
                             let response = HttpResponse::with_content(
                                 "404 Not Found",
                                 "application/json",
@@ -2278,7 +2296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tasks_recheck_live_iam_on_allocation_delete_and_job_controls() {
+    async fn http_tasks_recheck_live_iam_on_allocation_resolution_delete_and_job_controls() {
         use crate::access::iam;
         let home = tempfile::tempdir().unwrap();
         let mut state = iam::LocalIamState::default();
@@ -2370,9 +2388,19 @@ mod tests {
                     .await
                     .is_err()
             );
-            // The owner still resolves. Its creation-time root role supplies
-            // no authority, even when a request names an existing session.
-            assert!(resolve_http_task_session(session.id(), &current, Some("creator")).is_some());
+            // Matching ownership is not enough to renew a Tasks session.
+            // The original authorized snapshot still proves DELETE did not
+            // remove it; fresh denied requests fail before activity refresh.
+            let Err(error) = resolve_http_task_session(session.id(), &current, Some("creator"))
+            else {
+                panic!("denied session resolution must fail");
+            };
+            assert!(error.contains("Permission denied"), "{denial}: {error}");
+            assert!(
+                resolve_http_task_session(session.id(), &original, Some("creator"))
+                    .unwrap()
+                    .is_some()
+            );
             for method in ["tasks/get", "tasks/update", "tasks/cancel", "tools/call"] {
                 let params = if method == "tools/call" {
                     serde_json::json!({"name": "remote_command", "arguments": {

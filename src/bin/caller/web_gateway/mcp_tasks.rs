@@ -193,8 +193,8 @@ fn http_task_sessions() -> &'static Mutex<HttpTaskRegistry> {
     })
 }
 
-/// The current request's IAM snapshot is authoritative even for protocol
-/// allocation and session deletion: both consume/control remote-task resources.
+/// The current request's IAM snapshot governs protocol allocation, activity
+/// refresh and session deletion: each consumes/controls remote-task resources.
 pub(crate) fn authorize_http_tasks(access: &HttpAccessContext) -> Result<(), String> {
     let decision = access.decision(crate::mcp::mcp_tool_operation("remote_command"));
     if decision.allowed {
@@ -223,12 +223,16 @@ pub(crate) fn resolve_http_task_session(
     id: &str,
     access: &HttpAccessContext,
     gate_session: Option<&str>,
-) -> Option<HttpTaskSession> {
+) -> Result<Option<HttpTaskSession>, String> {
+    // Ownership deliberately excludes the live role/status. Check authority
+    // before touching the registry: even a notification would otherwise renew
+    // last_seen and let a revoked owner retain globally bounded capacity.
+    authorize_http_tasks(access)?;
     let owner = HttpTaskOwner::from_access(access, gate_session);
-    http_task_sessions()
+    Ok(http_task_sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .resolve(id, &owner, Instant::now())
+        .resolve(id, &owner, Instant::now()))
 }
 
 pub(crate) async fn close_http_task_session(
@@ -293,6 +297,65 @@ mod tests {
         let second = registry.create(owner, later).unwrap();
         assert_ne!(first.id(), second.id());
         second.tasks().request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn denied_resolution_cannot_refresh_session_activity() {
+        let root = access("principal:activity-test");
+        let session = create_http_task_session(&root, None).unwrap();
+        let previous = Instant::now() - Duration::from_secs(1);
+        http_task_sessions()
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(session.id())
+            .unwrap()
+            .last_seen = previous;
+        assert!(resolve_http_task_session(session.id(), &root, None)
+            .unwrap()
+            .is_some());
+        let refreshed = http_task_sessions()
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session.id())
+            .unwrap()
+            .last_seen;
+        assert!(refreshed > previous);
+
+        let mut denied = root.clone();
+        denied.principal.role_id = "role:observer".into();
+        for _ in 0..3 {
+            assert!(resolve_http_task_session(session.id(), &denied, None).is_err());
+            assert_eq!(
+                http_task_sessions()
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(session.id())
+                    .unwrap()
+                    .last_seen,
+                refreshed
+            );
+        }
+        let foreign = access("principal:activity-foreign");
+        assert!(resolve_http_task_session(session.id(), &foreign, None)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            http_task_sessions()
+                .lock()
+                .unwrap()
+                .sessions
+                .get(session.id())
+                .unwrap()
+                .last_seen,
+            refreshed
+        );
+        assert!(!session.tasks().shutdown_complete());
+        assert!(close_http_task_session(session.id(), &root, None)
+            .await
+            .unwrap());
     }
 
     #[test]
