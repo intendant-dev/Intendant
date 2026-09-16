@@ -239,6 +239,209 @@ pub fn main_display_pixel_size() -> Option<(u32, u32)> {
     None
 }
 
+// Experimental CGVirtualDisplay FFI lives in the platform unsafe-code island.
+#[cfg(target_os = "macos")]
+mod cgvirtual_native {
+    use crate::cgvirtual::{probe_abi, Dimensions, Error, NativeObject};
+    use std::ffi::{c_char, c_void, CString};
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    extern "C" {
+        fn intendant_cgvirtual_method(
+            class: *const c_char,
+            selector: *const c_char,
+            class_method: i32,
+            output: *mut c_char,
+            capacity: usize,
+        ) -> i32;
+        fn intendant_cgvirtual_create(
+            width: u32,
+            height: u32,
+            serial: u32,
+            owner: *mut *mut c_void,
+            display_id: *mut u32,
+        ) -> i32;
+        fn intendant_cgvirtual_destroy(owner: *mut c_void) -> i32;
+    }
+
+    static UNCERTAIN: AtomicBool = AtomicBool::new(false);
+    static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
+
+    pub(crate) struct NativeCGVirtualDisplay {
+        owner: Option<NonNull<c_void>>,
+        id: u32,
+    }
+
+    impl NativeCGVirtualDisplay {
+        pub(crate) fn probe() -> Result<(), Error> {
+            // SAFETY: pthread_main_np is a parameterless thread-identity query.
+            if unsafe { libc::pthread_main_np() } == 0 {
+                return Err(Error::MainThreadRequired);
+            }
+            if UNCERTAIN.load(Ordering::Acquire) {
+                return Err(Error::TeardownUnconfirmed);
+            }
+            probe_abi(|method| {
+                let class = CString::new(method.class).expect("static class name");
+                let selector = CString::new(method.selector).expect("static selector");
+                let mut output = [0_u8; 256];
+                // SAFETY: static names are valid C strings; output is writable
+                // for capacity bytes. The bridge only copies runtime metadata,
+                // catches ObjC exceptions and never allocates a native monitor.
+                let status = unsafe {
+                    intendant_cgvirtual_method(
+                        class.as_ptr(),
+                        selector.as_ptr(),
+                        i32::from(method.class_method),
+                        output.as_mut_ptr().cast(),
+                        output.len(),
+                    )
+                };
+                if status != 0 {
+                    return Err(Error::UnavailableAbi(format!(
+                        "{} {} (probe status {status})",
+                        method.class, method.selector
+                    )));
+                }
+                let len = output
+                    .iter()
+                    .position(|b| *b == 0)
+                    .ok_or_else(|| Error::UnavailableAbi("unterminated encoding".into()))?;
+                String::from_utf8(output[..len].to_vec())
+                    .map_err(|_| Error::UnavailableAbi("non-UTF8 encoding".into()))
+            })
+        }
+
+        pub(crate) fn create(dimensions: Dimensions) -> Result<Self, Error> {
+            // Re-probe immediately before effects, not merely at owner open.
+            Self::probe()?;
+            let serial = NEXT_SERIAL
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| Error::GenerationExhausted)?;
+            let mut owner = std::ptr::null_mut();
+            let mut id = 0;
+            // SAFETY: probe verified every private message's ABI. The bridge
+            // owns ARC locals, contains exceptions, and writes valid out-values.
+            // Any transferred +1 owner, including on failure, is consumed below.
+            let status = unsafe {
+                intendant_cgvirtual_create(
+                    dimensions.width,
+                    dimensions.height,
+                    serial,
+                    &mut owner,
+                    &mut id,
+                )
+            };
+            let mut object = Self {
+                owner: NonNull::new(owner),
+                id,
+            };
+            if status != 0 || object.owner.is_none() {
+                if status == 4 {
+                    // An initializer may throw before handing its object back.
+                    // Releasing our graph cannot prove that partial OS work died.
+                    UNCERTAIN.store(true, Ordering::Release);
+                }
+                object.shutdown()?;
+                return Err(Error::NativeFailure(match status {
+                    1 => "descriptor/settings/mode allocation",
+                    2 => "display initialization",
+                    3 => "applySettings refused",
+                    4 => "Objective-C exception",
+                    5 => "monitor did not become online at the requested size within two seconds",
+                    _ => "missing native owner",
+                }));
+            }
+            Ok(object)
+        }
+    }
+
+    impl NativeObject for NativeCGVirtualDisplay {
+        fn native_id(&self) -> u32 {
+            self.id
+        }
+
+        fn shutdown(&mut self) -> Result<(), Error> {
+            let Some(owner) = self.owner.take() else {
+                return Ok(());
+            };
+            // SAFETY: exactly one +1 bridge owner is consumed, on its original
+            // main thread (!Send/!Sync owner). No destruction by numeric ID.
+            // The bridge releases that object's graph and contains exceptions.
+            if unsafe { intendant_cgvirtual_destroy(owner.as_ptr()) } != 0 {
+                UNCERTAIN.store(true, Ordering::Release);
+                return Err(Error::TeardownUnconfirmed);
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for NativeCGVirtualDisplay {
+        fn drop(&mut self) {
+            let _ = self.shutdown();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn metadata_bridge_is_bounded_and_reports_absent_abi() {
+            // Only public NSObject metadata: no CGVirtualDisplay probe,
+            // allocation, GUI calls, TCC calls, environment or file accesses.
+            let class = CString::new("NSObject").unwrap();
+            let init = CString::new("init").unwrap();
+            let missing = CString::new("IntendantHermeticMissingClassOrSelector").unwrap();
+            let mut bytes = [0_u8; 64];
+            let mut lookup = |class: &CString, selector: &CString, capacity| {
+                // SAFETY: valid NUL-terminated names and bounded writable buffer.
+                unsafe {
+                    intendant_cgvirtual_method(
+                        class.as_ptr(),
+                        selector.as_ptr(),
+                        0,
+                        bytes.as_mut_ptr().cast(),
+                        capacity,
+                    )
+                }
+            };
+            assert_eq!(lookup(&missing, &init, 64), 1);
+            assert_eq!(lookup(&class, &missing, 64), 2);
+            assert_eq!(lookup(&class, &init, 1), 3);
+            assert_eq!(lookup(&class, &init, 64), 0);
+            assert_eq!(&bytes[..6], b"@|@|:\0");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use cgvirtual_native::NativeCGVirtualDisplay;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeCGVirtualDisplay;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeCGVirtualDisplay {
+    pub(crate) fn probe() -> Result<(), crate::cgvirtual::Error> {
+        Err(crate::cgvirtual::Error::UnsupportedPlatform)
+    }
+    pub(crate) fn create(_: crate::cgvirtual::Dimensions) -> Result<Self, crate::cgvirtual::Error> {
+        Err(crate::cgvirtual::Error::UnsupportedPlatform)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl crate::cgvirtual::NativeObject for NativeCGVirtualDisplay {
+    fn native_id(&self) -> u32 {
+        0
+    }
+    fn shutdown(&mut self) -> Result<(), crate::cgvirtual::Error> {
+        Err(crate::cgvirtual::Error::UnsupportedPlatform)
+    }
+}
+
 /// Probe for the Vortex Audio POSIX shared-memory segment.
 #[cfg(unix)]
 pub fn vortex_audio_shm_available() -> bool {
