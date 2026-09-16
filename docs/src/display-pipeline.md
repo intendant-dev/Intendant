@@ -50,7 +50,10 @@ Two kinds of displays go through the same lifecycle:
 
 - **Virtual displays** — on Linux, Xvfb displays (`:99`, `:100`, …) launched
   lazily when the agent first runs a graphical command. There is no Xvfb
-  analogue on macOS or Windows.
+  isolated X server analogue on macOS or Windows. The platform crate has an
+  [experimental macOS monitor lifecycle primitive](./computer-use-and-audio.md#experimental-macos-monitor-lifecycle-platform-primitive-only),
+  but it is not connected to this pipeline and shares the user's WindowServer
+  session; it is not a security sandbox.
 - **User-session displays** — the user's real desktop (`:0` on Linux, the native
   display on macOS/Windows), opt-in via the `DisplayControl` autonomy category.
 
@@ -587,8 +590,9 @@ Rates are computed over the elapsed window and counters reset on read.
 - **`rtc` 0.20 doesn't surface TWCC or populate RR stats**, hence the interceptor
   tap and the `bytes_sent`-delta bitrate estimate; per-RID RR-driven layer policy
   is inert on this stack.
-- **No virtual-display equivalent on macOS or Windows** — capture targets the real
-  session only. macOS can expose a single real native window as a capture target,
+- **No integrated virtual-display backend on macOS or Windows** — capture targets the real
+  session only. The experimental CGVirtualDisplay lifecycle primitive is unwired;
+  it adds no capture/input capability or isolation. macOS can expose a single real native window as a capture target,
   but that window still belongs to the user's logged-in desktop session.
 
 ## See Also
