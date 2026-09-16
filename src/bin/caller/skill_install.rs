@@ -485,6 +485,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dogfood_upgrade_sweeps_daemon_installed_copies_only() {
+        let home = tempfile::tempdir().unwrap();
+        for root in [".agents", ".claude"] {
+            let skill = home.path().join(root).join("skills/intendant-dogfood");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "obsolete builtin instructions").unwrap();
+            std::fs::write(skill.join(INSTALL_MARKER), BUILTIN_MARKER_CONTENT).unwrap();
+        }
+        let report = install_global_skills_in(home.path(), &[], &BTreeSet::new());
+        for root in [".agents", ".claude"] {
+            assert!(!home
+                .path()
+                .join(root)
+                .join("skills/intendant-dogfood")
+                .exists());
+            assert!(installed_report(
+                &report,
+                if root == ".agents" {
+                    "~/.agents/skills"
+                } else {
+                    "~/.claude/skills"
+                }
+            )
+            .removed_stale
+            .contains(&"intendant-dogfood".to_string()));
+        }
+        // A user's unmarked copy must never be deleted, even under a retired name.
+        let personal = home.path().join(".agents/skills/intendant-dogfood");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(personal.join("SKILL.md"), "user-owned instructions").unwrap();
+        install_global_skills_in(home.path(), &[], &BTreeSet::new());
+        assert_eq!(
+            std::fs::read_to_string(personal.join("SKILL.md")).unwrap(),
+            "user-owned instructions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dogfood_upgrade_preserves_user_owned_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("developer-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "developer instructions").unwrap();
+        // Even a marker behind a symlink must not turn its target into daemon property.
+        std::fs::write(source.join(INSTALL_MARKER), BUILTIN_MARKER_CONTENT).unwrap();
+        let root = home.path().join(".agents/skills");
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("intendant-dogfood");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        install_global_skills_in(home.path(), &[], &BTreeSet::new());
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(link.join("SKILL.md")).unwrap(),
+            "developer instructions"
+        );
+    }
+
+    #[test]
     fn global_install_is_complete_idempotent_and_ownership_safe() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();

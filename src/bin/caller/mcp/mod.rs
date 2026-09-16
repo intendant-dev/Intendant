@@ -134,6 +134,9 @@ pub struct IntendantServer {
     /// actions through `ControlMsg` so the session supervisor remains the
     /// single writer and resolves the exact session-owned registry.
     http_control_plane_facade: bool,
+    /// Restart-only developer opt-in, captured at the transport edge. Neither
+    /// IAM root authority nor a request field can enable dogfooding.
+    dev_dogfood_enabled: bool,
     /// The home dir persisted-session lookups resolve against. Resolved
     /// once at construction (the MCP transport edge); tests inject a temp
     /// home via [`IntendantServer::new_with_home`] so fixtures never read
@@ -145,6 +148,7 @@ pub struct IntendantServer {
 impl IntendantServer {
     pub fn new(state: SharedMcpState, bus: EventBus) -> Self {
         Self::new_with_home(state, bus, crate::platform::home_dir())
+            .with_dev_dogfood_enabled(tools_feedback::developer_opt_in_from_env())
     }
 
     pub fn new_with_home(state: SharedMcpState, bus: EventBus, home: std::path::PathBuf) -> Self {
@@ -152,6 +156,7 @@ impl IntendantServer {
             state,
             bus,
             http_control_plane_facade: false,
+            dev_dogfood_enabled: false,
             home,
             tool_router: Self::tool_router(),
         }
@@ -159,6 +164,12 @@ impl IntendantServer {
 
     pub fn new_http(state: SharedMcpState, bus: EventBus) -> Self {
         Self::new_http_with_home(state, bus, crate::platform::home_dir())
+            .with_dev_dogfood_enabled(tools_feedback::developer_opt_in_from_env())
+    }
+
+    fn with_dev_dogfood_enabled(mut self, enabled: bool) -> Self {
+        self.dev_dogfood_enabled = enabled;
+        self
     }
 
     pub(crate) fn new_http_with_home(
@@ -557,6 +568,10 @@ impl IntendantServer {
             .cloned()
             .collect();
         append_manual_http_tool_definitions(&mut tools, managed_context, tool_profile);
+        // Feature availability is separate from profile shaping and IAM. Apply
+        // it after both definition sources so full/unprofiled listings, cached
+        // schemas and every transport using this listing obey the same opt-in.
+        tools.retain(|tool| self.dev_dogfood_enabled || tool["name"].as_str() != Some("report"));
         serde_json::json!({ "tools": tools })
     }
 

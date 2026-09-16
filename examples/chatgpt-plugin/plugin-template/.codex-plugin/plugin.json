@@ -14,9 +14,6 @@
     "mcp",
     "agents"
   ],
-  "skills": [
-    "skills/intendant-dogfood"
-  ],
   "interface": {
     "displayName": "Intendant",
     "shortDescription": "Use the local Intendant MCP facade.",

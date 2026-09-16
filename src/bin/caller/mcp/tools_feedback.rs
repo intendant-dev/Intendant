@@ -1,4 +1,4 @@
-//! Exception-only dogfood feedback intake for MCP clients.
+//! Developer-only, opt-in dogfood feedback intake for MCP clients.
 //!
 //! The agent-facing surface is deliberately narrow: callers describe one
 //! concrete Intendant issue or efficiency opportunity; the daemon computes the
@@ -8,6 +8,17 @@
 
 use super::*;
 use std::fmt::Write as _;
+
+/// Only the daemon process environment opts in, never a client hint or an IAM
+/// grant. Capture this at server construction, not per request. Fixtures inject
+/// the boolean instead of reading or mutating the fleet runner's environment.
+pub(super) fn developer_opt_in_from_env() -> bool {
+    developer_opt_in_value(std::env::var_os("INTENDANT_DEV_DOGFOOD").as_deref())
+}
+
+fn developer_opt_in_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
 
 const MAX_SURFACE_CHARS: usize = 80;
 const MAX_SUMMARY_CHARS: usize = 240;
@@ -218,6 +229,9 @@ impl IntendantServer {
         params: DogfoodReportParams,
         actor: &crate::access::actor::ActorBinding,
     ) -> Result<serde_json::Value, String> {
+        if !self.dev_dogfood_enabled {
+            return Err("developer-only dogfooding is disabled on this daemon".to_string());
+        }
         let surface = required_text("surface", params.surface, MAX_SURFACE_CHARS)?;
         let summary = required_text("summary", params.summary, MAX_SUMMARY_CHARS)?;
         let details = optional_text("details", params.details, MAX_DETAILS_CHARS)?;
@@ -287,6 +301,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dogfood_requires_the_exact_explicit_opt_in() {
+        use std::ffi::OsStr;
+        assert!(!developer_opt_in_value(None));
+        for value in ["", "0", "false", "true", "yes", " 1", "1 "] {
+            assert!(
+                !developer_opt_in_value(Some(OsStr::new(value))),
+                "{value:?}"
+            );
+        }
+        assert!(developer_opt_in_value(Some(OsStr::new("1"))));
+    }
+
+    #[tokio::test]
+    async fn dogfood_listing_is_off_by_default_even_after_enabled_schema_cache() {
+        let (_home, server) =
+            crate::mcp::tests::test_server(crate::mcp::tests::test_state(), EventBus::new());
+        let enabled = server.clone().with_dev_dogfood_enabled(true);
+        for profile in [None, Some("full"), Some("core"), Some("facade")] {
+            let tools = enabled
+                .list_tools_json_for_session(None, Some(false), profile)
+                .await;
+            assert!(tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "report"));
+            if profile == Some("facade") {
+                assert_eq!(tools["tools"].as_array().unwrap().len(), 7);
+                assert!(serde_json::to_vec(&tools).unwrap().len() <= 8 * 1024);
+            }
+        }
+        for profile in std::iter::once(None)
+            .chain(
+                crate::mcp::tool_gate::TOOL_PROFILE_CATALOG
+                    .iter()
+                    .map(|(name, _)| Some(*name)),
+            )
+            .chain([Some("unknown")])
+        {
+            for managed in [false, true] {
+                let tools = server
+                    .list_tools_json_for_session(None, Some(managed), profile)
+                    .await;
+                assert!(
+                    !tools["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["name"] == "report"),
+                    "dogfood leaked through profile {profile:?}, managed={managed}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dogfood_disabled_dispatch_refuses_owner_and_scoped_calls_without_writes() {
+        let (_home, server) =
+            crate::mcp::tests::test_server(crate::mcp::tests::test_state(), EventBus::new());
+        let dir = tempfile::tempdir().unwrap();
+        let agenda = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            EventBus::new(),
+            dir.path(),
+        ));
+        server.state.write().await.agenda = Some(agenda.clone());
+        for trust in [ToolCallerTrust::OwnerSurface, ToolCallerTrust::Scoped] {
+            let caller = ToolCaller {
+                trust,
+                actor: crate::access::actor::ActorBinding::local_process(Some(
+                    "principal:test".into(),
+                )),
+                fs_scope: None,
+            };
+            let result = server
+                .call_tool_by_name_as_caller(
+                    "report",
+                    serde_json::json!({
+                        "kind": "issue", "surface": "facade", "summary": "cached call",
+                        "dev_dogfood_enabled": true, "client_context": "developer",
+                    }),
+                    None,
+                    None,
+                    caller,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let text = result.content[0].as_text().unwrap();
+            assert!(text.text.contains("developer-only dogfooding is disabled"));
+            assert!(agenda.snapshot().is_empty());
+        }
+        // The same gate remains effective even when an enabled server has
+        // already created a report: disabled clients cannot append occurrences.
+        let enabled = server.clone().with_dev_dogfood_enabled(true);
+        let params = || {
+            serde_json::from_value(serde_json::json!({
+                "kind": "issue", "surface": "facade", "summary": "cached call",
+            }))
+            .unwrap()
+        };
+        let actor =
+            crate::access::actor::ActorBinding::local_process(Some("principal:test".into()));
+        let first = enabled
+            .report_dogfood_inner(params(), &actor)
+            .await
+            .unwrap();
+        assert_eq!(first["status"], "created");
+        assert!(server.report_dogfood_inner(params(), &actor).await.is_err());
+        let second = enabled
+            .report_dogfood_inner(params(), &actor)
+            .await
+            .unwrap();
+        assert_eq!(second["status"], "merged");
+        assert_eq!(second["occurrences"], 2);
+        assert_eq!(agenda.snapshot().len(), 1);
+    }
+
+    #[test]
     fn fingerprint_normalizes_case_and_whitespace() {
         assert_eq!(
             fingerprint(DogfoodReportKind::Issue, "MCP Facade", "Too   many calls"),
@@ -324,7 +457,10 @@ mod tests {
                 .permissions
                 .as_slice()
         };
-        assert!(permissions("role:operator")
+        assert!(!permissions("role:operator")
+            .iter()
+            .any(|permission| permission == "feedback.write"));
+        assert!(permissions("role:root")
             .iter()
             .any(|permission| permission == "feedback.write"));
         assert!(!permissions("role:observer")
