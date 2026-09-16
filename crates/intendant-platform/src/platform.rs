@@ -2949,3 +2949,8 @@ mod tests {
         assert_ne!(identity, FileIdentity::from_path(&other).unwrap());
     }
 }
+
+#[cfg(target_os = "macos")]
+mod macos_process;
+#[cfg(target_os = "macos")]
+pub use macos_process::macos_process_birth;

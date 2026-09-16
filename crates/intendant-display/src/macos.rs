@@ -116,6 +116,7 @@ pub struct MacOSBackend {
     height: Arc<AtomicU32>,
     input_geometry: Arc<RwLock<InputGeometry>>,
     target: CaptureTarget,
+    background: bool,
     /// Observability slot for pre-bridge frame drops (see
     /// [`super::DisplayBackend::install_capture_frame_drop_counter`]).
     /// The SCK output handler clones the installed counter at
@@ -132,6 +133,12 @@ impl Default for MacOSBackend {
 }
 
 impl MacOSBackend {
+    pub fn with_background_window_id(window_id: u32) -> Self {
+        let mut backend = Self::with_window_id(window_id);
+        backend.background = true;
+        backend
+    }
+
     /// Create a new macOS backend.  Resolution is populated from the actual
     /// captured display once `start_capture()` runs.
     pub fn new() -> Self {
@@ -145,6 +152,7 @@ impl MacOSBackend {
             height: Arc::new(AtomicU32::new(0)),
             input_geometry: Arc::new(RwLock::new(InputGeometry::from_frame_size(0, 0))),
             target,
+            background: false,
             drop_counter: Arc::new(StdMutex::new(None)),
         }
     }
@@ -710,7 +718,9 @@ impl DisplayBackend for MacOSBackend {
 
         // Get shareable content (triggers TCC permission prompt on first use).
         let content = SCShareableContent::create()
-            .with_on_screen_windows_only(matches!(self.target, CaptureTarget::Window(_)))
+            .with_on_screen_windows_only(
+                matches!(self.target, CaptureTarget::Window(_)) && !self.background,
+            )
             .with_exclude_desktop_windows(true)
             .get()
             .map_err(|e| sck_capture_error("SCShareableContent::get", e))?;
@@ -718,6 +728,11 @@ impl DisplayBackend for MacOSBackend {
         let resolved = resolve_capture_target(&content, self.target)?;
         let width = resolved.width;
         let height = resolved.height;
+        if self.background && u64::from(width) * u64::from(height) > 33_554_432 {
+            return Err(CallerError::Display(
+                "background capture exceeds 32 megapixels".into(),
+            ));
+        }
         self.width.store(width, Ordering::SeqCst);
         self.height.store(height, Ordering::SeqCst);
         set_input_geometry(&self.input_geometry, resolved.input_geometry);
@@ -733,7 +748,7 @@ impl DisplayBackend for MacOSBackend {
             .with_width(width)
             .with_height(height)
             .with_pixel_format(PixelFormat::BGRA)
-            .with_shows_cursor(true)
+            .with_shows_cursor(!self.background)
             .with_minimum_frame_interval(&frame_interval)
             // SCK's own delivery queue. At the unset default (3), a brief
             // stall of the callback thread makes ScreenCaptureKit drop
@@ -744,7 +759,7 @@ impl DisplayBackend for MacOSBackend {
             // few more surfaces per stream and in exchange a busy boot
             // (Spotlight, login storms) coasts instead of thinning the
             // stream.
-            .with_queue_depth(8);
+            .with_queue_depth(if self.background { 3 } else { 8 });
 
         // Bounded channel: backend drops frames if consumer is slow. The
         // sender lives in a per-session slot shared with the output handler
@@ -756,7 +771,7 @@ impl DisplayBackend for MacOSBackend {
         // depth buys stall tolerance, not latency — overflow (counted via
         // the drop counter) now means a genuinely wedged consumer, not a
         // busy scheduler tick.
-        let (tx, rx) = mpsc::channel::<Frame>(8);
+        let (tx, rx) = mpsc::channel::<Frame>(if self.background { 1 } else { 8 });
         let frame_slot = Arc::new(StdMutex::new(Some(tx)));
 
         // Per-session teardown state (see `CaptureState` for why these must
@@ -782,6 +797,12 @@ impl DisplayBackend for MacOSBackend {
         let is_window_capture = resolved.is_window;
         let dirty_rects_enabled = sck_dirty_rects_enabled();
 
+        let config = if self.background {
+            background::check_capture_os()?;
+            config.with_ignores_shadows_single_window(true)
+        } else {
+            config
+        };
         let mut stream = SCStream::new(&resolved.filter, &config);
         stream.add_output_handler(
             move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
@@ -927,6 +948,11 @@ impl DisplayBackend for MacOSBackend {
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+        if self.background {
+            return Err(CallerError::Display(
+                "background capture backend is read-only; use window-targeted CU".into(),
+            ));
+        }
         let geometry = {
             let current = current_input_geometry(&self.input_geometry);
             if current.width > 0.0 && current.height > 0.0 {
@@ -1252,3 +1278,5 @@ mod tests {
         crate::capture_stress::run_real_backend_stress(&backend).await;
     }
 }
+
+pub mod background;

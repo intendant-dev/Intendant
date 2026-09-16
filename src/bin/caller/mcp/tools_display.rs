@@ -1068,6 +1068,20 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(spec) = params
+            .display_target
+            .as_deref()
+            .filter(|s| crate::background_cu::is_background_target(s))
+        {
+            return self
+                .background_cu_call(
+                    spec.to_string(),
+                    crate::background_cu::Request::Capture,
+                    caller,
+                    compact_output,
+                )
+                .await;
+        }
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
         #[cfg(target_os = "linux")]
@@ -1175,6 +1189,23 @@ impl IntendantServer {
         Parameters(params): Parameters<ReadScreenParams>,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(spec) = params
+            .display_target
+            .as_deref()
+            .filter(|s| crate::background_cu::is_background_target(s))
+        {
+            let request = if spec == crate::background_cu::LIST_TARGET {
+                crate::background_cu::Request::List
+            } else {
+                crate::background_cu::Request::Read {
+                    full_values: params.full_values.unwrap_or(false),
+                    json: params.format.as_deref() == Some("json"),
+                }
+            };
+            return self
+                .background_cu_call(spec.to_string(), request, caller, false)
+                .await;
+        }
         // Element trees only exist for the real session; default there
         // unconditionally rather than availability-probing like the pixel
         // tools do.
@@ -1227,6 +1258,13 @@ impl IntendantServer {
         Parameters(params): Parameters<DisplayReadinessParams>,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if params
+            .display_target
+            .as_deref()
+            .is_some_and(crate::background_cu::is_background_target)
+        {
+            return Ok(text_tool_error("background readiness is not a display probe; use cu windows then capture/read its target"));
+        }
         let (session_registry, autonomy) = {
             let state = self.state.read().await;
             (state.session_registry.clone(), state.autonomy.clone())
@@ -1271,6 +1309,15 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if params
+            .display_target
+            .as_deref()
+            .is_some_and(crate::background_cu::is_background_target)
+        {
+            return self
+                .background_cu_actions(params, caller, compact_output)
+                .await;
+        }
         use crate::computer_use::{execute_actions, DisplayBackend};
 
         #[cfg(target_os = "linux")]
@@ -1836,6 +1883,7 @@ fn attach_settle_json(
 
 #[cfg(test)]
 mod tests {
+    mod background;
     use super::*;
     use crate::mcp::tests::{
         test_session_registry_with_display, test_state, test_state_with_log_dir,

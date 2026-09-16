@@ -799,3 +799,7 @@ you source it.
   approvals.
 - [Integrations](./integrations.md) — `ControlMsg`, the control socket, and the
   web gateway WebSocket protocol.
+
+## Background native-window control
+
+The controller supports opt-in experimental macOS window targets without a global HID fallback. See [macOS background computer use](macos-background-cu.md) for the MCP facade, permissions, coordinates and explicit limitations.

@@ -74,6 +74,7 @@ pub(crate) use tools_ask::{
 pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_bounded_cu;
 pub(crate) use tools_bounded_cu::CuSessionParams;
+mod tools_background;
 mod tools_codex_cloud;
 mod tools_display;
 mod tools_events;
