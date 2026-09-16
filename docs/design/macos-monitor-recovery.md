@@ -20,4 +20,4 @@ The installed daemon and user permission settings were not changed. Default test
 
 ## Subsequent work
 
-Keep #925's existing-window input work separate. The next GUI slice should bind explicitly authorized, process-generation-checked app windows to a selected owned monitor, with placement/observation acceptance and no implicit activation or clipboard changes. A later input slice must demonstrate effects in native and Chromium/canvas fixtures while testing human focus/pointer interference; creation of a virtual monitor alone does not establish input isolation.
+Keep #925's existing-window input work separate. The following GUI slice now implements explicit, process-generation-checked app window binding and verified placement on a selected owned monitor; see `macos-monitor-window-placement.md` for its contract and pending validation. It adds no activation or clipboard changes. A later input slice must demonstrate effects in native and Chromium/canvas fixtures while testing human focus/pointer interference; creation of a virtual monitor alone does not establish input isolation.

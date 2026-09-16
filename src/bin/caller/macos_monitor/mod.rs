@@ -1,13 +1,17 @@
 //! Daemon-scoped macOS monitor broker. These monitors share WindowServer with
 //! the owner; ownership is never a display grant. No public display registry,
-//! streaming, browser placement, input or primary-display fallback.
+//! streaming, browser workspaces, input or primary-display fallback. Explicit
+//! owner-only AX window binding/placement uses the same serialized helper.
 
 mod capture;
 mod helper;
 mod inspection;
+pub(crate) mod placement;
 mod process;
 mod protocol;
 mod smoke;
+mod window_broker;
+pub(crate) use window_broker::{WindowAction, WindowValue};
 
 use crate::autonomy::SharedAutonomy;
 pub(crate) use inspection::{exact_selector, Capabilities, Inspection, Snapshot};
@@ -21,13 +25,16 @@ const QUEUE_SIZE: usize = 8;
 // Below the macOS window range (0x40000000); never native/helper IDs.
 pub(crate) const DISPLAY_ID_MIN: u32 = 0x2000_0000;
 pub(crate) const DISPLAY_ID_MAX: u32 = 0x3fff_ffff;
-pub(crate) const UNSUPPORTED: &str = "macos_virtual selectors support only exact read-only take_screenshot, display_readiness and destroy_virtual_display; input, AX, browser placement, shared views and streaming are unavailable";
+pub(crate) const UNSUPPORTED: &str = "generic macos_virtual display APIs support only exact take_screenshot, display_readiness and destroy_virtual_display; input, AX trees, browser workspaces, shared views and streaming are unavailable. Explicit owner-only app placement uses bind_macos_window/place_macos_window";
 
 /// Deliberately broad reservation: malformed/case/whitespace variants must
 /// never fall through an old parser to :99 or the user's primary display.
 pub(crate) fn reserved(value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
-    if value.contains("macos_virtual") {
+    if ["macos_virtual", "macos_window", "macos_candidate"]
+        .iter()
+        .any(|prefix| value.contains(prefix))
+    {
         return true;
     }
     let mut digits = value.as_str();
@@ -128,6 +135,7 @@ pub(crate) enum Value {
     Destroyed,
     Captured(Screenshot),
     Inspected(Snapshot),
+    Window(WindowValue),
 }
 
 /// The actor holds serialization until the frontend has synchronously built
@@ -141,9 +149,58 @@ pub(crate) struct Receipt {
 }
 
 impl Receipt {
-    pub(crate) fn commit(self) {
-        let _ = self.commit.send(());
+    #[cfg(test)]
+    pub(crate) fn fixture(value: Value) -> (Self, oneshot::Receiver<()>) {
+        let (commit, committed) = oneshot::channel();
+        (Self { value, commit }, committed)
     }
+    /// False means the bounded receipt expired; never publish its handles or
+    /// artifact as successful. Placement may already have applied partially.
+    pub(crate) fn commit(self) -> bool {
+        self.commit.send(()).is_ok()
+    }
+}
+
+/// Closing linearizes expiry against send. A send that won before close may
+/// already be buffered even though timeout last polled the receiver as pending.
+fn close_and_drain<T>(receive: &mut oneshot::Receiver<T>) -> Option<T> {
+    receive.close();
+    receive.try_recv().ok()
+}
+
+async fn await_commit(mut committed: oneshot::Receiver<()>) -> bool {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut committed).await {
+        Ok(result) => result.is_ok(),
+        Err(_) => close_and_drain(&mut committed).is_some(),
+    }
+}
+
+pub(crate) const PLACEMENT_UNCONFIRMED: &str = "placement effects unconfirmed";
+fn placement_unconfirmed(error: &str) -> String {
+    format!("{PLACEMENT_UNCONFIRMED}; window movement/resize may already have applied and may still be in progress; {error}")
+}
+
+async fn await_reply(
+    mut receive: oneshot::Receiver<Result<Receipt, String>>,
+    placement: bool,
+    budget: std::time::Duration,
+) -> Result<Receipt, String> {
+    let error = match tokio::time::timeout(budget, &mut receive).await {
+        Ok(Ok(result)) => return result,
+        Ok(Err(_)) => "macOS monitor broker retired before delivery",
+        Err(_) => {
+            // Preserve any completed result buffered at the deadline boundary.
+            if let Some(result) = close_and_drain(&mut receive) {
+                return result;
+            }
+            "monitor request deadline exceeded; broker retains cleanup ownership"
+        }
+    };
+    Err(if placement {
+        placement_unconfirmed(error)
+    } else {
+        error.into()
+    })
 }
 
 pub(crate) enum Action {
@@ -151,12 +208,19 @@ pub(crate) enum Action {
     Destroy { display_id: u32, selector: String },
     Capture { selector: String, path: PathBuf },
     Inspect(Inspection),
+    Window(WindowAction),
 }
 
 impl Action {
     async fn check(&self, authority: &Authority) -> Result<(), String> {
         match self {
             Self::Inspect(inspection) => inspection.check(authority).await,
+            Self::Window(action) => {
+                if !authority.owner_surface {
+                    return Err("macOS window operations require an owner surface; user-display grants do not authorize application window movement or enumeration".into());
+                }
+                action.validate()
+            }
             _ => authority.check().await,
         }
     }
@@ -214,6 +278,7 @@ impl Broker {
             })
             .as_ref()
             .map_err(Clone::clone)?;
+        let placement = matches!(action, Action::Window(WindowAction::Place { .. }));
         let (reply, receive) = oneshot::channel();
         sender
             .try_send(Request {
@@ -224,10 +289,7 @@ impl Broker {
             .map_err(|_| "macOS monitor broker unavailable or busy")?;
         // This deadline only cancels the caller's receipt. The worker retains
         // child/backend ownership through stop/rollback; it is never aborted.
-        tokio::time::timeout(std::time::Duration::from_secs(20), receive)
-            .await
-            .map_err(|_| "monitor request deadline exceeded; broker retains cleanup ownership")?
-            .map_err(|_| "macOS monitor broker retired")?
+        await_reply(receive, placement, std::time::Duration::from_secs(20)).await
     }
 }
 
@@ -236,6 +298,8 @@ struct State {
     last_handle: u32,
     next_display_id: u32,
     monitors: BTreeMap<u32, Monitor>,
+    bindings: BTreeMap<String, window_broker::WindowBinding>,
+    last_binding: u32,
 }
 
 impl State {
@@ -245,6 +309,8 @@ impl State {
             last_handle: 0,
             next_display_id: DISPLAY_ID_MIN,
             monitors: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            last_binding: 0,
         }
     }
 
@@ -334,6 +400,7 @@ where
                         retired = Some(error);
                         let _ = child.close().await;
                         state.monitors.clear();
+                        state.bindings.clear();
                         process = None;
                         Snapshot::empty(inspection::BrokerState::Retired)
                     }
@@ -351,6 +418,7 @@ where
                         retired = Some(error);
                         let _ = child.close().await;
                         state.monitors.clear();
+                        state.bindings.clear();
                         process = None;
                         snapshot = Snapshot::empty(inspection::BrokerState::Retired);
                         if let Err(error) = request.action.check(&request.authority).await {
@@ -364,7 +432,7 @@ where
                     value: Value::Inspected(snapshot),
                     commit,
                 }));
-                let _ = committed.await;
+                let _ = await_commit(committed).await;
             }
             continue;
         }
@@ -400,7 +468,7 @@ where
         if request.reply.is_closed() {
             continue;
         }
-        if let Err(e) = request.authority.check().await {
+        if let Err(e) = request.action.check(&request.authority).await {
             let _ = request.reply.send(Err(e));
             continue;
         }
@@ -411,6 +479,10 @@ where
                     Value::Created(m) => Some(m.display_id),
                     _ => None,
                 };
+                let bound = match &value {
+                    Value::Window(WindowValue::Bound(b)) => Some(b.binding.clone()),
+                    _ => None,
+                };
                 let artifact = match &value {
                     Value::Captured(s) => Some(s.path.clone()),
                     _ => None,
@@ -418,18 +490,37 @@ where
                 let (commit, committed) = oneshot::channel();
                 // A failed send drops the receipt and therefore the commit
                 // sender. A dropped frontend future does exactly the same.
-                let authorized = request.authority.check().await;
+                let authorized = request.action.check(&request.authority).await;
                 let live = child.live(); // last synchronous check before result delivery
                 if let Err(error) = &live {
                     retired = Some(error.clone());
                 }
                 if let Err(error) = authorized.and(live) {
-                    drop(commit);
-                    let _ = request.reply.send(Err(error));
+                    if let Value::Window(WindowValue::Placed(result)) = value {
+                        // The final liveness/authority check cannot erase an
+                        // already observed partial or verified placement.
+                        let _ = request.reply.send(Ok(Receipt {
+                            value: Value::Window(WindowValue::PlacementUnconfirmed {
+                                result,
+                                error,
+                            }),
+                            commit,
+                        }));
+                    } else {
+                        drop(commit);
+                        let _ = request.reply.send(Err(error));
+                    }
                 } else {
                     let _ = request.reply.send(Ok(Receipt { value, commit }));
                 }
-                if committed.await.is_err() {
+                if !await_commit(committed).await {
+                    if let Some(binding) = bound.filter(|_| retired.is_none()) {
+                        if let Err(e) =
+                            window_broker::rollback_binding(&mut state, child, &binding).await
+                        {
+                            retired = Some(e);
+                        }
+                    }
                     if let Some(path) = artifact {
                         let _ = std::fs::remove_file(path);
                     }
@@ -453,6 +544,7 @@ where
             // process exit cannot prove private WindowServer cleanup succeeded.
             let _ = child.close().await;
             state.monitors.clear();
+            state.bindings.clear();
             process = None;
         }
     }
@@ -504,6 +596,9 @@ async fn destroy(state: &mut State, child: &mut impl Driver, id: u32) -> Result<
         .monitors
         .remove(&id)
         .ok_or("no owned monitor generation")?;
+    state
+        .bindings
+        .retain(|_, b| b.display_target != monitor.selector);
     // Invalidate the public generation before native teardown; the private
     // pipe only ever receives the helper's retained-object handle.
     match child
@@ -597,6 +692,7 @@ async fn execute(
             }
             Ok(Value::Captured(image))
         }
+        Action::Window(_) => window_broker::execute_window(state, child, request).await,
         Action::Inspect(_) => unreachable!("inspection is handled without starting a helper"),
     }
 }
@@ -605,6 +701,61 @@ async fn execute(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn receipt_commit_before_timeout_close_is_drained_and_never_rolled_back() {
+        let (receipt, mut committed) = Receipt::fixture(Value::Destroyed);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(std::pin::Pin::new(&mut committed), &mut cx).is_pending()
+        );
+        // Exact old race: pending receiver, successful send, then timer branch.
+        assert!(receipt.commit());
+        assert_eq!(close_and_drain(&mut committed), Some(()));
+    }
+
+    #[test]
+    fn receipt_timeout_close_before_commit_refuses_publication() {
+        let (receipt, mut committed) = Receipt::fixture(Value::Destroyed);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(std::pin::Pin::new(&mut committed), &mut cx).is_pending()
+        );
+        assert_eq!(close_and_drain(&mut committed), None);
+        assert!(!receipt.commit());
+    }
+
+    #[test]
+    fn buffered_reply_at_deadline_keeps_the_complete_placement_receipt() {
+        let bounds = placement::tests::monitor();
+        let result = placement::PlacementResult {
+            status: placement::PlacementStatus::Verified,
+            requested_global: bounds,
+            before: placement::Observation {
+                ax: bounds,
+                cg: bounds,
+            },
+            after: Some(placement::Observation {
+                ax: bounds,
+                cg: bounds,
+            }),
+            writes_attempted: 2,
+            focus_interference: Some(false),
+            detail: None,
+        };
+        let expected = serde_json::to_value(&result).unwrap();
+        let (receipt, _committed) = Receipt::fixture(Value::Window(WindowValue::Placed(result)));
+        let (reply, mut receive) = oneshot::channel();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(std::pin::Pin::new(&mut receive), &mut cx).is_pending());
+        assert!(reply.send(receipt).is_ok());
+        let receipt = close_and_drain(&mut receive).expect("buffered result must survive expiry");
+        let Value::Window(WindowValue::Placed(result)) = &receipt.value else {
+            panic!()
+        };
+        assert_eq!(serde_json::to_value(result).unwrap(), expected);
+        assert!(receipt.commit());
+    }
 
     fn authority(owner_surface: bool) -> Authority {
         Authority {
@@ -622,6 +773,13 @@ mod tests {
         resolve_started: Option<oneshot::Sender<()>>,
         resolve_release: Option<oneshot::Receiver<()>>,
         next: u32,
+        next_binding: u32,
+        die_after_place: bool,
+        verified_place: bool,
+        window_started: Option<oneshot::Sender<()>>,
+        window_release: Option<oneshot::Receiver<()>>,
+        place_started: Option<oneshot::Sender<()>>,
+        place_release: Option<oneshot::Receiver<()>>,
         fail_destroy: bool,
         dead: bool,
         die_after_capture: bool,
@@ -684,6 +842,59 @@ mod tests {
                             + u32::from(self.captured && self.mismatch_after_capture),
                         width: 640,
                         height: 480,
+                    })
+                }
+                Operation::ListWindows { .. } => Ok(Outcome::Windows { candidates: vec![] }),
+                Operation::BindWindow { .. } => {
+                    self.log.lock().unwrap().push("bind");
+                    if let Some(started) = self.window_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.window_release.take() {
+                        let _ = release.await;
+                    }
+                    self.next_binding += 1;
+                    Ok(Outcome::BoundWindow {
+                        binding: self.next_binding,
+                    })
+                }
+                Operation::UnbindWindow { binding } => {
+                    self.log.lock().unwrap().push("unbind");
+                    Ok(Outcome::UnboundWindow { binding })
+                }
+                Operation::PlaceWindow { bounds, .. } => {
+                    self.log.lock().unwrap().push("place");
+                    if let Some(started) = self.place_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.place_release.take() {
+                        let _ = release.await;
+                    }
+                    self.dead = self.die_after_place;
+                    Ok(Outcome::PlacedWindow {
+                        result: placement::PlacementResult {
+                            status: if self.verified_place {
+                                placement::PlacementStatus::Verified
+                            } else {
+                                placement::PlacementStatus::Partial
+                            },
+                            requested_global: bounds,
+                            before: placement::Observation {
+                                ax: bounds,
+                                cg: bounds,
+                            },
+                            after: Some(placement::Observation {
+                                ax: bounds,
+                                cg: bounds,
+                            }),
+                            writes_attempted: if self.verified_place { 2 } else { 1 },
+                            focus_interference: Some(!self.verified_place),
+                            detail: if self.verified_place {
+                                None
+                            } else {
+                                Some("fixture focus interference".into())
+                            },
+                        },
                     })
                 }
                 Operation::Destroy { handle } => {
@@ -1542,5 +1753,319 @@ mod tests {
             assert!(a.resolve(invalid).is_err());
         }
         assert!(a.resolve(&a.selector(second)).is_ok());
+    }
+    fn bind_action(monitor: &Monitor) -> Action {
+        Action::Window(WindowAction::Bind {
+            selector: monitor.selector.clone(),
+            identity: placement::tests::identity(),
+            candidate: "macos_candidate:00000000000000000000000000000001".into(),
+        })
+    }
+    #[tokio::test]
+    async fn window_owner_gates_ignore_user_display_grants_without_starting_native_helper() {
+        for grant in [false, true] {
+            let a = authority(false);
+            a.autonomy.write().await.user_display_granted = grant;
+            let b = Broker::default();
+            for action in [
+                WindowAction::List { pid: 123 },
+                WindowAction::Bind {
+                    selector: format!("macos_virtual:{}:{}", "a".repeat(32), DISPLAY_ID_MIN),
+                    identity: placement::tests::identity(),
+                    candidate: "macos_candidate:00000000000000000000000000000001".into(),
+                },
+                WindowAction::Place {
+                    binding: "macos_window:fixture:1".into(),
+                    bounds: placement::tests::monitor(),
+                },
+                WindowAction::Unbind {
+                    binding: "macos_window:fixture:1".into(),
+                },
+            ] {
+                assert!(b
+                    .request(Action::Window(action), a.clone())
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains("owner surface"));
+                assert!(b.not_started());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn bind_cancellation_rolls_back_and_never_abandons_monitor_cleanup() {
+        for after_receipt in [false, true] {
+            let (started, begin) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            let fake = Fake {
+                window_started: Some(started),
+                window_release: Some(wait),
+                ..Default::default()
+            };
+            let log = fake.log.clone();
+            let (tx, worker) = runner(fake);
+            let monitor = committed_monitor(&tx).await;
+            let receive = send(&tx, bind_action(&monitor), authority(true));
+            begin.await.unwrap();
+            if after_receipt {
+                release.send(()).unwrap();
+                drop(receive.await.unwrap().unwrap());
+            } else {
+                drop(receive);
+                release.send(()).unwrap();
+            }
+            let receipt = send(
+                &tx,
+                Action::Destroy {
+                    display_id: monitor.display_id,
+                    selector: monitor.selector,
+                },
+                authority(true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            receipt.commit();
+            drop(tx);
+            worker.await.unwrap().unwrap();
+            assert_eq!(
+                *log.lock().unwrap(),
+                vec!["create", "bind", "unbind", "destroy", "close"]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn queued_cancelled_binding_has_no_native_effect_and_scoped_dequeue_refuses() {
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let creation = create(&tx).await.unwrap().unwrap();
+        let Value::Created(monitor) = &creation.value else {
+            panic!()
+        };
+        let monitor = monitor.clone();
+        drop(send(&tx, bind_action(&monitor), authority(true)));
+        let a = authority(false);
+        a.autonomy.write().await.user_display_granted = true;
+        let refused = send(&tx, bind_action(&monitor), a);
+        creation.commit();
+        assert!(refused
+            .await
+            .unwrap()
+            .err()
+            .unwrap()
+            .contains("owner surface"));
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["create", "close"]);
+    }
+    #[tokio::test]
+    async fn public_binding_rollback_stale_monitor_and_partial_result_are_exact() {
+        let fake = Fake::default();
+        let (tx, worker) = runner(fake);
+        let m = committed_monitor(&tx).await;
+        let receipt = send(&tx, bind_action(&m), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let Value::Window(WindowValue::Bound(b)) = &receipt.value else {
+            panic!()
+        };
+        let b = b.clone();
+        let public = serde_json::to_value(&b).unwrap();
+        assert!(public.get("helper_binding").is_none());
+        receipt.commit();
+        let receipt = send(
+            &tx,
+            Action::Window(WindowAction::Place {
+                binding: b.binding.clone(),
+                bounds: placement::tests::monitor(),
+            }),
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Value::Window(WindowValue::Placed(result)) = &receipt.value else {
+            panic!()
+        };
+        assert!(!result.verified());
+        receipt.commit();
+        let receipt = send(
+            &tx,
+            Action::Destroy {
+                display_id: m.display_id,
+                selector: m.selector,
+            },
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        receipt.commit();
+        assert!(send(
+            &tx,
+            Action::Window(WindowAction::Unbind { binding: b.binding }),
+            authority(true)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn late_liveness_failure_preserves_partial_and_verified_placement() {
+        for verified in [false, true] {
+            let (tx, worker) = runner(Fake {
+                die_after_place: true,
+                verified_place: verified,
+                ..Default::default()
+            });
+            let m = committed_monitor(&tx).await;
+            let receipt = send(&tx, bind_action(&m), authority(true))
+                .await
+                .unwrap()
+                .unwrap();
+            let Value::Window(WindowValue::Bound(b)) = &receipt.value else {
+                panic!()
+            };
+            let binding = b.binding.clone();
+            assert!(receipt.commit());
+            let receipt = send(
+                &tx,
+                Action::Window(WindowAction::Place {
+                    binding,
+                    bounds: placement::tests::monitor(),
+                }),
+                authority(true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let Value::Window(WindowValue::PlacementUnconfirmed { result, error }) = &receipt.value
+            else {
+                panic!("placement result discarded")
+            };
+            assert_eq!(result.verified(), verified);
+            assert!(result.after.is_some());
+            assert!(error.contains("helper died"));
+            assert!(receipt.commit());
+            drop(tx);
+            assert!(worker.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatched_placement_receipt_deadline_reports_unconfirmed_effects() {
+        let (started, begin) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let fake = Fake {
+            place_started: Some(started),
+            place_release: Some(wait),
+            ..Default::default()
+        };
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let m = committed_monitor(&tx).await;
+        let receipt = send(&tx, bind_action(&m), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let Value::Window(WindowValue::Bound(b)) = &receipt.value else {
+            panic!()
+        };
+        let binding = b.binding.clone();
+        assert!(receipt.commit());
+        let receive = send(
+            &tx,
+            Action::Window(WindowAction::Place {
+                binding,
+                bounds: placement::tests::monitor(),
+            }),
+            authority(true),
+        );
+        begin.await.unwrap();
+        let error = await_reply(receive, true, std::time::Duration::from_millis(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with(PLACEMENT_UNCONFIRMED));
+        assert!(error.contains("may still be in progress"));
+        release.send(()).unwrap();
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["create", "bind", "place", "close"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_placement_delivery_reports_unconfirmed_effects() {
+        let (reply, receive) = oneshot::channel();
+        drop(reply);
+        let error = await_reply(receive, true, std::time::Duration::from_secs(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with(PLACEMENT_UNCONFIRMED));
+    }
+
+    #[tokio::test]
+    async fn placement_cancellation_finishes_serialized_attempt_without_hidden_rollback() {
+        let (started, begin) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let fake = Fake {
+            place_started: Some(started),
+            place_release: Some(wait),
+            ..Default::default()
+        };
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let monitor = committed_monitor(&tx).await;
+        let receipt = send(&tx, bind_action(&monitor), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let Value::Window(WindowValue::Bound(b)) = &receipt.value else {
+            panic!()
+        };
+        let binding = b.binding.clone();
+        receipt.commit();
+        let receive = send(
+            &tx,
+            Action::Window(WindowAction::Place {
+                binding: binding.clone(),
+                bounds: placement::tests::monitor(),
+            }),
+            authority(true),
+        );
+        begin.await.unwrap();
+        drop(receive);
+        let cleanup = send(
+            &tx,
+            Action::Window(WindowAction::Unbind { binding }),
+            authority(true),
+        );
+        assert_eq!(*log.lock().unwrap(), vec!["create", "bind", "place"]);
+        release.send(()).unwrap();
+        cleanup.await.unwrap().unwrap().commit();
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["create", "bind", "place", "unbind", "close"]
+        );
+    }
+    #[test]
+    fn expired_receipt_cannot_acknowledge_a_rolled_back_binding() {
+        let (commit, receive) = oneshot::channel();
+        drop(receive);
+        assert!(!Receipt {
+            value: Value::Window(WindowValue::Unbound),
+            commit
+        }
+        .commit());
     }
 }

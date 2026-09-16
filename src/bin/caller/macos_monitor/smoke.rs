@@ -53,7 +53,9 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
         return Err("missing created monitor".into());
     };
     let monitor = monitor.clone();
-    created.commit();
+    if !created.commit() {
+        return Err("create receipt expired".into());
+    }
     let image = request(
         tx,
         Action::Capture {
@@ -71,12 +73,16 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
     {
         return Err("unexpected exact-monitor image geometry/format".into());
     }
-    image.commit();
+    if !image.commit() {
+        return Err("image receipt expired".into());
+    }
     let destroy = || Action::Destroy {
         display_id: monitor.display_id,
         selector: monitor.selector.clone(),
     };
-    request(tx, destroy()).await?.commit();
+    if !request(tx, destroy()).await?.commit() {
+        return Err("destroy receipt expired".into());
+    }
     if request(tx, destroy()).await.is_ok() {
         return Err("stale generation destruction accepted".into());
     }
@@ -93,7 +99,7 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
         return Err("stale generation capture accepted".into());
     }
     // A second test-owned monitor remains live to exercise EOF/owner cleanup.
-    request(
+    if !request(
         tx,
         Action::Create {
             width: 640,
@@ -101,7 +107,10 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
         },
     )
     .await?
-    .commit();
+    .commit()
+    {
+        return Err("create receipt expired".into());
+    }
     eprintln!("owned-monitor native lifecycle + exact capture passed; joining EOF cleanup");
     Ok(())
 }

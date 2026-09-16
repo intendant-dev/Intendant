@@ -139,6 +139,18 @@ impl VirtualDisplays {
         self.registry.info(handle)
     }
 
+    /// Live bounds from this exact retained native object, never a default display.
+    pub fn bounds(&self, handle: &Handle) -> Result<(f64, f64, f64, f64), Error> {
+        let entry = &self.registry.entries[self.registry.index(handle)?];
+        let bounds = entry.object.bounds()?;
+        if bounds.2 != f64::from(entry.info.dimensions.width)
+            || bounds.3 != f64::from(entry.info.dimensions.height)
+        {
+            return Err(Error::NativeFailure("owned monitor geometry changed"));
+        }
+        Ok(bounds)
+    }
+
     /// Invalidate this exact generation, release its objects, and poll removal
     /// for at most two seconds. Private OS calls themselves are not interruptible.
     /// An error never permits retrying destruction by numeric display ID.
@@ -150,6 +162,9 @@ impl VirtualDisplays {
 pub(crate) trait NativeObject {
     fn native_id(&self) -> u32;
     fn shutdown(&mut self) -> Result<(), Error>;
+    fn bounds(&self) -> Result<(f64, f64, f64, f64), Error> {
+        Err(Error::NativeFailure("live monitor bounds unavailable"))
+    }
 }
 
 struct Entry<T> {

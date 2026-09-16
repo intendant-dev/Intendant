@@ -920,3 +920,22 @@ authentication from staged identity vocabulary:
    signed-application confirmation still requires an instance of a qualifying
    distribution completing the verified install ceremony and
    platform-keystore enrollment, which nothing published can do yet.
+
+## Explicit owned-monitor app window placement
+
+Monitor ownership is not authority over app windows in the shared macOS login
+session. Window candidate listing requires `DisplayView` plus a gate-resolved
+owner surface; explicit bind/place/unbind require `DisplayInput` plus the same
+owner-only gate. Scoped user-display grants cannot authorize these operations,
+and HTTP/facade dispatch must preserve caller trust through the serialized actor.
+No new grant, permission prompt, credential access or startup placement is added.
+
+Exact monitor generations resolve only to the helper's retained native objects.
+Window identity combines PID, process start generation, CGWindowID and a retained
+AX object, with unique exact SPI mapping rechecked before/after placement. No
+raw display ID, title, primary/default fallback or PID-only cleanup is accepted.
+The helper serializes binding release with monitor destruction; unbind/EOF drop
+references without moving or closing user windows. Verified readback proves only
+that placement observation, not focus/input isolation or lasting exclusivity.
+See [Computer Use](./computer-use-and-audio.md#explicit-owner-only-app-window-placement)
+for the implemented contract and pending acceptance.

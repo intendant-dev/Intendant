@@ -179,8 +179,11 @@ impl Broker {
                                 };
                                 let snapshot = snapshot.clone();
                                 // No await between receipt delivery and commit.
-                                receipt.commit();
-                                return Ok(snapshot);
+                                return Ok(if receipt.commit() {
+                                    snapshot
+                                } else {
+                                    Snapshot::empty(BrokerState::Unavailable)
+                                });
                             }
                         }
                     }

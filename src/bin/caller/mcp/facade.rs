@@ -3698,4 +3698,60 @@ mod tests {
                 .contains("needs its skill")
         );
     }
+    #[test]
+    fn window_facade_vocabulary_has_exact_risk_and_iam_lanes() {
+        use crate::peer::access_policy::PeerOperation::{DisplayInput, DisplayView};
+        for (lane, args, tool, op) in [
+            (
+                "inspect",
+                vec!["display", "windows", "123"],
+                "list_macos_windows",
+                DisplayView,
+            ),
+            (
+                "act",
+                vec![
+                    "display",
+                    "bind-window",
+                    "macos_virtual:fixture:1",
+                    "macos_candidate:00000000000000000000000000000001",
+                    r#"{"pid":123,"start_seconds":456,"start_micros":7,"window_id":8}"#,
+                ],
+                "bind_macos_window",
+                DisplayInput,
+            ),
+            (
+                "act",
+                vec![
+                    "display",
+                    "place-window",
+                    "macos_window:fixture:1",
+                    r#"{"x":0,"y":0,"width":100,"height":100}"#,
+                ],
+                "place_macos_window",
+                DisplayInput,
+            ),
+            (
+                "act",
+                vec!["display", "unbind-window", "macos_window:fixture:1"],
+                "unbind_macos_window",
+                DisplayInput,
+            ),
+        ] {
+            let args = argv(&args);
+            let planned = plan_for_meta(lane, &args).unwrap();
+            assert_eq!(planned.tool, tool);
+            if tool == "bind_macos_window" {
+                let bind: crate::macos_monitor::placement::BindMacosWindowParams =
+                    serde_json::from_value(planned.args.clone()).unwrap();
+                assert_eq!(
+                    bind.candidate,
+                    "macos_candidate:00000000000000000000000000000001"
+                );
+                assert_eq!(bind.identity.window_id, 8);
+            }
+            assert_eq!(facade_gate_operation(lane, &args), Some(op));
+            assert!(plan_for_meta(if lane == "act" { "inspect" } else { "act" }, &args).is_err());
+        }
+    }
 }

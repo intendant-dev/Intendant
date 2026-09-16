@@ -108,22 +108,29 @@ impl Process {
         }
         self.live()?;
         match reply.result {
-            Outcome::Error { message, .. } => Err(message),
+            Outcome::Error {
+                message,
+                fatal: true,
+            } => Err(message),
             result => Ok(result),
         }
     }
 
     pub(super) async fn close(&mut self) -> Result<(), String> {
         // EOF asks the main-thread owner to release its monitors. A stalled
-        // helper is killed via this retained Child only, then reaped without
-        // abandoning wait. Exit/kill uncertainty never permits respawn.
+        // helper is killed via this retained Child only. Reaping has a second
+        // bounded deadline; on timeout the retained Child's kill-on-drop and
+        // Tokio reaper remain responsible. Exit/kill uncertainty never permits
+        // respawn and is never reported as successful native cleanup.
         self.input.take();
         match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
             Ok(Ok(status)) if status.success() => Ok(()),
             Ok(Ok(_)) => Err("monitor helper reported unsuccessful cleanup".into()),
             _ => {
                 let _ = self.child.start_kill();
-                self.child.wait().await.map_err(|e| e.to_string())?;
+                tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await
+                    .map_err(|_| "monitor helper reap deadline exceeded; retained child kill-on-drop remains armed")?
+                    .map_err(|e| e.to_string())?;
                 Err("monitor helper required termination; native cleanup unconfirmed".into())
             }
         }

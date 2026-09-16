@@ -6,7 +6,7 @@ Contract: bounded same-binary main-thread helper; private pipes; daemon-scoped o
 
 Creation, capture and destruction must remain independently testable with hermetic transports. Native smoke is explicitly opt-in and limited to test-owned resources. The installed daemon is not changed by this work.
 
-Out of scope: global mouse/keyboard injection, clipboard isolation, AX routing, browser placement, dashboard/peer streaming and merging #925/#927/#928. Input will need a separate verified design and fixture acceptance, not a claim that a second monitor is a separate login session.
+Out of scope for this capture slice: global mouse/keyboard injection, clipboard isolation, AX routing, browser placement, dashboard/peer streaming and merging #925/#927/#928. Explicit owner-only AX window binding/placement is implemented separately in `macos-monitor-window-placement.md`, with its validation still pending. Input will need a separate verified design and fixture acceptance, not a claim that a second monitor is a separate login session.
 
 ## Independent HTTP pixel acceptance
 

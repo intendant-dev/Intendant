@@ -590,6 +590,30 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Enumerate displays and their session state",
     },
     CommandSpec {
+        path: &["display", "windows"], lane: RiskLane::Inspect,
+        tool: "list_macos_windows", seed: "{}",
+        positionals: &[p_u64("PID", "pid")], flags: &[],
+        help: "Owner-only bounded candidate identities for one macOS application PID",
+    },
+    CommandSpec {
+        path: &["display", "bind-window"], lane: RiskLane::Act,
+        tool: "bind_macos_window", seed: "{}",
+        positionals: &[p_str("MONITOR", "display_target", true, false), p_str("CANDIDATE", "candidate", true, false), p_json("IDENTITY", "identity", true)], flags: &[],
+        help: "Bind listed candidate token and full window identity JSON to an exact owned macOS monitor",
+    },
+    CommandSpec {
+        path: &["display", "place-window"], lane: RiskLane::Act,
+        tool: "place_macos_window", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_json("BOUNDS", "bounds", true)], flags: &[],
+        help: "Place by binding with monitor-local bounds JSON and verify AX/CG readback",
+    },
+    CommandSpec {
+        path: &["display", "unbind-window"], lane: RiskLane::Act,
+        tool: "unbind_macos_window", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],
+        help: "Release an exact window binding without moving or closing the window",
+    },
+    CommandSpec {
         path: &["display", "monitors"],
         lane: RiskLane::Inspect,
         tool: "list_macos_monitors",

@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--report', required=True)
     parser.add_argument('--allow-shared-session-monitor', action='store_true')
     parser.add_argument('--check-recovery', action='store_true', help='Verify owner monitor inventory and exact read-only status')
+    parser.add_argument("--placement-fixture", help="Also exercise explicit window placement using this disposable fixture binary")
     args = parser.parse_args()
     if not args.allow_shared_session_monitor:
         parser.error('Native monitor hotplug requires explicit opt-in')
@@ -124,6 +125,11 @@ def main():
                 assert inventory() == report['before'], 'inspection changed native display inventory'
                 report['checks']['empty_inventory_before_create'] = True
             first = create(); report['created'] = first
+            if args.placement_fixture:
+                placement_report = root / "placement.json"
+                placement = subprocess.run(["python3", str(Path(__file__).resolve().with_name("verify-macos-window-placement.py")), "--bin", args.bin, "--fixture", args.placement_fixture, "--port", str(port), "--monitor", first["display_target"], "--report", str(placement_report), "--allow-fixture-window-placement"], cwd=project, env=env, timeout=110)
+                report["placement"] = json.loads(placement_report.read_text())
+                assert placement.returncode == 0, report["placement"]
             if args.check_recovery:
                 listed = recover()
                 assert len(listed) == 1, listed

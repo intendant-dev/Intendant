@@ -211,6 +211,10 @@ pub(crate) fn tool_allowed_for_profile(
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
                     | "list_macos_monitors"
+                    | "list_macos_windows"
+                    | "bind_macos_window"
+                    | "place_macos_window"
+                    | "unbind_macos_window"
                     | "create_virtual_display"
                     | "destroy_virtual_display"
                     | "grant_user_display"
@@ -249,6 +253,10 @@ pub(crate) fn tool_allowed_for_profile(
                 "get_status"
                     | "list_displays"
                     | "list_macos_monitors"
+                    | "list_macos_windows"
+                    | "bind_macos_window"
+                    | "place_macos_window"
+                    | "unbind_macos_window"
                     | "list_browser_workspaces"
                     | "browser_workspace_providers"
                     | "create_browser_workspace"
@@ -447,6 +455,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // same audience and sensitivity as list_displays.
         "list_displays"
         | "list_macos_monitors"
+        | "list_macos_windows"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -463,6 +472,9 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "release_display"
         | "create_virtual_display"
         | "destroy_virtual_display"
+        | "bind_macos_window"
+        | "place_macos_window"
+        | "unbind_macos_window"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -905,6 +917,27 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             EmptyToolParams
         ),
     );
+    // Schemas/descriptions derive from the typed stdio declarations.
+    for (name, tool) in [
+        (
+            "list_macos_windows",
+            IntendantServer::list_macos_windows_tool_attr(),
+        ),
+        (
+            "bind_macos_window",
+            IntendantServer::bind_macos_window_tool_attr(),
+        ),
+        (
+            "place_macos_window",
+            IntendantServer::place_macos_window_tool_attr(),
+        ),
+        (
+            "unbind_macos_window",
+            IntendantServer::unbind_macos_window_tool_attr(),
+        ),
+    ] {
+        push(name, serde_json::to_value(tool).expect("tool definition"));
+    }
     push(
         "list_macos_monitors",
         serde_json::to_value(IntendantServer::list_macos_monitors_tool_attr())
@@ -2152,5 +2185,58 @@ mod tests {
                 "agenda_op's served oneOf must keep the full AgendaCommand vocabulary"
             );
         });
+    }
+    #[test]
+    fn macos_window_tools_derive_schemas_and_preserve_view_input_iam_split() {
+        use crate::peer::access_policy::PeerOperation::{DisplayInput, DisplayView};
+        for profile in [None, Some("core"), Some("screen")] {
+            let mut definitions = Vec::new();
+            append_manual_http_tool_definitions(&mut definitions, false, profile);
+            for (name, attr, op) in [
+                (
+                    "list_macos_windows",
+                    IntendantServer::list_macos_windows_tool_attr(),
+                    DisplayView,
+                ),
+                (
+                    "bind_macos_window",
+                    IntendantServer::bind_macos_window_tool_attr(),
+                    DisplayInput,
+                ),
+                (
+                    "place_macos_window",
+                    IntendantServer::place_macos_window_tool_attr(),
+                    DisplayInput,
+                ),
+                (
+                    "unbind_macos_window",
+                    IntendantServer::unbind_macos_window_tool_attr(),
+                    DisplayInput,
+                ),
+            ] {
+                assert_eq!(mcp_tool_operation(name), op);
+                assert_eq!(
+                    *definitions.iter().find(|d| d["name"] == name).unwrap(),
+                    serde_json::to_value(attr).unwrap()
+                );
+            }
+        }
+        assert!(serde_json::from_value::<BindMacosWindowParams>(
+            serde_json::json!({"display_target":"1","identity":{"pid":123,"window_id":8}})
+        )
+        .is_err());
+        let mut bind = serde_json::json!({"display_target":"macos_virtual:fixture:1","identity":{"pid":123,"start_seconds":456,"start_micros":7,"window_id":8}});
+        assert!(serde_json::from_value::<BindMacosWindowParams>(bind.clone()).is_err());
+        bind["candidate"] = "macos_candidate:00000000000000000000000000000001".into();
+        assert!(serde_json::from_value::<BindMacosWindowParams>(bind).is_ok());
+        let schema = serde_json::to_value(IntendantServer::bind_macos_window_tool_attr()).unwrap();
+        assert!(schema["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("candidate")));
+        assert!(serde_json::from_value::<ListMacosWindowsParams>(
+            serde_json::json!({"pid":123,"owner_surface":true})
+        )
+        .is_err());
     }
 }

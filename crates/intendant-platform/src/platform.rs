@@ -263,6 +263,11 @@ mod cgvirtual_native {
             display_id: *mut u32,
         ) -> i32;
         fn intendant_cgvirtual_destroy(owner: *mut c_void) -> i32;
+        fn intendant_cgvirtual_bounds(
+            owner: *mut c_void,
+            expected_id: u32,
+            bounds: *mut f64,
+        ) -> i32;
     }
 
     static UNCERTAIN: AtomicBool = AtomicBool::new(false);
@@ -358,6 +363,25 @@ mod cgvirtual_native {
     }
 
     impl NativeObject for NativeCGVirtualDisplay {
+        fn bounds(&self) -> Result<(f64, f64, f64, f64), Error> {
+            let owner = self.owner.ok_or(Error::StaleHandle)?;
+            let mut bounds = [0.0_f64; 4];
+            // SAFETY: the retained bridge object is alive on its original main
+            // thread; output has four writable doubles. No ownership transfer.
+            let status =
+                unsafe { intendant_cgvirtual_bounds(owner.as_ptr(), self.id, bounds.as_mut_ptr()) };
+            if status != 0
+                || !bounds.iter().all(|v| v.is_finite())
+                || bounds[2] <= 0.0
+                || bounds[3] <= 0.0
+            {
+                return Err(Error::NativeFailure(
+                    "live owned monitor bounds unavailable",
+                ));
+            }
+            Ok((bounds[0], bounds[1], bounds[2], bounds[3]))
+        }
+
         fn native_id(&self) -> u32 {
             self.id
         }
@@ -2542,6 +2566,40 @@ mod owner_private_acl {
         }
         Ok(protected)
     }
+}
+
+/// Process start generation for exact macOS AX window binding. No PID-only fallback.
+#[cfg(target_os = "macos")]
+pub fn macos_process_birth(pid: i32) -> Option<(u64, u32)> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: kernel writes at most size bytes to aligned storage. Read fields
+    // only after a complete proc_bsdinfo was returned.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written != size as i32 {
+        return None;
+    }
+    // SAFETY: exact-sized successful kernel output initialized the struct.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid as u32
+        || info.pbi_start_tvsec == 0
+        || info.pbi_start_tvusec >= 1_000_000
+        || info.pbi_status == libc::SZOMB
+    {
+        return None;
+    }
+    Some((info.pbi_start_tvsec, info.pbi_start_tvusec as u32))
 }
 
 #[cfg(test)]

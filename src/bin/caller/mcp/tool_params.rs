@@ -2,6 +2,9 @@
 //! persisted-log readers behind `get_logs`.
 
 use super::*;
+pub(crate) use crate::macos_monitor::placement::{
+    BindMacosWindowParams, ListMacosWindowsParams, PlaceMacosWindowParams, UnbindMacosWindowParams,
+};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmptyToolParams {}

@@ -453,9 +453,11 @@ daemon/plugin integration remain separate slices.
 by the daemon's EventBus starts **one same-binary private helper**, intercepted
 before runtime, configuration, credentials, logging or network startup. The
 helper retains all native objects on its main thread. Its versioned JSON-line
-protocol uses private stdin/stdout pipes, a 4096-byte line cap and monotonic
-request/handle counters; there is no socket, authentication protocol, PID/native
-ID adoption, or respawn. EOF releases its owned monitors. The parent closes the
+protocol uses private stdin/stdout pipes, a 16 KiB line cap and monotonic
+request/handle counters; there is no socket, authentication protocol, native
+display ID adoption, or respawn. Explicit window identities carry a PID and start
+generation; they confer no monitor ownership. EOF releases its owned monitors
+and bound AX references. The parent closes the
 pipe, waits, and if necessary terminates and reaps only the exact retained child.
 Any uncertain protocol/native cleanup permanently retires that broker.
 
@@ -515,7 +517,8 @@ or timed-out inspection reports `unavailable`. Neither outcome permits respawn,
 ID adoption or bypassing cleanup.
 
 Reserved selectors, including malformed/case/whitespace variants, are refused
-by input, AX, shared views, browser placement and peer forwarding. Exact canonical
+by generic input, AX-tree, shared-view, browser-workspace and peer forwarding APIs.
+Explicit owner-only window placement is described below. Exact canonical
 selectors alone have a read-only `display_readiness` route: existing `DisplayView`
 and shared-session authority are required, and status uses only broker liveness
 and `Resolve`. It reports lifecycle verification separately from unverified
@@ -524,6 +527,53 @@ Unknown/stale/foreign generations are distinct from a retired broker. Malformed
 selectors and raw-ID aliases remain refused, without a physical-display fallback.
 There is no automatic/default selection of these monitors, global input,
 clipboard isolation, streaming or browser-placement claim.
+
+#### Explicit owner-only app window placement
+
+The same private main-thread helper now retains exact AX windows alongside
+owned monitors. `list_macos_windows {pid}` retains one inventory of at most 16
+exact AX objects and lists their opaque `candidate` tokens plus identities
+(`pid`, `start_seconds`, `start_micros`, `window_id`) under `DisplayView` plus
+owner-surface-only authority. `bind_macos_window {display_target,candidate,identity}`,
+`place_macos_window {binding,bounds}` and `unbind_macos_window {binding}` require
+`DisplayInput` **and** owner-surface-only authority. Existing scoped user-display
+grants do not authorize these operations. Neither listing nor placement starts a
+native helper; an owned monitor must already have been created.
+
+Each helper listing refresh (even failed) invalidates unbound tokens across PIDs
+and callers. Existing bindings survive refresh. Bind requires token plus matching
+identity, transfers the retained listed AX object, and consumes the token when
+selected; no ID-only replacement is admitted. It verifies unique SPI mapping and
+process start generation, freezes the retained monitor's live bounds, and returns an opaque
+binding. Place uses monitor-local logical-point bounds wholly inside that
+monitor. Identity, monitor geometry and focus are checked around each AX
+position/size write. Verified success requires AX **and** CG readback within one
+logical point per component and strict whole-rectangle containment; dispatch
+alone is not success. Failure after a setter path returns partial application
+and observed/unknown focus interference, preserving the latest observation even
+on AX/CG disagreement. Late deadline/delivery/liveness failures explicitly mark
+`effects_unconfirmed:true` and preserve any available partial or verified placement
+result, with outer `ok:false`. Movement may already have applied or still be in
+progress. There is no activation, raising,
+unminimizing, keyboard/mouse/clipboard action, retry or focus restoration.
+
+Sixteen bindings maximum; 50 ms AX IPC limits and a four-second operation budget;
+receipt commit has a two-second limit. Expiry closes the receiver then drains a
+buffered commit, so successful send cannot race binding rollback. Dropped
+bind receipts roll back only the retained binding. Cancellation after placement
+dispatch finishes the bounded attempt without undoing window movement. Unbind,
+monitor teardown and helper EOF release references without closing/moving user
+windows. This is shared-session app placement, not input isolation or general CU
+readiness. Windows/Linux refuse clearly. Ordinary startup remains unchanged.
+
+See the source-tree design record `docs/design/macos-monitor-window-placement.md`
+for exact response/error semantics, limitations, validation commands and
+`scripts/verify-macos-window-placement.py`. The native fixture passed on the
+plugin Mac on 2026-09-16 in a separate temporary-HOME HTTP daemon. It verified
+candidate lifetime, exact placement/readback and cleanup using only its disposable
+panel. The existing HTTP harness supports `--placement-fixture` for reproduction.
+Final readback may settle for at most 250 ms / 20 polls within the original budget;
+this never repeats a setter and still fails closed on identity/focus/geometry changes.
 
 #### Recovery/status validation
 
