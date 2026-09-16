@@ -266,9 +266,12 @@ The root key lives on an org-designated daemon
 `<access-cert-dir>/org/<handle>/root.pk8`, 0600), following the
 existing daemon-identity custody pattern; it is exportable for offline
 custody. The access-cert directory is `<state-root>/access-certs` on
-macOS/Linux (default `~/.intendant/access-certs`) and the OS data directory's
-`intendant/access-certs` on Windows. Day-to-day signing can move to delegated
-issuer keys certified by the root; root-signed documents carry no chain, and
+macOS/Linux (default `~/.intendant/access-certs`). On Windows an explicit
+nonempty `INTENDANT_HOME` selects `<state-root>/access-certs`; unset/empty
+preserves the OS RoamingAppData directory's `intendant/access-certs` (or the
+legacy `temp_dir()/intendant-access-certs` fallback). Selecting an explicit
+root does not migrate or reset the default store. Day-to-day signing can move
+to delegated issuer keys certified by the root; root-signed documents carry no chain, and
 delegated documents carry the issuer certificate beside the signature it
 explains.
 

@@ -33,9 +33,11 @@ pub struct WindowsBackend;
 #[cfg(target_os = "windows")]
 impl AccessBackend for WindowsBackend {
     fn cert_dir(&self) -> PathBuf {
-        dirs::data_dir()
-            .map(|d| d.join("intendant").join("access-certs"))
-            .unwrap_or_else(|| std::env::temp_dir().join("intendant-access-certs"))
+        windows_cert_dir(
+            intendant_core::state_paths::intendant_home_override(),
+            dirs::data_dir(),
+            std::env::temp_dir(),
+        )
     }
 
     fn detect_primary_ip(&self) -> AccessResult<String> {
@@ -43,6 +45,23 @@ impl AccessBackend for WindowsBackend {
         println!(":: primary IP: {ip} (interface enumeration)");
         Ok(ip)
     }
+}
+
+/// Only an explicit state root supersedes the historical Windows Known Folder
+/// location. Inputs are paths so every branch can be tested on any platform
+/// without querying a real profile or mutating the process environment.
+#[cfg(any(target_os = "windows", test))]
+fn windows_cert_dir(
+    explicit_root: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    temp_dir: PathBuf,
+) -> PathBuf {
+    if let Some(root) = explicit_root {
+        return root.join("access-certs");
+    }
+    data_dir
+        .map(|d| d.join("intendant").join("access-certs"))
+        .unwrap_or_else(|| temp_dir.join("intendant-access-certs"))
 }
 
 /// Select the address used in the dashboard URL from the already-filtered
@@ -79,6 +98,31 @@ pub fn select_backend() -> Box<dyn AccessBackend> {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn windows_explicit_root_takes_precedence_over_profile_and_fallback() {
+        let root = PathBuf::from("pinned-state");
+        for data_dir in [Some(PathBuf::from("roaming")), None] {
+            assert_eq!(
+                windows_cert_dir(Some(root.clone()), data_dir, PathBuf::from("temp")),
+                root.join("access-certs")
+            );
+        }
+    }
+
+    #[test]
+    fn windows_no_override_preserves_roaming_and_legacy_temp_paths() {
+        assert_eq!(
+            windows_cert_dir(None, Some(PathBuf::from("roaming")), PathBuf::from("temp")),
+            PathBuf::from("roaming")
+                .join("intendant")
+                .join("access-certs")
+        );
+        assert_eq!(
+            windows_cert_dir(None, None, PathBuf::from("temp")),
+            PathBuf::from("temp").join("intendant-access-certs")
+        );
+    }
 
     #[test]
     fn primary_ip_selection_prefers_ipv4_and_falls_back_to_ipv6() {
