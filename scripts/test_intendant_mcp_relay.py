@@ -141,6 +141,34 @@ class RelayTests(unittest.TestCase):
         return server
 
     @staticmethod
+    def exchange(
+        server: ThreadingHTTPServer,
+        method: str,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            int(server.server_address[1]),
+            timeout=5,
+        )
+        request_headers = {"Content-Type": "application/json"}
+        if headers:
+            request_headers.update(headers)
+        try:
+            connection.request(
+                method,
+                "/mcp?tool_profile=facade",
+                body=body,
+                headers=request_headers,
+            )
+            response = connection.getresponse()
+            response_headers = {name.lower(): value for name, value in response.getheaders()}
+            return response.status, response_headers, response.read()
+        finally:
+            connection.close()
+
+    @staticmethod
     def post(server: ThreadingHTTPServer, body: bytes) -> tuple[int, bytes]:
         connection = http.client.HTTPConnection(
             "127.0.0.1",
@@ -194,6 +222,69 @@ class RelayTests(unittest.TestCase):
             {b"parallel:" + body for body in bodies},
         )
         self.assertGreater(metrics.max_active, 1)
+
+    def test_forwards_mcp_session_id_in_both_directions(self) -> None:
+        token = "session-private-token"
+        session_id = "task-session-123"
+        seen: list[str | None] = []
+
+        class SessionHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                self.assert_header()
+                seen.append(self.headers.get("Mcp-Session-Id"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Mcp-Session-Id", session_id)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_DELETE(self) -> None:
+                self.assert_header()
+                seen.append(self.headers.get("Mcp-Session-Id"))
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def assert_header(self) -> None:
+                if self.headers.get("X-Intendant-Loopback-Token") != token:
+                    raise AssertionError("relay token missing")
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), SessionHandler)
+        self.servers.append(upstream)
+        start_server(upstream)
+        self.point_descriptor(upstream, token, 404)
+        relay_server = self.add_relay()
+
+        status, headers, body = self.exchange(relay_server, "POST", b"initialize")
+        self.assertEqual((status, body), (200, b"initialize"))
+        self.assertEqual(headers.get("mcp-session-id"), session_id)
+        self.assertEqual(seen, [None])
+
+        status, headers, body = self.exchange(
+            relay_server,
+            "POST",
+            b"poll",
+            headers={"Mcp-Session-Id": session_id},
+        )
+        self.assertEqual((status, body), (200, b"poll"))
+        self.assertEqual(headers.get("mcp-session-id"), session_id)
+        self.assertEqual(seen[-1], session_id)
+
+        status, _, body = self.exchange(
+            relay_server,
+            "DELETE",
+            headers={"Mcp-Session-Id": session_id},
+        )
+        self.assertEqual((status, body), (202, b""))
+        self.assertEqual(seen[-1], session_id)
 
     def test_returns_502_without_exposing_failure_details(self) -> None:
         relay_server = self.add_relay()

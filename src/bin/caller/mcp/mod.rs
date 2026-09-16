@@ -86,6 +86,9 @@ pub(crate) use tools_terminal::{
     TerminalWriteParams,
 };
 mod sdk_tasks;
+#[cfg(test)]
+pub(crate) use sdk_tasks::tests as task_tests;
+pub(crate) use sdk_tasks::RemoteTasks;
 mod tools_managed;
 mod tools_notes;
 mod tools_remote_compute;

@@ -1,4 +1,5 @@
-//! SDK-backed, owner-only stdio Tasks surface. Never used by the HTTP gateway.
+//! SDK-backed, owner-only stdio Tasks surface. The remote job lifecycle is
+//! shared with the independently authenticated HTTP Tasks sessions.
 //!
 //! A wrapper belongs to exactly one transport. It deliberately is not Clone:
 //! cloning the inner controller must not share a task store across clients.
@@ -12,7 +13,7 @@ use rmcp::{
 use std::sync::Arc;
 
 mod remote;
-use remote::RemoteTasks;
+pub(crate) use remote::RemoteTasks;
 
 pub(super) struct StdioTaskServer {
     inner: IntendantServer,
@@ -179,7 +180,7 @@ impl ServerHandler for StdioTaskServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::remote::{RemoteFuture, RemoteOperations};
     use super::*;
     use crate::remote_compute::{
@@ -197,14 +198,15 @@ mod tests {
     };
     use tokio::sync::watch;
 
-    struct MockRemote {
+    pub(crate) struct MockRemote {
         updates: watch::Sender<RemoteCommandJobView>,
         starts: AtomicUsize,
         cancellations: AtomicUsize,
         callers: Mutex<Vec<String>>,
+        start_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
     impl MockRemote {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 updates: watch::channel(RemoteCommandJobView {
                     job_id: format!("remote-test-{}", uuid::Uuid::new_v4()),
@@ -230,9 +232,26 @@ mod tests {
                 starts: AtomicUsize::new(0),
                 cancellations: AtomicUsize::new(0),
                 callers: Mutex::new(Vec::new()),
+                start_gate: Mutex::new(None),
             })
         }
-        fn finish(&self, state: RemoteCommandState) {
+        pub(crate) fn tasks(self: &Arc<Self>, ttl_ms: u64, capacity: usize) -> Arc<RemoteTasks> {
+            Arc::new(RemoteTasks::with_backend(self.clone(), ttl_ms, capacity))
+        }
+        pub(crate) fn hold_starts(&self) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.start_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+        pub(crate) fn assert_callers(&self, expected: &str) {
+            let callers = self.callers.lock().unwrap();
+            assert!(!callers.is_empty());
+            assert!(
+                callers.iter().all(|caller| caller == expected),
+                "{callers:?}"
+            );
+        }
+        pub(crate) fn finish(&self, state: RemoteCommandState) {
             self.updates.send_modify(|job| {
                 job.state = state;
                 job.error = (state == RemoteCommandState::Failed).then(|| "fixture failure".into());
@@ -255,7 +274,7 @@ mod tests {
                 });
             });
         }
-        async fn saw_cancel(&self) {
+        pub(crate) async fn saw_cancel(&self) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while self.cancellations.load(Ordering::SeqCst) == 0 {
                     tokio::task::yield_now().await;
@@ -274,6 +293,9 @@ mod tests {
         ) -> RemoteFuture {
             self.callers.lock().unwrap().push(format!("{caller:?}"));
             let mut updates = self.updates.subscribe();
+            let start_gate = matches!(params, RemoteCommandParams::Start { .. })
+                .then(|| self.start_gate.lock().unwrap().clone())
+                .flatten();
             match params {
                 RemoteCommandParams::Start { .. } => {
                     self.starts.fetch_add(1, Ordering::SeqCst);
@@ -290,6 +312,9 @@ mod tests {
                 _ => {}
             }
             Box::pin(async move {
+                if let Some(gate) = start_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
                 if matches!(params, RemoteCommandParams::Wait { .. })
                     && !updates.borrow().state.is_terminal()
                 {
@@ -299,7 +324,7 @@ mod tests {
             })
         }
     }
-    fn start_params() -> RemoteCommandParams {
+    pub(crate) fn start_params() -> RemoteCommandParams {
         serde_json::from_value(serde_json::json!({
             "op": "start", "argv": ["fixture"], "expected_revision": "0123456"
         }))
@@ -436,6 +461,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ttl_eviction_holds_task_capacity_until_real_cleanup() {
+        let backend = MockRemote::new();
+        let tasks = backend.tasks(50, 1);
+        let id = task_id(tasks.start(start_params(), None).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(tasks.get(&id).is_ok()); // Marks the overdue task failed.
+        backend.saw_cancel().await;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(tasks.get(&id).is_err()); // Evicts the retained protocol task.
+        assert!(tasks.start(start_params(), None).await.is_err());
+        assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+        backend.finish(RemoteCommandState::Cancelled);
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn retention_is_bounded_and_capacity_is_checked_before_start() {
         let backend = MockRemote::new();
         backend.finish(RemoteCommandState::Succeeded);
@@ -468,6 +509,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(tasks.start(start_params(), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_start_waits_for_registration_and_real_cleanup() {
+        let backend = MockRemote::new();
+        let gate = backend.hold_starts();
+        let tasks = backend.tasks(10_000, 1);
+        let start = tasks.start(start_params(), None);
+        tokio::pin!(start);
+        tokio::select! {
+            biased;
+            _ = &mut start => panic!("start must wait for the fixture gate"),
+            _ = std::future::ready(()) => {}
+        }
+        tasks.request_shutdown();
+        assert!(
+            !tasks.shutdown_complete(),
+            "in-flight admission owns cleanup capacity"
+        );
+        let shutdown = tasks.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown must wait for in-flight admission"),
+            _ = std::future::ready(()) => {}
+        }
+        gate.add_permits(1);
+        let id = task_id(start.await.unwrap());
+        backend.saw_cancel().await;
+        assert!(!tasks.shutdown_complete());
+        assert!(tasks.start(start_params(), None).await.is_err());
+        backend.finish(RemoteCommandState::Cancelled);
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap();
+        assert!(tasks.shutdown_complete());
+        assert!(
+            tasks.get(&id).is_err(),
+            "shutdown must clear late-registered SDK tasks"
+        );
     }
 
     struct TestClient {
