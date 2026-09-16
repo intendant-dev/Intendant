@@ -3660,6 +3660,11 @@ mod tests {
     #[test]
     fn docs_lists_and_fetches_embedded_skills() {
         let list = render_docs(&serde_json::json!({}));
+        assert!(!list.contains("intendant-dogfood"));
+        assert!(
+            render_docs(&serde_json::json!({ "skill": "intendant-dogfood" }))
+                .contains("unknown skill")
+        );
         assert!(list.contains("intendant-cli"));
         let one = render_docs(&serde_json::json!({ "skill": "intendant-cli" }));
         assert!(

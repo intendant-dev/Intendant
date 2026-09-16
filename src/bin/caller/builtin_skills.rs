@@ -203,8 +203,6 @@ mod tests {
             !manifest["skills"].to_string().contains("dogfood"),
             "default plugin must not teach dogfooding"
         );
-        let docs = crate::mcp::facade::render_docs(&serde_json::json!({}));
-        assert!(!docs.contains("intendant-dogfood"));
     }
 
     fn embedded(name: &str) -> &'static BuiltinSkill {
