@@ -319,7 +319,7 @@ mod tests {
         // real grant-bound caller so changing its role changes its authority.
         let root = HttpAccessContext {
             principal: iam::principal_for_loopback_mcp(&state, "http").unwrap(),
-            iam_state: Some(state),
+            iam_state: Some(Arc::new(state)),
             peer_filesystem: None,
         };
         let session = create_http_task_session(&root, None).unwrap();
@@ -345,10 +345,7 @@ mod tests {
 
         let mut denied = root.clone();
         denied.principal.role_id = "role:observer".into();
-        let stored = denied
-            .iam_state
-            .as_mut()
-            .unwrap()
+        let stored = Arc::make_mut(denied.iam_state.as_mut().unwrap())
             .grants
             .iter_mut()
             .find(|stored| stored.id == grant.id)
