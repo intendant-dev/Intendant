@@ -3703,6 +3703,24 @@ mod tests {
         for (lane, args, tool, op) in [
             (
                 "inspect",
+                vec!["display", "window-elements", "macos_window:fixture:1"],
+                "read_macos_window_elements",
+                DisplayView,
+            ),
+            (
+                "act",
+                vec![
+                    "display",
+                    "window-element",
+                    "macos_window:fixture:1",
+                    "macos_element:00000000000000000000000000000001",
+                    r#"{"type":"set_value","text":"fixture"}"#,
+                ],
+                "act_macos_window_element",
+                DisplayInput,
+            ),
+            (
+                "inspect",
                 vec!["display", "windows", "123"],
                 "list_macos_windows",
                 DisplayView,

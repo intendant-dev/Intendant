@@ -23,13 +23,13 @@
 use std::ffi::c_void;
 
 use accessibility_sys::{
-    kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute, kAXErrorSuccess,
-    kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute,
-    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
-    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
-    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueGetTypeID,
-    AXValueGetValue, AXValueRef,
+    kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute,
+    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess, kAXFocusedAttribute,
+    kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute, kAXPositionAttribute,
+    kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetTypeID,
+    AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueGetTypeID, AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFGetTypeID, CFType, TCFType};
@@ -536,7 +536,8 @@ fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, 
     }
     Ok(id)
 }
-fn placement_pid(element: &AXUIElement) -> Result<i32, String> {
+fn placement_pid(element: &AXUIElement, deadline: Instant) -> Result<i32, String> {
+    placement_timeout(element, deadline)?;
     let mut pid = 0;
     // SAFETY: retained AX object and writable pid_t output.
     let status =
@@ -664,6 +665,7 @@ fn placement_ax(element: &AXUIElement, deadline: Instant) -> Result<Bounds, Stri
     let position: AXValue = copy_attr(element, kAXPositionAttribute)
         .and_then(|v| v.downcast_into())
         .ok_or("AX position unavailable")?;
+    placement::time_left(deadline)?;
     let size: AXValue = copy_attr(element, kAXSizeAttribute)
         .and_then(|v| v.downcast_into())
         .ok_or("AX size unavailable")?;
@@ -697,7 +699,12 @@ fn placement_ax(element: &AXUIElement, deadline: Instant) -> Result<Bounds, Stri
     bounds.validate()?;
     Ok(bounds)
 }
-fn placement_settable(window: &AXUIElement, attribute: &str) -> Result<(), String> {
+fn placement_settable(
+    window: &AXUIElement,
+    attribute: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    placement_timeout(window, deadline)?;
     let key = CFString::new(attribute);
     let mut settable = 0;
     // SAFETY: retained window/key and writable C Boolean output.
@@ -727,7 +734,7 @@ fn placement_set(
     } else {
         kAXPositionAttribute
     };
-    placement_settable(window, attribute)?;
+    placement_settable(window, attribute, deadline)?;
     let point = CGPoint::new(target.x, target.y);
     let dimensions = CGSize::new(target.width, target.height);
     let (kind, ptr) = if size {
@@ -746,7 +753,7 @@ fn placement_set(
     placement::time_left(deadline)?;
     placement_generation(retained.identity)?;
     if placement_window_id(window, deadline)? != retained.identity.window_id
-        || placement_pid(window)? != retained.identity.pid
+        || placement_pid(window, deadline)? != retained.identity.pid
     {
         return Err("retained window identity changed immediately before write".into());
     }
@@ -817,18 +824,20 @@ impl Native for PlacementNative {
         let exact = placement_exact(identity, deadline)?;
         // CFEqual tests remote AX object identity, not CGWindowID, title or frame.
         if exact != window.element
-            || placement_pid(&window.element)? != identity.pid
+            || placement_pid(&window.element, deadline)? != identity.pid
             || placement_window_id(&window.element, deadline)? != identity.window_id
         {
             return Err("retained AX window destroyed/replaced; refusing reused CGWindowID".into());
         }
-        if attr_bool(&window.element, "AXMinimized") != Some(false)
-            || attr_bool(&window.element, "AXFullScreen") != Some(false)
-        {
+        placement_timeout(&window.element, deadline)?;
+        let minimized = attr_bool(&window.element, "AXMinimized");
+        placement::time_left(deadline)?;
+        let fullscreen = attr_bool(&window.element, "AXFullScreen");
+        if minimized != Some(false) || fullscreen != Some(false) {
             return Err("window minimized/fullscreen state unavailable or unsupported".into());
         }
-        placement_settable(&window.element, kAXPositionAttribute)?;
-        placement_settable(&window.element, kAXSizeAttribute)?;
+        placement_settable(&window.element, kAXPositionAttribute, deadline)?;
+        placement_settable(&window.element, kAXSizeAttribute, deadline)?;
         let ax = placement_ax(&window.element, deadline)?;
         let cg = placement_cg(identity, deadline)?;
         placement_generation(identity)?;
@@ -849,7 +858,7 @@ impl Native for PlacementNative {
             .and_then(|v| v.downcast_into())
             .ok_or("focus observation unavailable; placement refused")?;
         placement_timeout(&element, deadline)?;
-        let pid = placement_pid(&element)?;
+        let pid = placement_pid(&element, deadline)?;
         let birth = crate::platform::macos_process_birth(pid)
             .ok_or("focus process identity unavailable")?;
         Ok(PlacementFocus {
@@ -876,9 +885,613 @@ impl Native for PlacementNative {
     }
 }
 
+// Semantic controls use private retained AX references, on the SAME helper main
+// thread as monitors/windows. None of these wrappers sends global input.
+use crate::macos_monitor::controls::{self, Metadata, Safety};
+#[derive(Clone)]
+pub(crate) struct RetainedElement {
+    element: AXUIElement,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType, String> {
+    placement_permissions(deadline)?;
+    placement_timeout(e, deadline)?;
+    copy_attr(e, key).ok_or_else(|| format!("required AX attribute {key} unavailable"))
+}
+fn control_string(value: CFType, cap: usize) -> Result<String, String> {
+    let string = value
+        .downcast_into::<CFString>()
+        .ok_or("AX string type required")?;
+    // Bound before materializing Rust UTF-8, then enforce the UTF-8 byte cap.
+    // SAFETY: retained, dynamically checked CFString.
+    let length =
+        unsafe { core_foundation::string::CFStringGetLength(string.as_concrete_TypeRef()) };
+    if length < 0 || length as usize > cap {
+        return Err("AX string limit exceeded".into());
+    }
+    let text = string.to_string();
+    if text.len() > cap {
+        return Err("AX UTF-8 string limit exceeded".into());
+    }
+    Ok(text)
+}
+fn control_safety(e: &AXUIElement, deadline: Instant) -> Result<Safety, String> {
+    let role = control_string(control_attr(e, kAXRoleAttribute, deadline)?, 64)?;
+    if role == "AXSecureTextField" {
+        return Ok(Safety { role, secure: true });
+    }
+    // A missing subrole is not evidence that a text field is nonsecure. Check
+    // every node, including containers, BEFORE labels, children or AXValue.
+    let subrole = control_string(control_attr(e, "AXSubrole", deadline)?, 64)?;
+    let secure = [role.as_str(), subrole.as_str()].iter().any(|s| {
+        let s = s.to_ascii_lowercase();
+        s.contains("secure") || s.contains("password")
+    });
+    Ok(Safety { role, secure })
+}
+// Only documented absence is an empty optional label. An IPC/type error must
+// not make a changed button title look identical to a previous empty snapshot.
+fn control_label_result(
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+) -> Result<String, String> {
+    if (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue) && value.is_none() {
+        return Ok(String::new());
+    }
+    if status != kAXErrorSuccess {
+        return Err("AX title read failed; refresh after the application responds".into());
+    }
+    control_string(
+        value.ok_or("AX title missing from successful reply")?,
+        controls::MAX_LABEL,
+    )
+}
+fn control_label(e: &AXUIElement, deadline: Instant) -> Result<String, String> {
+    placement_timeout(e, deadline)?;
+    let key = CFString::new(kAXTitleAttribute);
+    let mut raw = std::ptr::null();
+    // SAFETY: retained element/key and writable Copy-rule output. All non-null
+    // output is wrapped and released, including on native error.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValue(
+            e.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut raw,
+        )
+    };
+    let value = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: Copy-rule output is independently retained and type-checked below.
+        Some(unsafe { CFType::wrap_under_create_rule(raw) })
+    };
+    placement::time_left(deadline)?;
+    control_label_result(status, value)
+}
+fn control_enabled(e: &AXUIElement, deadline: Instant) -> Result<bool, String> {
+    control_attr(e, kAXEnabledAttribute, deadline)?
+        .downcast_into::<CFBoolean>()
+        .map(bool::from)
+        .ok_or_else(|| "AX enabled state unavailable".into())
+}
+fn control_settable(e: &AXUIElement, deadline: Instant) -> Result<bool, String> {
+    placement_timeout(e, deadline)?;
+    let key = CFString::new(kAXValueAttribute);
+    let mut value = 0;
+    // SAFETY: retained object/key and writable C Boolean output.
+    let status = unsafe {
+        accessibility_sys::AXUIElementIsAttributeSettable(
+            e.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut value,
+        )
+    };
+    if status != kAXErrorSuccess {
+        return Err("AX value mutability unavailable".into());
+    }
+    Ok(value != 0)
+}
+// AXPress may include an AppKit button animation. Keep mutation IPC bounded
+// separately from the short read probes, without exceeding the operation budget.
+fn control_action_timeout_seconds(remaining: std::time::Duration) -> Result<f32, String> {
+    let seconds = remaining.as_secs_f32().min(0.5);
+    if seconds <= 0.0 {
+        return Err("element action deadline exceeded before dispatch".into());
+    }
+    Ok(seconds)
+}
+fn control_action_timeout(e: &AXUIElement, deadline: Instant) -> Result<(), String> {
+    placement::time_left(deadline)?;
+    let seconds =
+        control_action_timeout_seconds(deadline.saturating_duration_since(Instant::now()))?;
+    // SAFETY: exact retained element; strictly positive timeout capped at 500 ms
+    // and the remaining operation budget. This does not set a system-wide default.
+    let status = unsafe { AXUIElementSetMessagingTimeout(e.as_concrete_TypeRef(), seconds) };
+    if status != kAXErrorSuccess {
+        return Err("cannot bound element action messaging timeout".into());
+    }
+    Ok(())
+}
+fn control_press_supported(e: &AXUIElement, deadline: Instant) -> Result<bool, String> {
+    placement_timeout(e, deadline)?;
+    let mut raw = std::ptr::null();
+    // SAFETY: retained AX object and writable Copy-rule array output.
+    let status =
+        unsafe { accessibility_sys::AXUIElementCopyActionNames(e.as_concrete_TypeRef(), &mut raw) };
+    if raw.is_null() {
+        return Err("AX action names unavailable".into());
+    }
+    // SAFETY: Copy-rule array retained and released on every following exit.
+    let actions: CFArray = unsafe { CFArray::wrap_under_create_rule(raw) };
+    if status != kAXErrorSuccess || actions.len() > 32 {
+        return Err("AX action names unavailable/excessive".into());
+    }
+    let mut press = false;
+    for item in actions.iter() {
+        placement::time_left(deadline)?;
+        let ptr = *item;
+        if ptr.is_null() {
+            return Err("null AX action name".into());
+        }
+        // SAFETY: the array retains this CF item, get-rule wrapper retains it.
+        let value = unsafe { CFType::wrap_under_get_rule(ptr) };
+        press |= control_string(value, 64)? == "AXPress";
+    }
+    Ok(press)
+}
+fn control_writable(e: &AXUIElement, press: bool, deadline: Instant) -> Result<(), String> {
+    placement_permissions(deadline)?;
+    let safety = control_safety(e, deadline)?;
+    if safety.secure || !control_enabled(e, deadline)? {
+        return Err("secure or disabled control refused".into());
+    }
+    let supported = if press {
+        matches!(
+            safety.role.as_str(),
+            "AXButton" | "AXCheckBox" | "AXRadioButton"
+        ) && control_press_supported(e, deadline)?
+    } else {
+        matches!(safety.role.as_str(), "AXTextField" | "AXTextArea")
+            && control_settable(e, deadline)?
+    };
+    if !supported {
+        return Err("control role/operation unsupported".into());
+    }
+    placement::time_left(deadline)
+}
+
+fn control_child_count(status: accessibility_sys::AXError, count: isize) -> Result<usize, String> {
+    if status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue {
+        Ok(0)
+    } else if status == kAXErrorSuccess && (0..=controls::MAX_CHILDREN as isize).contains(&count) {
+        Ok(count as usize)
+    } else {
+        Err("AX children count unavailable or overflow".into())
+    }
+}
+
+fn control_children_result(
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+    deadline: Instant,
+) -> Result<Vec<AXUIElement>, String> {
+    placement::time_left(deadline)?;
+    if (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue) && value.is_none() {
+        return Ok(vec![]);
+    }
+    if status != kAXErrorSuccess {
+        return Err("bounded AX children unavailable".into());
+    }
+    let array = value
+        .and_then(|v| v.downcast_into::<CFArray>())
+        .ok_or("AX children array required")?;
+    if array.len() as usize > controls::MAX_CHILDREN {
+        return Err("AX children overflow".into());
+    }
+    let mut children = Vec::new();
+    for item in array.iter() {
+        placement::time_left(deadline)?;
+        let ptr = *item;
+        if ptr.is_null() {
+            return Err("null AX child".into());
+        }
+        // SAFETY: the array retains this CF item throughout the loop.
+        let value = unsafe { CFType::wrap_under_get_rule(ptr) };
+        children.push(
+            value
+                .downcast_into::<AXUIElement>()
+                .ok_or("non-element AX child")?,
+        );
+    }
+    Ok(children)
+}
+
+fn control_child_membership<E>(
+    path: &[E],
+    mut children: impl FnMut(&E) -> Result<Vec<E>, String>,
+    equal: impl Fn(&E, &E) -> bool,
+) -> Result<(), String> {
+    for edge in path.windows(2) {
+        let current = children(&edge[0])?;
+        if current.len() > controls::MAX_CHILDREN
+            || !current.iter().any(|child| equal(child, &edge[1]))
+        {
+            return Err("retained AX child membership changed or excessive".into());
+        }
+    }
+    Ok(())
+}
+
+impl controls::Native for PlacementNative {
+    type Element = RetainedElement;
+    fn root(&mut self, window: &RetainedWindow) -> Result<RetainedElement, String> {
+        Ok(RetainedElement {
+            element: window.element.clone(),
+            _thread: std::marker::PhantomData,
+        })
+    }
+    fn equal(&self, a: &RetainedElement, b: &RetainedElement) -> bool {
+        a.element == b.element
+    }
+    fn safety(&mut self, e: &RetainedElement, deadline: Instant) -> Result<Safety, String> {
+        control_safety(&e.element, deadline)
+    }
+    fn children(
+        &mut self,
+        e: &RetainedElement,
+        deadline: Instant,
+    ) -> Result<Vec<RetainedElement>, String> {
+        placement_timeout(&e.element, deadline)?;
+        let key = CFString::new(kAXChildrenAttribute);
+        let mut count = -1;
+        // SAFETY: retained object/key and writable CFIndex output.
+        let status = unsafe {
+            accessibility_sys::AXUIElementGetAttributeValueCount(
+                e.element.as_concrete_TypeRef(),
+                key.as_concrete_TypeRef(),
+                &mut count,
+            )
+        };
+        placement::time_left(deadline)?;
+        if control_child_count(status, count)? == 0 {
+            // Do not request index zero from an empty array: the SDK permits
+            // kAXErrorIllegalArgument for an out-of-range copy.
+            return Ok(vec![]);
+        }
+        placement_timeout(&e.element, deadline)?;
+        let mut raw = std::ptr::null();
+        // SAFETY: retained object/key, writable Copy-rule output, bounded cap+1.
+        let status = unsafe {
+            accessibility_sys::AXUIElementCopyAttributeValues(
+                e.element.as_concrete_TypeRef(),
+                key.as_concrete_TypeRef(),
+                0,
+                (controls::MAX_CHILDREN + 1) as _,
+                &mut raw,
+            )
+        };
+        let value = if raw.is_null() {
+            None
+        } else {
+            // SAFETY: Copy-rule CF result; release even on error and dynamically
+            // check for an array before using any array-specific operations.
+            Some(unsafe { CFType::wrap_under_create_rule(raw as _) })
+        };
+        control_children_result(status, value, deadline)?
+            .into_iter()
+            .map(|element| {
+                placement_timeout(&element, deadline)?;
+                Ok(RetainedElement {
+                    element,
+                    _thread: std::marker::PhantomData,
+                })
+            })
+            .collect()
+    }
+    fn metadata(
+        &mut self,
+        e: &RetainedElement,
+        role: &str,
+        deadline: Instant,
+    ) -> Result<Metadata, String> {
+        let safety = control_safety(&e.element, deadline)?;
+        if safety.secure || safety.role != role {
+            return Err("control safety changed".into());
+        }
+        let enabled = control_enabled(&e.element, deadline)?;
+        // Disabled controls are omitted without even reading their label.
+        if !enabled {
+            return Ok(Metadata {
+                label: String::new(),
+                bounds: placement_ax(&e.element, deadline)?,
+                enabled,
+                press: false,
+                value_settable: false,
+            });
+        }
+        let text = matches!(role, "AXTextField" | "AXTextArea");
+        let press = !text && control_press_supported(&e.element, deadline)?;
+        let value_settable = text && control_settable(&e.element, deadline)?;
+        // AXTitle only: no AXDescription/document text/value fallback. Missing
+        // title is an empty label; excessive present titles refuse the snapshot.
+        let label = control_label(&e.element, deadline)?;
+        Ok(Metadata {
+            label,
+            bounds: placement_ax(&e.element, deadline)?,
+            enabled,
+            press,
+            value_settable,
+        })
+    }
+    fn member(
+        &mut self,
+        window: &RetainedWindow,
+        path: &[RetainedElement],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if path.is_empty()
+            || path.len() > controls::MAX_DEPTH + 1
+            || path[0].element != window.element
+        {
+            return Err("invalid retained AX ancestry".into());
+        }
+        placement_generation(window.identity)?;
+        for (index, e) in path.iter().enumerate() {
+            let safety = control_safety(&e.element, deadline)?;
+            if safety.secure || placement_pid(&e.element, deadline)? != window.identity.pid {
+                return Err("secure/foreign AX ancestry".into());
+            }
+            if index > 0 {
+                let parent: AXUIElement = control_attr(&e.element, "AXParent", deadline)?
+                    .downcast_into()
+                    .ok_or("AX parent unavailable")?;
+                if parent != path[index - 1].element {
+                    return Err(format!(
+                        "retained AX parent changed at depth {index} for {}",
+                        safety.role
+                    ));
+                }
+                let owner: AXUIElement = control_attr(&e.element, "AXWindow", deadline)?
+                    .downcast_into()
+                    .ok_or("AX window unavailable")?;
+                if owner != window.element {
+                    return Err("element left retained AX window".into());
+                }
+            }
+        }
+        // Back-pointers alone may survive detachment. Check every parent still
+        // exposes its exact retained child; never replace any path object.
+        control_child_membership(
+            path,
+            |parent| self.children(parent, deadline),
+            |a, b| a.element == b.element,
+        )?;
+        placement::time_left(deadline)
+    }
+    fn press(&mut self, e: &RetainedElement, deadline: Instant) -> Result<(), String> {
+        control_writable(&e.element, true, deadline)?;
+        let action = CFString::new("AXPress");
+        control_action_timeout(&e.element, deadline)?;
+        // SAFETY: exact retained live element and action; allowed role/action
+        // checked immediately above. No global input or focus mutation.
+        let status = unsafe {
+            accessibility_sys::AXUIElementPerformAction(
+                e.element.as_concrete_TypeRef(),
+                action.as_concrete_TypeRef(),
+            )
+        };
+        if status != kAXErrorSuccess {
+            return Err(format!("AXPress refused or unconfirmed ({status})"));
+        }
+        Ok(())
+    }
+    fn set_value(
+        &mut self,
+        e: &RetainedElement,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if text.len() > controls::MAX_TEXT {
+            return Err("text limit exceeded".into());
+        }
+        control_writable(&e.element, false, deadline)?;
+        let key = CFString::new(kAXValueAttribute);
+        let value = CFString::new(text);
+        placement::time_left(deadline)?;
+        control_action_timeout(&e.element, deadline)?;
+        // SAFETY: exact retained live element, key and bounded string. Only
+        // nonsecure enabled editable text roles with settable AXValue reach here.
+        let status = unsafe {
+            accessibility_sys::AXUIElementSetAttributeValue(
+                e.element.as_concrete_TypeRef(),
+                key.as_concrete_TypeRef(),
+                value.as_CFTypeRef(),
+            )
+        };
+        if status != kAXErrorSuccess {
+            return Err(format!("AXValue write refused or unconfirmed ({status})"));
+        }
+        Ok(())
+    }
+    fn value_matches(
+        &mut self,
+        e: &RetainedElement,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<bool, String> {
+        control_writable(&e.element, false, deadline)?; // secure check BEFORE value
+        let value = control_string(
+            control_attr(&e.element, kAXValueAttribute, deadline)?,
+            controls::MAX_TEXT,
+        )?;
+        placement::time_left(deadline)?;
+        Ok(value == text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_control_label_distinguishes_absence_from_ipc_or_type_failure() {
+        use accessibility_sys::{kAXErrorCannotComplete, kAXErrorInvalidUIElement};
+        for status in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
+            assert_eq!(control_label_result(status, None).unwrap(), "");
+        }
+        for status in [
+            kAXErrorCannotComplete,
+            kAXErrorInvalidUIElement,
+            kAXErrorSuccess,
+        ] {
+            assert!(control_label_result(status, None).is_err());
+        }
+        let label = CFString::new("Preview").as_CFType();
+        assert_eq!(
+            control_label_result(kAXErrorSuccess, Some(label.clone())).unwrap(),
+            "Preview"
+        );
+        assert!(control_label_result(kAXErrorCannotComplete, Some(label)).is_err());
+        assert!(
+            control_label_result(kAXErrorSuccess, Some(CFBoolean::true_value().as_CFType()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_mutation_timeout_is_positive_capped_and_respects_remaining_budget() {
+        use std::time::Duration;
+        assert!(control_action_timeout_seconds(Duration::ZERO).is_err());
+        assert_eq!(
+            control_action_timeout_seconds(Duration::from_secs(4)).unwrap(),
+            0.5
+        );
+        assert_eq!(
+            control_action_timeout_seconds(Duration::from_millis(500)).unwrap(),
+            0.5
+        );
+        let short = control_action_timeout_seconds(Duration::from_millis(10)).unwrap();
+        assert!((short - 0.01).abs() < f32::EPSILON);
+        assert!(control_action_timeout_seconds(Duration::from_nanos(1)).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn control_children_accept_only_documented_absence_or_bounded_counts() {
+        use accessibility_sys::{
+            kAXErrorCannotComplete, kAXErrorFailure, kAXErrorIllegalArgument,
+            kAXErrorInvalidUIElement, kAXErrorNotImplemented,
+        };
+        for status in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
+            assert_eq!(control_child_count(status, -1).unwrap(), 0);
+        }
+        assert_eq!(control_child_count(kAXErrorSuccess, 0).unwrap(), 0);
+        assert_eq!(
+            control_child_count(kAXErrorSuccess, controls::MAX_CHILDREN as isize).unwrap(),
+            controls::MAX_CHILDREN
+        );
+        for count in [-1, controls::MAX_CHILDREN as isize + 1] {
+            assert!(control_child_count(kAXErrorSuccess, count).is_err());
+        }
+        for status in [
+            kAXErrorCannotComplete,
+            kAXErrorFailure,
+            kAXErrorIllegalArgument,
+            kAXErrorInvalidUIElement,
+            kAXErrorNotImplemented,
+        ] {
+            // A zero-initialized output is never evidence of a leaf on failure.
+            assert!(control_child_count(status, 0).is_err());
+            assert!(control_children_result(
+                status,
+                None,
+                Instant::now() + std::time::Duration::from_secs(4)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn control_children_leaf_results_do_not_mask_malformed_arrays_or_limits() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(4);
+        let empty = || CFArray::<CFString>::from_CFTypes(&[]).as_CFType();
+        for status in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
+            assert!(control_children_result(status, None, deadline)
+                .unwrap()
+                .is_empty());
+            assert!(control_children_result(status, Some(empty()), deadline).is_err());
+        }
+        assert!(
+            control_children_result(kAXErrorSuccess, Some(empty()), deadline)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(control_children_result(kAXErrorSuccess, None, deadline).is_err());
+        assert!(control_children_result(
+            kAXErrorSuccess,
+            Some(CFString::new("not an array").as_CFType()),
+            deadline,
+        )
+        .is_err());
+        let non_element = CFArray::from_CFTypes(&[CFString::new("not an AX element")]);
+        assert!(
+            control_children_result(kAXErrorSuccess, Some(non_element.as_CFType()), deadline)
+                .err()
+                .unwrap()
+                .contains("non-element")
+        );
+        let overflow =
+            CFArray::from_CFTypes(&vec![CFString::new("child"); controls::MAX_CHILDREN + 1]);
+        assert!(
+            control_children_result(kAXErrorSuccess, Some(overflow.as_CFType()), deadline)
+                .err()
+                .unwrap()
+                .contains("overflow")
+        );
+        assert!(control_children_result(
+            kAXErrorSuccess,
+            Some(empty()),
+            Instant::now() - std::time::Duration::from_secs(1),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn control_membership_rechecks_each_retained_edge_without_substitution() {
+        // This is the edge validator called by PlacementNative::member after
+        // AXParent/AXWindow/security checks, with current child reads injected.
+        let path = [10, 20, 30];
+        let mut visited = Vec::new();
+        control_child_membership(
+            &path,
+            |parent| {
+                visited.push(*parent);
+                Ok(vec![parent + 10])
+            },
+            |a, b| a == b,
+        )
+        .unwrap();
+        assert_eq!(visited, [10, 20]);
+        for parent in [10, 20] {
+            for failure in ["detached", "replacement", "overflow", "ipc"] {
+                let result = control_child_membership(
+                    &path,
+                    |current| {
+                        if *current != parent {
+                            return Ok(vec![current + 10]);
+                        }
+                        match failure {
+                            "detached" => Ok(vec![]),
+                            "replacement" => Ok(vec![99]),
+                            "overflow" => Ok(vec![current + 10; controls::MAX_CHILDREN + 1]),
+                            _ => Err("AX messaging failed".into()),
+                        }
+                    },
+                    |a, b| a == b,
+                );
+                assert!(result.is_err(), "{parent}: {failure}");
+            }
+        }
+    }
 
     /// Live probe against the real GUI session. Requires the Accessibility
     /// permission for the invoking process tree; both outcomes are printed.

@@ -1119,6 +1119,30 @@ impl IntendantServer {
                     .await,
                 ))
             }
+            "read_macos_window_elements" => {
+                let Parameters(p) = parse_params::<ReadMacosWindowElementsParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::ReadElements { binding: p.binding },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "act_macos_window_element" => {
+                let Parameters(p) = parse_params::<ActMacosWindowElementParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::ActElement {
+                            binding: p.binding,
+                            element: p.element,
+                            action: p.action,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "unbind_macos_window" => {
                 let Parameters(p) = parse_params::<UnbindMacosWindowParams>(args)?;
                 Ok(text_tool_result(
@@ -1885,6 +1909,37 @@ impl IntendantServer {
             crate::macos_monitor::WindowAction::Place {
                 binding: p.binding,
                 bounds: p.bounds,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Inspect at most 16 actionable controls only within an exact retained macOS bound window wholly on its unchanged owned nonprimary monitor. DisplayView plus OwnerSurface required; no helper startup, document text or values. Roles, short labels, bounds, supported operations and opaque one-use tokens only. Each helper refresh/failure replaces the inventory across all bindings. Secure subtrees omitted; missing required attributes or traversal/wire overflow refuse.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn read_macos_window_elements(
+        &self,
+        Parameters(p): Parameters<ReadMacosWindowElementsParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::ReadElements { binding: p.binding },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "One-shot semantic action on an opaque retained macOS element token AND its exact window binding. DisplayInput plus OwnerSurface always. Tagged action type press or set_value with text <=1024 UTF-8 bytes. Only enabled AXPress buttons/checkboxes/radios or nonsecure editable AXValue text fields/areas. Consumes inventory before native validation. Press reports dispatched/effect-unverified; text requires exact bounded readback without exposing contents. Rechecks identity, ancestry, geometry, existing permissions and focus. No global input, activation, clipboard, retries, rollback or focus restoration. Shared WindowServer is not an isolated seat."
+    )]
+    pub(crate) async fn act_macos_window_element(
+        &self,
+        Parameters(p): Parameters<ActMacosWindowElementParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::ActElement {
+                binding: p.binding,
+                element: p.element,
+                action: p.action,
             },
             ToolCallerTrust::OwnerSurface,
         )

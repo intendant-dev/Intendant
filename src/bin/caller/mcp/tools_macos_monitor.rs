@@ -13,6 +13,7 @@ impl IntendantServer {
         action: WindowAction,
         caller: ToolCallerTrust,
     ) -> String {
+        let element_action = matches!(&action, WindowAction::ActElement { .. });
         let authority = self.macos_monitor_authority(caller).await;
         let receipt = match self
             .bus
@@ -21,7 +22,16 @@ impl IntendantServer {
             .await
         {
             Ok(receipt) => receipt,
-            Err(error) => return window_error(error),
+            Err(error) => {
+                if element_action {
+                    let uncertain = error.starts_with(crate::macos_monitor::ELEMENT_UNCONFIRMED);
+                    return serde_json::json!({"ok":false, "error":error,
+                        "action_attempted": if uncertain { None } else { Some(false) },
+                        "effects_unconfirmed":uncertain, "focus_interference":null})
+                    .to_string();
+                }
+                return window_error(error);
+            }
         };
         window_response(receipt)
     }
@@ -299,6 +309,17 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
         Value::Window(WindowValue::PlacementUnconfirmed { result, error }) => {
             serde_json::json!({"ok":false,"placement":result,"effects_unconfirmed":true,"error":error})
         }
+        Value::Window(WindowValue::Elements(controls)) => {
+            serde_json::json!({"ok":true,"controls":controls})
+        }
+        Value::Window(WindowValue::Acted(result)) => {
+            serde_json::json!({"ok":result.successful(),"action":result,
+            "action_attempted":result.action_attempted,"effects_unconfirmed":result.effects_unconfirmed,"focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::ActionUnconfirmed { result, error }) => {
+            serde_json::json!({"ok":false,"action":result,
+            "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,"focus_interference":result.focus_interference,"error":error})
+        }
         Value::Window(WindowValue::Unbound) => serde_json::json!({"ok":true,"unbound":true}),
         _ => return window_error("unexpected window result".into()),
     };
@@ -306,10 +327,13 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
     if !receipt.commit() {
         // Keep the complete observation, including verified effects. Only the
         // delivery/commit is unconfirmed; never replace it with a generic error.
-        if response.get("placement").is_some() {
+        if response.get("placement").is_some() || response.get("action").is_some() {
             response["ok"] = false.into();
-            response["effects_unconfirmed"] = true.into();
-            let expired = "window receipt expired; placement effects may already have applied; no rollback attempted";
+            response["effects_unconfirmed"] = response
+                .get("action")
+                .is_none_or(|action| action["action_attempted"] == true)
+                .into();
+            let expired = "window receipt expired; available observations retained; no retry or rollback attempted";
             response["error"] = match response["error"].as_str() {
                 Some(error) => format!("{error}; {expired}"),
                 None => expired.into(),
@@ -326,6 +350,67 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn element_receipt_expiry_and_late_failure_keep_attempt_focus_and_readback_evidence() {
+        use crate::macos_monitor::{controls::*, Receipt};
+        for status in [
+            ActionStatus::Verified,
+            ActionStatus::Dispatched,
+            ActionStatus::Partial,
+        ] {
+            for attempted in [true, false] {
+                if !attempted && status != ActionStatus::Partial {
+                    continue;
+                }
+                for late_failure in [true, false] {
+                    let bounds = crate::macos_monitor::placement::Bounds {
+                        x: -100.0,
+                        y: 0.0,
+                        width: 80.0,
+                        height: 40.0,
+                    };
+                    let result = ActionResult {
+                        status,
+                        operation: if status == ActionStatus::Dispatched {
+                            SupportedOperation::Press
+                        } else {
+                            SupportedOperation::SetValue
+                        },
+                        action_attempted: attempted,
+                        before: bounds,
+                        after: Some(bounds),
+                        value_matches: if attempted && status != ActionStatus::Dispatched {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                        focus_interference: Some(status == ActionStatus::Partial),
+                        effects_unconfirmed: attempted && status != ActionStatus::Verified,
+                        detail: None,
+                    };
+                    let expected = serde_json::to_value(&result).unwrap();
+                    let value = if late_failure {
+                        WindowValue::ActionUnconfirmed {
+                            result,
+                            error: "helper died after observation".into(),
+                        }
+                    } else {
+                        WindowValue::Acted(result)
+                    };
+                    let (receipt, committed) = Receipt::fixture(Value::Window(value));
+                    drop(committed);
+                    let response: serde_json::Value =
+                        serde_json::from_str(&window_response(receipt)).unwrap();
+                    assert_eq!(response["ok"], false);
+                    assert_eq!(response["action"], expected);
+                    assert_eq!(response["action_attempted"], attempted);
+                    assert_eq!(response["effects_unconfirmed"], attempted);
+                    assert!(response["error"].as_str().unwrap().contains("expired"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn expired_and_late_failure_responses_keep_partial_and_verified_evidence() {
@@ -686,6 +771,7 @@ mod tests {
             "macos_virtual".into(),
             "macos_window:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1".into(),
             " MACOS_WINDOW:bad ".into(),
+            " MACOS_ELEMENT:bad ".into(),
             "macos_candidate:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             "display_macos_candidate:bad".into(),
             crate::macos_monitor::DISPLAY_ID_MIN.to_string(),
@@ -816,6 +902,22 @@ mod tests {
         for granted in [false, true] {
             autonomy.write().await.user_display_granted = granted;
             for (tool, args) in [
+                (
+                    "read_macos_window_elements",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                ),
+                (
+                    "act_macos_window_element",
+                    serde_json::json!({"binding":"macos_window:fixture:1","element":"macos_element:00000000000000000000000000000001","action":{"type":"press"}}),
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","window-elements","macos_window:fixture:1"]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","window-element","macos_window:fixture:1","macos_element:00000000000000000000000000000001",r#"{"type":"press"}"#]}),
+                ),
                 ("list_macos_windows", serde_json::json!({"pid":123})),
                 (
                     "bind_macos_window",

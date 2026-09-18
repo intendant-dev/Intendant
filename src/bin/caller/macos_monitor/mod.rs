@@ -4,6 +4,7 @@
 //! owner-only AX window binding/placement uses the same serialized helper.
 
 mod capture;
+pub(crate) mod controls;
 mod helper;
 mod inspection;
 pub(crate) mod placement;
@@ -31,9 +32,14 @@ pub(crate) const UNSUPPORTED: &str = "generic macos_virtual display APIs support
 /// never fall through an old parser to :99 or the user's primary display.
 pub(crate) fn reserved(value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
-    if ["macos_virtual", "macos_window", "macos_candidate"]
-        .iter()
-        .any(|prefix| value.contains(prefix))
+    if [
+        "macos_virtual",
+        "macos_window",
+        "macos_candidate",
+        "macos_element",
+    ]
+    .iter()
+    .any(|prefix| value.contains(prefix))
     {
         return true;
     }
@@ -175,6 +181,11 @@ async fn await_commit(mut committed: oneshot::Receiver<()>) -> bool {
     }
 }
 
+pub(crate) const ELEMENT_UNCONFIRMED: &str = "element action effects unconfirmed";
+fn element_unconfirmed(error: &str) -> String {
+    format!("{ELEMENT_UNCONFIRMED}; action may already have applied or still be in progress; do not replay; {error}")
+}
+
 pub(crate) const PLACEMENT_UNCONFIRMED: &str = "placement effects unconfirmed";
 fn placement_unconfirmed(error: &str) -> String {
     format!("{PLACEMENT_UNCONFIRMED}; window movement/resize may already have applied and may still be in progress; {error}")
@@ -200,6 +211,23 @@ async fn await_reply(
         placement_unconfirmed(error)
     } else {
         error.into()
+    })
+}
+
+async fn await_element_reply(
+    receive: oneshot::Receiver<Result<Receipt, String>>,
+    dispatched: &std::sync::atomic::AtomicBool,
+    budget: std::time::Duration,
+) -> Result<Receipt, String> {
+    await_reply(receive, false, budget).await.map_err(|e| {
+        if dispatched.load(std::sync::atomic::Ordering::SeqCst)
+            && (e.starts_with("monitor request deadline")
+                || e.starts_with("macOS monitor broker retired"))
+        {
+            element_unconfirmed(&e)
+        } else {
+            e
+        }
     })
 }
 
@@ -230,6 +258,7 @@ struct Request {
     action: Action,
     authority: Authority,
     reply: oneshot::Sender<Result<Receipt, String>>,
+    element_dispatch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Allocated with the EventBus, shared across MCP transports/sessions. Lazy
@@ -252,6 +281,9 @@ impl Broker {
         }
         if let Action::Create { width, height } = action {
             validate_dimensions(width, height)?;
+        }
+        if matches!(action, Action::Window(_)) && self.sender.get().is_none() {
+            return Err("no owned macOS monitor generation".into());
         }
         if !cfg!(target_os = "macos") {
             return Err("macOS owned monitors require macOS".into());
@@ -279,17 +311,24 @@ impl Broker {
             .as_ref()
             .map_err(Clone::clone)?;
         let placement = matches!(action, Action::Window(WindowAction::Place { .. }));
+        let element_dispatch = matches!(action, Action::Window(WindowAction::ActElement { .. }))
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (reply, receive) = oneshot::channel();
         sender
             .try_send(Request {
                 action,
                 authority,
                 reply,
+                element_dispatch: element_dispatch.clone(),
             })
             .map_err(|_| "macOS monitor broker unavailable or busy")?;
         // This deadline only cancels the caller's receipt. The worker retains
         // child/backend ownership through stop/rollback; it is never aborted.
-        await_reply(receive, placement, std::time::Duration::from_secs(20)).await
+        if let Some(progress) = element_dispatch {
+            await_element_reply(receive, &progress, std::time::Duration::from_secs(20)).await
+        } else {
+            await_reply(receive, placement, std::time::Duration::from_secs(20)).await
+        }
     }
 }
 
@@ -496,14 +535,24 @@ where
                     retired = Some(error.clone());
                 }
                 if let Err(error) = authorized.and(live) {
-                    if let Value::Window(WindowValue::Placed(result)) = value {
-                        // The final liveness/authority check cannot erase an
-                        // already observed partial or verified placement.
-                        let _ = request.reply.send(Ok(Receipt {
-                            value: Value::Window(WindowValue::PlacementUnconfirmed {
+                    let preserved = match value {
+                        Value::Window(WindowValue::Placed(result)) => {
+                            Some(WindowValue::PlacementUnconfirmed {
                                 result,
-                                error,
-                            }),
+                                error: error.clone(),
+                            })
+                        }
+                        Value::Window(WindowValue::Acted(result)) => {
+                            Some(WindowValue::ActionUnconfirmed {
+                                result,
+                                error: error.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = preserved {
+                        let _ = request.reply.send(Ok(Receipt {
+                            value: Value::Window(value),
                             commit,
                         }));
                     } else {
@@ -774,6 +823,7 @@ mod tests {
         resolve_release: Option<oneshot::Receiver<()>>,
         next: u32,
         next_binding: u32,
+        element_token: Option<(u32, String)>,
         die_after_place: bool,
         verified_place: bool,
         window_started: Option<oneshot::Sender<()>>,
@@ -858,11 +908,58 @@ mod tests {
                         binding: self.next_binding,
                     })
                 }
+                Operation::ReadWindowElements { binding } => {
+                    self.log.lock().unwrap().push("elements");
+                    let token = format!("macos_element:{}", uuid::Uuid::new_v4().simple());
+                    self.element_token = Some((binding, token.clone()));
+                    Ok(Outcome::WindowElements {
+                        controls: vec![controls::Control {
+                            element: token,
+                            role: "AXButton".into(),
+                            label: "fixture".into(),
+                            bounds: placement::tests::monitor(),
+                            operations: vec![controls::SupportedOperation::Press],
+                        }],
+                    })
+                }
+                Operation::ActWindowElement {
+                    binding, element, ..
+                } => {
+                    if self.element_token.take() != Some((binding, element)) {
+                        return Ok(Outcome::Error {
+                            message: "stale element token".into(),
+                            fatal: false,
+                        });
+                    }
+                    self.log.lock().unwrap().push("element_action");
+                    if let Some(started) = self.place_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.place_release.take() {
+                        let _ = release.await;
+                    }
+                    self.dead = self.die_after_place;
+                    Ok(Outcome::ActedWindowElement {
+                        result: controls::ActionResult {
+                            status: controls::ActionStatus::Dispatched,
+                            operation: controls::SupportedOperation::Press,
+                            action_attempted: true,
+                            before: placement::tests::monitor(),
+                            after: Some(placement::tests::monitor()),
+                            value_matches: None,
+                            focus_interference: Some(false),
+                            effects_unconfirmed: true,
+                            detail: None,
+                        },
+                    })
+                }
                 Operation::UnbindWindow { binding } => {
+                    self.element_token = None;
                     self.log.lock().unwrap().push("unbind");
                     Ok(Outcome::UnboundWindow { binding })
                 }
                 Operation::PlaceWindow { bounds, .. } => {
+                    self.element_token = None;
                     self.log.lock().unwrap().push("place");
                     if let Some(started) = self.place_started.take() {
                         let _ = started.send(());
@@ -898,6 +995,7 @@ mod tests {
                     })
                 }
                 Operation::Destroy { handle } => {
+                    self.element_token = None;
                     self.log.lock().unwrap().push("destroy");
                     self.destroyed.lock().unwrap().push(handle);
                     if self.fail_destroy {
@@ -967,7 +1065,8 @@ mod tests {
             .try_send(Request {
                 action,
                 authority,
-                reply
+                reply,
+                element_dispatch: None,
             })
             .is_ok());
         receive
@@ -1768,6 +1867,14 @@ mod tests {
             a.autonomy.write().await.user_display_granted = grant;
             let b = Broker::default();
             for action in [
+                WindowAction::ReadElements {
+                    binding: "macos_window:fixture:1".into(),
+                },
+                WindowAction::ActElement {
+                    binding: "macos_window:fixture:1".into(),
+                    element: "macos_element:00000000000000000000000000000001".into(),
+                    action: controls::ElementAction::Press {},
+                },
                 WindowAction::List { pid: 123 },
                 WindowAction::Bind {
                     selector: format!("macos_virtual:{}:{}", "a".repeat(32), DISPLAY_ID_MIN),
@@ -2067,5 +2174,217 @@ mod tests {
             commit
         }
         .commit());
+    }
+    async fn bound_fixture(tx: &mpsc::Sender<Request>) -> String {
+        let monitor = committed_monitor(tx).await;
+        let receipt = send(tx, bind_action(&monitor), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let Value::Window(WindowValue::Bound(b)) = &receipt.value else {
+            panic!("binding")
+        };
+        let binding = b.binding.clone();
+        assert!(receipt.commit());
+        binding
+    }
+    async fn elements_fixture(tx: &mpsc::Sender<Request>, binding: &str) -> (Receipt, String) {
+        let receipt = send(
+            tx,
+            Action::Window(WindowAction::ReadElements {
+                binding: binding.into(),
+            }),
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Value::Window(WindowValue::Elements(c)) = &receipt.value else {
+            panic!("elements")
+        };
+        let token = c[0].element.clone();
+        (receipt, token)
+    }
+    fn press_fixture(binding: &str, element: &str) -> Action {
+        Action::Window(WindowAction::ActElement {
+            binding: binding.into(),
+            element: element.into(),
+            action: controls::ElementAction::Press {},
+        })
+    }
+    #[tokio::test]
+    async fn element_reads_and_actions_never_start_a_helper_or_broker() {
+        let broker = Broker::default();
+        for action in [
+            Action::Window(WindowAction::ReadElements {
+                binding: "macos_window:fixture:1".into(),
+            }),
+            press_fixture(
+                "macos_window:fixture:1",
+                "macos_element:00000000000000000000000000000001",
+            ),
+        ] {
+            assert!(broker.request(action, authority(true)).await.is_err());
+            assert!(broker.not_started());
+        }
+    }
+    #[tokio::test]
+    async fn element_snapshot_replacement_and_cross_binding_tokens_do_not_dispatch_effects() {
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let (receipt, old) = elements_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        let (receipt, new) = elements_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        assert_ne!(old, new);
+        assert!(send(&tx, press_fixture(&binding, &old), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        // The foreign-token attempt itself consumed the fresh snapshot.
+        assert!(send(&tx, press_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        let (receipt, new) = elements_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        assert!(send(
+            &tx,
+            press_fixture("macos_window:foreign:1", &new),
+            authority(true)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(send(&tx, press_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .unwrap()
+            .commit());
+        assert!(send(&tx, press_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "element_action")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn cancellation_before_element_dispatch_is_no_effect_and_after_is_uncertain_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started, begin) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let fake = Fake {
+            place_started: Some(started),
+            place_release: Some(wait),
+            ..Default::default()
+        };
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let (receipt, token) = elements_fixture(&tx, &binding).await;
+        // Hold the read receipt so the action is definitely queued, then close.
+        let progress = Arc::new(AtomicBool::new(false));
+        let (reply, receive) = oneshot::channel();
+        assert!(tx
+            .send(Request {
+                action: press_fixture(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .is_ok());
+        let error = await_element_reply(receive, &progress, std::time::Duration::from_millis(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.starts_with(ELEMENT_UNCONFIRMED));
+        assert!(!progress.load(Ordering::SeqCst));
+        assert!(receipt.commit());
+        let (reply, receive) = oneshot::channel();
+        assert!(tx
+            .send(Request {
+                action: press_fixture(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .is_ok());
+        begin.await.unwrap();
+        let error = await_element_reply(receive, &progress, std::time::Duration::from_millis(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with(ELEMENT_UNCONFIRMED));
+        release.send(()).unwrap();
+        // Serialized replay cannot duplicate the dispatched effect.
+        assert!(send(&tx, press_fixture(&binding, &token), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "element_action")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn action_receipt_expiry_and_final_liveness_preserve_evidence_and_never_rollback() {
+        for dead in [false, true] {
+            let fake = Fake {
+                die_after_place: dead,
+                ..Default::default()
+            };
+            let log = fake.log.clone();
+            let (tx, worker) = runner(fake);
+            let binding = bound_fixture(&tx).await;
+            let (receipt, token) = elements_fixture(&tx, &binding).await;
+            assert!(receipt.commit());
+            let receipt = send(&tx, press_fixture(&binding, &token), authority(true))
+                .await
+                .unwrap()
+                .unwrap();
+            match &receipt.value {
+                Value::Window(WindowValue::Acted(r)) if !dead => {
+                    assert!(r.action_attempted && r.successful())
+                }
+                Value::Window(WindowValue::ActionUnconfirmed { result, error }) if dead => {
+                    assert!(result.action_attempted && result.successful());
+                    assert!(error.contains("died"));
+                }
+                _ => panic!("lost evidence"),
+            }
+            // Exercise the actor's actual receipt expiry, not a synthetic error.
+            let replay = send(&tx, press_fixture(&binding, &token), authority(true));
+            assert!(replay.await.unwrap().is_err());
+            assert!(!receipt.commit());
+            drop(tx);
+            assert_eq!(worker.await.unwrap().is_err(), dead);
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&x| x == "element_action")
+                    .count(),
+                1
+            );
+            assert!(!log.lock().unwrap().contains(&"unbind"));
+        }
     }
 }

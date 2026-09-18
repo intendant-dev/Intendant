@@ -1,4 +1,5 @@
 //! Public binding generations never expose private helper handles/native IDs.
+use super::controls::{ActionResult, Control, ElementAction};
 use super::placement::{Bounds, Candidate, PlacementResult, WindowIdentity, MAX_BINDINGS};
 use super::*;
 use serde::Serialize;
@@ -15,6 +16,14 @@ pub(crate) enum WindowAction {
     Place {
         binding: String,
         bounds: Bounds,
+    },
+    ReadElements {
+        binding: String,
+    },
+    ActElement {
+        binding: String,
+        element: String,
+        action: ElementAction,
     },
     Unbind {
         binding: String,
@@ -41,7 +50,16 @@ impl WindowAction {
                 valid_binding(binding)?;
                 bounds.validate()
             }
-            Self::Unbind { binding } => valid_binding(binding),
+            Self::Unbind { binding } | Self::ReadElements { binding } => valid_binding(binding),
+            Self::ActElement {
+                binding,
+                element,
+                action,
+            } => {
+                valid_binding(binding)?;
+                controls::validate_token(element)?;
+                action.validate()
+            }
             _ => Ok(()),
         }
     }
@@ -68,7 +86,26 @@ pub(crate) enum WindowValue {
         result: PlacementResult,
         error: String,
     },
+    Elements(Vec<Control>),
+    Acted(ActionResult),
+    ActionUnconfirmed {
+        result: ActionResult,
+        error: String,
+    },
     Unbound,
+}
+
+fn begin_window_dispatch(
+    progress: Option<&std::sync::atomic::AtomicBool>,
+    cancelled: impl FnOnce() -> bool,
+) -> bool {
+    // Publish possible dispatch BEFORE the final cancellation check. A caller
+    // that closes its receiver and then observes false must prevent dispatch;
+    // once true is visible, a lost reply conservatively means uncertain effects.
+    if let Some(progress) = progress {
+        progress.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    !cancelled()
 }
 
 pub(super) async fn execute_window(
@@ -112,6 +149,28 @@ pub(super) async fn execute_window(
                 bounds: *bounds,
             }
         }
+        WindowAction::ReadElements { binding } | WindowAction::ActElement { binding, .. } => {
+            let bound = state
+                .bindings
+                .get(binding)
+                .ok_or_else(|| Failure::Request("stale or foreign window binding".into()))?;
+            // The helper checks its retained monitor geometry within the same
+            // snapshot/action budget. Do not dispatch a separate native resolve
+            // ahead of consuming the element inventory.
+            match action {
+                WindowAction::ReadElements { .. } => Operation::ReadWindowElements {
+                    binding: bound.helper_binding,
+                },
+                WindowAction::ActElement {
+                    element, action, ..
+                } => Operation::ActWindowElement {
+                    binding: bound.helper_binding,
+                    element: element.clone(),
+                    action: action.clone(),
+                },
+                _ => unreachable!(),
+            }
+        }
         WindowAction::Unbind { binding } => {
             let bound = state
                 .bindings
@@ -127,7 +186,9 @@ pub(super) async fn execute_window(
         .check(&request.authority)
         .await
         .map_err(Failure::Request)?;
-    if request.reply.is_closed() {
+    if !begin_window_dispatch(request.element_dispatch.as_deref(), || {
+        request.reply.is_closed()
+    }) {
         return Err(Failure::Request(
             "window request cancelled before dispatch".into(),
         ));
@@ -135,6 +196,8 @@ pub(super) async fn execute_window(
     let outcome = child.exchange(op).await.map_err(|e| {
         Failure::Retire(if matches!(action, WindowAction::Place { .. }) {
             placement_unconfirmed(&e)
+        } else if matches!(action, WindowAction::ActElement { .. }) {
+            element_unconfirmed(&e)
         } else {
             format!("window operation unconfirmed; {e}")
         })
@@ -177,6 +240,29 @@ pub(super) async fn execute_window(
         (WindowAction::Place { .. }, Outcome::PlacedWindow { result }) if result.valid_reply() => {
             WindowValue::Placed(result)
         }
+        (WindowAction::ReadElements { .. }, Outcome::WindowElements { controls })
+            if controls.len() <= controls::MAX_CONTROLS
+                && controls.iter().all(Control::valid_reply)
+                && controls
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| controls[..i].iter().all(|p| p.element != c.element)) =>
+        {
+            WindowValue::Elements(controls)
+        }
+        (WindowAction::ActElement { action, .. }, Outcome::ActedWindowElement { result })
+            if result.valid_reply()
+                && matches!(
+                    (action, result.operation),
+                    (ElementAction::Press {}, controls::SupportedOperation::Press)
+                        | (
+                            ElementAction::SetValue { .. },
+                            controls::SupportedOperation::SetValue
+                        )
+                ) =>
+        {
+            WindowValue::Acted(result)
+        }
         (WindowAction::Unbind { binding }, Outcome::UnboundWindow { binding: helper })
             if state
                 .bindings
@@ -191,6 +277,8 @@ pub(super) async fn execute_window(
             return Err(Failure::Retire(
                 if matches!(action, WindowAction::Place { .. }) {
                     placement_unconfirmed(error)
+                } else if matches!(action, WindowAction::ActElement { .. }) {
+                    element_unconfirmed(error)
                 } else {
                     error.into()
                 },
@@ -217,5 +305,48 @@ pub(super) async fn rollback_binding(
     {
         Outcome::UnboundWindow { binding } if binding == b.helper_binding => Ok(()),
         _ => Err("window binding rollback unconfirmed; cleanup required".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancellation_before_publication_cannot_dispatch_after_reporting_no_attempt() {
+        let progress = AtomicBool::new(false);
+        let (reply, receive) = oneshot::channel();
+        let error = await_element_reply(receive, &progress, Duration::ZERO)
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.starts_with(ELEMENT_UNCONFIRMED));
+        assert!(!progress.load(Ordering::SeqCst));
+        assert!(!begin_window_dispatch(Some(&progress), || reply.is_closed()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_or_after_final_check_always_reports_possible_dispatch() {
+        for at_check in [true, false] {
+            let progress = AtomicBool::new(false);
+            let (reply, mut receive) = oneshot::channel();
+            let may_dispatch = begin_window_dispatch(Some(&progress), || {
+                // Deterministically stop at the former race boundary: the
+                // publication must already be visible when cancellation checks.
+                assert!(progress.load(Ordering::SeqCst));
+                if at_check {
+                    receive.close();
+                }
+                reply.is_closed()
+            });
+            assert_eq!(may_dispatch, !at_check);
+            let error = await_element_reply(receive, &progress, Duration::ZERO)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.starts_with(ELEMENT_UNCONFIRMED));
+        }
     }
 }

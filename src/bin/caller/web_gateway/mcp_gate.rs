@@ -1823,6 +1823,30 @@ mod tests {
                 == crate::mcp::ToolCallerTrust::OwnerSurface;
             for (tool, args, operation, label) in [
                 (
+                    "read_macos_window_elements",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "act_macos_window_element",
+                    serde_json::json!({"binding":"macos_window:fixture:1","element":"macos_element:00000000000000000000000000000001","action":{"type":"press"}}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","window-elements","macos_window:fixture:1"]}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","window-element","macos_window:fixture:1","macos_element:00000000000000000000000000000001",r#"{"type":"press"}"#]}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
                     "list_macos_windows",
                     serde_json::json!({"pid":123}),
                     DisplayView,
