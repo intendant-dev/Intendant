@@ -27,6 +27,42 @@ static id ax_copy(AXUIElementRef element, CFStringRef key) {
     if (error != kAXErrorSuccess) { if (value) CFRelease(value); return nil; }
     return value ? CFBridgingRelease(value) : nil;
 }
+// Describe only exact-object relationships in the disposable fixture.
+static NSString *probe_role(id object) {
+    if (!object || CFGetTypeID((__bridge CFTypeRef)object) != AXUIElementGetTypeID()) return @"not-element";
+    AXUIElementRef element = (__bridge AXUIElementRef)object;
+    AXUIElementSetMessagingTimeout(element, 0.05);
+    id role = ax_copy(element, kAXRoleAttribute);
+    return [role isKindOfClass:NSString.class] && [role length] <= 64 ? role : @"unavailable";
+}
+static NSDictionary *probe_parent_chain(id object, id root, pid_t pid, NSTimeInterval deadline) {
+    NSMutableArray *nodes = [NSMutableArray array], *seen = [NSMutableArray array];
+    NSString *error = nil; BOOL reached = NO;
+    for (NSUInteger depth = 0; depth <= 16; depth++) {
+        if (NSProcessInfo.processInfo.systemUptime >= deadline) { error = @"parent deadline"; break; }
+        if (!object || CFGetTypeID((__bridge CFTypeRef)object) != AXUIElementGetTypeID() || [seen containsObject:object]) { error = @"parent invalid/cycle"; break; }
+        [seen addObject:object]; AXUIElementRef element = (__bridge AXUIElementRef)object;
+        AXUIElementSetMessagingTimeout(element, 0.05);
+        pid_t actual = 0;
+        if (AXUIElementGetPid(element, &actual) != kAXErrorSuccess || actual != pid) { error = @"foreign parent"; break; }
+        if (CFEqual((__bridge CFTypeRef)object, (__bridge CFTypeRef)root)) { reached = YES; [nodes addObject:@{@"role":probe_role(object), @"root":@YES}]; break; }
+        id parent = ax_copy(element, kAXParentAttribute), window = ax_copy(element, kAXWindowAttribute);
+        if (!parent || CFGetTypeID((__bridge CFTypeRef)parent) != AXUIElementGetTypeID()) { error = @"parent unavailable"; break; }
+        AXUIElementRef p = (__bridge AXUIElementRef)parent; AXUIElementSetMessagingTimeout(p, 0.05);
+        CFIndex count = 0; AXError status = AXUIElementGetAttributeValueCount(p, kAXChildrenAttribute, &count);
+        BOOL member = NO; NSString *childError = @"";
+        if (status == kAXErrorSuccess && count > 0 && count <= 32) {
+            CFArrayRef raw = NULL; status = AXUIElementCopyAttributeValues(p, kAXChildrenAttribute, 0, 33, &raw);
+            NSArray *children = raw ? CFBridgingRelease(raw) : nil;
+            if (status == kAXErrorSuccess && children && children.count <= 32) member = [children containsObject:object];
+            else childError = @"children copy failed";
+        } else childError = @"no bounded children";
+        [nodes addObject:@{@"role":probe_role(object), @"parent_role":probe_role(parent), @"parent_exposes_child":@(member),
+            @"window_matches":@(window && CFEqual((__bridge CFTypeRef)window, (__bridge CFTypeRef)root)), @"children_error":childError}];
+        object = parent;
+    }
+    return @{@"chain":nodes, @"reached_exact_window":@(reached), @"error":error ?: @""};
+}
 static NSDictionary *tree_probe(pid_t pid) {
     if (!AXIsProcessTrusted()) return @{ @"error": @"diagnostic accessibility permission unavailable" };
     AXUIElementRef app = AXUIElementCreateApplication(pid);
@@ -34,8 +70,8 @@ static NSDictionary *tree_probe(pid_t pid) {
     id windows = ax_copy(app, kAXWindowsAttribute); CFRelease(app);
     if (![windows isKindOfClass:NSArray.class] || [windows count] != 1)
         return @{ @"error": @"diagnostic requires one exact fixture window" };
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:@{ @"element": windows[0], @"path": @[] }];
-    NSMutableArray *seen = [NSMutableArray array];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:@{ @"element": windows[0], @"path": @[], @"objects": @[] }];
+    NSMutableArray *seen = [NSMutableArray array], *mismatches = [NSMutableArray array];
     NSArray *deepest = @[]; NSUInteger maxChildren = 0, controls = 0;
     NSString *error = nil;
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 4;
@@ -56,6 +92,14 @@ static NSDictionary *tree_probe(pid_t pid) {
         if (path.count > 32) { error = @"diagnostic depth budget"; break; }
         if ([role.lowercaseString containsString:@"secure"] || [role.lowercaseString containsString:@"password"] ||
             ([subrole isKindOfClass:NSString.class] && ([subrole.lowercaseString containsString:@"secure"] || [subrole.lowercaseString containsString:@"password"]))) continue;
+        NSArray *objects = [entry[@"objects"] arrayByAddingObject:object];
+        if ([entry[@"objects"] count] > 0) {
+            id parent = ax_copy(element, kAXParentAttribute), expected = [entry[@"objects"] lastObject];
+            if ((!parent || !CFEqual((__bridge CFTypeRef)parent, (__bridge CFTypeRef)expected)) && mismatches.count < 8) {
+                [mismatches addObject:@{@"downward_roles":path, @"expected_parent_role":probe_role(expected),
+                    @"actual_parent_role":probe_role(parent), @"parents":probe_parent_chain(object, windows[0], pid, deadline)}];
+            }
+        }
         if ([@[@"AXButton", @"AXTextField", @"AXTextArea", @"AXCheckBox", @"AXRadioButton"] containsObject:role]) controls++;
         CFIndex count = 0; AXError status = AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute, &count);
         if (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue || (status == kAXErrorSuccess && count == 0)) continue;
@@ -64,11 +108,11 @@ static NSDictionary *tree_probe(pid_t pid) {
         CFArrayRef raw = NULL; status = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute, 0, 33, &raw);
         NSArray *children = raw ? CFBridgingRelease(raw) : nil;
         if (status != kAXErrorSuccess || !children || children.count > 32) { error = @"diagnostic child array failure"; break; }
-        for (id child in children.reverseObjectEnumerator) [stack addObject:@{ @"element":child, @"path":path }];
+        for (id child in children.reverseObjectEnumerator) [stack addObject:@{ @"element":child, @"path":path, @"objects":objects }];
     }
     return @{ @"visited": @(seen.count), @"max_depth": @(deepest.count ? deepest.count - 1 : 0),
         @"max_children": @(maxChildren), @"actionable_roles": @(controls), @"deepest_roles":deepest,
-        @"complete":error ? @NO : @YES, @"error":error ?: @"" };
+        @"complete":error ? @NO : @YES, @"error":error ?: @"", @"parent_mismatches":mismatches };
 }
 
 int main(int argc, const char **argv) {

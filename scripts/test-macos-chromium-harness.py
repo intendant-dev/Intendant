@@ -58,6 +58,36 @@ class Tests(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
+    def test_window_readiness_only_repeats_reads_and_keeps_exact_identity(self):
+        current = {'browser_pid': 42, 'windows': [{'window_id': 7}]}
+        ready = {'ok': True, 'candidates': [{'identity': {'window_id': 7}}]}
+        pending = {'ok': False, 'error': 'application does not expose bounded AX windows'}
+        for responses in [[pending, ready], [pending, pending, pending]]:
+            calls = []
+            pauses = []
+            def call(name, **args):
+                self.assertEqual(name, 'list_macos_windows')
+                self.assertEqual(args, {'pid': 42})
+                result = responses[len(calls)]
+                calls.append(result)
+                return result
+            last, candidates, attempts = h.list_ready_fixture_window(call, lambda: current, current, pauses.append)
+            self.assertEqual(calls, responses)
+            self.assertEqual(attempts, responses)
+            self.assertEqual(len(pauses), len(calls) - 1)
+            self.assertEqual(bool(candidates), last is ready)
+
+    def test_window_readiness_never_masks_permission_or_retargets_window(self):
+        current = {'browser_pid': 42, 'windows': [{'window_id': 7}]}
+        with patch.object(h.time, 'sleep') as sleep:
+            result = h.list_ready_fixture_window(lambda *a, **kw: {'error': 'permission denied'}, lambda: current, current, sleep)
+            self.assertEqual(len(result[2]), 1)
+            sleep.assert_not_called()
+        for changed in [{'browser_pid': 99, 'windows': [{'window_id': 7}]},
+                        {'browser_pid': 42, 'windows': [{'window_id': 8}]}]:
+            with self.assertRaises(RuntimeError):
+                h.list_ready_fixture_window(lambda *a, **kw: {'candidates': []}, lambda: changed, current, lambda _: None)
+
     def test_address_refuses_header_injection_and_nonbrowser_paths(self):
         for port, path in [(0, '/devtools/browser/a'), (65536, '/devtools/browser/a'),
                            (1234, '/devtools/page/a'), (1234, '/devtools/browser/a\r\nInjected: true'),

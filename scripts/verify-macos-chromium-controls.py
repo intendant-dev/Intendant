@@ -146,6 +146,30 @@ class CDP:
         self.sock.close()
 
 
+def list_ready_fixture_window(call, status, initial, pause=time.sleep):
+    """At most three read-only discovery calls; never change the selected window."""
+    pid = initial['browser_pid']
+    require(len(initial['windows']) == 1, 'browser window not unique')
+    window_id = initial['windows'][0]['window_id']
+    attempts = []
+    candidates = []
+    for attempt in range(3):
+        listed = call('list_macos_windows', pid=pid)
+        attempts.append(listed)
+        candidates = [w for w in listed.get('candidates', []) if w['identity']['window_id'] == window_id]
+        if len(candidates) == 1:
+            break
+        if listed.get('error') not in (None, 'application does not expose bounded AX windows'):
+            break
+        if attempt < 2:
+            pause(.1)
+            current = status()
+            require(current['browser_pid'] == pid and len(current['windows']) == 1
+                    and current['windows'][0]['window_id'] == window_id,
+                    'browser window changed during readiness')
+    return listed, candidates, attempts
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bin', required=True, type=Path)
@@ -257,9 +281,9 @@ def main():
             time.sleep(.05)
             current = status()
         require(len(current['windows']) == 1, 'browser window not unique')
-        listed = call('list_macos_windows', pid=current['browser_pid'])
+        listed, candidates, attempts = list_ready_fixture_window(call, status, current)
         report['checks']['window_listing'] = listed
-        candidates = [w for w in listed.get('candidates', []) if w['identity']['window_id'] == current['windows'][0]['window_id']]
+        report['checks']['window_listing_attempts'] = attempts
         require(len(candidates) == 1, listed)
         bound = call('bind_macos_window', display_target=args.monitor, **{k: candidates[0][k] for k in ('candidate', 'identity')})
         require(bound.get('ok') is True, bound)
@@ -316,6 +340,7 @@ def main():
             text = 'Chromium exact text π 😀'
             result = action(field, {'type': 'set_value', 'text': text})
             report['checks']['text_action'] = result
+            report['checks']['text_independent_readback'] = evaluate('fixtureStatus().text') == text
             require(result.get('ok') is True and result['action']['status'] == 'verified', result)
             require(evaluate('fixtureStatus().text') == text, 'independent DOM text disagrees')
             replay = action(field, {'type': 'set_value', 'text': 'must not replay'})
@@ -324,6 +349,7 @@ def main():
             _, button = read()
             result = action(button, {'type': 'press'})
             report['checks']['press_action'] = result
+            report['checks']['button_independent_count'] = evaluate('fixtureStatus().button_count')
             require(result.get('ok') is True and result['action']['status'] == 'dispatched' and result['effects_unconfirmed'], result)
             require(evaluate('fixtureStatus().button_count') == 1, 'button effect not observed')
             replay = action(button, {'type': 'press'})
@@ -335,6 +361,22 @@ def main():
             require(stale.get('ok') is False and stale.get('action_attempted') is False, stale)
             require(evaluate('fixtureStatus().text') == 'replacement disposable text', 'replacement acted on')
             report['checks']['replacement_refused'] = True
+            # Negative action test: replace the document in OUR disposable page.
+            # CDP does not provide the text/button actions being tested.
+            field, _ = read()
+            cdp.call('Page.reload', {}, session)
+            until = time.monotonic() + 5
+            ready = False
+            while time.monotonic() < until:
+                ready = evaluate("document.readyState === 'complete' && typeof fixtureStatus === 'function' && fixtureStatus().text === 'initial disposable text' && fixtureStatus().button_count === 0")
+                if ready:
+                    break
+                time.sleep(.05)
+            require(ready, 'replacement document not ready')
+            stale = action(field, {'type': 'set_value', 'text': 'must not cross navigation'})
+            require(stale.get('ok') is False and stale.get('action_attempted') is False, stale)
+            require(evaluate('fixtureStatus().text') == 'initial disposable text', 'stale control crossed navigation')
+            report['checks']['navigation_refused'] = True
             require(evaluate('fixtureStatus().canvas_count') == 0, 'unexpected canvas input')
             report['checks']['canvas_input'] = 'not implemented or exercised; semantic controls are not raw canvas input'
         else:

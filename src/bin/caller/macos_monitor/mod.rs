@@ -3,6 +3,8 @@
 //! streaming, browser workspaces, input or primary-display fallback. Explicit
 //! owner-only AX window binding/placement uses the same serialized helper.
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod ancestry;
 mod capture;
 pub(crate) mod controls;
 mod helper;

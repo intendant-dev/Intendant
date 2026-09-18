@@ -887,12 +887,9 @@ impl Native for PlacementNative {
 
 // Semantic controls use private retained AX references, on the SAME helper main
 // thread as monitors/windows. None of these wrappers sends global input.
+use crate::macos_monitor::ancestry;
 use crate::macos_monitor::controls::{self, Metadata, Safety};
-#[derive(Clone)]
-pub(crate) struct RetainedElement {
-    element: AXUIElement,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
+pub(crate) type RetainedElement = ancestry::Node<AXUIElement>;
 fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType, String> {
     placement_permissions(deadline)?;
     placement_timeout(e, deadline)?;
@@ -1176,11 +1173,11 @@ fn control_children_result(
 
 fn control_child_membership<E>(
     path: &[E],
-    mut children: impl FnMut(&E) -> Result<Vec<E>, String>,
+    mut children: impl FnMut(&E, &E) -> Result<Vec<E>, String>,
     equal: impl Fn(&E, &E) -> bool,
 ) -> Result<(), String> {
     for edge in path.windows(2) {
-        let current = children(&edge[0])?;
+        let current = children(&edge[0], &edge[1])?;
         if current.len() > controls::MAX_CHILDREN
             || !current.iter().any(|child| equal(child, &edge[1]))
         {
@@ -1190,13 +1187,76 @@ fn control_child_membership<E>(
     Ok(())
 }
 
+// Raw AXChildren is deliberately separate from exact bridge projection.
+fn control_raw_children(e: &AXUIElement, deadline: Instant) -> Result<Vec<AXUIElement>, String> {
+    placement_timeout(e, deadline)?;
+    let key = CFString::new(kAXChildrenAttribute);
+    let mut count = -1;
+    // SAFETY: retained object/key and writable CFIndex output.
+    let status = unsafe {
+        accessibility_sys::AXUIElementGetAttributeValueCount(
+            e.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut count,
+        )
+    };
+    placement::time_left(deadline)?;
+    if control_child_count(status, count)? == 0 {
+        // Do not request index zero from an empty array: the SDK permits
+        // kAXErrorIllegalArgument for an out-of-range copy.
+        return Ok(vec![]);
+    }
+    placement_timeout(e, deadline)?;
+    let mut raw = std::ptr::null();
+    // SAFETY: retained object/key, writable Copy-rule output, bounded cap+1.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValues(
+            e.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            0,
+            (controls::MAX_CHILDREN + 1) as _,
+            &mut raw,
+        )
+    };
+    let value = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: Copy-rule CF result; release even on error and dynamically
+        // check for an array before using any array-specific operations.
+        Some(unsafe { CFType::wrap_under_create_rule(raw as _) })
+    };
+    control_children_result(status, value, deadline)
+}
+struct ControlTreeNative {
+    deadline: Instant,
+}
+impl ancestry::Graph for ControlTreeNative {
+    type Element = AXUIElement;
+    fn safety(&mut self, e: &AXUIElement) -> Result<controls::Safety, String> {
+        control_safety(e, self.deadline)
+    }
+    fn parent(&mut self, e: &AXUIElement) -> Result<AXUIElement, String> {
+        control_attr(e, "AXParent", self.deadline)?
+            .downcast_into()
+            .ok_or("AX parent unavailable".into())
+    }
+    fn window(&mut self, e: &AXUIElement) -> Result<AXUIElement, String> {
+        control_attr(e, "AXWindow", self.deadline)?
+            .downcast_into()
+            .ok_or("AX window unavailable".into())
+    }
+    fn pid(&mut self, e: &AXUIElement) -> Result<i32, String> {
+        placement_pid(e, self.deadline)
+    }
+    fn children(&mut self, e: &AXUIElement) -> Result<Vec<AXUIElement>, String> {
+        control_raw_children(e, self.deadline)
+    }
+}
+
 impl controls::Native for PlacementNative {
     type Element = RetainedElement;
     fn root(&mut self, window: &RetainedWindow) -> Result<RetainedElement, String> {
-        Ok(RetainedElement {
-            element: window.element.clone(),
-            _thread: std::marker::PhantomData,
-        })
+        Ok(RetainedElement::plain(window.element.clone()))
     }
     fn equal(&self, a: &RetainedElement, b: &RetainedElement) -> bool {
         a.element == b.element
@@ -1209,52 +1269,7 @@ impl controls::Native for PlacementNative {
         e: &RetainedElement,
         deadline: Instant,
     ) -> Result<Vec<RetainedElement>, String> {
-        placement_timeout(&e.element, deadline)?;
-        let key = CFString::new(kAXChildrenAttribute);
-        let mut count = -1;
-        // SAFETY: retained object/key and writable CFIndex output.
-        let status = unsafe {
-            accessibility_sys::AXUIElementGetAttributeValueCount(
-                e.element.as_concrete_TypeRef(),
-                key.as_concrete_TypeRef(),
-                &mut count,
-            )
-        };
-        placement::time_left(deadline)?;
-        if control_child_count(status, count)? == 0 {
-            // Do not request index zero from an empty array: the SDK permits
-            // kAXErrorIllegalArgument for an out-of-range copy.
-            return Ok(vec![]);
-        }
-        placement_timeout(&e.element, deadline)?;
-        let mut raw = std::ptr::null();
-        // SAFETY: retained object/key, writable Copy-rule output, bounded cap+1.
-        let status = unsafe {
-            accessibility_sys::AXUIElementCopyAttributeValues(
-                e.element.as_concrete_TypeRef(),
-                key.as_concrete_TypeRef(),
-                0,
-                (controls::MAX_CHILDREN + 1) as _,
-                &mut raw,
-            )
-        };
-        let value = if raw.is_null() {
-            None
-        } else {
-            // SAFETY: Copy-rule CF result; release even on error and dynamically
-            // check for an array before using any array-specific operations.
-            Some(unsafe { CFType::wrap_under_create_rule(raw as _) })
-        };
-        control_children_result(status, value, deadline)?
-            .into_iter()
-            .map(|element| {
-                placement_timeout(&element, deadline)?;
-                Ok(RetainedElement {
-                    element,
-                    _thread: std::marker::PhantomData,
-                })
-            })
-            .collect()
+        ancestry::children(&mut ControlTreeNative { deadline }, e, deadline)
     }
     fn metadata(
         &mut self,
@@ -1305,7 +1320,8 @@ impl controls::Native for PlacementNative {
         }
         placement_generation(window.identity)?;
         for (index, e) in path.iter().enumerate() {
-            let safety = control_safety(&e.element, deadline)?;
+            let safety = control_safety(&e.element, deadline)
+                .map_err(|e| format!("AX retained ancestor {index}: {e}"))?;
             if safety.secure || placement_pid(&e.element, deadline)? != window.identity.pid {
                 return Err("secure/foreign AX ancestry".into());
             }
@@ -1331,8 +1347,15 @@ impl controls::Native for PlacementNative {
         // exposes its exact retained child; never replace any path object.
         control_child_membership(
             path,
-            |parent| self.children(parent, deadline),
-            |a, b| a.element == b.element,
+            |parent, expected| {
+                ancestry::membership_children(
+                    &mut ControlTreeNative { deadline },
+                    parent,
+                    expected,
+                    deadline,
+                )
+            },
+            |a, b| a == b, // Compare the originally exposed child witness too.
         )?;
         placement::time_left(deadline)
     }
@@ -1598,7 +1621,7 @@ mod tests {
         let mut visited = Vec::new();
         control_child_membership(
             &path,
-            |parent| {
+            |parent, _expected| {
                 visited.push(*parent);
                 Ok(vec![parent + 10])
             },
@@ -1610,7 +1633,7 @@ mod tests {
             for failure in ["detached", "replacement", "overflow", "ipc"] {
                 let result = control_child_membership(
                     &path,
-                    |current| {
+                    |current, _expected| {
                         if *current != parent {
                             return Ok(vec![current + 10]);
                         }
