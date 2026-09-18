@@ -21,11 +21,6 @@ pub(crate) const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         support_files: &[],
     },
     BuiltinSkill {
-        name: "intendant-dogfood",
-        skill_md: include_str!("../../../skills/intendant-dogfood/SKILL.md"),
-        support_files: &[],
-    },
-    BuiltinSkill {
         name: "intendant-cli",
         skill_md: include_str!("../../../skills/intendant-cli/SKILL.md"),
         support_files: &[],
@@ -190,13 +185,23 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_dogfood_skill_matches_builtin() {
-        assert_eq!(
-            embedded("intendant-dogfood").skill_md,
-            include_str!(
-            "../../../examples/chatgpt-plugin/plugin-template/skills/intendant-dogfood/SKILL.md"
-        ),
-            "ChatGPT plugin dogfood teaching drifted from the shared builtin skill"
+    fn dogfood_instructions_are_not_shipped_to_end_users() {
+        assert!(!BUILTIN_SKILLS
+            .iter()
+            .any(|skill| skill.name.contains("dogfood")));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(!root.join("skills/intendant-dogfood").exists());
+        let template = root.join("examples/chatgpt-plugin/plugin-template");
+        for name in ["intendant-dogfood", "skill-dogfood-feedback"] {
+            assert!(!template.join("skills").join(name).exists());
+        }
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(template.join(".codex-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !manifest["skills"].to_string().contains("dogfood"),
+            "default plugin must not teach dogfooding"
         );
     }
 

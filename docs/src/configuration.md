@@ -16,6 +16,20 @@ CLI flags win over env vars where they overlap (`--provider` sets `PROVIDER`,
 `--openai-auth` sets `OPENAI_AUTH_MODE`, and `--model` sets `MODEL_NAME`).
 `intendant.toml` and `.env` are both git-ignored.
 
+## Developer dogfood opt-in
+
+`INTENDANT_DEV_DOGFOOD=1` enables the developer-only MCP `report` intake on the
+intended daemon. Unset, empty, `0`, and every value other than the exact string
+`1` leave it disabled and absent from tool listings. This is a process-start
+setting, not a remote settings operation; changing it requires restarting the
+daemon. A caller still needs `feedback.write`, which ordinary `role:operator`
+does not grant. Root authority alone cannot bypass the disabled feature.
+
+Dogfood instructions are not embedded or installed by default. Developer skill
+installation or a ChatGPT package generated with `--dev-dogfood` is a separate
+opt-in; neither silently enables the daemon. See
+[MCP developer reporting](./mcp-server.md#the-facade-profile).
+
 ## Environment variables
 
 The controller reads these from the process environment (populated from `.env`;

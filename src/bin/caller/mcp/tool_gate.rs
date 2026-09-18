@@ -177,8 +177,9 @@ pub(crate) fn tool_allowed_for_profile(
                     // `ctl notify`).
                     | "ask_user"
                     | "notify_user"
-                    // Exception-only product feedback is a core collaboration
-                    // primitive with its own narrow feedback.write gate.
+                    // Optional developer feedback. The server's separate
+                    // availability gate removes this unless explicitly enabled;
+                    // profile membership never enables it or grants authority.
                     | "report"
                     // Self-identity for provenance: memory and agenda
                     // writes cite the ids whoami reports (also reachable
@@ -302,7 +303,7 @@ pub(crate) enum ToolProfileFamily {
     Core,
     Screen,
     Managed,
-    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): seven tools,
+    /// The CLI-shaped meta-tool surface (`mcp/facade.rs`): six default tools,
     /// everything else discovered lazily through help/docs.
     Facade,
 }
@@ -625,8 +626,8 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     // The facade meta-tools (`tool_profile=facade`): a CLI-shaped,
     // context-efficient control surface — three risk-lane argv executors
     // plus lazy discovery. Kept deliberately lean: the whole facade
-    // listing is budget-pinned in tests (the point is that these seven
-    // definitions replace dozens of typed schemas).
+    // listing is budget-pinned in tests (six default definitions plus the
+    // opt-in developer report replace dozens of typed schemas).
     push(
         "inspect",
         manual_http_tool_definition!(
@@ -671,7 +672,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     "report",
     manual_http_tool_definition!(
         "report",
-        "Report one exceptional Intendant-specific issue or concrete efficiency opportunity. Do not report routine success or paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets. The daemon stamps trusted provenance/build metadata and atomically creates or merges the Agenda-backed report under the narrow feedback.write permission.",
+        "Developer-only, explicitly opted-in feedback: report one exceptional Intendant-specific issue or concrete efficiency opportunity. Do not report routine success or paste transcripts, prompts, environment dumps, tool arguments/output, credentials, or secrets. The daemon stamps trusted provenance/build metadata and atomically creates or merges the Agenda-backed report under the narrow feedback.write permission.",
         DogfoodReportParams
     ),
 );
@@ -1145,7 +1146,7 @@ mod tests {
         }
     }
 
-    /// The facade profile advertises exactly the seven meta-tools, and the
+    /// The default facade advertises exactly the six meta-tools, and the
     /// whole serialized listing stays inside the context budget — the
     /// facade's reason to exist (design doc M1 acceptance).
     #[test]

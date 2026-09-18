@@ -153,15 +153,29 @@ the relay forwards the DELETE and Intendant cancels/awaits any real remote work
 owned by that Tasks session. The protocol session and task handles are in-memory
 and do not survive a daemon restart.
 
-The generated plugin also carries the `intendant-dogfood` skill. It teaches
-ChatGPT/Codex to call the narrow `report` tool only for exceptional
-Intendant-specific friction or concrete efficiency opportunities, never for
-routine success. Reports remain local and Agenda-backed; the feature does not
-open GitHub issues or publish externally. The `report` call is gated by
-`feedback.write` rather than broad `agenda.write`. Because the Secure MCP relay
-authenticates as the local-process principal, any `client_context` supplied by
-the model is explicitly self-described; only gate-stamped actor provenance is
-trusted.
+### Developer-only dogfooding (opt-in)
+
+The **default generated plugin does not contain dogfood instructions**, and the
+daemon does not advertise or accept `report` by default. End users are not
+asked to produce developer feedback.
+
+Developers may add `--dev-dogfood` when running `configure_plugin.py` to include
+only the internal `skill-dogfood-feedback` skill in that developer package.
+This does not enable the daemon feature or grant authority: independently start
+the developer daemon with `INTENDANT_DEV_DOGFOOD=1` and use a principal authorized
+for `feedback.write`. Ordinary `role:operator` no longer grants that permission.
+Do not distribute the opted-in package as the ordinary end-user plugin.
+
+Reports remain local and Agenda-backed; no GitHub issues or central collection
+are created. The Secure MCP relay authenticates as the local-process principal,
+so `client_context` is self-described and only gate-stamped provenance is trusted.
+The skill tells agents to continue silently when the tool is unavailable or
+denied, never to enable it themselves or write Agenda feedback as a workaround.
+
+For packages generated before this default-off boundary, regenerate into a new
+directory and reinstall without `--dev-dogfood`. Stop/restart the updated daemon
+without `INTENDANT_DEV_DOGFOOD=1` to disable reporting regardless of cached client
+instructions. Existing local reports are not deleted.
 
 ## Verification and troubleshooting
 
