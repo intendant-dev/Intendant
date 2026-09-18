@@ -75,6 +75,11 @@ def assess_pointer_receipts(plan, receipts, tagged_click_count):
             or not 0 < plan['window_id'] < 2**32
             or not all(_number(plan.get(k)) for k in ('x', 'y'))):
         return result
+    coordinates = ('x', 'y')
+    if any(k in plan for k in ('local_x', 'local_y')):
+        if not all(_number(plan.get(k)) for k in ('local_x', 'local_y')):
+            return result
+        coordinates += ('local_x', 'local_y')
     matching = []
     for receipt in receipts:
         if not isinstance(receipt, dict):
@@ -88,7 +93,7 @@ def assess_pointer_receipts(plan, receipts, tagged_click_count):
         if (any(type(receipt.get(k)) is not int or receipt[k] != plan[k]
                 for k in ('pid', 'source_pid', 'window_id'))
                 or not all(_number(receipt.get(k)) and
-                           abs(receipt[k] - plan[k]) <= 0.5 for k in ('x', 'y'))
+                           abs(receipt[k] - plan[k]) <= 0.5 for k in coordinates)
                 or receipt.get('kind') not in ('left_down', 'left_up')):
             return result
     kinds = [receipt['kind'] for receipt in matching]

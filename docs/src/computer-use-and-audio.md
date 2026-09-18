@@ -1185,3 +1185,20 @@ counter. That live mode is not yet acceptance-tested and is not a daemon tool.
 No arbitrary application, raw keyboard/canvas capability, independent seat or
 expanded display grant is advertised. See
 [raw pointer probe](../design/macos-raw-pointer-probe.md) for boundaries and commands.
+
+### Disposable raw-pointer receiver acceptance
+
+The opt-in test fixture now demonstrates a paired click both within its own
+process and from a private child to its retained parent window. It uses an
+explicit window-addressed event plus runtime-probed private window-local
+coordinate accessors; missing symbols or failed readback refuse. Delivery is
+separate from posting: exact tagged receiver/source/window/global/local receipts
+and one canvas-counter increment are required. The source stays alive through
+acknowledgement and both processes have bounded cleanup. Whole-run owner activity
+remains unattributed; target activation never becomes acceptable because the
+owner is active.
+
+This is test infrastructure, not an enabled daemon raw-input tool, arbitrary
+Chromium support or an independent input/clipboard seat. The default mode remains
+nonposting and creates no application/window. See
+`docs/design/macos-raw-pointer-delivery.md` for the evidence and private-API boundary.
