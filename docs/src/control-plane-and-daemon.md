@@ -420,6 +420,13 @@ Co-homed daemons coordinate through the **active-scheduler lease**
 chapter for the firing rules). A running holder can hand its role to a
 successor without kill-and-relaunch:
 
+The scheduler-lease and per-boot presence guards explicitly unlock on graceful
+owner drop. File close alone can leave a lock held by a descriptor inherited
+across a concurrent fork. Only the creating process unlocks; a copied child
+guard cannot release its parent. Abrupt exits still depend on OS descriptor
+cleanup, and uncertain liveness probes stay conservative. See
+`docs/design/handover-lock-release.md` in the source tree.
+
 - `intendant --takeover` boots a successor that asks the current holder to
   **drain** (`POST /api/daemon/takeover` — owner-grade, loopback
   admission-token trust class; `intendant ctl takeover` is the standalone

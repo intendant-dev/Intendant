@@ -4,9 +4,9 @@
 //! - `<boot_id>.lock` — an **empty** file whose advisory exclusive lock
 //!   the daemon holds for its process lifetime. Liveness of any boot_id
 //!   is "can I take its lock?" — the same clock-free primitive as the
-//!   scheduler lease, so a crashed daemon is *provably* dead (the OS
-//!   released its lock) and a live one *provably* live (the probe gets
-//!   `WouldBlock`). No heartbeats, no staleness heuristics.
+//!   scheduler lease. Graceful drop explicitly unlocks; after abrupt exit,
+//!   inherited descriptors may conservatively keep the probe live until
+//!   they close. No heartbeats, no staleness heuristics.
 //! - `<boot_id>.json` — an atomically rewritten description
 //!   (pid/port/version/state), observability only. Boot-recovery scoping
 //!   (HS2) keys on the *lock*, never the JSON.
@@ -122,6 +122,25 @@ pub(crate) struct DaemonPresence {
     record: PresenceRecord,
     /// Held for the process lifetime — the liveness substrate.
     _lock: std::fs::File,
+}
+
+// Release at the owner lifetime boundary, not the last duplicate close.
+impl Drop for DaemonPresence {
+    fn drop(&mut self) {
+        // A fork child must not unlock its parent. PID is minted here,
+        // not loaded from disk.
+        if self.record.pid != std::process::id() {
+            return;
+        }
+        if let Err(error) = self._lock.unlock() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[handover] presence unlock failed: {error}"
+            );
+        }
+        // File close is the fallback; logging must not panic in Drop.
+    }
 }
 
 impl DaemonPresence {
@@ -326,6 +345,38 @@ pub(crate) fn read_presence_records(state_root: &Path) -> Vec<PresenceRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_guard_does_not_unlock_another_process_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut copied = DaemonPresence::register(dir.path(), "boot-a", 7001).unwrap();
+        let owner = copied._lock.try_clone().unwrap();
+        copied.record.pid = 0; // Model a guard inherited from another process.
+        drop(copied);
+        assert!(boot_id_is_live(dir.path(), "boot-a"));
+        owner.unlock().unwrap();
+        assert!(!boot_id_is_live(dir.path(), "boot-a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_drop_releases_presence_with_duplicated_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DaemonPresence::register(dir.path(), "boot-a", 7001).unwrap();
+        let inherited = first._lock.try_clone().unwrap();
+        assert!(boot_id_is_live(dir.path(), "boot-a"));
+        drop(first);
+        assert!(
+            !boot_id_is_live(dir.path(), "boot-a"),
+            "an inherited descriptor must not keep a dropped owner live"
+        );
+        let successor = DaemonPresence::register(dir.path(), "boot-b", 7002).unwrap();
+        drop(inherited);
+        assert!(boot_id_is_live(dir.path(), "boot-b"));
+        drop(successor);
+        assert!(!boot_id_is_live(dir.path(), "boot-b"));
+    }
 
     #[test]
     fn boot_liveness_is_lock_takeability() {

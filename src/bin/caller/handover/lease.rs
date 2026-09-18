@@ -7,9 +7,9 @@
 //!
 //! - `holder.lock` — an **empty** advisory-exclusive-locked file, held for
 //!   the holder's process lifetime. The flock IS the authority: crash
-//!   release is free (the OS drops the lock with the process), so there
-//!   are no heartbeats, no clocks, no staleness heuristics, and a zombie
-//!   holder is impossible. Same primitive the codebase already trusts in
+//!   release follows OS descriptor lifetime, including inherited copies.
+//!   Graceful drop explicitly unlocks; abrupt exit can remain held until
+//!   an inherited descriptor closes. No heartbeat or clock grants authority. Same primitive the codebase already trusts in
 //!   `memory/store.rs` (`plane.lock`) and `file_watcher.rs` (`store.lock`).
 //!   It stays empty because Windows' LockFileEx blocks *reads* of a locked
 //!   file — data never rides the locked file itself.
@@ -89,6 +89,22 @@ pub(crate) enum LeaseAttempt {
     HeldElsewhere(Option<LeaseSidecar>),
 }
 
+// Release at the owner lifetime boundary, not the last duplicate close.
+impl Drop for SchedulerLease {
+    fn drop(&mut self) {
+        // A fork child must not unlock its parent. PID is minted here,
+        // not loaded from disk.
+        if self.sidecar.pid != std::process::id() {
+            return;
+        }
+        if let Err(error) = self._lock.unlock() {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "[handover] lease unlock failed: {error}");
+        }
+        // File close is the fallback; logging must not panic in Drop.
+    }
+}
+
 impl SchedulerLease {
     /// Try to acquire the lease under `state_root`. Never blocks; never
     /// panics. `journal_generation_floor` is the max generation already
@@ -133,11 +149,13 @@ impl SchedulerLease {
             state: "active".to_string(),
             acquired_at_ms: super::now_ms(),
         };
-        write_lease_sidecar(&dir, &sidecar)?;
-        Ok(LeaseAttempt::Held(SchedulerLease {
+        // Guard the lock before the fallible sidecar write.
+        let lease = SchedulerLease {
             _lock: lock,
             sidecar,
-        }))
+        };
+        write_lease_sidecar(&dir, &lease.sidecar)?;
+        Ok(LeaseAttempt::Held(lease))
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -186,6 +204,61 @@ mod tests {
         SchedulerLease::try_acquire(root, boot_id, 8765, floor).expect("lease io")
     }
 
+    // A duplicate models the open-file-description reference inherited by a
+    // concurrent fork before exec closes CLOEXEC descriptors. No timing needed.
+    #[cfg(unix)]
+    #[test]
+    fn owner_drop_releases_lease_with_duplicated_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = match acquire(dir.path(), "boot-a", 0) {
+            LeaseAttempt::Held(lease) => lease,
+            LeaseAttempt::HeldElsewhere(_) => panic!("fresh lock"),
+        };
+        let inherited = first._lock.try_clone().unwrap();
+        assert!(matches!(
+            acquire(dir.path(), "contender", 0),
+            LeaseAttempt::HeldElsewhere(_)
+        ));
+        drop(first);
+        let successor = match acquire(dir.path(), "boot-b", 0) {
+            LeaseAttempt::Held(lease) => lease,
+            LeaseAttempt::HeldElsewhere(_) => panic!("dropped owner left an inherited lock held"),
+        };
+        assert_eq!(successor.generation(), 2);
+        drop(inherited);
+        assert!(
+            matches!(
+                acquire(dir.path(), "contender", 0),
+                LeaseAttempt::HeldElsewhere(_)
+            ),
+            "closing the old duplicate must not release the successor's lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_guard_does_not_unlock_another_process_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut copied = match acquire(dir.path(), "boot-a", 0) {
+            LeaseAttempt::Held(lease) => lease,
+            LeaseAttempt::HeldElsewhere(_) => panic!("fresh lock"),
+        };
+        let owner = copied._lock.try_clone().unwrap();
+        // Model the PID mismatch in a fork child; the retained descriptor
+        // stands for the still-live parent's copy of this open description.
+        copied.sidecar.pid = 0;
+        drop(copied);
+        assert!(matches!(
+            acquire(dir.path(), "contender", 0),
+            LeaseAttempt::HeldElsewhere(_)
+        ));
+        owner.unlock().unwrap();
+        assert!(matches!(
+            acquire(dir.path(), "next", 0),
+            LeaseAttempt::Held(_)
+        ));
+    }
+
     #[test]
     fn lease_generation_monotonic_across_reacquire() {
         let dir = tempfile::tempdir().unwrap();
@@ -194,7 +267,7 @@ mod tests {
             LeaseAttempt::HeldElsewhere(_) => panic!("fresh dir must acquire"),
         };
         assert_eq!(first.generation(), 1);
-        drop(first); // release (crash or graceful — same OS semantics)
+        drop(first); // graceful release explicitly unlocks before closing
 
         let second = match acquire(dir.path(), "boot-b", 0) {
             LeaseAttempt::Held(lease) => lease,
