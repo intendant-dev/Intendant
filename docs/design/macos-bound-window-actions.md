@@ -63,14 +63,20 @@ observed focus identity. It returns only:
 - `operations`: `press` or `set_value`.
 
 No AXValue, AXDescription, full document text or title-based lookup is used for
-inspection. Role and subrole must be available; secure/password nodes and their
-entire subtrees are omitted before reading labels, children or values. Disabled
-controls and unsupported roles/operations are omitted. Labels do not fall back
-to values or descriptions. Only documented AXTitle absence is an empty label; IPC errors, malformed types and missing successful-reply values refuse rather than looking like an unchanged empty label. The SDK makes AXSubrole optional, but this profile
-deliberately requires it to fail closed on unknown secure state. Ordinary AppKit
-controls that omit it can therefore refuse the entire snapshot. The fixture
-supplies explicit subroles; it does not establish general AppKit or Chromium
-compatibility.
+inspection. AXRole remains required. AXSubrole and AXContainsProtectedContent
+are optional metadata: only AttributeUnsupported/NoValue without a value means
+absence. Transport errors, successful null replies, contradictory replies and
+wrong/oversized types refuse the snapshot or action. Explicit secure/password
+roles or subroles and a true protected-content flag omit the entire subtree
+before labels, children or values. Disabled controls and unsupported operations
+remain excluded. AXTitle absence is an empty label; other label failures refuse.
+
+This deliberately supersedes the initial requirement that every node supply an
+AXSubrole. Apple's SDK declares it required only when role alone is insufficient;
+ordinary AppKit controls need not synthesize AXUnknown. Explicit protected
+content is now checked on containers too. This follows app-reported metadata,
+not a guarantee against a dishonest app or sensitive text in ordinary fields.
+See `macos-appkit-controls.md` for the baseline reproduction and native profile.
 
 Every read reaching the helper clears the previous inventory first, including
 failed refreshes. Every helper action takes the whole inventory before native
@@ -215,3 +221,5 @@ The serialized local battery passed on 2026-09-18 with the compile governor unch
 A fresh local independent review attempt was quota-blocked; no fresh review result is claimed. The previous four concrete review findings were addressed with regressions, and resumed source/native review found and corrected the issues recorded above. CI and repository review on the published head remain separate gates.
 
 A subsequent final-build combined run passed placement but refused controls discovery; a diagnostic controls-only run listed and placed the window, then refused a read when focus was unavailable. Both restored the display inventory and cleaned up. These are retained failures, not a final-build native pass. The successful semantic run preceded the final optional-label error-classification tightening; the final source passed the full hermetic battery. Shared-session focus availability and general app compatibility remain limitations, not reasons to relax identity/focus checks or retry uncertain actions.
+
+Post-publication continuation: the unchanged e2354b2 head completed its full native monitor/placement/semantic-control fixture on 2026-09-18 and then merged through the normal queue as 035c760. Earlier refusals remain historical evidence, not passes. Standard AppKit compatibility is recorded separately in macos-appkit-controls.md.

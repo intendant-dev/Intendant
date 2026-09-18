@@ -949,8 +949,10 @@ semantic AXPress/AXValue actions add `DisplayInput` **and** OwnerSurface, includ
 the actual HTTP/facade caller. A monitor handle, window binding, element token or
 scoped user-display grant alone never supplies this authority. One bounded helper
 inventory retains exact AX controls/ancestor objects; refresh/action consumes old
-tokens, and placement/unbind/destruction invalidates relevant snapshots. Secure
-subtrees and unavailable required state refuse before value reads. Neither
+tokens, and placement/unbind/destruction invalidates relevant snapshots. Secure/password and explicitly protected
+subtrees are excluded before labels, traversal or values. Required roles and
+failed/malformed optional metadata refuse; documented optional absence is not
+a transport error. This consumes app-reported metadata, not a new security sandbox. Neither
 operation starts a helper, requests TCC, or mints a grant. Shared WindowServer
 remains one seat: these checks provide bounded observations, not atomic execution,
 exclusive focus or isolation. See [semantic controls](../design/macos-bound-window-actions.md)
