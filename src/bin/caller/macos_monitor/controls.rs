@@ -332,7 +332,9 @@ fn walk<N: Native>(
                 });
             }
         }
-        let children = native.children(element, deadline)?;
+        let children = native
+            .children(element, deadline)
+            .map_err(|e| format!("AX traversal depth {}: {e}", path.len() - 1))?;
         if children.len() > MAX_CHILDREN
             || (path.len() > MAX_DEPTH && !children.is_empty())
             || visited.len() + stack.len() + children.len() > MAX_NODES

@@ -1117,8 +1117,8 @@ exact bounded labels, bounds, monitor, permissions and focus are checked
 before/after the attempt; cancellation/late failures preserve available evidence.
 There is no global input, activation, clipboard, retry, rollback or focus restoration.
 
-This shares WindowServer and is not an isolated seat. AXRole remains required;
-documented absence of optional AXSubrole/AXContainsProtectedContent is addocumented absence of optional AXSC. Explicit secure/password metadata and protected
+This shares WindowServer and is not an isolated seat. AXRole remains required.
+Documented absence of optional AXSubrole/AXContainsProtectedContent is admitted; errors are not absence. Explicit secure/password metadata and protected
 containers are excluded before traversal or content reads. Malformed, oversized,
 contradictory or failed metadata replies still refuse. The standard-AppKit fixture
 profile uses native controls without subrole or hierarchy overrides; its acceptance
@@ -1146,3 +1146,26 @@ fixture detects observed activation and refuses, never restoring focus.
 
 This does not enable arbitrary canvas input or make an independent input seat.
 See `docs/design/macos-chromium-controls.md` for the exact acceptance status.
+
+### Exact Chromium accessibility bridges
+
+The native adapter projects one narrowly checked shape: an AXGroup exposes an
+AXWebArea whose actual AXParent is an omitted AXScrollArea under that same group.
+The exact intermediate node and original exposed child are retained together.
+The original AXParent/AXWindow/PID checks still run on the resulting path; current
+child membership also compares the exposed-child witness, not only the intermediate
+object. Replacement, detachment, reparenting or protection requires a fresh read
+or refuses the action. This is not a generic ancestry-repair fallback.
+
+A projected intermediate counts toward the existing node/depth limits and is
+checked for protected content before traversing its sole exposed child. It does
+not expose other children hidden under that intermediate. No global input or
+activation fallback is added. See `docs/design/macos-ax-parent-ancestry.md` for
+native evidence and the deliberately narrow acceptance scope.
+
+The Chrome for Testing 153.0.8010.52 semantic fixture passed on 2026-09-18:
+exact Unicode text and one button effect were independently observed; old tokens
+were refused after control replacement and same-window document reload. The
+standard-AppKit regression passed too. Earlier unavailable-focus/metadata and
+deadline refusals remain recorded separately. This does not establish arbitrary
+site/canvas input, continuous focus isolation or an independent clipboard seat.

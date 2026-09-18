@@ -95,3 +95,14 @@ library/acceptance tests (3 existing ignores), 57 E2E tests; workspace Clippy
 with warnings denied, formatting and whitespace passed. Six hermetic Python
 harness tests passed on macOS. The compiler governor and CI policy are unchanged.
 The merge-group matrix remains the cross-platform runtime landing gate.
+
+## Follow-up: exact parent bridges (#939)
+
+The blocked semantic profile above was subsequently completed by the narrow
+Group/ScrollArea/WebArea projection described in `macos-ax-parent-ancestry.md`.
+That follow-up preserves exact native parents and the original exposed child,
+without global input fallback. Full fixture text/button actions, replay/control
+replacement/document-navigation refusals, capture and cleanup now have native
+positive evidence. The earlier placement-only results and failures remain
+historical evidence; raw canvas input and arbitrary application compatibility
+are still not established.

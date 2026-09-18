@@ -106,7 +106,10 @@ current element role/security/enabled/operation state, exact bounded label and b
 containment, existing TCC and unchanged observed focus. Bounded AXWindow and
 AXParent checks use CFEqual on the retained window and each retained ancestor;
 each parent must also expose its exact retained child in bounded current
-AXChildren. Detachment with stale back-pointers, reparenting or replacement
+AXChildren, including the original exposed-child witness for a projected native
+bridge. The narrow Group -> omitted ScrollArea -> WebArea projection is described
+in `macos-ax-parent-ancestry.md`; it retains and validates actual parents rather
+than accepting a changed parent. Detachment with stale back-pointers, reparenting or replacement
 refuses, even with the same title/role/frame. A changed label requires a fresh
 inventory, even if identity and geometry are unchanged.
 It never substitutes a freshly resolved object. Native wrappers repeat the
