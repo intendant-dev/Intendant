@@ -608,6 +608,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Place by binding with monitor-local bounds JSON and verify AX/CG readback",
     },
     CommandSpec {
+        path: &["display", "window-elements"], lane: RiskLane::Inspect,
+        tool: "read_macos_window_elements", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],
+        help: "Owner-only bounded control snapshot on a retained bound macOS window; refresh consumes old tokens",
+    },
+    CommandSpec {
+        path: &["display", "window-element"], lane: RiskLane::Act,
+        tool: "act_macos_window_element", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_str("ELEMENT", "element", true, false), p_json("ACTION_JSON", "action", true)], flags: &[],
+        help: "Owner-only one-use semantic action JSON: type press or type set_value with text; no focus restoration",
+    },
+    CommandSpec {
         path: &["display", "unbind-window"], lane: RiskLane::Act,
         tool: "unbind_macos_window", seed: "{}",
         positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],

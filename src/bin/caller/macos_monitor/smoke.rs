@@ -34,6 +34,7 @@ async fn request(tx: &mpsc::Sender<Request>, action: Action) -> Result<Receipt, 
             autonomy: std::sync::Arc::new(tokio::sync::RwLock::new(Default::default())),
         },
         reply,
+        element_dispatch: None,
     })
     .await
     .map_err(|_| "smoke broker closed")?;

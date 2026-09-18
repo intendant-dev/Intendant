@@ -213,6 +213,8 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_displays"
                     | "list_macos_monitors"
                     | "list_macos_windows"
+                    | "read_macos_window_elements"
+                    | "act_macos_window_element"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -255,6 +257,8 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_displays"
                     | "list_macos_monitors"
                     | "list_macos_windows"
+                    | "read_macos_window_elements"
+                    | "act_macos_window_element"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -457,6 +461,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "list_displays"
         | "list_macos_monitors"
         | "list_macos_windows"
+        | "read_macos_window_elements"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -476,6 +481,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "bind_macos_window"
         | "place_macos_window"
         | "unbind_macos_window"
+        | "act_macos_window_element"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -920,6 +926,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     );
     // Schemas/descriptions derive from the typed stdio declarations.
     for (name, tool) in [
+        (
+            "read_macos_window_elements",
+            IntendantServer::read_macos_window_elements_tool_attr(),
+        ),
+        (
+            "act_macos_window_element",
+            IntendantServer::act_macos_window_element_tool_attr(),
+        ),
         (
             "list_macos_windows",
             IntendantServer::list_macos_windows_tool_attr(),
@@ -2195,6 +2209,16 @@ mod tests {
             append_manual_http_tool_definitions(&mut definitions, false, profile);
             for (name, attr, op) in [
                 (
+                    "read_macos_window_elements",
+                    IntendantServer::read_macos_window_elements_tool_attr(),
+                    DisplayView,
+                ),
+                (
+                    "act_macos_window_element",
+                    IntendantServer::act_macos_window_element_tool_attr(),
+                    DisplayInput,
+                ),
+                (
                     "list_macos_windows",
                     IntendantServer::list_macos_windows_tool_attr(),
                     DisplayView,
@@ -2237,6 +2261,29 @@ mod tests {
             .contains(&serde_json::json!("candidate")));
         assert!(serde_json::from_value::<ListMacosWindowsParams>(
             serde_json::json!({"pid":123,"owner_surface":true})
+        )
+        .is_err());
+    }
+    #[test]
+    fn semantic_typed_schemas_require_binding_element_and_action_without_escape_hatches() {
+        let schema =
+            serde_json::to_value(IntendantServer::act_macos_window_element_tool_attr()).unwrap();
+        for name in ["binding", "element", "action"] {
+            assert!(schema["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(name)));
+        }
+        for value in [
+            serde_json::json!({"binding":"b","action":{"type":"press"}}),
+            serde_json::json!({"element":"e","action":{"type":"press"}}),
+            serde_json::json!({"binding":"b","element":"e","action":{"type":"press"},"owner_surface":true}),
+            serde_json::json!({"binding":"b","element":"e","action":{"type":"set_value","text":"x","restore_focus":true}}),
+        ] {
+            assert!(serde_json::from_value::<ActMacosWindowElementParams>(value).is_err());
+        }
+        assert!(serde_json::from_value::<ReadMacosWindowElementsParams>(
+            serde_json::json!({"binding":"b","pid":123})
         )
         .is_err());
     }

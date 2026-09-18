@@ -881,9 +881,9 @@ not grant user-display access or establish an input/capture sandbox. The local
 controller's create/capture/destroy tools preserve their original IAM operations
 and additionally require an owner surface or an existing explicit user-display
 grant. A private main-thread helper owns native objects; exact-generation SCK
-screenshots disable input and cursor overlay. The controller publishes no
-stream/dashboard capabilities and enables no CGEvent, AX, browser placement or
-clipboard control. Failed or uncertain cleanup never permits helper respawn.
+screenshots disable input and cursor overlay. The generic monitor lane publishes no stream/dashboard capabilities or CGEvent,
+browser placement or clipboard control. Explicit owner-only retained-window
+placement and semantic AX controls use the separate gates described below. Failed or uncertain cleanup never permits helper respawn.
 
 ### Shipped authentication and identity status
 
@@ -942,3 +942,16 @@ references without moving or closing user windows. Verified readback proves only
 that placement observation, not focus/input isolation or lasting exclusivity.
 See [Computer Use](./computer-use-and-audio.md#explicit-owner-only-app-window-placement)
 for the implemented contract and pending acceptance.
+
+
+Bound-window control inspection adds `DisplayView` **and** OwnerSurface;
+semantic AXPress/AXValue actions add `DisplayInput` **and** OwnerSurface, including
+the actual HTTP/facade caller. A monitor handle, window binding, element token or
+scoped user-display grant alone never supplies this authority. One bounded helper
+inventory retains exact AX controls/ancestor objects; refresh/action consumes old
+tokens, and placement/unbind/destruction invalidates relevant snapshots. Secure
+subtrees and unavailable required state refuse before value reads. Neither
+operation starts a helper, requests TCC, or mints a grant. Shared WindowServer
+remains one seat: these checks provide bounded observations, not atomic execution,
+exclusive focus or isolation. See [semantic controls](../design/macos-bound-window-actions.md)
+for the implemented contract and pending supervisor acceptance.

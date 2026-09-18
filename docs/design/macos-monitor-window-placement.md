@@ -229,3 +229,14 @@ application compatibility, streaming, keyboard/mouse control and clipboard/focus
 isolation remain separate work.
 
 Final serialized local validation passed: 6,499 binary tests (10 existing ignores), 1,020 required library/acceptance tests (3 existing ignores), 55 E2E tests, workspace Clippy with warnings denied, formatting and whitespace. Focused monitor coverage passed 63 tests. The compile governor remained intact.
+
+
+## Companion semantic-control slice
+
+The retained-window foundation now also hosts owner-only bounded control snapshots
+and one-use AXPress/AXValue actions. Placement, unbind and monitor teardown
+invalidate the relevant control snapshot without changing placement's setters or
+readback contract. See [bound-window controls](macos-bound-window-actions.md) for
+the separate strict limits, authority gates, evidence semantics and disposable
+controls harness. The placement acceptance above does not validate that new slice;
+its supervisor builds, regressions and native acceptance remain pending.

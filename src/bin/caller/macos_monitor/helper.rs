@@ -2,9 +2,10 @@
 //! EOF (including parent death) drops the retained native owner. No sockets,
 //! runtime, configuration, credentials, dashboard or display-session registry.
 
+use super::controls::Native;
 #[cfg(not(target_os = "macos"))]
 use super::placement::UnsupportedNative as PlacementNative;
-use super::placement::{Bounds, Native, Windows};
+use super::placement::{Bounds, Windows};
 use super::protocol::*;
 #[cfg(target_os = "macos")]
 use crate::ax::PlacementNative;
@@ -163,6 +164,24 @@ fn serve_with_windows<O: Owner, N: Native>(
                             owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
                         })
                         .map(|result| Outcome::PlacedWindow { result }),
+                ),
+                Operation::ReadWindowElements { binding } => window_outcome(
+                    windows
+                        .read_elements(binding, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|controls| Outcome::WindowElements { controls }),
+                ),
+                Operation::ActWindowElement {
+                    binding,
+                    element,
+                    action,
+                } => window_outcome(
+                    windows
+                        .act_element(binding, &element, &action, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|result| Outcome::ActedWindowElement { result }),
                 ),
                 Operation::UnbindWindow { binding } => window_outcome(
                     windows

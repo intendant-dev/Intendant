@@ -1,6 +1,7 @@
 //! Private, versioned pipe protocol. Window identities carry explicit PIDs; monitor selectors never adopt
 //! native display IDs. Length limits apply before JSON allocation/deserialization.
 
+use super::controls::{ActionResult, Control, ElementAction};
 use super::placement::{Bounds, Candidate, PlacementResult, WindowIdentity};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -41,6 +42,14 @@ pub(super) enum Operation {
         binding: u32,
         bounds: Bounds,
     },
+    ReadWindowElements {
+        binding: u32,
+    },
+    ActWindowElement {
+        binding: u32,
+        element: String,
+        action: ElementAction,
+    },
     UnbindWindow {
         binding: u32,
     },
@@ -76,6 +85,12 @@ pub(super) enum Outcome {
     },
     PlacedWindow {
         result: PlacementResult,
+    },
+    WindowElements {
+        controls: Vec<Control>,
+    },
+    ActedWindowElement {
+        result: ActionResult,
     },
     UnboundWindow {
         binding: u32,
@@ -209,5 +224,39 @@ mod tests {
         assert!(
             matches!(decoded.op, Operation::BindWindow { candidate, .. } if candidate == "macos_candidate:00000000000000000000000000000001")
         );
+    }
+    #[test]
+    fn semantic_protocol_requires_both_tokens_and_strict_tagged_actions() {
+        for op in [
+            serde_json::json!({"op":"read_window_elements"}),
+            serde_json::json!({"op":"act_window_element","binding":1,"action":{"type":"press"}}),
+            serde_json::json!({"op":"act_window_element","element":"token","action":{"type":"press"}}),
+            serde_json::json!({"op":"act_window_element","binding":1,"element":"token","action":{"type":"press","text":"ignored"}}),
+            serde_json::json!({"op":"act_window_element","binding":1,"element":"token","action":{"type":"set_value"}}),
+            serde_json::json!({"op":"act_window_element","binding":1,"element":"token","action":{"type":"activate"}}),
+            serde_json::json!({"op":"act_window_element","binding":1,"element":"token","action":{"type":"press"},"activate":true}),
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(serde_json::json!({"seq":1,"op":op})).is_err()
+            );
+        }
+        for action in [
+            ElementAction::Press {},
+            ElementAction::SetValue {
+                text: "\u{0001}".repeat(super::super::controls::MAX_TEXT),
+            },
+        ] {
+            let request = Request {
+                seq: u64::MAX,
+                op: Operation::ActWindowElement {
+                    binding: u32::MAX,
+                    element: "macos_element:00000000000000000000000000000001".into(),
+                    action,
+                },
+            };
+            let wire = encode(&request).unwrap();
+            assert!(wire.len() <= MAX_LINE);
+            assert!(serde_json::from_slice::<Request>(&wire).is_ok());
+        }
     }
 }

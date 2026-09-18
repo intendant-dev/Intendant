@@ -213,22 +213,24 @@ pub(crate) trait Native {
         deadline: Instant,
     ) -> Result<(), String>;
 }
-struct Binding<W> {
-    monitor: u32,
-    identity: WindowIdentity,
-    geometry: Bounds,
-    window: W,
+pub(super) struct Binding<W> {
+    pub(super) monitor: u32,
+    pub(super) identity: WindowIdentity,
+    pub(super) geometry: Bounds,
+    pub(super) window: W,
 }
-pub(super) struct Windows<N: Native> {
-    native: N,
+pub(super) struct Windows<N: super::controls::Native> {
+    pub(super) native: N,
+    pub(super) elements: super::controls::Inventory<N::Element, N::Focus>,
     next: u32,
-    bindings: BTreeMap<u32, Binding<N::Window>>,
+    pub(super) bindings: BTreeMap<u32, Binding<N::Window>>,
     candidates: BTreeMap<String, ListedWindow<N::Window>>,
 }
-impl<N: Native> Windows<N> {
+impl<N: super::controls::Native> Windows<N> {
     pub(super) fn new(native: N) -> Self {
         Self {
             native,
+            elements: Default::default(),
             next: 1,
             bindings: BTreeMap::new(),
             candidates: BTreeMap::new(),
@@ -308,12 +310,18 @@ impl<N: Native> Windows<N> {
         Ok(id)
     }
     pub(super) fn unbind(&mut self, id: u32) -> Result<(), String> {
+        self.elements.invalidate(id);
         self.bindings
             .remove(&id)
             .map(|_| ())
             .ok_or_else(|| "stale window binding".into())
     }
     pub(super) fn destroy_monitor(&mut self, monitor: u32) {
+        for (&id, b) in &self.bindings {
+            if b.monitor == monitor {
+                self.elements.invalidate(id);
+            }
+        }
         self.bindings.retain(|_, b| b.monitor != monitor);
     }
     pub(super) fn place(
@@ -322,6 +330,7 @@ impl<N: Native> Windows<N> {
         local: Bounds,
         mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<PlacementResult, String> {
+        self.elements.invalidate(id);
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         let deadline = Instant::now() + BUDGET;
         let target = b.geometry.target(local)?;
@@ -470,6 +479,11 @@ impl Native for UnsupportedNative {
     fn size(&mut self, _: &(), _: Bounds, _: Instant) -> Result<(), String> {
         Err("macOS window placement requires macOS".into())
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl super::controls::Native for UnsupportedNative {
+    type Element = ();
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -621,6 +635,9 @@ pub(in crate::macos_monitor) mod tests {
             }
             Ok(())
         }
+    }
+    impl super::super::controls::Native for Fake {
+        type Element = ();
     }
     impl Native for Fake {
         type Window = Exact;

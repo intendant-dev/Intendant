@@ -158,6 +158,7 @@ impl Broker {
                     action: Action::Inspect(inspection.clone()),
                     authority: authority.clone(),
                     reply,
+                    element_dispatch: None,
                 };
                 match sender.try_send(request) {
                     Err(mpsc::error::TrySendError::Full(_)) => {

@@ -1098,3 +1098,29 @@ language = "en"              # optional ISO-639-1 hint
 ```
 
 Requires `OPENAI_API_KEY` (or a custom `endpoint`).
+
+### Owner-only bound-window semantic controls
+
+`read_macos_window_elements {binding}` (`inspect display window-elements BINDING`)
+returns a bounded inventory of actionable controls only inside the retained exact
+window on its unchanged owned monitor. It requires DisplayView and OwnerSurface,
+reads no values/document text, skips secure subtrees, and replaces prior tokens
+across bindings. `act_macos_window_element {binding,element,action}` (`act display
+window-element BINDING ELEMENT ACTION_JSON`) requires DisplayInput and OwnerSurface
+through typed, HTTP and facade dispatch. Both handles are mandatory. Actions are
+`{"type":"press"}` or `{"type":"set_value","text":"..."}`; tokens are consumed
+before native validation. Only known enabled AXPress controls and nonsecure
+settable text roles are admitted. Text is at most 1024 UTF-8 bytes and exact
+readback returns no contents. Press reports dispatched, never verified effect.
+Identity, retained ancestry (including reciprocal bounded AXChildren membership),
+exact bounded labels, bounds, monitor, permissions and focus are checked
+before/after the attempt; cancellation/late failures preserve available evidence.
+There is no global input, activation, clipboard, retry, rollback or focus restoration.
+
+This shares WindowServer and is not an isolated seat. The strict AX attribute
+profile deliberately requires AXSubrole although the SDK makes it optional, so
+ordinary AppKit controls omitting it may refuse the snapshot. Documented missing
+AXChildren and empty arrays are admitted as leaves; IPC/type/cap failures still
+refuse. No general Chromium/canvas compatibility
+is claimed. Native semantic-control acceptance passed on 2026-09-18 against an isolated daemon and disposable AppKit controls; general application/Chromium compatibility remains unverified.
+See the [bounded control design and supervisor harness](../design/macos-bound-window-actions.md).
