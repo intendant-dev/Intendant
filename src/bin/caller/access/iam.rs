@@ -1269,7 +1269,7 @@ fn save_state_locked(cert_dir: &Path, state: &LocalIamState) -> AccessResult<()>
     // fingerprint re-check below is the correctness backbone, so a lost
     // refresh only costs one re-parse.
     if let Some(fingerprint) = iam_state_fingerprint(&path) {
-        let _ = store_cached_iam_state(&path, fingerprint, normalized);
+        let _ = store_cached_iam_state(iam_state_cache(), &path, fingerprint, normalized);
     }
     Ok(())
 }
@@ -1319,25 +1319,25 @@ struct IamStateCacheEntry {
     state: std::sync::Arc<LocalIamState>,
 }
 
-/// Cache is keyed by the state file path so tests (and multi-cert-dir
-/// processes) with distinct cert dirs never cross-talk.
-fn iam_state_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, IamStateCacheEntry>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, IamStateCacheEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+type IamStateCache = std::sync::Mutex<std::collections::HashMap<PathBuf, IamStateCacheEntry>>;
+
+/// Entries are path-keyed, but capacity eviction is process-wide. Tests which
+/// assert snapshot identity must own their cache, not share other tests' churn.
+fn iam_state_cache() -> &'static IamStateCache {
+    static CACHE: std::sync::OnceLock<IamStateCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(IamStateCache::default)
 }
 
 const IAM_STATE_CACHE_MAX_DIRS: usize = 8;
 
 fn store_cached_iam_state(
+    cache: &IamStateCache,
     path: &Path,
     fingerprint: IamStateFingerprint,
     state: LocalIamState,
 ) -> std::sync::Arc<LocalIamState> {
     let state = std::sync::Arc::new(state);
-    let mut cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= IAM_STATE_CACHE_MAX_DIRS && !cache.contains_key(path) {
         cache.clear();
     }
@@ -1359,6 +1359,13 @@ fn store_cached_iam_state(
 /// that bypass [`save_state`] (other processes, hand edits) are picked up
 /// on the next request. Parse errors are never cached.
 pub fn load_state_cached_arc(cert_dir: &Path) -> AccessResult<std::sync::Arc<LocalIamState>> {
+    load_state_cached_arc_with_cache(cert_dir, iam_state_cache())
+}
+
+fn load_state_cached_arc_with_cache(
+    cert_dir: &Path,
+    cache: &IamStateCache,
+) -> AccessResult<std::sync::Arc<LocalIamState>> {
     let path = iam_state_path(cert_dir);
     let Some(fingerprint) = iam_state_fingerprint(&path) else {
         // Missing file: same contract as load_state. Nothing to cache —
@@ -1366,7 +1373,7 @@ pub fn load_state_cached_arc(cert_dir: &Path) -> AccessResult<std::sync::Arc<Loc
         return Ok(std::sync::Arc::new(LocalIamState::default()));
     };
     {
-        let cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache
             .get(&path)
             .filter(|entry| entry.fingerprint == fingerprint)
@@ -1379,7 +1386,7 @@ pub fn load_state_cached_arc(cert_dir: &Path) -> AccessResult<std::sync::Arc<Loc
     // read, caching the read under the pre-read fingerprint could pin a
     // torn view. Matching fingerprints prove read and stat saw one file.
     if matches!(iam_state_fingerprint(&path), Some(after) if after == fingerprint) {
-        return Ok(store_cached_iam_state(&path, fingerprint, state));
+        return Ok(store_cached_iam_state(cache, &path, fingerprint, state));
     }
     Ok(std::sync::Arc::new(state))
 }
@@ -4494,12 +4501,42 @@ mod tests {
     }
 
     #[test]
+    fn iam_cache_eviction_reloads_without_changing_retained_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let cache = IamStateCache::default();
+        save_state(&original, &LocalIamState::default()).unwrap();
+        let first = load_state_cached_arc_with_cache(&original, &cache).unwrap();
+        let path = iam_state_path(&original);
+        let fingerprint = iam_state_fingerprint(&path).unwrap();
+
+        // Deterministic version of the parallel-test eviction: no threads,
+        // sleeps, global-cache clearing, or weakened cache-hit assertion.
+        for index in 0..IAM_STATE_CACHE_MAX_DIRS {
+            let other = root.path().join(format!("other-{index}"));
+            save_state(&other, &LocalIamState::default()).unwrap();
+            load_state_cached_arc_with_cache(&other, &cache).unwrap();
+            assert!(cache.lock().unwrap().len() <= IAM_STATE_CACHE_MAX_DIRS);
+        }
+        assert!(!cache.lock().unwrap().contains_key(&path));
+        assert_eq!(iam_state_fingerprint(&path), Some(fingerprint));
+        let reloaded = load_state_cached_arc_with_cache(&original, &cache).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(*first, *reloaded);
+        let hit = load_state_cached_arc_with_cache(&original, &cache).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&hit, &reloaded));
+        assert_eq!(*reloaded, load_state(&original).unwrap());
+    }
+
+    #[test]
     fn load_state_cached_matches_uncached_and_sees_external_writes() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let cache = IamStateCache::default();
+        let load_cached = |root: &Path| load_state_cached_arc_with_cache(root, &cache);
 
         // Missing file: same default-state contract as load_state.
         assert_eq!(
-            *load_state_cached_arc(tmp.path()).unwrap(),
+            *load_cached(tmp.path()).unwrap(),
             load_state(tmp.path()).unwrap()
         );
 
@@ -4519,14 +4556,14 @@ mod tests {
             created_at_unix_ms: Some(1),
         });
         save_state(tmp.path(), &state).unwrap();
-        let cached = load_state_cached_arc(tmp.path()).unwrap();
+        let cached = load_cached(tmp.path()).unwrap();
         assert_eq!(*cached, load_state(tmp.path()).unwrap());
         assert!(cached
             .principals
             .iter()
             .any(|p| p.id == "principal:cache-a"));
         // Second read (a cache hit) is the same shared snapshot.
-        let hit = load_state_cached_arc(tmp.path()).unwrap();
+        let hit = load_cached(tmp.path()).unwrap();
         assert!(std::sync::Arc::ptr_eq(&hit, &cached));
         assert_eq!(*hit, *cached);
 
@@ -4541,7 +4578,7 @@ mod tests {
         }
         let body = serde_json::to_string_pretty(&external).unwrap();
         std::fs::write(iam_state_path(tmp.path()), body).unwrap();
-        let reread = load_state_cached_arc(tmp.path()).unwrap();
+        let reread = load_cached(tmp.path()).unwrap();
         assert!(reread
             .principals
             .iter()
@@ -4550,10 +4587,7 @@ mod tests {
 
         // Deleting the file falls back to the default state.
         std::fs::remove_file(iam_state_path(tmp.path())).unwrap();
-        assert_eq!(
-            *load_state_cached_arc(tmp.path()).unwrap(),
-            LocalIamState::default()
-        );
+        assert_eq!(*load_cached(tmp.path()).unwrap(), LocalIamState::default());
     }
 
     #[test]

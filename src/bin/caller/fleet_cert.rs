@@ -232,12 +232,13 @@ struct FleetOriginProvenanceCacheEntry {
     provenance: Arc<FleetOriginProvenance>,
 }
 
-fn fleet_origin_provenance_cache(
-) -> &'static Mutex<std::collections::HashMap<PathBuf, FleetOriginProvenanceCacheEntry>> {
-    static CACHE: OnceLock<
-        Mutex<std::collections::HashMap<PathBuf, FleetOriginProvenanceCacheEntry>>,
-    > = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+type FleetOriginProvenanceCache =
+    Mutex<std::collections::HashMap<PathBuf, FleetOriginProvenanceCacheEntry>>;
+
+// Entries are path-keyed; eviction still affects all callers of this instance.
+fn fleet_origin_provenance_cache() -> &'static FleetOriginProvenanceCache {
+    static CACHE: OnceLock<FleetOriginProvenanceCache> = OnceLock::new();
+    CACHE.get_or_init(FleetOriginProvenanceCache::default)
 }
 
 #[cfg(test)]
@@ -247,13 +248,12 @@ thread_local! {
 }
 
 fn current_cached_fleet_origin_provenance(
+    cache: &FleetOriginProvenanceCache,
     path: &Path,
     fingerprint: &FleetOriginProvenanceFingerprint,
 ) -> Option<Arc<FleetOriginProvenance>> {
     let cached = {
-        let cache = fleet_origin_provenance_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
         cache
             .get(path)
             .filter(|entry| &entry.fingerprint == fingerprint)
@@ -391,6 +391,14 @@ fn load_fleet_origin_provenance_cached_arc_with_absence_fence_in(
     cert_dir: &Path,
     immediate: bool,
 ) -> Result<Arc<FleetOriginProvenance>, String> {
+    load_fleet_origin_provenance_with_cache(cert_dir, immediate, fleet_origin_provenance_cache())
+}
+
+fn load_fleet_origin_provenance_with_cache(
+    cert_dir: &Path,
+    immediate: bool,
+    cache: &FleetOriginProvenanceCache,
+) -> Result<Arc<FleetOriginProvenance>, String> {
     let path = fleet_origin_provenance_path_in(cert_dir);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -429,7 +437,7 @@ fn load_fleet_origin_provenance_cached_arc_with_absence_fence_in(
         // an empty provenance set.
         return load_fleet_origin_provenance_uncached_in(cert_dir).map(Arc::new);
     };
-    if let Some(provenance) = current_cached_fleet_origin_provenance(&path, &fingerprint) {
+    if let Some(provenance) = current_cached_fleet_origin_provenance(cache, &path, &fingerprint) {
         return Ok(provenance);
     }
     let provenance = Arc::new(load_fleet_origin_provenance_uncached_in(cert_dir)?);
@@ -437,9 +445,7 @@ fn load_fleet_origin_provenance_cached_arc_with_absence_fence_in(
         fleet_origin_provenance_fingerprint(&path),
         Some(after) if after == fingerprint
     ) {
-        let mut cache = fleet_origin_provenance_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
         if cache.len() >= FLEET_ORIGIN_PROVENANCE_CACHE_MAX_DIRS && !cache.contains_key(&path) {
             cache.clear();
         }
@@ -3369,12 +3375,50 @@ mod tests {
     }
 
     #[test]
+    fn fleet_origin_cache_eviction_reloads_the_exact_file_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let cache = FleetOriginProvenanceCache::default();
+        let name = "d-00000000000000000000.fleet.example.test";
+        remember_fleet_origin_in(&original, Some("fleet.example.test"), name).unwrap();
+        let first = load_fleet_origin_provenance_with_cache(&original, false, &cache).unwrap();
+        let path = fleet_origin_provenance_path_in(&original);
+        let fingerprint = fleet_origin_provenance_fingerprint(&path).unwrap();
+
+        // Force the bounded instance to evict a still-current generation.
+        // This is legal cache behavior, not an authority or content change.
+        for index in 0..FLEET_ORIGIN_PROVENANCE_CACHE_MAX_DIRS {
+            let other = root.path().join(format!("other-{index}"));
+            remember_fleet_origin_in(&other, Some("fleet.example.test"), name).unwrap();
+            load_fleet_origin_provenance_with_cache(&other, false, &cache).unwrap();
+            assert!(cache.lock().unwrap().len() <= FLEET_ORIGIN_PROVENANCE_CACHE_MAX_DIRS);
+        }
+        assert!(!cache.lock().unwrap().contains_key(&path));
+        assert_eq!(
+            fleet_origin_provenance_fingerprint(&path),
+            Some(fingerprint)
+        );
+        let reloaded = load_fleet_origin_provenance_with_cache(&original, false, &cache).unwrap();
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(
+            serde_json::to_value(&*first).unwrap(),
+            serde_json::to_value(&*reloaded).unwrap()
+        );
+        assert_eq!(reloaded.name.as_deref(), Some(name));
+        let hit = load_fleet_origin_provenance_with_cache(&original, false, &cache).unwrap();
+        assert!(Arc::ptr_eq(&hit, &reloaded));
+    }
+
+    #[test]
     fn fleet_origin_provenance_cache_reuses_only_an_exact_file_generation() {
         let temp = tempfile::tempdir().unwrap();
+        let cache = FleetOriginProvenanceCache::default();
+        let load_cached =
+            |root: &Path| load_fleet_origin_provenance_with_cache(root, false, &cache);
         let first_name = "d-00000000000000000000.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), first_name).unwrap();
-        let first = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
-        let hit = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
+        let first = load_cached(temp.path()).unwrap();
+        let hit = load_cached(temp.path()).unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
 
         // Reproduce the cache-hit interleaving deterministically: the caller
@@ -3385,10 +3429,10 @@ mod tests {
         let second_name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), second_name).unwrap();
         assert!(
-            current_cached_fleet_origin_provenance(&path, &stale_fingerprint).is_none(),
+            current_cached_fleet_origin_provenance(&cache, &path, &stale_fingerprint).is_none(),
             "a path replacement between fingerprint and cache lookup must invalidate the hit"
         );
-        let changed = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
+        let changed = load_cached(temp.path()).unwrap();
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed.name.as_deref(), Some(second_name));
     }

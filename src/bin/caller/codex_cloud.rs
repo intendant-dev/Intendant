@@ -2803,6 +2803,53 @@ fn print_bootstrap_help() {
 
 #[cfg(test)]
 mod tests {
+    // Never open an executable fixture for writing in this multithreaded test
+    // process: a foreign fork can inherit that descriptor and keep Linux exec
+    // returning ETXTBSY after our File closes. Only the dedicated writer child
+    // opens it; waiting for that child establishes the writer has exited.
+    #[cfg(unix)]
+    fn write_codex_fixture(path: &Path, contents: impl AsRef<str>) -> std::io::Result<()> {
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; printf '%s' \"$2\" > \"$1\" && /bin/chmod 755 \"$1\"",
+                "intendant-fixture-writer",
+            ])
+            .arg(path)
+            .arg(contents.as_ref())
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "fixture writer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fixture_writer_preserves_literal_bytes_and_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake codex 'quoted'");
+        let script = "#!/bin/sh\n# '$()' `not-a-command` \\\n\nprintf '%s' \"$1\"\n";
+        write_codex_fixture(&path, script).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let output = std::process::Command::new(&path)
+            .arg("literal argument with spaces")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"literal argument with spaces");
+        assert!(write_codex_fixture(&dir.path().join("missing/cli"), script).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -3134,8 +3181,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn refresh_collects_probe_fingerprints_from_the_diff() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("leases.json");
         let mut probe = lease("task_e_probe");
@@ -3145,7 +3190,7 @@ mod tests {
         // The fake CLI answers `cloud list` with the probe task finished and
         // `cloud diff` with the fingerprint file.
         let command = dir.path().join("fake-codex");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             r#"#!/bin/sh
 if [ "$2" = "list" ]; then
@@ -3163,7 +3208,6 @@ fi
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let outcome = refresh_leases_with(
             command.to_str().unwrap(),
@@ -3284,8 +3328,6 @@ fi
     #[cfg(unix)]
     #[tokio::test]
     async fn refresh_outcome_carries_window_tracked_and_cursor() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("leases.json");
         let mut tracked = lease("task_e_offwindow");
@@ -3294,7 +3336,7 @@ fi
         save_store(&store_path, &store_with(vec![tracked])).unwrap();
 
         let command = dir.path().join("fake-codex");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             r#"#!/bin/sh
 cat <<'EOF'
@@ -3305,7 +3347,6 @@ EOF
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let outcome = refresh_leases_with(
             command.to_str().unwrap(),
@@ -3338,13 +3379,11 @@ EOF
     #[cfg(unix)]
     #[tokio::test]
     async fn submit_prompt_uses_stdin_instead_of_process_arguments() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let command = dir.path().join("fake-codex");
         let args_path = dir.path().join("args.txt");
         let stdin_path = dir.path().join("stdin.txt");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\ncat > '{}'\necho 'Submitted task task_e_stdin'\n",
@@ -3353,7 +3392,6 @@ EOF
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = dir.path().join("leases.json");
         let secret_prompt = "one-time-enrollment-secret";
         let result = submit_task_with(
@@ -3380,16 +3418,13 @@ EOF
     #[cfg(unix)]
     #[tokio::test]
     async fn provider_cli_runs_in_disposable_working_directory() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let command = dir.path().join("fake-codex");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             "#!/bin/sh\npwd\nprintf 'sensitive provider log' > error.log\n",
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let output = run_codex(command.to_str().unwrap(), &[]).await.unwrap();
         let provider_cwd = PathBuf::from(output.stdout.trim());
@@ -3497,13 +3532,11 @@ EOF
 
     #[cfg(unix)]
     fn fake_codex_emitting(dir: &Path, stdout: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let command = dir.join("fake-codex");
         let mut script = String::from("#!/bin/sh\ncat <<'FAKE_EOF'\n");
         script.push_str(stdout);
         script.push_str("\nFAKE_EOF\n");
-        std::fs::write(&command, script).unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_codex_fixture(&command, script).unwrap();
         command
     }
 
@@ -3993,14 +4026,12 @@ index 0000000..ce01362\n\
     #[cfg(unix)]
     #[tokio::test]
     async fn followup_upserts_a_lease_for_untracked_ready_tasks() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("leases.json");
         // Empty window forces the outside-window status fallback; the
         // status verb reports READY.
         let command = dir.path().join("fake-codex");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             r#"#!/bin/sh
 if [ "$2" = "list" ]; then
@@ -4013,7 +4044,6 @@ fi
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (backend, _requests) = stub_backend(vec![
             (
                 200,
@@ -4053,8 +4083,6 @@ fi
     #[cfg(unix)]
     #[tokio::test]
     async fn refresh_reprobes_after_each_terminal_edge() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("leases.json");
         let mut probe = lease("task_e_reprobe");
@@ -4065,7 +4093,7 @@ fi
         // The task completes another turn (running -> ready edge) and its
         // rewritten fingerprint now names a different booted worker.
         let command = dir.path().join("fake-codex");
-        std::fs::write(
+        write_codex_fixture(
             &command,
             r#"#!/bin/sh
 if [ "$2" = "list" ]; then
@@ -4082,7 +4110,6 @@ fi
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let outcome = refresh_leases_with(
             command.to_str().unwrap(),
