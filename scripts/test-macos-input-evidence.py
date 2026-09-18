@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic tests: no GUI, input posting, display capture or user state access."""
 import importlib.util
+import copy
 import os
 import stat
 import tempfile
@@ -158,10 +159,103 @@ class Tests(unittest.TestCase):
         result = assess_pointer_receipts(dict(self.plan, pid=2**40), self.receipts(), 1)
         self.assertEqual(result['delivery'], 'invalid')
 
-    def test_native_probe_has_only_self_process_posting(self):
+    def cross_native(self):
+        plan = dict(self.plan, source_pid=100, local_x=160.25, local_y=126.5)
+        return {'ok': True, 'mode': 'cross_process_click', 'posted_events': 2,
+                'sender_pid': 100, 'sender_reaped': True, 'posting_report_available': True, 'queue_overflow': False,
+                'sender_report': {'ok': True, 'posted_events': 2, 'sender_pid': 100,
+                                  'receiver_pid': 99, 'acknowledged': True, 'post_access': True},
+                'plan': plan, 'receipts': [dict(plan, kind=k) for k in ('left_down', 'left_up')],
+                'tagged_click_count': 1, 'window_closed': True, 'receipt_overflow': False,
+                'observations_complete': True, 'target_ever_front': False,
+                'before': self.sample, 'after': dict(self.sample, pointer_y=400)}
+
+    def test_cross_process_requires_separate_supervised_sender_and_receiver(self):
+        native = self.cross_native()
+        result = probe.assess_cross_native(native, 99)
+        self.assertTrue(result['passed'])
+        self.assertTrue(result['cross_process_verified'])
+        self.assertFalse(result['production_dispatch_enabled'])
+        self.assertEqual(result['desktop_observation_assessment']['change_attribution'], 'undetermined')
+        for pid in (None, True, 100, 101):
+            self.assertFalse(probe.assess_cross_native(native, pid)['passed'])
+        for key, value in (('sender_pid', 99), ('sender_pid', True), ('sender_pid', 2**32),
+                           ('mode', 'self_process_click'), ('plan', None)):
+            self.assertFalse(probe.assess_cross_native(dict(native, **{key: value}), 99)['passed'])
+        self.assertFalse(probe.assess_native(native, True, 99)['passed'])
+
+    def test_cross_sender_report_cannot_replace_receipts_or_canvas_effect(self):
+        native = self.cross_native()
+        for key, value in (('receipts', []), ('tagged_click_count', 0), ('tagged_click_count', 2),
+                           ('posted_events', None), ('posted_events', True), ('posted_events', 1),
+                           ('ok', False), ('posting_report_available', False)):
+            result = probe.assess_cross_native(dict(native, **{key: value}), 99)
+            self.assertFalse(result['passed'])
+            self.assertFalse(result['cross_process_verified'])
+        for rows in (native['receipts'][:1], native['receipts'][::-1], native['receipts']*2):
+            self.assertFalse(probe.assess_cross_native(dict(native, receipts=rows), 99)['passed'])
+
+    def test_cross_cleanup_acknowledgement_and_post_permission_are_required(self):
+        native = self.cross_native()
+        for key, value in (('sender_reaped', False), ('window_closed', False),
+                           ('receipt_overflow', True), ('observations_complete', False),
+                           ('target_ever_front', True), ('after', None), ('queue_overflow', True)):
+            self.assertFalse(probe.assess_cross_native(dict(native, **{key: value}), 99)['passed'])
+        for key, value in (('ok', False), ('acknowledged', False), ('post_access', False),
+                           ('posted_events', None), ('posted_events', True),
+                           ('sender_pid', 101), ('receiver_pid', 98)):
+            changed = copy.deepcopy(native)
+            changed['sender_report'][key] = value
+            self.assertFalse(probe.assess_cross_native(changed, 99)['passed'])
+        for posting in (None, [], {}, {'ok': True}):
+            self.assertFalse(probe.assess_cross_native(dict(native, sender_report=posting), 99)['passed'])
+
+    def test_cross_window_local_coordinates_are_not_global_coordinates(self):
+        native = self.cross_native()
+        for key in ('local_x', 'local_y'):
+            for value in (None, True, float('nan'), float('inf'), -999, 10**500):
+                changed = copy.deepcopy(native)
+                changed['receipts'][0][key] = value
+                self.assertFalse(probe.assess_cross_native(changed, 99)['passed'])
+            changed = copy.deepcopy(native)
+            del changed['receipts'][0][key]
+            self.assertFalse(probe.assess_cross_native(changed, 99)['passed'])
+            changed = copy.deepcopy(native)
+            del changed['plan'][key]
+            self.assertFalse(probe.assess_cross_native(changed, 99)['passed'])
+        for row in native['receipts']:
+            row['local_x'] = row['x']
+            row['local_y'] = row['y']
+        self.assertFalse(probe.assess_cross_native(native, 99)['passed'])
+
+    def test_cross_missing_local_plan_never_silently_downgrades_evidence(self):
+        native = self.cross_native()
+        for key in ('local_x', 'local_y'):
+            del native['plan'][key]
+        self.assertFalse(probe.assess_cross_native(native, 99)['passed'])
+        # Historical self-process records without local fields remain readable;
+        # they are never promoted to cross-process evidence.
+        old = dict(self.plan)
+        self.assertTrue(assess_pointer_receipts(old, self.receipts(), 1)['effect_verified'])
+
+    def test_cross_wrong_receipt_source_or_receiver_is_not_routing_success(self):
+        native = self.cross_native()
+        for key, value in (('pid', 100), ('source_pid', 99), ('window_id', 999)):
+            changed = copy.deepcopy(native)
+            changed['receipts'][0][key] = value
+            self.assertFalse(probe.assess_cross_native(changed, 99)['passed'])
+
+    def test_native_probe_posts_only_to_self_or_verified_parent(self):
         source = Path(__file__).resolve().parent.parent / 'tests/fixtures/macos-monitor/raw-pointer.m'
         text = source.read_text()
         self.assertEqual(text.count('CGEventPostToPid(getpid(),'), 2)
+        self.assertEqual(text.count('CGEventPostToPid(plan.receiver,'), 2)
+        self.assertIn('plan.receiver != getppid()', text)
+        self.assertIn('parent_window_matches(plan)', text)
+        self.assertIn('S_ISFIFO(info.st_mode)', text)
+        self.assertIn('alarm(4)', text)
+        self.assertIn('CGEventSetWindowLocation', text)
+        self.assertIn('CGEventGetWindowLocation', text)
         for name in ('CGEventPost(', 'CGWarpMouseCursorPosition(', 'CGEventTapCreate(',
                      'CGEventCreateKeyboardEvent(', 'activateWithOptions:', 'makeKeyAndOrderFront:'):
             self.assertNotIn(name, text)
