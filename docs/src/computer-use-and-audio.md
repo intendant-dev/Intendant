@@ -1169,3 +1169,19 @@ were refused after control replacement and same-window document reload. The
 standard-AppKit regression passed too. Earlier unavailable-focus/metadata and
 deadline refusals remain recorded separately. This does not establish arbitrary
 site/canvas input, continuous focus isolation or an independent clipboard seat.
+
+### Concurrent-owner evidence and raw-pointer experiments
+
+The manual Chromium harness reports whole-run desktop sample changes separately
+from action-level focus checks. Pointer, foreground-app and clipboard-change-count
+differences are unattributed; missing observations are unknown, and equal samples
+do not prove continuous isolation. Target activation and failed native focus
+checks still refuse.
+
+The separate raw-pointer fixture defaults to nonposting event construction with
+native field readback. Its explicitly opted-in live mode targets only its own
+process and requires matching tagged receiver events plus an independent canvas
+counter. That live mode is not yet acceptance-tested and is not a daemon tool.
+No arbitrary application, raw keyboard/canvas capability, independent seat or
+expanded display grant is advertised. See
+[raw pointer probe](../design/macos-raw-pointer-probe.md) for boundaries and commands.

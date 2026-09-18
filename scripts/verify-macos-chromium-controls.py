@@ -24,6 +24,8 @@ import subprocess
 import tempfile
 import time
 
+from macos_input_evidence import assess_desktop
+
 
 def require(value, detail):
     if not value:
@@ -430,6 +432,9 @@ def main():
                 report['passed'] = False
         else:
             report['cleanup']['profile_retained'] = str(root)
+        report['desktop_observation_assessment'] = assess_desktop(
+            report.get('observations_before_launch'), report.get('observations_after'),
+            report.get('browser_pid'), report['cleanup'].get('browser_ever_front'))
         args.report.write_text(json.dumps(report, indent=2) + '\n')
     return 0 if report['passed'] else 1
 
