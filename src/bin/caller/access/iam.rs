@@ -2500,7 +2500,7 @@ fn permission_label(id: &str) -> &'static str {
         "filesystem.write" => "Filesystem write",
         "agenda.read" => "Agenda read",
         "agenda.write" => "Agenda write",
-        "feedback.write" => "Dogfood feedback",
+        "feedback.write" => "Developer dogfood feedback",
         "memory.read" => "Memory read",
         "memory.write" => "Memory propose",
         _ => "Permission",
@@ -2546,7 +2546,7 @@ fn permission_summary(id: &str) -> &'static str {
         "filesystem.write" => "Create directories or write uploaded file content.",
         "agenda.read" => "Read the daemon's agenda ledger (parked items and counts).",
         "agenda.write" => "Park, edit, complete, reopen, and retire agenda items.",
-        "feedback.write" => "Submit bounded Intendant dogfood issues and efficiency recommendations; no generic agenda mutation authority.",
+        "feedback.write" => "Submit bounded developer feedback only when the daemon explicitly opts in; disabled by default, with no generic agenda mutation authority.",
         "memory.read" => "Search and read Memory claims (bounded, provenance-labeled).",
         "memory.write" => "Propose Memory claims (the candidate lane).",
         _ => "Operation permission.",
@@ -3423,7 +3423,6 @@ pub(crate) fn builtin_role_templates() -> Vec<IamRole> {
                 "filesystem.write".to_string(),
                 "agenda.read".to_string(),
                 "agenda.write".to_string(),
-                "feedback.write".to_string(),
                 "memory.read".to_string(),
                 "memory.write".to_string(),
             ],
@@ -4554,6 +4553,42 @@ mod tests {
         assert_eq!(
             *load_state_cached_arc(tmp.path()).unwrap(),
             LocalIamState::default()
+        );
+    }
+
+    #[test]
+    fn dogfood_upgrade_removes_implicit_operator_permission_but_keeps_custom_roles() {
+        let mut state = LocalIamState::default();
+        state
+            .roles
+            .iter_mut()
+            .find(|r| r.id == "role:operator")
+            .unwrap()
+            .permissions
+            .push("feedback.write".to_string());
+        state.roles.push(IamRole {
+            id: "role:dev-feedback".to_string(),
+            label: "Developer feedback".to_string(),
+            status: "enforced".to_string(),
+            summary: "Explicit owner opt-in".to_string(),
+            permissions: vec!["feedback.write".to_string()],
+            source: "local_iam_state".to_string(),
+        });
+        let normalized = state.normalize();
+        let permissions = |id| {
+            &normalized
+                .roles
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .permissions
+        };
+        assert!(!permissions("role:operator")
+            .iter()
+            .any(|p| p == "feedback.write"));
+        assert_eq!(
+            permissions("role:dev-feedback"),
+            &["feedback.write".to_string()]
         );
     }
 

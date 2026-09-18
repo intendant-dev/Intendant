@@ -50,3 +50,5 @@ for root in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
   done
 done
 echo "dev skills installed (symlinked from $src)"
+echo "Dogfood reporting is separate: start the developer daemon with INTENDANT_DEV_DOGFOOD=1."
+echo "The caller also needs feedback.write; unavailable/denied reporting must not be worked around."

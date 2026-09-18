@@ -1,11 +1,11 @@
 //! The CLI-shaped MCP facade: a context-efficient control surface.
 //!
 //! Instead of a client swallowing dozens of typed tool schemas up front,
-//! `tool_profile=facade` advertises seven meta-tools — `inspect`, `act`, and
-//! `authorize` (risk-split argv executors), plus `help`, `docs`, `events`, and
-//! the narrow `report` dogfood intake — whose
-//! grammar is the declarative command registry below. Everything else is
-//! discovered lazily: `help` renders the command map from the registry,
+//! `tool_profile=facade` advertises six meta-tools — `inspect`, `act`, and
+//! `authorize` (risk-split argv executors), plus `help`, `docs`, and `events` —
+//! whose grammar is the declarative command registry below. The developer-only
+//! `report` intake is an optional seventh tool, disabled without daemon opt-in.
+//! Everything else is discovered lazily: `help` renders the command map from the registry,
 //! `docs` serves the embedded operate-skills corpus, and each executor call
 //! names one registered command as an argv array.
 //!
@@ -33,16 +33,10 @@ use crate::peer::access_policy::PeerOperation;
 mod registry;
 pub(crate) use registry::*;
 
-/// The meta-tool names the facade serves.
-pub(crate) const FACADE_TOOLS: [&str; 7] = [
-    "inspect",
-    "act",
-    "authorize",
-    "help",
-    "docs",
-    "events",
-    "report",
-];
+/// The default meta-tools. The developer-only `report` is separately recognized
+/// for dispatch/IAM, but server availability gates both listing and execution.
+pub(crate) const FACADE_TOOLS: [&str; 6] =
+    ["inspect", "act", "authorize", "help", "docs", "events"];
 
 /// Params for the three executor meta-tools (`inspect`/`act`/`authorize`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -76,7 +70,7 @@ pub struct FacadeDocsParams {
 }
 
 pub(crate) fn is_facade_tool(name: &str) -> bool {
-    FACADE_TOOLS.contains(&name)
+    FACADE_TOOLS.contains(&name) || name == "report"
 }
 
 /// The three risk-lane executors — the only facade tools that recurse into
@@ -3666,6 +3660,11 @@ mod tests {
     #[test]
     fn docs_lists_and_fetches_embedded_skills() {
         let list = render_docs(&serde_json::json!({}));
+        assert!(!list.contains("intendant-dogfood"));
+        assert!(
+            render_docs(&serde_json::json!({ "skill": "intendant-dogfood" }))
+                .contains("unknown skill")
+        );
         assert!(list.contains("intendant-cli"));
         let one = render_docs(&serde_json::json!({ "skill": "intendant-cli" }));
         assert!(

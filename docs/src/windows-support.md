@@ -172,6 +172,16 @@ other platforms (see [Getting Started](./getting-started.md)), then:
 
 ## Per-OS Backend Architecture
 
+The access-certificate/IAM store uses RoamingAppData's
+`intendant/access-certs` by default, with the legacy
+`temp_dir()/intendant-access-certs` fallback if the Known Folder is unavailable.
+An explicit nonempty `INTENDANT_HOME` instead selects
+`<INTENDANT_HOME>/access-certs`, using the same process-stable root resolution
+as other daemon state. Relative overrides resolve at first use; unset/empty
+keeps the existing default. This does not migrate, copy, or reset user state.
+The E2E harness explicitly pins each rig's children to `home/.intendant` because
+Windows Known Folders do not follow fixture HOME/USERPROFILE changes.
+
 Intendant prefers platform-agnostic code; where the OS forces a difference, the
 Windows implementation slots in behind the same trait or `cfg` gate the X11,
 Wayland, and macOS backends use. The Windows-specific backends are:

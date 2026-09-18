@@ -88,6 +88,10 @@ impl TestRig {
             // credential leases) and no real provider keys.
             .env("HOME", self.home.path())
             .env("USERPROFILE", self.home.path())
+            // Windows Known Folders ignore HOME/USERPROFILE, and the host may
+            // export its own state root. Pin access-certs/IAM and all state
+            // consumers to this rig, including ctl and daemonless children.
+            .env("INTENDANT_HOME", self.home.path().join(".intendant"))
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("GEMINI_API_KEY")
@@ -941,6 +945,22 @@ fn stdout_json(output: &std::process::Output) -> serde_json::Value {
             text_of(output)
         )
     })
+}
+
+/// A successful process can still return a structured tool refusal. Preserve
+/// its stdout/stderr when an agenda write did not actually mint an item.
+fn minted_item_id(output: &std::process::Output) -> String {
+    assert!(output.status.success(), "{}", text_of(output));
+    stdout_json(output)["item"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "agenda add returned no minted item id:\n{}",
+                text_of(output)
+            )
+        })
+        .to_string()
 }
 
 async fn http_get_json(client: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
@@ -2105,6 +2125,7 @@ async fn cli_descriptor_resolves_the_cli_for_unsupervised_shells() {
         // intendant` must fail so the descriptor is the resolving rung.
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", daemon.rig.home.path())
+        .env("INTENDANT_HOME", daemon.rig.home.path().join(".intendant"))
         .output()
         .await
         .expect("run the resolver shell");
@@ -2162,10 +2183,7 @@ async fn agenda_start_now_fires_one_occurrence_and_writes_back() {
     )
     .await;
     assert!(added.status.success(), "{}", text_of(&added));
-    let item_id = stdout_json(&added)["item"]["id"]
-        .as_str()
-        .expect("minted item id")
-        .to_string();
+    let item_id = minted_item_id(&added);
 
     let started = ctl(&daemon, &["agenda", "start", &item_id[..10]]).await;
     assert!(started.status.success(), "{}", text_of(&started));
@@ -2285,10 +2303,7 @@ async fn eight_fire_wave_staggers_and_daemon_stays_responsive() {
         )
         .await;
         assert!(added.status.success(), "{}", text_of(&added));
-        let item_id = stdout_json(&added)["item"]["id"]
-            .as_str()
-            .expect("minted item id")
-            .to_string();
+        let item_id = minted_item_id(&added);
         let started = ctl(&daemon, &["agenda", "start", &item_id]).await;
         assert!(started.status.success(), "{}", text_of(&started));
         item_ids.push(item_id);
@@ -5367,12 +5382,11 @@ async fn coordination_message_verbs_daemonless_round_trip() {
     let rig = TestRig::new();
     // One invocation = one short-lived keyless process. The host may
     // itself run under a supervised Intendant shell, so scrub the
-    // identity/state env the verbs would otherwise inherit; the rig's
-    // command() already scrubs INTENDANT_COORDINATION_DIR.
+    // identity env the verbs would otherwise inherit; the rig's command()
+    // already scrubs INTENDANT_COORDINATION_DIR and pins INTENDANT_HOME.
     let run_verb = |args: Vec<String>, stdin_body: Option<String>, session_env: Option<String>| {
         let mut cmd = rig.command();
-        cmd.env_remove("INTENDANT_SESSION_ID")
-            .env_remove("INTENDANT_HOME");
+        cmd.env_remove("INTENDANT_SESSION_ID");
         if let Some(session_id) = session_env {
             cmd.env("INTENDANT_SESSION_ID", session_id);
         }
@@ -7038,10 +7052,7 @@ fn journal_states_for_item(rig: &TestRig, item_id: &str) -> Vec<String> {
 async fn approve_manifest_at(rig: &TestRig, port: u16, fire_at_ms: u64, title: &str) -> String {
     let added = ctl_on_rig(rig, port, &["--json", "agenda", "add", title, "--task"]).await;
     assert!(added.status.success(), "{}", text_of(&added));
-    let item_id = stdout_json(&added)["item"]["id"]
-        .as_str()
-        .expect("minted item id")
-        .to_string();
+    let item_id = minted_item_id(&added);
     let scheduled = ctl_on_rig(
         rig,
         port,
@@ -7514,10 +7525,7 @@ async fn drainer_exits_at_last_session_end() {
         "ordinary agenda writes still serve while draining: {}",
         text_of(&refused)
     );
-    let refused_item_id = stdout_json(&refused)["item"]["id"]
-        .as_str()
-        .expect("minted item id")
-        .to_string();
+    let refused_item_id = minted_item_id(&refused);
     let start_refused = ctl_on_rig(
         &daemon_a.rig,
         daemon_a.port,
@@ -8553,10 +8561,7 @@ async fn chained_drain_payload_resolves_only_live_non_draining_holder() {
     )
     .await;
     assert!(probe.status.success(), "{}", text_of(&probe));
-    let probe_id = stdout_json(&probe)["item"]["id"]
-        .as_str()
-        .expect("minted item id")
-        .to_string();
+    let probe_id = minted_item_id(&probe);
     let refused = ctl_on_rig(
         &daemon_a.rig,
         daemon_a.port,
@@ -11368,8 +11373,8 @@ async fn http_tasks_negotiate_fail_poll_isolate_and_delete_on_the_wire() {
 }
 
 /// Revocation must be enforced before session activity, including notifications
-/// that do not pass through a tool-operation gate. All IAM edits affect only
-/// this synthetic test daemon's temporary home.
+/// that do not pass through a tool-operation gate. A second real daemon with
+/// the same loopback grant must remain authorized in its separate state root.
 #[tokio::test]
 async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
     use serde_json::{json, Value};
@@ -11379,16 +11384,21 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .build()
         .unwrap();
     let mut daemon = spawn_daemon(&plain, &json!({"profiles":[]})).await;
+    let mut sibling = spawn_daemon(&plain, &json!({"profiles":[]})).await;
     let client = daemon.authed_client();
+    let sibling_client = sibling.authed_client();
     let base = format!("http://127.0.0.1:{}", daemon.port);
     let mcp = format!("{base}/mcp");
-    let grant = |status: &str| {
+    let sibling_mcp = format!("http://127.0.0.1:{}/mcp", sibling.port);
+    let grant = |client: &reqwest::Client, port: u16, status: &str| {
         client
-            .post(format!("{base}/api/access/iam/user-client-grants"))
+            .post(format!(
+                "http://127.0.0.1:{port}/api/access/iam/user-client-grants"
+            ))
             .timeout(Duration::from_secs(15))
             .json(&json!({"kind":"local_process", "role_id":"role:root", "status":status}))
     };
-    let original: Value = grant("active")
+    let original: Value = grant(&client, daemon.port, "active")
         .send()
         .await
         .unwrap()
@@ -11397,8 +11407,42 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .json()
         .await
         .unwrap();
-    let initialize = || {
-        client.post(&mcp).timeout(Duration::from_secs(15)).json(
+    let sibling_grant: Value = grant(&sibling_client, sibling.port, "active")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // These identifiers are deliberately identical. Isolation must come from
+    // the state roots, not from test-specific principal or grant names.
+    assert!(original["grant"]["id"].is_string(), "{original}");
+    assert_eq!(original["grant"]["id"], sibling_grant["grant"]["id"]);
+    let iam_path = |rig: &TestRig| {
+        rig.home
+            .path()
+            .join(".intendant")
+            .join("access-certs")
+            .join("iam.json")
+    };
+    let daemon_iam = iam_path(&daemon.rig);
+    let sibling_iam = iam_path(&sibling.rig);
+    assert_ne!(daemon_iam, sibling_iam);
+    let read_iam = |path: &Path| {
+        std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "IAM must be inside the fixture root {}: {e}",
+                path.display()
+            )
+        })
+    };
+    let daemon_iam_before = read_iam(&daemon_iam);
+    let sibling_iam_before = read_iam(&sibling_iam);
+
+    let initialize = |client: &reqwest::Client, url: &str| {
+        client.post(url).timeout(Duration::from_secs(15)).json(
             &json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
                 "protocolVersion":"2025-06-18",
                 "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
@@ -11406,7 +11450,7 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
             }}),
         )
     };
-    let response = initialize()
+    let response = initialize(&client, &mcp)
         .send()
         .await
         .unwrap()
@@ -11420,7 +11464,21 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .unwrap()
         .to_string();
     let _: Value = response.json().await.unwrap();
-    let revoked: Value = grant("revoked")
+    let response = initialize(&sibling_client, &sibling_mcp)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let sibling_session = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("sibling negotiated a Tasks session before revocation")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _: Value = response.json().await.unwrap();
+    let revoked: Value = grant(&client, daemon.port, "revoked")
         .send()
         .await
         .unwrap()
@@ -11430,6 +11488,16 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .await
         .unwrap();
     assert_eq!(original["grant"]["id"], revoked["grant"]["id"]);
+    assert_ne!(
+        read_iam(&daemon_iam),
+        daemon_iam_before,
+        "revocation must persist on A"
+    );
+    assert_eq!(
+        read_iam(&sibling_iam),
+        sibling_iam_before,
+        "A must not rewrite B's IAM"
+    );
 
     for method in [
         "notifications/progress",
@@ -11467,8 +11535,40 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .unwrap();
     assert_eq!(denied_delete.status(), 403);
 
+    // While A remains revoked, B's existing Tasks session and a fresh ctl
+    // agenda write both traverse real authorization successfully. No re-grant
+    // on B and no retries can conceal a shared access store.
+    let response = sibling_client
+        .post(&sibling_mcp)
+        .timeout(Duration::from_secs(15))
+        .header("Mcp-Session-Id", &sibling_session)
+        .json(&json!({"jsonrpc":"2.0", "method":"notifications/progress"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 202, "revoking A must not deny B's session: {body}");
+    let added = ctl(
+        &sibling,
+        &[
+            "--json",
+            "agenda",
+            "add",
+            "unaffected-by-sibling-revocation",
+            "--task",
+        ],
+    )
+    .await;
+    let _item_id = minted_item_id(&added);
+    assert_eq!(
+        read_iam(&sibling_iam),
+        sibling_iam_before,
+        "B's IAM must stay unchanged"
+    );
+
     // Revocation does not break ordinary initialization or allocate Tasks.
-    let response = initialize()
+    let response = initialize(&client, &mcp)
         .send()
         .await
         .unwrap()
@@ -11480,7 +11580,7 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
 
     // Explicitly restoring the same fixture grant proves denied requests and
     // DELETE did not remove/cancel the session as an unauthorized side effect.
-    let restored: Value = grant("active")
+    let restored: Value = grant(&client, daemon.port, "active")
         .send()
         .await
         .unwrap()
@@ -11512,4 +11612,9 @@ async fn http_tasks_revocation_denies_session_notifications_on_the_wire() {
         .kill()
         .await
         .expect("stop and reap test daemon");
+    sibling
+        .child
+        .kill()
+        .await
+        .expect("stop and reap sibling daemon");
 }

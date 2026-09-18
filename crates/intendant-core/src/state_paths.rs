@@ -57,9 +57,10 @@ pub fn home_dir() -> std::path::PathBuf {
 /// session-index cache, recordings, quarantine, leased credentials, and most
 /// other machine-local daemon state. It is `~/.intendant` by default.
 ///
-/// Known platform/product exceptions do not use this seam: Windows keeps its
-/// access-certificate/IAM store under the OS data directory, the durable
-/// daemon identity key uses the OS data directory on every platform, and the
+/// Known platform/product exceptions: Windows keeps its access-certificate/IAM
+/// store under the OS data directory unless a nonempty `$INTENDANT_HOME` is
+/// explicit (see [`intendant_home_override`]); the durable daemon identity key
+/// uses the OS data directory on every platform, and the
 /// current macOS durable Memory plane still hard-codes
 /// `~/.intendant/memory-plane`.
 ///
@@ -96,33 +97,32 @@ pub fn home_dir() -> std::path::PathBuf {
 pub fn intendant_home() -> std::path::PathBuf {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
-        let root =
-            intendant_home_override(std::env::var_os("INTENDANT_HOME")).unwrap_or_else(|| {
-                #[cfg(test)]
-                {
-                    // PID alone is NOT unique across runs: busy CI boxes recycle
-                    // PIDs fast, and a recycled PID inherits a previous test
-                    // process's scratch home — stale state files included (seen
-                    // live: a diagnostics append test read a prior run's records
-                    // on the loaded Linux runner). A startup-time nanos component
-                    // makes the root unique per process INSTANCE; OnceLock keeps
-                    // it stable within the process.
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    std::env::temp_dir()
-                        .join(format!(
-                            "intendant-test-home-{}-{nanos}",
-                            std::process::id()
-                        ))
-                        .join(".intendant")
-                }
-                #[cfg(not(test))]
-                {
-                    home_dir().join(".intendant")
-                }
-            });
+        let root = intendant_home_override().unwrap_or_else(|| {
+            #[cfg(test)]
+            {
+                // PID alone is NOT unique across runs: busy CI boxes recycle
+                // PIDs fast, and a recycled PID inherits a previous test
+                // process's scratch home — stale state files included (seen
+                // live: a diagnostics append test read a prior run's records
+                // on the loaded Linux runner). A startup-time nanos component
+                // makes the root unique per process INSTANCE; OnceLock keeps
+                // it stable within the process.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                std::env::temp_dir()
+                    .join(format!(
+                        "intendant-test-home-{}-{nanos}",
+                        std::process::id()
+                    ))
+                    .join(".intendant")
+            }
+            #[cfg(not(test))]
+            {
+                home_dir().join(".intendant")
+            }
+        });
         // Create the root owner-only at first resolution: every piece of
         // daemon state (session logs, leases, certs, quarantine) lives
         // under this directory, and the scattered `create_dir_all` callers
@@ -187,25 +187,61 @@ pub fn write_private_file(
     file.write_all(contents.as_ref())
 }
 
-/// Interpret an `INTENDANT_HOME` value: absolute paths pass through,
-/// relative ones resolve against the current directory, unset/empty means
-/// "no override". Split from [`intendant_home`] so tests can pin every
-/// branch without racing the parallel runner over process-global env.
-fn intendant_home_override(raw: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
-    let raw = raw?;
+/// The explicit nonempty `$INTENDANT_HOME`, resolved once for this process.
+///
+/// Shared with [`intendant_home`] so platform-specific stores can honor an
+/// explicit root while preserving their historical default when unset/empty.
+/// Relative values are pinned against the current directory at the first call
+/// to either accessor; later environment or directory changes cannot move them.
+/// This accessor only resolves a path; it does not create or migrate state.
+///
+/// An explicit path that cannot be made absolute is a fatal configuration
+/// error (exit status 2), never a panic or fallback to the default IAM store.
+pub fn intendant_home_override() -> Option<std::path::PathBuf> {
+    static ROOT: std::sync::OnceLock<Result<Option<std::path::PathBuf>, String>> =
+        std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        resolve_intendant_home_override(std::env::var_os("INTENDANT_HOME"), |path| {
+            std::path::absolute(path)
+        })
+    })
+    .as_ref()
+    .unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(2)
+    })
+    .clone()
+}
+
+/// Pure path interpretation: tests inject absolute-path resolution rather than
+/// changing process-global environment or cwd. Only unset/empty means no override.
+fn resolve_intendant_home_override(
+    raw: Option<std::ffi::OsString>,
+    absolute: impl FnOnce(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
     let path = std::path::PathBuf::from(raw);
     if path.is_absolute() {
-        Some(path)
-    } else {
-        Some(
-            std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(path),
-        )
+        return Ok(Some(path));
     }
+    // A cwd.join() can leave Windows drive-relative paths (C:state) relative.
+    // Resolve both drive-relative and root-relative (\state) paths before caching.
+    let error = |reason: String| {
+        format!(
+            "cannot resolve explicit INTENDANT_HOME {path:?} to an absolute path: {reason}; \
+             refusing to fall back to the default state/IAM store"
+        )
+    };
+    let resolved = absolute(&path).map_err(|err| error(err.to_string()))?;
+    if !resolved.is_absolute() {
+        return Err(error("path resolution returned a relative path".into()));
+    }
+    Ok(Some(resolved))
 }
 
 /// The state root for an explicit `home`: `<home>/.intendant`, except that
@@ -241,28 +277,80 @@ mod tests {
             std::path::PathBuf::from("/scratch/state")
         };
         assert_eq!(
-            intendant_home_override(Some(abs.clone().into_os_string())),
-            Some(abs)
+            resolve_intendant_home_override(Some(abs.clone().into_os_string()), |_| {
+                panic!("an absolute override must pass through unchanged")
+            }),
+            Ok(Some(abs))
         );
     }
 
     #[test]
     fn intendant_home_override_relative_resolves_against_cwd() {
-        let resolved = intendant_home_override(Some("scratch-state".into())).unwrap();
-        assert!(resolved.is_absolute());
-        assert!(resolved.ends_with("scratch-state"));
+        let cwd = std::path::Path::new(if cfg!(windows) { "C:\\work" } else { "/work" });
+        // Nonempty means nonempty, not trimmed: a space is a path too.
+        for raw in ["scratch-state", " ", " scratch-state "] {
+            assert_eq!(
+                resolve_intendant_home_override(Some(raw.into()), |path| {
+                    assert_eq!(path.as_os_str(), std::ffi::OsStr::new(raw));
+                    Ok(cwd.join(path))
+                }),
+                Ok(Some(cwd.join(raw)))
+            );
+        }
     }
 
     #[test]
     fn intendant_home_override_unset_and_empty_mean_no_override() {
-        assert_eq!(intendant_home_override(None), None);
-        assert_eq!(intendant_home_override(Some("".into())), None);
+        for raw in [None, Some("".into())] {
+            assert_eq!(
+                resolve_intendant_home_override(raw, |_| {
+                    panic!("unset/empty must not require path resolution")
+                }),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn intendant_home_override_resolution_failure_is_an_error_not_no_override() {
+        let error = resolve_intendant_home_override(Some("scratch-state".into()), |_| {
+            Err(std::io::Error::other("current directory unavailable"))
+        })
+        .unwrap_err();
+        assert!(error.contains("INTENDANT_HOME"));
+        assert!(error.contains("scratch-state"));
+        assert!(error.contains("current directory unavailable"));
+        assert!(error.contains("refusing to fall back to the default state/IAM store"));
+    }
+
+    #[test]
+    fn intendant_home_override_rejects_unresolved_relative_paths() {
+        let error = resolve_intendant_home_override(Some("scratch-state".into()), |path| {
+            Ok(path.to_path_buf())
+        })
+        .unwrap_err();
+        assert!(error.contains("path resolution returned a relative path"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn intendant_home_override_windows_drive_and_root_relative_paths_are_absolute() {
+        // Uses only lexical Windows path resolution; no files, env/cwd mutation,
+        // or access to a real state/IAM store.
+        for raw in [r"C:scratch-state", r"\scratch-state"] {
+            let resolved =
+                resolve_intendant_home_override(Some(raw.into()), |path| std::path::absolute(path))
+                    .unwrap()
+                    .unwrap();
+            assert!(resolved.is_absolute(), "{raw:?} resolved to {resolved:?}");
+            assert!(resolved.ends_with("scratch-state"));
+        }
     }
 
     /// In unit-test builds the unset default is the per-process scratch
     /// root, never the live `~/.intendant` — the property the whole seam
     /// exists to guarantee. (The `INTENDANT_HOME` env branch itself is
-    /// pinned via `intendant_home_override` above; the prod default is
+    /// pinned via `resolve_intendant_home_override` above; the prod default is
     /// covered behaviorally by the e2e suite's fake-home daemons.)
     #[test]
     fn intendant_home_in_tests_is_process_scratch_not_live_home() {
