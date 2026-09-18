@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'">
+<title>Intendant disposable Chromium controls</title>
+<style>body{font:18px system-ui;margin:30px}input,button{display:block;margin:12px 0;width:260px;font-size:18px}canvas{display:block;border:2px solid;margin:15px 0}</style>
+<label for="normal">Normal browser field</label><input id="normal" aria-label="Normal browser field" value="initial disposable text">
+<button id="button" aria-label="Increment browser counter">Increment browser counter</button>
+<input id="secure" aria-label="Omit secure browser field" type="password" value="synthetic-secret-never-return">
+<button id="disabled" aria-label="Omit disabled browser button" disabled>Omit disabled browser button</button>
+<canvas id="canvas" aria-label="Fixture canvas" width="260" height="70"></canvas>
+<script>
+let buttonCount=0,canvasCount=0,generation=1;
+document.querySelector('#button').addEventListener('click',()=>{buttonCount++;draw()});
+document.querySelector('#canvas').addEventListener('click',()=>{canvasCount++;draw()});
+function draw(){let c=document.querySelector('#canvas').getContext('2d');c.fillStyle=buttonCount?'#19734f':'#a52220';c.fillRect(0,0,260,70);c.fillStyle='white';c.font='18px sans-serif';c.fillText('Button: '+buttonCount+'  Canvas: '+canvasCount,10,40)}
+window.fixtureStatus=()=>({text:document.querySelector('#normal').value,button_count:buttonCount,canvas_count:canvasCount,generation});
+window.replaceFixtureField=()=>{let old=document.querySelector('#normal'),n=old.cloneNode();n.value='replacement disposable text';old.replaceWith(n);generation++;};
+draw();
+</script>

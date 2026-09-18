@@ -307,7 +307,7 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
             serde_json::json!({"ok":result.verified(),"placement":result})
         }
         Value::Window(WindowValue::PlacementUnconfirmed { result, error }) => {
-            serde_json::json!({"ok":false,"placement":result,"effects_unconfirmed":true,"error":error})
+            serde_json::json!({"ok":false,"placement":result,"effects_unconfirmed":result.writes_attempted > 0,"error":error})
         }
         Value::Window(WindowValue::Elements(controls)) => {
             serde_json::json!({"ok":true,"controls":controls})
@@ -329,10 +329,11 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
         // delivery/commit is unconfirmed; never replace it with a generic error.
         if response.get("placement").is_some() || response.get("action").is_some() {
             response["ok"] = false.into();
-            response["effects_unconfirmed"] = response
-                .get("action")
-                .is_none_or(|action| action["action_attempted"] == true)
-                .into();
+            response["effects_unconfirmed"] = if let Some(action) = response.get("action") {
+                (action["action_attempted"] == true).into()
+            } else {
+                (response["placement"]["writes_attempted"] != 0).into()
+            };
             let expired = "window receipt expired; available observations retained; no retry or rollback attempted";
             response["error"] = match response["error"].as_str() {
                 Some(error) => format!("{error}; {expired}"),
@@ -350,6 +351,59 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_write_placement_receipts_never_invent_input_effects() {
+        use crate::macos_monitor::{placement::*, Receipt};
+        let bounds = Bounds {
+            x: -700.0,
+            y: 20.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        for late in [false, true] {
+            for expired in [false, true] {
+                let result = PlacementResult {
+                    status: PlacementStatus::Verified,
+                    requested_global: bounds,
+                    before: Observation {
+                        ax: bounds,
+                        cg: bounds,
+                    },
+                    after: Some(Observation {
+                        ax: bounds,
+                        cg: bounds,
+                    }),
+                    writes_attempted: 0,
+                    focus_interference: Some(false),
+                    detail: None,
+                };
+                let value = if late {
+                    WindowValue::PlacementUnconfirmed {
+                        result,
+                        error: "fixture late failure".into(),
+                    }
+                } else {
+                    WindowValue::Placed(result)
+                };
+                let (receipt, committed) = Receipt::fixture(Value::Window(value));
+                let held = if expired {
+                    drop(committed);
+                    None
+                } else {
+                    Some(committed)
+                };
+                let response: serde_json::Value =
+                    serde_json::from_str(&window_response(receipt)).unwrap();
+                assert_eq!(response["placement"]["writes_attempted"], 0);
+                assert_eq!(response["ok"], !late && !expired);
+                if late || expired {
+                    assert_eq!(response["effects_unconfirmed"], false);
+                }
+                drop(held);
+            }
+        }
+    }
 
     #[test]
     fn element_receipt_expiry_and_late_failure_keep_attempt_focus_and_readback_evidence() {
