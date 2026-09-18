@@ -915,18 +915,86 @@ fn control_string(value: CFType, cap: usize) -> Result<String, String> {
     }
     Ok(text)
 }
+// Optional does not mean errors are ignored: only documented absence without
+// an accompanying value is admitted. In particular, failed IPC is never false.
+fn control_optional_result(
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+) -> Result<Option<CFType>, String> {
+    if (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue) && value.is_none() {
+        return Ok(None);
+    }
+    if status != kAXErrorSuccess || value.is_none() {
+        return Err("optional AX metadata unavailable or contradictory".into());
+    }
+    Ok(value)
+}
+fn control_optional_attr(
+    element: &AXUIElement,
+    attribute: &str,
+    deadline: Instant,
+) -> Result<Option<CFType>, String> {
+    placement_permissions(deadline)?;
+    placement_timeout(element, deadline)?;
+    let key = CFString::new(attribute);
+    let mut raw = std::ptr::null();
+    // SAFETY: retained object/key and writable Copy-rule output. Every returned
+    // object is released even on failure, and typed only by the decoder below.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValue(
+            element.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut raw,
+        )
+    };
+    let value = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: non-null Copy-rule CF object, dynamically checked by caller.
+        Some(unsafe { CFType::wrap_under_create_rule(raw) })
+    };
+    placement::time_left(deadline)?;
+    control_optional_result(status, value)
+        .map_err(|_| format!("AX {attribute} read failed; metadata is not known"))
+}
+fn control_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("secure") || name.contains("password")
+}
+fn control_optional_subrole(value: Option<CFType>) -> Result<Option<String>, String> {
+    value.map(|v| control_string(v, 64)).transpose()
+}
+fn control_optional_protected(value: Option<CFType>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) => value
+            .downcast_into::<CFBoolean>()
+            .map(bool::from)
+            .ok_or_else(|| "AX protected-content metadata must be a Boolean".into()),
+    }
+}
 fn control_safety(e: &AXUIElement, deadline: Instant) -> Result<Safety, String> {
     let role = control_string(control_attr(e, kAXRoleAttribute, deadline)?, 64)?;
-    if role == "AXSecureTextField" {
+    if role.is_empty() {
+        return Err("empty AX role".into());
+    }
+    if control_sensitive_name(&role) {
         return Ok(Safety { role, secure: true });
     }
-    // A missing subrole is not evidence that a text field is nonsecure. Check
-    // every node, including containers, BEFORE labels, children or AXValue.
-    let subrole = control_string(control_attr(e, "AXSubrole", deadline)?, 64)?;
-    let secure = [role.as_str(), subrole.as_str()].iter().any(|s| {
-        let s = s.to_ascii_lowercase();
-        s.contains("secure") || s.contains("password")
-    });
+    // AXSubrole is optional in Apple's SDK. An absent specialization is not a
+    // transport failure. Explicit secure subroles still stop before all content.
+    let subrole = control_optional_subrole(control_optional_attr(e, "AXSubrole", deadline)?)?;
+    if subrole.as_deref().is_some_and(control_sensitive_name) {
+        return Ok(Safety { role, secure: true });
+    }
+    // Also respect protected content on containers, before labels/children/value.
+    // This is reported app metadata, not a security sandbox or a promise that
+    // arbitrary app-supplied text contains no sensitive information.
+    let secure = control_optional_protected(control_optional_attr(
+        e,
+        "AXContainsProtectedContent",
+        deadline,
+    )?)?;
     Ok(Safety { role, secure })
 }
 // Only documented absence is an empty optional label. An IPC/type error must
@@ -1332,6 +1400,73 @@ impl controls::Native for PlacementNative {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_control_metadata_distinguishes_absence_from_failure() {
+        for status in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
+            assert!(control_optional_result(status, None).unwrap().is_none());
+            assert!(
+                control_optional_result(status, Some(CFString::new("AXUnknown").as_CFType()))
+                    .is_err()
+            );
+        }
+        for status in [
+            accessibility_sys::kAXErrorCannotComplete,
+            accessibility_sys::kAXErrorInvalidUIElement,
+            accessibility_sys::kAXErrorIllegalArgument,
+        ] {
+            assert!(control_optional_result(status, None).is_err());
+            assert!(
+                control_optional_result(status, Some(CFBoolean::false_value().as_CFType()))
+                    .is_err()
+            );
+        }
+        assert!(control_optional_result(kAXErrorSuccess, None).is_err());
+        let value = CFString::new("AXUnknown").as_CFType();
+        assert_eq!(
+            control_optional_result(kAXErrorSuccess, Some(value.clone())).unwrap(),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn optional_control_subroles_remain_typed_and_bounded() {
+        assert!(control_optional_subrole(None).unwrap().is_none());
+        for name in ["", "AXUnknown", "AXSearchField"] {
+            assert_eq!(
+                control_optional_subrole(Some(CFString::new(name).as_CFType()))
+                    .unwrap()
+                    .as_deref(),
+                Some(name)
+            );
+        }
+        assert!(control_optional_subrole(Some(CFBoolean::false_value().as_CFType())).is_err());
+        assert!(
+            control_optional_subrole(Some(CFString::new(&"a".repeat(65)).as_CFType())).is_err()
+        );
+        assert!(
+            control_optional_subrole(Some(CFString::new(&"π".repeat(33)).as_CFType())).is_err()
+        );
+        for name in ["AXSecureTextField", "axpassword", "AXContainerSecure"] {
+            assert!(control_sensitive_name(name));
+        }
+        assert!(!control_sensitive_name("AXTextField"));
+        assert!(!control_sensitive_name("AXButton"));
+    }
+
+    #[test]
+    fn optional_protected_content_requires_actual_boolean() {
+        assert!(!control_optional_protected(None).unwrap());
+        assert!(!control_optional_protected(Some(CFBoolean::false_value().as_CFType())).unwrap());
+        assert!(control_optional_protected(Some(CFBoolean::true_value().as_CFType())).unwrap());
+        for value in [
+            CFString::new("false").as_CFType(),
+            CFString::new("").as_CFType(),
+            CFNumber::from(0i32).as_CFType(),
+        ] {
+            assert!(control_optional_protected(Some(value)).is_err());
+        }
+    }
 
     #[test]
     fn optional_control_label_distinguishes_absence_from_ipc_or_type_failure() {

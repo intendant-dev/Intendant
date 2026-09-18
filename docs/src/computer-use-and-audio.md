@@ -1117,10 +1117,13 @@ exact bounded labels, bounds, monitor, permissions and focus are checked
 before/after the attempt; cancellation/late failures preserve available evidence.
 There is no global input, activation, clipboard, retry, rollback or focus restoration.
 
-This shares WindowServer and is not an isolated seat. The strict AX attribute
-profile deliberately requires AXSubrole although the SDK makes it optional, so
-ordinary AppKit controls omitting it may refuse the snapshot. Documented missing
-AXChildren and empty arrays are admitted as leaves; IPC/type/cap failures still
-refuse. No general Chromium/canvas compatibility
-is claimed. Native semantic-control acceptance passed on 2026-09-18 against an isolated daemon and disposable AppKit controls; general application/Chromium compatibility remains unverified.
+This shares WindowServer and is not an isolated seat. AXRole remains required;
+documented absence of optional AXSubrole/AXContainsProtectedContent is addocumented absence of optional AXSC. Explicit secure/password metadata and protected
+containers are excluded before traversal or content reads. Malformed, oversized,
+contradictory or failed metadata replies still refuse. The standard-AppKit fixture
+profile uses native controls without subrole or hierarchy overrides; its acceptance
+scope and results are recorded in `docs/design/macos-appkit-controls.md`.
+No general Chromium/canvas compatibility or protection against dishonest
+application metadata is claimed. Existing exact-identity, focus, containment,
+permission and single-use-token checks are unchanged.
 See the [bounded control design and supervisor harness](../design/macos-bound-window-actions.md).

@@ -99,6 +99,7 @@ def main():
                 raise RuntimeError('independent fixture readback timeout')
 
             initial = status()
+            report["fixture_profile"] = {k: initial.get(k) for k in ("standard_appkit", "field_subrole_present")}
             listed = call('list_macos_windows', pid=child.pid)
             report['checks']['window_listing'] = listed
             candidates = [c for c in listed.get('candidates', []) if c['identity']['window_id'] == initial['window_id']]
@@ -121,7 +122,7 @@ def main():
                 require(0 < len(controls) <= 16, 'unexpected controls inventory')
                 require(all(set(c) == {'element', 'role', 'label', 'bounds', 'operations'} for c in controls), 'unexpected fields/text')
                 wire = json.dumps(controls)
-                require('synthetic-secret' not in wire and 'Omit secure' not in wire and 'Omit disabled' not in wire, 'secure or disabled control leaked')
+                require('synthetic-secret' not in wire and 'Omit secure' not in wire and 'Omit disabled' not in wire and 'Omit protected' not in wire and 'synthetic-protected' not in wire, 'secure or disabled control leaked')
                 field = [c for c in controls if c['role'] == 'AXTextField' and c['label'] == 'Normal fixture field']
                 button = [c for c in controls if c['role'] == 'AXButton' and c['label'] == 'Increment fixture counter']
                 require(len(field) == len(button) == 1, 'fixture controls not uniquely described')
@@ -129,6 +130,22 @@ def main():
 
             def action(element, value):
                 return call('act', argv=['display', 'window-element', binding, element, json.dumps(value)])
+
+            if initial.get('standard_appkit'):
+                read()  # Initially protected: the subtree must be absent.
+                child.stdin.write(b'u'); child.stdin.flush()
+                status(lambda s: s.get('protected_container') is False)
+                visible = call('read_macos_window_elements', binding=binding)
+                require(visible.get('ok') is True, str(visible))
+                exposed = [c for c in visible['controls'] if c['label'] == 'Omit protected fixture']
+                require(len(exposed) == 1, 'protected fixture was not visible when explicitly unprotected')
+                child.stdin.write(b'p'); child.stdin.flush()
+                status(lambda s: s.get('protected_container') is True)
+                refused = action(exposed[0]['element'], {'type': 'set_value', 'text': 'must not write'})
+                require(refused.get('ok') is False and refused.get('action_attempted') is False,
+                        'an element in a newly protected subtree was acted on')
+                read()  # Protected again: no label or value may escape.
+                report['checks']['protected_subtree_exclusion_and_revalidation'] = True
 
             old, _ = read()
             field, _ = read()
