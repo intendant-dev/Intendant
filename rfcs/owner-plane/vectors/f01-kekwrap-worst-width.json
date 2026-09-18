@@ -1,0 +1,21 @@
+{
+  "case_kind": "cap-fit",
+  "expected": {
+    "result": {
+      "fits": true,
+      "sizes": {
+        "kekwrap": 314
+      }
+    }
+  },
+  "family": 1,
+  "inputs": {
+    "template": "kekwrap-worst"
+  },
+  "name": "kekwrap-worst-width",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
