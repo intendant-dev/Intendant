@@ -836,8 +836,8 @@ impl Native for PlacementNative {
         if minimized != Some(false) || fullscreen != Some(false) {
             return Err("window minimized/fullscreen state unavailable or unsupported".into());
         }
-        placement_settable(&window.element, kAXPositionAttribute, deadline)?;
-        placement_settable(&window.element, kAXSizeAttribute, deadline)?;
+        // Observation does not require writable geometry. Each actual setter
+        // checks its own capability immediately before mutation.
         let ax = placement_ax(&window.element, deadline)?;
         let cg = placement_cg(identity, deadline)?;
         placement_generation(identity)?;

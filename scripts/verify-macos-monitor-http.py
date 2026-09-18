@@ -34,7 +34,14 @@ def main():
     parser.add_argument('--check-recovery', action='store_true', help='Verify owner monitor inventory and exact read-only status')
     parser.add_argument("--placement-fixture", help="Also exercise explicit window placement using this disposable fixture binary")
     parser.add_argument("--controls-fixture", help="Also exercise owner-only semantic controls using a supervisor-built disposable fixture")
+    parser.add_argument('--chromium-app', help='Explicit Chrome for Testing bundle for disposable native AX acceptance')
+    parser.add_argument('--chromium-supervisor', help='Supervisor built from tests/fixtures/macos-monitor/browser.m')
+    parser.add_argument('--chromium-placement-only', action='store_true', help='Run only the browser placement/no-op acceptance profile')
     args = parser.parse_args()
+    if args.chromium_placement_only and not args.chromium_app:
+        parser.error('--chromium-placement-only requires the Chromium fixture')
+    if bool(args.chromium_app) != bool(args.chromium_supervisor):
+        parser.error('--chromium-app and --chromium-supervisor must be supplied together')
     if not args.allow_shared_session_monitor:
         parser.error('Native monitor hotplug requires explicit opt-in')
     if not __debug__:
@@ -136,6 +143,14 @@ def main():
                 controls = subprocess.run(["python3", str(Path(__file__).resolve().with_name("verify-macos-window-controls.py")), "--bin", args.bin, "--fixture", args.controls_fixture, "--port", str(port), "--monitor", first["display_target"], "--report", str(controls_report), "--allow-fixture-window-controls"], cwd=project, env=env, timeout=140)
                 report["controls"] = json.loads(controls_report.read_text())
                 assert controls.returncode == 0, report["controls"]
+            if args.chromium_app:
+                chromium_report = root / 'chromium.json'
+                chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-chromium-controls.py')),
+                    '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
+                    '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
+                    '--allow-disposable-chromium'] + (['--placement-only'] if args.chromium_placement_only else []), cwd=project, env=env, timeout=230)
+                report['chromium'] = json.loads(chromium_report.read_text()) if chromium_report.exists() else {'passed': False, 'error': 'Chromium fixture exited before producing a report; see stderr', 'exit_code': chromium.returncode}
+                assert chromium.returncode == 0, report['chromium']
             if args.check_recovery:
                 listed = recover()
                 assert len(listed) == 1, listed

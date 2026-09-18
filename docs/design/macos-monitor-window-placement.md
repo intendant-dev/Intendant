@@ -62,11 +62,14 @@ layout changes require explicit rebind.
 The helper checks the process start generation, PID, `_AXUIElementGetWindow`
 mapping, a unique current AX match, and `CFEqual` against the **retained exact AX
 window**. Thus same-process reuse of a CGWindowID cannot substitute a fresh AX
-object. Minimized/fullscreen windows, unknown state or non-settable AX geometry
-refuse. The implementation consulted PR925 source at `17e316c` for the generation
+object. Minimized/fullscreen windows and unknown state refuse. Observation and
+binding do not require writable geometry; each actual setter checks its own
+mutability immediately before mutation. The implementation consulted PR925 source at `17e316c` for the generation
 and exact mapping ABI shape; its input implementation is not imported.
 
-Position and size are attempted once each, in that order. Identity, live monitor
+Position and size are attempted at most once each, in that order. A component
+already matching the target exactly in BOTH current AX and CG observations is
+not written again. All pre/postchecks still run for a skipped component. Identity, live monitor
 geometry, current focus and AX/CG geometry are rechecked around **each** write.
 Geometry changes between checks stop the next write. The helper never activates,
 raises, unminimizes or refocuses an app; never injects keyboard/mouse input; and
@@ -79,10 +82,10 @@ match the requested global x/y/width/height to **1 logical point per component**
 and both full readback rectangles to lie inside the owned monitor with **zero**
 containment tolerance. It also requires unchanged observed focus and live
 identity/monitor checks after writes. Dispatch success alone is insufficient.
-After both single-attempt setters, readback may settle for at most 250 ms / 20 polls within the existing four-second operation budget. This repeats observation only, never writes; every poll rechecks retained identity, monitor geometry and focus. Unsettled or changed targets still return partial.
+After both placement stages, readback may settle for at most 250 ms / 20 polls within the existing four-second operation budget. This repeats observation only, never writes; every poll rechecks retained identity, monitor geometry and focus. Unsettled or changed targets still return partial.
 
-Before any write path, failures return `ok:false,error`. Once a write path has
-been attempted, failures return `ok:false,placement.status:"partial"`, with
+Initial preflight failures return `ok:false,error`. Later validation failures
+can preserve a zero-write no-op result as well as a mutated result, returning `ok:false,placement.status:"partial"`, with
 requested global bounds, before/last available after observations,
 `writes_attempted`, `focus_interference` and detail. A setter may act before
 returning an error. Attempts conservatively include entering a setter path that
@@ -91,8 +94,9 @@ or process was observed; `false` means the final focus check matched; `null` mea
 focus could not be reobserved. No failure triggers rollback or focus restoration.
 Second-write refusals retain the newest geometry observation even if AX and CG
 disagree. Post-dispatch helper/deadline/delivery failures explicitly report
-`effects_unconfirmed:true`; movement/resize may already have applied or may still
-be in progress. Available placement results survive final liveness failure or
+`effects_unconfirmed:true` when dispatch is unknown or a setter was attempted;
+a retained zero-write result keeps it false even when delivery fails.
+Movement/resize may already have applied or may still be in progress. Available placement results survive final liveness failure or
 receipt expiry, including `status:"verified"` observations, but the outer response
 is `ok:false`. A helper exchange failure retires the broker; a frontend receipt
 wait timeout only closes delivery while the worker retains ownership and finishes
@@ -240,3 +244,14 @@ readback contract. See [bound-window controls](macos-bound-window-actions.md) fo
 the separate strict limits, authority gates, evidence semantics and disposable
 controls harness. The placement acceptance above does not validate that new slice;
 its supervisor builds, regressions and native acceptance remain pending.
+
+## Chromium/no-op follow-up (2026-09-18)
+
+A disposable Chromium window already at the requested size moved correctly but
+refused its redundant AXSize setter. Matching components now skip their setters,
+with actual attempt counts 0, 1 or 2. Final geometry, containment, identity and
+focus checks remain mandatory; this is not an optimistic success shortcut.
+A zero-write verified reply must also agree with its initial observations.
+Receipt expiry cannot invent an input effect for a known no-op.
+
+See `macos-chromium-controls.md` for native browser evidence and limitations.

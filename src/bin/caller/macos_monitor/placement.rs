@@ -149,13 +149,15 @@ impl PlacementResult {
         self.requested_global.validate().is_ok()
             && self.before.ax.validate().is_ok()
             && self.before.cg.validate().is_ok()
-            && (1..=2).contains(&self.writes_attempted)
+            && self.writes_attempted <= 2
             && self.detail.as_ref().is_none_or(|s| s.len() <= 2048)
             && self
                 .after
                 .is_none_or(|o| o.ax.validate().is_ok() && o.cg.validate().is_ok())
             && (!self.verified()
-                || (self.writes_attempted == 2
+                || ((self.writes_attempted != 0
+                    || (self.before.ax.close(self.requested_global)
+                        && self.before.cg.close(self.requested_global)))
                     && self.focus_interference == Some(false)
                     && self.detail.is_none()
                     && self.after.is_some_and(|o| {
@@ -359,7 +361,7 @@ impl<N: super::controls::Native> Windows<N> {
             focus_interference: None,
             detail: None,
         };
-        // Position then size, once each. No retries, rollback, activation or focus
+        // Position then size, at most once each. No retries, rollback, activation or focus
         // restoration. Revalidate exact identity and monitor on BOTH sides of
         // EACH write, even when an AX setter returns an error (it may have acted).
         for size in [false, true] {
@@ -390,12 +392,26 @@ impl<N: super::controls::Native> Windows<N> {
                 result.detail = Some(error);
                 return Ok(result);
             }
-            result.writes_attempted += 1;
+            // Skip only when BOTH observations match the component exactly.
+            // No-op stages retain the same identity/geometry/focus postchecks.
+            let current = result.after.expect("preflight observed");
+            let matches = [current.ax, current.cg].iter().all(|bounds| {
+                if size {
+                    bounds.width == target.width && bounds.height == target.height
+                } else {
+                    bounds.x == target.x && bounds.y == target.y
+                }
+            });
             result.focus_interference = None;
-            let write = if size {
-                self.native.size(&b.window, target, deadline)
+            let write = if matches {
+                Ok(())
             } else {
-                self.native.position(&b.window, target, deadline)
+                result.writes_attempted += 1;
+                if size {
+                    self.native.size(&b.window, target, deadline)
+                } else {
+                    self.native.position(&b.window, target, deadline)
+                }
             };
             let post = (|| {
                 check_geometry(&mut geometry)?;
@@ -417,7 +433,7 @@ impl<N: super::controls::Native> Windows<N> {
         // never repeat either write and never restore focus or old geometry.
         let settle_deadline = deadline.min(Instant::now() + Duration::from_millis(250));
         for attempt in 0..=20 {
-            let after = result.after.expect("both writes observed");
+            let after = result.after.expect("both placement stages observed");
             if after.ax.close(target)
                 && after.cg.close(target)
                 && after.ax.close(after.cg)
@@ -547,6 +563,96 @@ pub(in crate::macos_monitor) mod tests {
             height: 200.0,
         }
     }
+    #[test]
+    fn zero_write_placement_still_checks_focus_and_permissions() {
+        for lose_permission in [false, true] {
+            let f = Fake::default();
+            f.0.borrow_mut().bounds = monitor().target(local()).unwrap();
+            let mut w = Windows::new(f.clone());
+            let c = w.candidates(identity().pid).unwrap().remove(0);
+            let binding = w
+                .bind(1, identity(), &c.candidate, |_| Ok(monitor()))
+                .unwrap();
+            let mut probes = 0;
+            let result = w
+                .place(binding, local(), |_| {
+                    probes += 1;
+                    if probes == 2 {
+                        if lose_permission {
+                            f.0.borrow_mut().permission = false;
+                        } else {
+                            f.0.borrow_mut().focus += 1;
+                        }
+                    }
+                    Ok(monitor())
+                })
+                .unwrap();
+            assert!(!result.verified(), "{result:?}");
+            assert!(result.valid_reply(), "{result:?}");
+            assert_eq!(result.writes_attempted, 0);
+            assert_eq!(f.0.borrow().writes, 0);
+            if !lose_permission {
+                assert_eq!(result.focus_interference, Some(true));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_write_verified_reply_requires_matching_initial_geometry() {
+        let f = Fake::default();
+        f.0.borrow_mut().bounds = monitor().target(local()).unwrap();
+        let mut w = Windows::new(f);
+        let c = w.candidates(identity().pid).unwrap().remove(0);
+        let binding = w
+            .bind(1, identity(), &c.candidate, |_| Ok(monitor()))
+            .unwrap();
+        let mut result = w.place(binding, local(), |_| Ok(monitor())).unwrap();
+        assert!(result.valid_reply());
+        result.before.cg.width += 10.0;
+        assert!(
+            !result.valid_reply(),
+            "no-op cannot claim unexplained geometry changes"
+        );
+        result.before = result.after.unwrap();
+        result.writes_attempted = 3;
+        assert!(!result.valid_reply());
+    }
+
+    #[test]
+    fn matching_placement_components_are_not_written_again() {
+        for (position_matches, size_matches, writes) in [
+            (false, false, 2),
+            (false, true, 1),
+            (true, false, 1),
+            (true, true, 0),
+        ] {
+            let f = Fake::default();
+            let target = monitor().target(local()).unwrap();
+            {
+                let mut m = f.0.borrow_mut();
+                if position_matches {
+                    m.bounds.x = target.x;
+                    m.bounds.y = target.y;
+                }
+                if size_matches {
+                    m.bounds.width = target.width;
+                    m.bounds.height = target.height;
+                    m.fail_size = true;
+                }
+            }
+            let mut windows = Windows::new(f.clone());
+            let candidate = windows.candidates(identity().pid).unwrap().remove(0);
+            let binding = windows
+                .bind(1, identity(), &candidate.candidate, |_| Ok(monitor()))
+                .unwrap();
+            let result = windows.place(binding, local(), |_| Ok(monitor())).unwrap();
+            assert!(result.verified(), "{result:?}");
+            assert!(result.valid_reply(), "{result:?}");
+            assert_eq!(result.writes_attempted, writes);
+            assert_eq!(f.0.borrow().writes, writes as usize);
+        }
+    }
+
     #[derive(Clone)]
     pub(in crate::macos_monitor) struct Fake(pub(in crate::macos_monitor) Rc<RefCell<Model>>);
     pub(in crate::macos_monitor) struct Model {

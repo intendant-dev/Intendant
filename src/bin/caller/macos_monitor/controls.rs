@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 pub(crate) const MAX_NODES: usize = 128;
-pub(crate) const MAX_DEPTH: usize = 8;
+// Chromium 153 fixture reaches depth 13 with only 51 nodes. Keep all other
+// budgets unchanged; depth remains finite and exact ancestry remains retained.
+pub(crate) const MAX_DEPTH: usize = 16;
 pub(crate) const MAX_CHILDREN: usize = 32;
 pub(crate) const MAX_CONTROLS: usize = 16;
 pub(crate) const MAX_LABEL: usize = 128;
@@ -1073,6 +1075,56 @@ mod tests {
         }
     }
     #[test]
+    fn chromium_depth_and_exact_boundary_keep_retained_ancestry_guards() {
+        for depth in [13, MAX_DEPTH, MAX_DEPTH + 1] {
+            let (mut w, f, b) = rig();
+            {
+                let mut m = f.0.borrow_mut();
+                m.nodes.clear();
+                for id in 0..=depth {
+                    let role = if id == 0 {
+                        "AXWindow"
+                    } else if id == depth {
+                        "AXButton"
+                    } else {
+                        "AXGroup"
+                    };
+                    let mut node = Node::new(role);
+                    node.parent = id.saturating_sub(1);
+                    if id < depth {
+                        node.children = vec![id + 1];
+                    }
+                    m.nodes.insert(id, node);
+                }
+            }
+            let result = w.read_elements(b, |_| Ok(monitor()));
+            if depth > MAX_DEPTH {
+                assert!(result.is_err());
+                assert_eq!(f.0.borrow().writes, 0);
+                continue;
+            }
+            let c = result.unwrap();
+            assert_eq!(c.len(), 1);
+            let result = act(&mut w, b, &c[0].element, &ElementAction::Press {}).unwrap();
+            assert_eq!(result.status, ActionStatus::Dispatched);
+            assert_eq!(f.0.borrow().writes, 1);
+            let c = read(&mut w, b);
+            f.0.borrow_mut().nodes.get_mut(&(depth / 2)).unwrap().secure = true;
+            assert!(refused(act(
+                &mut w,
+                b,
+                &c[0].element,
+                &ElementAction::Press {}
+            )));
+            assert_eq!(
+                f.0.borrow().writes,
+                1,
+                "newly protected ancestor forbids another write"
+            );
+        }
+    }
+
+    #[test]
     fn traversal_label_text_and_wire_limits_refuse_without_partial_inventory() {
         for mode in ["children", "depth", "nodes", "controls", "label", "cycle"] {
             let (mut w, f, b) = rig();
@@ -1090,11 +1142,13 @@ mod tests {
                     "label" => m.nodes.get_mut(&1).unwrap().meta.label = "x".repeat(MAX_LABEL + 1),
                     "cycle" => m.nodes.get_mut(&0).unwrap().children.push(0),
                     "depth" => {
-                        m.nodes.get_mut(&0).unwrap().children = vec![3];
-                        for id in 3..=12 {
+                        m.nodes.get_mut(&0).unwrap().children = vec![1];
+                        for id in 1..=MAX_DEPTH + 1 {
                             let mut n = Node::new("AXGroup");
                             n.parent = id - 1;
-                            n.children = vec![id + 1];
+                            if id <= MAX_DEPTH {
+                                n.children = vec![id + 1];
+                            }
                             m.nodes.insert(id, n);
                         }
                     }

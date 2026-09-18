@@ -44,12 +44,15 @@ AX/CG agreement retains placement's one-point observation tolerance, but window
 and control containment has **zero tolerance**. The window must remain unchanged
 during snapshot construction. No other window's controls are walked.
 
-DFS is limited to 128 visited nodes, depth 8 (root at depth zero), 32 children per
+DFS is limited to 128 visited nodes, depth 16 (root at depth zero), 32 children per
 node, and 16 actionable controls. Native children reads check the count first,
 then request cap+1 and refuse overflow. Documented AXChildren absence
 (`kAXErrorAttributeUnsupported` / `kAXErrorNoValue`) and successful zero counts
 mean empty children; a zero count avoids an out-of-range indexed copy. IPC
 failures, invalid objects, malformed types and excess counts still refuse.
+The Chromium 153 fixture measured 51 nodes and depth 13; the initial depth-8
+profile could not traverse even that small tree. Only the depth cap was widened;
+128 nodes, 32 children, 16 controls, wire size and operation budgets remain unchanged.
 Cycles, excess depth/nodes/controls, missing required attributes,
 invalid geometry and oversized strings refuse the whole snapshot. There is one
 replaceable inventory across all bindings and callers, not one per window.

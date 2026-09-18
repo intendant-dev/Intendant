@@ -1127,3 +1127,22 @@ No general Chromium/canvas compatibility or protection against dishonest
 application metadata is claimed. Existing exact-identity, focus, containment,
 permission and single-use-token checks are unchanged.
 See the [bounded control design and supervisor harness](../design/macos-bound-window-actions.md).
+
+### Chromium acceptance and redundant placement writes
+
+Owned-window placement skips position or size only when both native observations
+already match that component exactly. Results report 0, 1 or 2 attempted setters;
+a no-op still validates current identity, containment and focus. A known zero-write
+result preserves that evidence on a late receipt failure. Mutability is checked
+for the setter being attempted, not demanded by read-only observation.
+
+The bounded semantic tree depth is 16 (formerly 8), covering the measured depth-13
+disposable Chromium tree. Other traversal, retention, wire and time limits are
+unchanged. The opt-in Chromium fixture uses a dedicated Chrome for Testing profile
+and a synthetic local page. CDP creates the test window and independently observes
+its state; it does not supply tested text, clicks or canvas input. Browser launch
+can still activate an app despite an OS nonactivating request; the background-window
+fixture detects observed activation and refuses, never restoring focus.
+
+This does not enable arbitrary canvas input or make an independent input seat.
+See `docs/design/macos-chromium-controls.md` for the exact acceptance status.
