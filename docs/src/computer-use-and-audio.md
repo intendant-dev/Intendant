@@ -1202,3 +1202,20 @@ This is test infrastructure, not an enabled daemon raw-input tool, arbitrary
 Chromium support or an independent input/clipboard seat. The default mode remains
 nonposting and creates no application/window. See
 `docs/design/macos-raw-pointer-delivery.md` for the evidence and private-API boundary.
+
+
+### Native Chromium canvas pointer fixture
+
+The opt-in Chromium pointer fixture verifies a single native process/window-addressed
+mouse pair on a synthetic page in a fresh Chrome for Testing profile. It requires
+matching browser client/screen coordinates, one independent canvas effect and a
+refused replay. The private event window location uses a top-left origin in the
+tested runtime; asymmetric Chromium and AppKit cases expose the reflection that
+center-only tests missed. Missing SPI or inconsistent geometry refuses.
+
+This is test infrastructure, not a raw-input MCP tool or an isolated input seat.
+DOM does not expose the Quartz correlation tag; observed events are not authenticated
+source attribution. The standalone fixture does not create a virtual monitor.
+Production integration still needs exact retained-window/monitor generations,
+current authorization and cancellation/partial-pair handling. See
+`docs/design/macos-chromium-pointer.md` for reproduction and evidence boundaries.

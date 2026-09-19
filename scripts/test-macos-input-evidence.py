@@ -247,7 +247,7 @@ class Tests(unittest.TestCase):
 
     def test_native_probe_posts_only_to_self_or_verified_parent(self):
         source = Path(__file__).resolve().parent.parent / 'tests/fixtures/macos-monitor/raw-pointer.m'
-        text = source.read_text()
+        text = source.read_text() + source.with_name("pointer-event.h").read_text()
         self.assertEqual(text.count('CGEventPostToPid(getpid(),'), 2)
         self.assertEqual(text.count('CGEventPostToPid(plan.receiver,'), 2)
         self.assertIn('plan.receiver != getppid()', text)

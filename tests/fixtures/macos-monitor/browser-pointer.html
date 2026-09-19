@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'">
+<title>Intendant disposable native pointer canvas</title>
+<style>html,body{margin:0;overflow:hidden}body{font:18px system-ui;padding:24px}canvas{display:block;margin-top:20px;border:0}</style>
+<p>Disposable native pointer receiver. No user content.</p>
+<canvas id="receiver" width="400" height="200"></canvas>
+<script>
+'use strict';
+const canvas=document.querySelector('#receiver'), context=canvas.getContext('2d');
+let arm=null, clicks=0, unrelated=0, overflow=false, events=[];
+context.fillStyle='#284962';context.fillRect(0,0,400,200);
+window.armPointer=nonce=>{
+  if(arm!==null || typeof nonce!=='string' || !/^[a-f0-9]{32}$/.test(nonce))throw Error('invalid/repeated arm');
+  arm=nonce;return true;
+};
+for(const type of ['mousedown','mouseup','click']) document.addEventListener(type,event=>{
+  if(arm===null)return;
+  if(event.target!==canvas){unrelated++;return;}
+  if(events.length>=8){overflow=true;return;}
+  events.push({type:event.type,trusted:event.isTrusted,button:event.button,buttons:event.buttons,
+    client_x:event.clientX,client_y:event.clientY,screen_x:event.screenX,screen_y:event.screenY});
+  if(type==='click'){clicks++;context.fillStyle='#367d52';context.fillRect(0,0,400,200);}
+},true);
+window.pointerFixtureState=()=>{
+  const r=canvas.getBoundingClientRect();
+  return {nonce:arm,clicks,unrelated,overflow,events:events.slice(),ready:document.readyState,
+    metrics:{screen_x:screenX,screen_y:screenY,outer_width:outerWidth,outer_height:outerHeight,
+      inner_width:innerWidth,inner_height:innerHeight,scale:visualViewport.scale,
+      scroll_x:scrollX,scroll_y:scrollY,canvas:{x:r.x,y:r.y,width:r.width,height:r.height}}};
+};
+</script>
