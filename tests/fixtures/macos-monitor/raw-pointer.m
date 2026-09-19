@@ -12,24 +12,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include "pointer-event.h"
 
 // Normalize both constructors identically; a source state is not a private seat.
-static void configure_pointer(CGEventSourceRef source, CGEventRef event, CGEventType type,
-                              CGPoint point, uint32_t window, pid_t pid, int64_t tag) {
-    CGEventSetSource(event,source); CGEventSetType(event,type); CGEventSetLocation(event,point);
-    // Never inherit the human's held modifier flags or pointer deltas.
-    CGEventSetFlags(event, 0);
-    CGEventSetIntegerValueField(event, kCGMouseEventClickState, 1);
-    CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 0);
-    CGEventSetIntegerValueField(event, kCGMouseEventDeltaX, 0);
-    CGEventSetIntegerValueField(event, kCGMouseEventDeltaY, 0);
-    CGEventSetIntegerValueField(event, kCGMouseEventWindowUnderMousePointer, window);
-    CGEventSetIntegerValueField(event, kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent, window);
-    CGEventSetIntegerValueField(event, kCGEventTargetUnixProcessID, pid);
-    CGEventSetIntegerValueField(event, kCGEventSourceUserData, tag);
-    CGEventSetDoubleValueField(event, kCGMouseEventPressure,
-                              type == kCGEventLeftMouseDown ? 1.0 : 0.0);
-}
 
 static CGEventRef make_pointer(CGEventSourceRef source, CGEventType type,
                                CGPoint point, uint32_t window, pid_t pid, int64_t tag) {
@@ -42,26 +27,6 @@ static CGEventRef make_pointer(CGEventSourceRef source, CGEventType type,
     return event;
 }
 
-static BOOL event_matches(CGEventSourceRef source, CGEventRef event, CGEventType type, CGPoint point,
-                          uint32_t window, pid_t pid, int64_t tag) {
-    return source && event && CGEventGetType(event) == type && CGEventGetFlags(event) == 0 &&
-        CGPointEqualToPoint(CGEventGetLocation(event), point) &&
-        // Private creates a unique table; -1 is the creation selector, not its ID.
-        CGEventSourceGetSourceStateID(source) != kCGEventSourceStateCombinedSessionState &&
-        CGEventSourceGetSourceStateID(source) != kCGEventSourceStateHIDSystemState &&
-        CGEventGetIntegerValueField(event, kCGEventSourceStateID) == CGEventSourceGetSourceStateID(source) &&
-        CGEventGetIntegerValueField(event, kCGMouseEventClickState) == 1 &&
-        CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) == 0 &&
-        CGEventGetIntegerValueField(event, kCGMouseEventDeltaX) == 0 &&
-        CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) == 0 &&
-        CGEventGetIntegerValueField(event, kCGMouseEventWindowUnderMousePointer) == window &&
-        CGEventGetIntegerValueField(event, kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent) == window &&
-        CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) == pid &&
-        CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid() &&
-        CGEventGetIntegerValueField(event, kCGEventSourceUserData) == tag &&
-        CGEventGetDoubleValueField(event, kCGMouseEventPressure) ==
-            (type == kCGEventLeftMouseDown ? 1.0 : 0.0);
-}
 
 static int emit(NSDictionary *value, int code) {
     NSError *error = nil;
@@ -90,7 +55,6 @@ static NSDictionary *event_fields(CGEventRef event) {
         @"dy":@(CGEventGetIntegerValueField(event,kCGMouseEventDeltaY))};
 }
 
-static BOOL set_window_point(CGEventRef event, CGPoint point);
 
 static int construction_test(void) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStatePrivate);
@@ -223,40 +187,6 @@ static BOOL own_bounds(NSWindow *window, CGRect *bounds) {
 // Public AppKit constructor carries the actual destination window, unlike
 // Quartz's under-pointer metadata. The event still travels through CGEventPostToPid;
 // no direct view/window delivery or global fallback is used.
-typedef void (*SetWindowLocation)(CGEventRef, CGPoint);
-typedef CGPoint (*GetWindowLocation)(CGEventRef);
-static BOOL set_window_point(CGEventRef event, CGPoint point) {
-    if (!event || !isfinite(point.x) || !isfinite(point.y)) return NO;
-    SetWindowLocation set = (SetWindowLocation)dlsym(RTLD_DEFAULT, "CGEventSetWindowLocation");
-    GetWindowLocation get = (GetWindowLocation)dlsym(RTLD_DEFAULT, "CGEventGetWindowLocation");
-    if (!set || !get) return NO;
-    set(event,point);
-    return CGPointEqualToPoint(get(event),point);
-}
-
-static CGEventRef make_addressed_pointer(CGEventSourceRef source, CGEventType type,
-                                        CGPoint point, uint32_t window, NSPoint local, pid_t pid, int64_t tag) {
-    if (!source || !window || pid <= 0 || tag <= 0 ||
-        !isfinite(point.x) || !isfinite(point.y) || !isfinite(local.x) || !isfinite(local.y) ||
-        fabs(point.x) > 1000000 || fabs(point.y) > 1000000 ||
-        fabs(local.x) > 1000000 || fabs(local.y) > 1000000 ||
-        (type != kCGEventLeftMouseDown && type != kCGEventLeftMouseUp)) return NULL;
-    NSEvent *seed = [NSEvent mouseEventWithType:(type == kCGEventLeftMouseDown ? NSEventTypeLeftMouseDown : NSEventTypeLeftMouseUp)
-        location:local modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime
-        windowNumber:window context:nil eventNumber:0 clickCount:1
-        pressure:(type == kCGEventLeftMouseDown ? 1.0 : 0.0)];
-    if (!seed.CGEvent) return NULL;
-    CGEventRef event = CGEventCreateCopy(seed.CGEvent);
-    if (!event) return NULL;
-    configure_pointer(source,event,type,point,window,pid,tag);
-    // Private SPI signatures are declared in WebKit Tools/TestRunnerShared/spi/CoreGraphicsTestSPI.h.
-    // Missing SPI or failed readback refuses before posting; never guess numeric fields.
-    if (!set_window_point(event,NSPointToCGPoint(local)) ||
-        [NSEvent eventWithCGEvent:event].windowNumber != window) {
-        CFRelease(event); return NULL;
-    }
-    return event;
-}
 
 
 // Private child protocol: fixed-size pipe message from the owning receiver.
@@ -402,12 +332,16 @@ static int live_probe(BOOL cross) {
     if (!observationsComplete || !boundsObserved || CGRectIsEmpty(bounds) || front || panel.keyWindow || humanButtonHeld) {
         error = @"target unavailable, foreground, or human mouse button held; no dispatch";
     } else {
-        point = CGPointMake(CGRectGetMidX(bounds),CGRectGetMidY(bounds));
-        NSPoint local = [panel convertPointFromScreen:NSMakePoint(NSMidX(panel.frame),NSMidY(panel.frame))];
+        point = CGPointMake(CGRectGetMinX(bounds)+0.37*bounds.size.width,
+                            CGRectGetMinY(bounds)+0.67*bounds.size.height);
+        NSPoint local = [panel convertPointFromScreen:NSMakePoint(
+            NSMinX(panel.frame)+point.x-CGRectGetMinX(bounds),
+            NSMaxY(panel.frame)-(point.y-CGRectGetMinY(bounds)))];
         view.expectedGlobal = point; view.expectedLocal = local;
+        NSPoint quartzLocal = NSMakePoint(point.x-bounds.origin.x,point.y-bounds.origin.y);
         source = CGEventSourceCreate(kCGEventSourceStatePrivate);
-        down = make_addressed_pointer(source,kCGEventLeftMouseDown,point,view.expectedWindow,local,getpid(),tag);
-        up = make_addressed_pointer(source,kCGEventLeftMouseUp,point,view.expectedWindow,local,getpid(),tag);
+        down = make_addressed_pointer(source,kCGEventLeftMouseDown,point,view.expectedWindow,quartzLocal,getpid(),tag);
+        up = make_addressed_pointer(source,kCGEventLeftMouseUp,point,view.expectedWindow,quartzLocal,getpid(),tag);
         if (!event_matches(source,down,kCGEventLeftMouseDown,point,view.expectedWindow,getpid(),tag) ||
             !event_matches(source,up,kCGEventLeftMouseUp,point,view.expectedWindow,getpid(),tag)) {
             error = @"event construction/readback refused; no dispatch";
@@ -429,7 +363,7 @@ static int live_probe(BOOL cross) {
                     view.expectedSource = sender.processIdentifier;
                     SenderPlan plan = {0}; plan.version = 1; plan.window = view.expectedWindow;
                     plan.receiver = getpid(); plan.tag = tag; plan.point = point;
-                    plan.local = local; plan.bounds = bounds;
+                    plan.local = quartzLocal; plan.bounds = bounds;
                     // One bounded plan plus dispatch marker; acknowledgement ends source ownership.
                     NSMutableData *message = [NSMutableData dataWithBytes:&plan length:sizeof(plan)];
                     [message appendBytes:"D" length:1];

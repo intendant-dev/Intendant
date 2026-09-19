@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include "browser-pointer.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -72,6 +73,7 @@ static NSDictionary *tree_probe(pid_t pid) {
         return @{ @"error": @"diagnostic requires one exact fixture window" };
     NSMutableArray *stack = [NSMutableArray arrayWithObject:@{ @"element": windows[0], @"path": @[], @"objects": @[] }];
     NSMutableArray *seen = [NSMutableArray array], *mismatches = [NSMutableArray array];
+    NSMutableArray *geometries = [NSMutableArray array];
     NSArray *deepest = @[]; NSUInteger maxChildren = 0, controls = 0;
     NSString *error = nil;
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 4;
@@ -101,6 +103,15 @@ static NSDictionary *tree_probe(pid_t pid) {
             }
         }
         if ([@[@"AXButton", @"AXTextField", @"AXTextArea", @"AXCheckBox", @"AXRadioButton"] containsObject:role]) controls++;
+        if (geometries.count < 8 && [@[@"AXWindow",@"AXWebArea",@"AXScrollArea"] containsObject:role]) {
+            id pos=ax_copy(element,kAXPositionAttribute), size=ax_copy(element,kAXSizeAttribute);
+            CGPoint p=CGPointZero; CGSize z=CGSizeZero;
+            if (pos && size && CFGetTypeID((__bridge CFTypeRef)pos)==AXValueGetTypeID() &&
+                CFGetTypeID((__bridge CFTypeRef)size)==AXValueGetTypeID() &&
+                AXValueGetValue((__bridge AXValueRef)pos,kAXValueCGPointType,&p) &&
+                AXValueGetValue((__bridge AXValueRef)size,kAXValueCGSizeType,&z))
+                [geometries addObject:@{@"role":role,@"x":@(p.x),@"y":@(p.y),@"width":@(z.width),@"height":@(z.height)}];
+        }
         CFIndex count = 0; AXError status = AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute, &count);
         if (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue || (status == kAXErrorSuccess && count == 0)) continue;
         if (status != kAXErrorSuccess || count < 0 || count > 32) { error = @"diagnostic children budget or read failure"; break; }
@@ -112,11 +123,13 @@ static NSDictionary *tree_probe(pid_t pid) {
     }
     return @{ @"visited": @(seen.count), @"max_depth": @(deepest.count ? deepest.count - 1 : 0),
         @"max_children": @(maxChildren), @"actionable_roles": @(controls), @"deepest_roles":deepest,
-        @"complete":error ? @NO : @YES, @"error":error ?: @"", @"parent_mismatches":mismatches };
+        @"complete":error ? @NO : @YES, @"error":error ?: @"", @"parent_mismatches":mismatches, @"geometries":geometries };
 }
 
 int main(int argc, const char **argv) {
-    if (argc != 6 || strcmp(argv[1], "--disposable-chromium") != 0) return 2;
+    if (argc != 6) return 2;
+    BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
+    if (!pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
     @autoreleasepool {
         NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
         NSString *profile = [NSString stringWithUTF8String:argv[3]];
@@ -149,11 +162,24 @@ int main(int argc, const char **argv) {
                 });
             }];
         NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+        CGEventSourceRef pointerSource = NULL;
+        NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
         NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO;
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);
             if (command == 'd' && browser && !browser.terminated) diagnostic = tree_probe(browser.processIdentifier);
+            if (command == 'p') {
+                BrowserPointerPlan plan={0}; BOOL readOK=browser_pointer_read(&plan);
+                if (pointerConsumed) pointerReplays++;
+                else {
+                    pointerConsumed=YES; // Invalid frames consume the one attempt too.
+                    pointerResult = pointerMode && readOK && !stopping && !browserEverFront
+                        ? browser_pointer_send(browser,plan,&pointerSource)
+                        : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+                            @"error":@"pointer mode, frame or lifecycle refused"};
+                }
+            }
             if (!stopping && (n == 0 || command == 'q' || NSProcessInfo.processInfo.systemUptime - started > 180)) {
                 stopping = YES; stopAt = NSProcessInfo.processInfo.systemUptime;
                 [browser terminate];
@@ -173,6 +199,8 @@ int main(int argc, const char **argv) {
                 browserEverFront |= [current[@"front_pid"] intValue] == browser.processIdentifier;
             }
             status[@"tick"] = @(++tick);
+            if (pointerResult) status[@"pointer_result"] = pointerResult;
+            status[@"pointer_replays_refused"] = @(pointerReplays);
             status[@"browser_ever_front"] = browserEverFront ? @YES : @NO;
             if (launchError) status[@"error"] = launchError;
             // Enumerate ONLY numeric metadata of our exact browser process.
@@ -196,6 +224,7 @@ int main(int argc, const char **argv) {
             @"browser_terminated": (!browser || browser.terminated ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
             @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}};
         [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+        if (pointerSource) CFRelease(pointerSource);
         return browser && browser.terminated ? 0 : 6;
     }
 }
