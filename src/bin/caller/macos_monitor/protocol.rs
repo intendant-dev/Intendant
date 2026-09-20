@@ -50,6 +50,14 @@ pub(super) enum Operation {
         element: String,
         action: ElementAction,
     },
+    PreparePointer {
+        binding: u32,
+        point: super::pointer::Point,
+    },
+    ClickPointer {
+        binding: u32,
+        token: String,
+    },
     UnbindWindow {
         binding: u32,
     },
@@ -91,6 +99,12 @@ pub(super) enum Outcome {
     },
     ActedWindowElement {
         result: ActionResult,
+    },
+    PreparedPointer {
+        prepared: super::pointer::Prepared,
+    },
+    ClickedPointer {
+        result: super::pointer::ClickResult,
     },
     UnboundWindow {
         binding: u32,
@@ -257,6 +271,19 @@ mod tests {
             let wire = encode(&request).unwrap();
             assert!(wire.len() <= MAX_LINE);
             assert!(serde_json::from_slice::<Request>(&wire).is_ok());
+        }
+    }
+    #[test]
+    fn pointer_protocol_accepts_no_retarget_or_implicit_defaults() {
+        for op in [
+            serde_json::json!({"op":"click_pointer","binding":1}),
+            serde_json::json!({"op":"click_pointer","binding":1,"token":"token","pid":123}),
+            serde_json::json!({"op":"click_pointer","binding":1,"token":"token","point":{"x":1,"y":2}}),
+            serde_json::json!({"op":"prepare_pointer","binding":1,"point":{"x":1,"y":2,"normalized":true}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(serde_json::json!({"seq":1,"op":op})).is_err()
+            );
         }
     }
 }

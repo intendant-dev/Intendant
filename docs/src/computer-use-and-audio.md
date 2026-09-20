@@ -1219,3 +1219,31 @@ source attribution. The standalone fixture does not create a virtual monitor.
 Production integration still needs exact retained-window/monitor generations,
 current authorization and cancellation/partial-pair handling. See
 `docs/design/macos-chromium-pointer.md` for reproduction and evidence boundaries.
+
+
+### Owner-bound paired window clicks
+
+`prepare_macos_window_click {binding,point:{x,y}}` prepares one window-local,
+top-left logical-point left click without posting input. Its one-use token lasts
+ten seconds and freezes the exact bound window, point, observed geometry and focus.
+`click_macos_window {binding,token}` consumes it; it cannot accept replacement
+coordinates, a PID or a display ID. The facade equivalents are `inspect display
+prepare-click BINDING POINT_JSON` and `act display click-window BINDING TOKEN`.
+
+Preparation needs DisplayView and dispatch needs DisplayInput; both require an
+OwnerSurface and an already-owned monitor/window binding. Ordinary user-display
+grants are not sufficient. The entire retained AX/CG window and requested point
+must remain within the unchanged bound monitor. Refresh, placement, unbind,
+monitor destruction and semantic-control operations invalidate preparations.
+This is positional input, not a frozen document or secure-field exclusion.
+
+Both events are preallocated and posted once without an intervening await. A
+cancelled queued request does not dispatch; after possible dispatch, lost replies
+are uncertain and must not be replayed. Native results distinguish posting calls
+from application effects: even `dispatched` keeps `effect_verified:false`.
+The new native HTTP fixture independently checks one Chromium canvas effect,
+replay/bounds/stale-token refusals and exact cleanup on an owned virtual monitor.
+No global-input fallback, activation, keyboard, clipboard, retry or focus restoration
+is provided. The generic monitor input/streaming capability flags remain false.
+See [bound-window pointer transactions](../design/macos-bound-window-click.md)
+for native SPI, source retention, authorization and shared-session limitations.

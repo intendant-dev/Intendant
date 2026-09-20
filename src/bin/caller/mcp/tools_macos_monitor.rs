@@ -13,7 +13,10 @@ impl IntendantServer {
         action: WindowAction,
         caller: ToolCallerTrust,
     ) -> String {
-        let element_action = matches!(&action, WindowAction::ActElement { .. });
+        let element_action = matches!(
+            &action,
+            WindowAction::ActElement { .. } | WindowAction::Click { .. }
+        );
         let authority = self.macos_monitor_authority(caller).await;
         let receipt = match self
             .bus
@@ -24,7 +27,8 @@ impl IntendantServer {
             Ok(receipt) => receipt,
             Err(error) => {
                 if element_action {
-                    let uncertain = error.starts_with(crate::macos_monitor::ELEMENT_UNCONFIRMED);
+                    let uncertain = error.starts_with(crate::macos_monitor::ELEMENT_UNCONFIRMED)
+                        || error.starts_with(crate::macos_monitor::POINTER_UNCONFIRMED);
                     return serde_json::json!({"ok":false, "error":error,
                         "action_attempted": if uncertain { None } else { Some(false) },
                         "effects_unconfirmed":uncertain, "focus_interference":null})
@@ -319,6 +323,19 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
         Value::Window(WindowValue::ActionUnconfirmed { result, error }) => {
             serde_json::json!({"ok":false,"action":result,
             "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,"focus_interference":result.focus_interference,"error":error})
+        }
+        Value::Window(WindowValue::PreparedPointer(prepared)) => {
+            serde_json::json!({"ok":true,"prepared":prepared,"action_attempted":false})
+        }
+        Value::Window(WindowValue::Clicked(result)) => {
+            serde_json::json!({"ok":result.successful(),"action":result,
+                "action_attempted":result.action_attempted,"effects_unconfirmed":result.effects_unconfirmed,
+                "focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::ClickUnconfirmed { result, error }) => {
+            serde_json::json!({"ok":false,"action":result,"error":error,
+                "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,
+                "focus_interference":result.focus_interference})
         }
         Value::Window(WindowValue::Unbound) => serde_json::json!({"ok":true,"unbound":true}),
         _ => return window_error("unexpected window result".into()),
@@ -957,6 +974,22 @@ mod tests {
             autonomy.write().await.user_display_granted = granted;
             for (tool, args) in [
                 (
+                    "prepare_macos_window_click",
+                    serde_json::json!({"binding":"macos_window:fixture:1","point":{"x":10,"y":20}}),
+                ),
+                (
+                    "click_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1","token":"macos_pointer:00000000000000000000000000000001"}),
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","prepare-click","macos_window:fixture:1",r#"{"x":10,"y":20}"#]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","click-window","macos_window:fixture:1","macos_pointer:00000000000000000000000000000001"]}),
+                ),
+                (
                     "read_macos_window_elements",
                     serde_json::json!({"binding":"macos_window:fixture:1"}),
                 ),
@@ -1029,5 +1062,57 @@ mod tests {
             }
         }
         assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn pointer_receipt_loss_never_promotes_posting_to_verified_effects() {
+        use crate::macos_monitor::{placement::*, pointer::*, Receipt};
+        let b = Bounds {
+            x: -700.,
+            y: 20.,
+            width: 200.,
+            height: 100.,
+        };
+        for calls in [0, 1, 2] {
+            for late in [false, true] {
+                let r = ClickResult {
+                    status: if calls == 2 {
+                        ClickStatus::Dispatched
+                    } else {
+                        ClickStatus::Partial
+                    },
+                    action_attempted: calls > 0,
+                    posting_calls: calls,
+                    effects_unconfirmed: calls > 0,
+                    effect_verified: false,
+                    point: Point { x: 10., y: 20. },
+                    global: Point { x: -690., y: 40. },
+                    before: Observation { ax: b, cg: b },
+                    after: Some(Observation { ax: b, cg: b }),
+                    focus_interference: Some(false),
+                    detail: if calls == 2 {
+                        None
+                    } else {
+                        Some("fixture partial".into())
+                    },
+                };
+                let value = if late {
+                    WindowValue::ClickUnconfirmed {
+                        result: r,
+                        error: "fixture late failure".into(),
+                    }
+                } else {
+                    WindowValue::Clicked(r)
+                };
+                let (receipt, committed) = Receipt::fixture(Value::Window(value));
+                drop(committed);
+                let out: serde_json::Value =
+                    serde_json::from_str(&window_response(receipt)).unwrap();
+                assert_eq!(out["ok"], false);
+                assert_eq!(out["action"]["posting_calls"], calls);
+                assert_eq!(out["action_attempted"], calls > 0);
+                assert_eq!(out["effects_unconfirmed"], calls > 0);
+                assert_eq!(out["action"]["effect_verified"], false);
+            }
+        }
     }
 }

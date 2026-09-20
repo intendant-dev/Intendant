@@ -1143,6 +1143,32 @@ impl IntendantServer {
                     .await,
                 ))
             }
+            "prepare_macos_window_click" => {
+                let Parameters(p) = parse_params::<PrepareMacosWindowClickParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::PrepareClick {
+                            binding: p.binding,
+                            point: p.point,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "click_macos_window" => {
+                let Parameters(p) = parse_params::<ClickMacosWindowParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::Click {
+                            binding: p.binding,
+                            token: p.token,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "unbind_macos_window" => {
                 let Parameters(p) = parse_params::<UnbindMacosWindowParams>(args)?;
                 Ok(text_tool_result(
@@ -1940,6 +1966,39 @@ impl IntendantServer {
                 binding: p.binding,
                 element: p.element,
                 action: p.action,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Prepare one left click in window-local top-left logical points on an exact retained window wholly inside its unchanged owned monitor. Owner-only DisplayView. No input is posted. Returns a one-use 10-second token binding point, window geometry and observed focus; refresh or intervening window/control operations invalidate it. This is positional input, not document identity or an isolated seat.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn prepare_macos_window_click(
+        &self,
+        Parameters(p): Parameters<PrepareMacosWindowClickParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::PrepareClick {
+                binding: p.binding,
+                point: p.point,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Consume one opaque pointer preparation token and its exact macOS window binding to post one paired left click. Owner-only DisplayInput; fresh identity, geometry, existing permissions and focus checks. No raw PID/display/coordinates at dispatch, global input, activation, keyboard, clipboard, retry or rollback. Dispatched means two posting attempts, not confirmed delivery or effect; lost replies are uncertain and must not be replayed. Shared WindowServer is not an isolated seat."
+    )]
+    pub(crate) async fn click_macos_window(
+        &self,
+        Parameters(p): Parameters<ClickMacosWindowParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::Click {
+                binding: p.binding,
+                token: p.token,
             },
             ToolCallerTrust::OwnerSurface,
         )

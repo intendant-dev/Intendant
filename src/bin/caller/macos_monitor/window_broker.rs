@@ -25,6 +25,14 @@ pub(crate) enum WindowAction {
         element: String,
         action: ElementAction,
     },
+    PrepareClick {
+        binding: String,
+        point: pointer::Point,
+    },
+    Click {
+        binding: String,
+        token: String,
+    },
     Unbind {
         binding: String,
     },
@@ -45,6 +53,14 @@ impl WindowAction {
                 }
                 placement::validate_candidate(candidate)?;
                 identity.validate()
+            }
+            Self::PrepareClick { binding, point } => {
+                valid_binding(binding)?;
+                point.validate()
+            }
+            Self::Click { binding, token } => {
+                valid_binding(binding)?;
+                pointer::validate_token(token)
             }
             Self::Place { binding, bounds } => {
                 valid_binding(binding)?;
@@ -90,6 +106,12 @@ pub(crate) enum WindowValue {
     Acted(ActionResult),
     ActionUnconfirmed {
         result: ActionResult,
+        error: String,
+    },
+    PreparedPointer(pointer::Prepared),
+    Clicked(pointer::ClickResult),
+    ClickUnconfirmed {
+        result: pointer::ClickResult,
         error: String,
     },
     Unbound,
@@ -149,7 +171,10 @@ pub(super) async fn execute_window(
                 bounds: *bounds,
             }
         }
-        WindowAction::ReadElements { binding } | WindowAction::ActElement { binding, .. } => {
+        WindowAction::ReadElements { binding }
+        | WindowAction::ActElement { binding, .. }
+        | WindowAction::PrepareClick { binding, .. }
+        | WindowAction::Click { binding, .. } => {
             let bound = state
                 .bindings
                 .get(binding)
@@ -158,6 +183,14 @@ pub(super) async fn execute_window(
             // snapshot/action budget. Do not dispatch a separate native resolve
             // ahead of consuming the element inventory.
             match action {
+                WindowAction::PrepareClick { point, .. } => Operation::PreparePointer {
+                    binding: bound.helper_binding,
+                    point: *point,
+                },
+                WindowAction::Click { token, .. } => Operation::ClickPointer {
+                    binding: bound.helper_binding,
+                    token: token.clone(),
+                },
                 WindowAction::ReadElements { .. } => Operation::ReadWindowElements {
                     binding: bound.helper_binding,
                 },
@@ -196,6 +229,8 @@ pub(super) async fn execute_window(
     let outcome = child.exchange(op).await.map_err(|e| {
         Failure::Retire(if matches!(action, WindowAction::Place { .. }) {
             placement_unconfirmed(&e)
+        } else if matches!(action, WindowAction::Click { .. }) {
+            pointer_unconfirmed(&e)
         } else if matches!(action, WindowAction::ActElement { .. }) {
             element_unconfirmed(&e)
         } else {
@@ -263,6 +298,16 @@ pub(super) async fn execute_window(
         {
             WindowValue::Acted(result)
         }
+        (WindowAction::PrepareClick { point, .. }, Outcome::PreparedPointer { prepared })
+            if prepared.valid_reply() && prepared.point == *point =>
+        {
+            WindowValue::PreparedPointer(prepared)
+        }
+        (WindowAction::Click { .. }, Outcome::ClickedPointer { result })
+            if result.valid_reply() =>
+        {
+            WindowValue::Clicked(result)
+        }
         (WindowAction::Unbind { binding }, Outcome::UnboundWindow { binding: helper })
             if state
                 .bindings
@@ -277,6 +322,8 @@ pub(super) async fn execute_window(
             return Err(Failure::Retire(
                 if matches!(action, WindowAction::Place { .. }) {
                     placement_unconfirmed(error)
+                } else if matches!(action, WindowAction::Click { .. }) {
+                    pointer_unconfirmed(error)
                 } else if matches!(action, WindowAction::ActElement { .. }) {
                     element_unconfirmed(error)
                 } else {

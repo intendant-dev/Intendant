@@ -774,6 +774,32 @@ fn placement_set(
     Ok(())
 }
 impl Native for PlacementNative {
+    fn pointer_ready(&mut self, window: &RetainedWindow, deadline: Instant) -> Result<(), String> {
+        placement_permissions(deadline)?;
+        placement_generation(window.identity)?;
+        if !intendant_platform::platform::bound_pointer::ready(window.identity.pid) {
+            return Err("pointer requires existing post-event permission, background target and no held human mouse buttons".into());
+        }
+        placement::time_left(deadline)
+    }
+    fn pointer_pair(
+        &mut self,
+        window: &RetainedWindow,
+        point: crate::macos_monitor::pointer::Point,
+        global: crate::macos_monitor::pointer::Point,
+        deadline: Instant,
+    ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
+        self.pointer_ready(window, deadline)?;
+        let pair = intendant_platform::platform::bound_pointer::Pair::create(
+            window.identity.pid,
+            window.identity.window_id,
+            (global.x, global.y),
+            (point.x, point.y),
+        )?;
+        placement::time_left(deadline)?;
+        Ok(Box::new(pair))
+    }
+
     type Window = RetainedWindow;
     type Focus = PlacementFocus;
     fn candidates(
@@ -1669,5 +1695,12 @@ mod tests {
             }
             Err(e) => println!("read_frontmost error (expected without TCC): {e}"),
         }
+    }
+}
+
+impl crate::macos_monitor::pointer::Pair for intendant_platform::platform::bound_pointer::Pair {
+    fn post(&mut self) -> crate::macos_monitor::pointer::Posting {
+        let native = self.post_once();
+        crate::macos_monitor::pointer::Posting::from_native(native.calls, native.failed)
     }
 }

@@ -859,3 +859,17 @@ you source it.
   approvals.
 - [Integrations](./integrations.md) — `ControlMsg`, the control socket, and the
   web gateway WebSocket protocol.
+
+
+### Exact owned-window pointer transactions
+
+The macOS owner-only window surface includes `prepare_macos_window_click`
+(DisplayView, read-only preparation) and `click_macos_window` (DisplayInput,
+one consumed-token left-click pair), on both SDK stdio and HTTP dispatch.
+Their schemas and facade routes are described in
+[Computer Use](./computer-use-and-audio.md#owner-bound-paired-window-clicks).
+Preparation grants no authority; every dispatch still passes the current ingress
+authorizer and the owner-only broker boundary. These tools do not turn the generic
+`macos_virtual` selector into a globally routable input target. A successful
+posting result is not application-effect verification, and uncertain requests
+must not be retried automatically.
