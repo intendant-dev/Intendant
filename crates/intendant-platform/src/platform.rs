@@ -3212,4 +3212,4 @@ mod tests {
 }
 
 #[cfg(target_os = "macos")]
-pub use crate::bound_pointer::bound_pointer;
+pub use crate::bound_pointer_ffi::bound_pointer;
