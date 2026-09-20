@@ -485,6 +485,78 @@ pub(crate) struct PlacementFocus {
     birth: (u64, u32),
 }
 
+// Preserve an exact element/process focus identity when the system-wide AX
+// router cannot complete. A foreground PID alone is never an acceptable focus.
+fn placement_system_focus_result(
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+) -> Result<Option<AXUIElement>, String> {
+    if status == accessibility_sys::kAXErrorCannotComplete && value.is_none() {
+        return Ok(None);
+    }
+    if status != kAXErrorSuccess {
+        return Err("system focus reply unavailable or contradictory".into());
+    }
+    value
+        .and_then(|v| v.downcast_into::<AXUIElement>())
+        .map(Some)
+        .ok_or_else(|| "system focus element unavailable or malformed".into())
+}
+fn placement_foreground_process(
+    deadline: Instant,
+) -> Result<crate::macos_monitor::focus::Process, String> {
+    placement_permissions(deadline)?;
+    let pid = crate::platform::macos_foreground_pid()
+        .ok_or("foreground process observation unavailable")?;
+    let birth = crate::platform::macos_process_birth(pid)
+        .ok_or("foreground process start identity unavailable")?;
+    placement::time_left(deadline)?;
+    Ok(crate::macos_monitor::focus::Process { pid, birth })
+}
+struct PlacementAppFocus {
+    app: AXUIElement,
+    deadline: Instant,
+}
+impl crate::macos_monitor::focus::Native for PlacementAppFocus {
+    type Element = AXUIElement;
+    fn process(&mut self) -> Result<crate::macos_monitor::focus::Process, String> {
+        placement_foreground_process(self.deadline)
+    }
+    fn frontmost(&mut self) -> Result<bool, String> {
+        // AXFrontmost rechecks the retained application directly, so a stale
+        // NSWorkspace foreground candidate cannot by itself authorize this path.
+        control_attr(&self.app, "AXFrontmost", self.deadline)?
+            .downcast_into::<CFBoolean>()
+            .map(Into::into)
+            .ok_or_else(|| "application frontmost metadata unavailable or malformed".into())
+    }
+    fn focused(&mut self) -> Result<AXUIElement, String> {
+        control_attr(&self.app, kAXFocusedUIElementAttribute, self.deadline)?
+            .downcast_into::<AXUIElement>()
+            .ok_or_else(|| "application focused element unavailable or malformed".into())
+    }
+    fn element_pid(&mut self, element: &AXUIElement) -> Result<i32, String> {
+        placement_pid(element, self.deadline)
+    }
+}
+fn placement_focus_from_application(deadline: Instant) -> Result<PlacementFocus, String> {
+    let expected = placement_foreground_process(deadline)?;
+    let app = placement_app(expected.pid, deadline)?;
+    if placement_pid(&app, deadline)? != expected.pid {
+        return Err("foreground application object identity changed".into());
+    }
+    let element = crate::macos_monitor::focus::observe(
+        &mut PlacementAppFocus { app, deadline },
+        expected,
+        deadline,
+    )?;
+    Ok(PlacementFocus {
+        element,
+        pid: expected.pid,
+        birth: expected.birth,
+    })
+}
+
 fn placement_permissions(deadline: Instant) -> Result<(), String> {
     placement::time_left(deadline)?;
     if !is_trusted() || !core_graphics::access::ScreenCaptureAccess.preflight() {
@@ -880,9 +952,27 @@ impl Native for PlacementNative {
         // SAFETY: non-null Create-rule result released on drop.
         let system = unsafe { AXUIElement::wrap_under_create_rule(raw) };
         placement_timeout(&system, deadline)?;
-        let element: AXUIElement = copy_attr(&system, kAXFocusedUIElementAttribute)
-            .and_then(|v| v.downcast_into())
-            .ok_or("focus observation unavailable; placement refused")?;
+        let key = CFString::new(kAXFocusedUIElementAttribute);
+        let mut value = std::ptr::null();
+        // SAFETY: retained system object/key and writable Copy-rule output.
+        // Returned objects are released even for failed/contradictory replies.
+        let status = unsafe {
+            AXUIElementCopyAttributeValue(
+                system.as_concrete_TypeRef(),
+                key.as_concrete_TypeRef(),
+                &mut value,
+            )
+        };
+        let value = if value.is_null() {
+            None
+        } else {
+            // SAFETY: non-null Copy-rule result, dynamically checked below.
+            Some(unsafe { CFType::wrap_under_create_rule(value) })
+        };
+        placement::time_left(deadline)?;
+        let Some(element) = placement_system_focus_result(status, value)? else {
+            return placement_focus_from_application(deadline);
+        };
         placement_timeout(&element, deadline)?;
         let pid = placement_pid(&element, deadline)?;
         let birth = crate::platform::macos_process_birth(pid)
@@ -1702,5 +1792,37 @@ impl crate::macos_monitor::pointer::Pair for intendant_platform::platform::bound
     fn post(&mut self) -> crate::macos_monitor::pointer::Posting {
         let native = self.post_once();
         crate::macos_monitor::pointer::Posting::from_native(native.calls, native.failed)
+    }
+}
+
+#[cfg(test)]
+mod placement_focus_route_tests {
+    use super::*;
+    #[test]
+    fn only_empty_cannot_complete_reply_uses_application_focus() {
+        assert!(
+            placement_system_focus_result(accessibility_sys::kAXErrorCannotComplete, None)
+                .unwrap()
+                .is_none()
+        );
+        for status in [
+            kAXErrorSuccess,
+            kAXErrorNoValue,
+            kAXErrorAttributeUnsupported,
+            accessibility_sys::kAXErrorFailure,
+            accessibility_sys::kAXErrorInvalidUIElement,
+        ] {
+            assert!(
+                placement_system_focus_result(status, None).is_err(),
+                "status {status}"
+            );
+        }
+        let wrong_type = || Some(CFString::new("not an AX element").as_CFType());
+        assert!(placement_system_focus_result(
+            accessibility_sys::kAXErrorCannotComplete,
+            wrong_type()
+        )
+        .is_err());
+        assert!(placement_system_focus_result(kAXErrorSuccess, wrong_type()).is_err());
     }
 }

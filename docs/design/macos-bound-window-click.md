@@ -181,3 +181,50 @@ This is an observation failure, not proof that the owner caused it; it is not
 converted into a safe focus state. These failed runs remain separate from the
 successful development-tree acceptance. Published-head acceptance is still a
 landing gate unless a later independently recorded fresh run succeeds.
+
+
+## Resumed focus-routing correction
+
+The interrupted final pass left a macOS-only Clippy module-inception error after
+its pure FFI move. The private file-module alias is now `bound_pointer_ffi`;
+`platform::bound_pointer` and the native posting behavior are unchanged. The
+complete local battery passed after that correction.
+
+A bounded metadata-only diagnostic then distinguished a system-wide AX routing
+failure from unavailable application focus: both system-wide focused-application
+and focused-element queries returned CannotComplete, while the foreground
+application returned a real focused AX element directly. No labels, field values,
+documents, keyboard events or clipboard contents were read.
+
+Bound-window focus observation retains the system-wide path first. Only
+CannotComplete **without** a returned value admits an application-local read.
+Other errors, successful nulls, malformed types and contradictory Other errors, suche alternative requires the live foreground process start Other errors, successful n AXFrontmost property on its retained application object at three checkpoints.
+It reads the focused AX element twice, checks its process both times and requires
+exact object equality. A stale NSWorksexact object equality. A stale NSWorksexact object equality. A stale replaced focus, missing metadata and deadline expiry
+all refuse. The same exact element/PID/start identity is stored in preparations
+and compared around each action, regardless of which observation route succeeded.
+
+The four-second operation budget and existing 50-millisecond per-attribute timeout
+remain unchanged. No event tap, activation, focus restoration, empty-focus sentinel
+or input fallback was added. The scalar foreground query is read-only and lives in the permitted
+platform-query island (`platform.rs` with the ARC/exception-only `foreground.m`
+shim), not the narrower pointer-input island. Like all AX-based observation,
+this remains app/OS-reported state with observation-to-dispatch races, not an
+independent focus seat or an atomic isolation guarantee.
+
+
+### Resumed validation
+
+The complete corrected local battery passed: 6,594 binary tests (10 existing
+ignores), 1,022 required library/acceptance tests (3 existing ignores), 57 E2E
+tests, workspace Clippy with warnings denied, formatting and whitespace. All
+45 Python checks and 9 nonposting native exception/replay cases passed.
+The read-only follow-up review found no concrete regressions after the foreground
+query moved into the permitted platform-query island.
+
+The fresh development-tree HTTP/owned-monitor Chromium test passed, including
+one independently observed canvas click, exact event coordinates, stale-token
+and replay refusals, browser/profile cleanup and original display restoration.
+A prior invocation used a relative supervisor path under the temporary project
+and failed before browser launch; it remains recorded separately. Published-head
+acceptance and landing status are recorded on the PR, never inferred from CI.

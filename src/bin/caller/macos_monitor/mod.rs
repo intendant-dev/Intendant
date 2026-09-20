@@ -7,6 +7,8 @@
 pub(crate) mod ancestry;
 mod capture;
 pub(crate) mod controls;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod focus;
 mod helper;
 mod inspection;
 pub(crate) mod placement;
