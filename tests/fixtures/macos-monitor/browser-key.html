@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><title>Disposable native keyboard fixture</title>
+<style>body{margin:24px}#receiver{width:400px;height:200px;border:1px solid;outline:none}</style>
+<div id="receiver" tabindex="0">Arrow-key receiver: <output id="count">0</output></div>
+<script>
+'use strict';
+const receiver=document.getElementById('receiver');
+let nonce=null, count=0, events=[], unrelated=0, overflow=false;
+window.armKey=function(value) {
+  if(nonce!==null || count!==0 || events.length!==0 || !/^[0-9a-f]{32}$/.test(value)) return false;
+  receiver.focus({preventScroll:true}); // Fixture setup only; not a tested key or OS activation.
+  if(document.activeElement!==receiver) return false;
+  nonce=value; return true;
+};
+for(const type of ['keydown','keyup']) receiver.addEventListener(type,event=>{
+  if(!nonce || event.key!=='ArrowRight') { ++unrelated; return; }
+  if(events.length>=8) { overflow=true; return; }
+  events.push({type:event.type,key:event.key,code:event.code,trusted:event.isTrusted,
+    repeat:event.repeat,shift:event.shiftKey,ctrl:event.ctrlKey,alt:event.altKey,
+    meta:event.metaKey,target:event.target.id});
+  if(type==='keydown' && event.isTrusted && !event.repeat &&
+      !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    ++count; document.getElementById('count').textContent=String(count);
+  }
+  event.preventDefault();
+});
+window.keyFixtureState=()=>({nonce,count,events,unrelated,overflow,
+  active:document.activeElement===receiver,
+  metrics:{width:innerWidth,height:innerHeight,outer_width:outerWidth,outer_height:outerHeight,
+    screen_x:screenX,screen_y:screenY,scroll_x:scrollX,scroll_y:scrollY}});
+</script>

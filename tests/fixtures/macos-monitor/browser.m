@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <string.h>
 #include "browser-pointer.h"
+#include "browser-key.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -129,7 +130,8 @@ static NSDictionary *tree_probe(pid_t pid) {
 int main(int argc, const char **argv) {
     if (argc != 6) return 2;
     BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
-    if (!pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
+    BOOL keyMode = strcmp(argv[1], "--disposable-chromium-key") == 0;
+    if (!keyMode && !pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
     @autoreleasepool {
         NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
         NSString *profile = [NSString stringWithUTF8String:argv[3]];
@@ -162,13 +164,25 @@ int main(int argc, const char **argv) {
                 });
             }];
         NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
-        CGEventSourceRef pointerSource = NULL;
+        CGEventSourceRef pointerSource = NULL, keySource = NULL;
+        NSDictionary *keyResult=nil; BOOL keyConsumed=NO; NSUInteger keyReplays=0;
         NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
         NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO;
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);
             if (command == 'd' && browser && !browser.terminated) diagnostic = tree_probe(browser.processIdentifier);
+            if (command == 'k') {
+                BrowserKeyPlan plan={0}; BOOL readOK=key_plan_read(&plan);
+                if(keyConsumed) ++keyReplays;
+                else {
+                    keyConsumed=YES;
+                    keyResult=keyMode && readOK && !stopping && !browserEverFront
+                        ? key_send(browser,plan,&keySource)
+                        : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+                            @"error":@"key mode, plan or lifecycle refused"};
+                }
+            }
             if (command == 'p') {
                 BrowserPointerPlan plan={0}; BOOL readOK=browser_pointer_read(&plan);
                 if (pointerConsumed) pointerReplays++;
@@ -199,6 +213,8 @@ int main(int argc, const char **argv) {
                 browserEverFront |= [current[@"front_pid"] intValue] == browser.processIdentifier;
             }
             status[@"tick"] = @(++tick);
+            if(keyResult) status[@"key_result"]=keyResult;
+            status[@"key_replays_refused"]=@(keyReplays);
             if (pointerResult) status[@"pointer_result"] = pointerResult;
             status[@"pointer_replays_refused"] = @(pointerReplays);
             status[@"browser_ever_front"] = browserEverFront ? @YES : @NO;
@@ -220,11 +236,14 @@ int main(int argc, const char **argv) {
         NSTimeInterval end = NSProcessInfo.processInfo.systemUptime + 5;
         while (browser && !browser.terminated && NSProcessInfo.processInfo.systemUptime < end)
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-        NSDictionary *final = @{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
+        NSMutableDictionary *final = [@{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
             @"browser_terminated": (!browser || browser.terminated ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
-            @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}};
+            @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}} mutableCopy];
+        if(keyResult) final[@"key_result"]=keyResult;
+        final[@"key_replays_refused"]=@(keyReplays);
         [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
         if (pointerSource) CFRelease(pointerSource);
+        if (keySource) CFRelease(keySource);
         return browser && browser.terminated ? 0 : 6;
     }
 }
