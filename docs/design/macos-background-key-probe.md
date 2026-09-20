@@ -194,3 +194,26 @@ a clean diagnostic or verified effect. Regression coverage includes the ordering
 gate, repeated shutdown-policy evaluation, late browser availability and mutated
 evidence. The updated pure Python suite passes 103 tests, and the native
 nonposting suite passes 79 cases. No genuinely hung browser was injected.
+
+
+### Orderly browser closure and pending launch
+
+Native ordinary termination alone left two disposable Chromium runs pending.
+Their keyboard observations were preserved, but both complete tests failed
+cleanup. Recovery verified each private profile and browser PID over its own
+CDP connection, sent one Browser.close request, observed the retained native
+owner exit, and removed the profile. The original failed reports are unchanged.
+
+The key harness now requests Browser.close once only after verifying that its
+private connection belongs to the exact launched fixture browser. It never
+issues this request for an unverified connection and never retries a lost reply.
+Native observed process exit remains the cleanup proof. This is fixture teardown,
+not input injection. If launch completion itself remains pending beyond the
+native loop deadline, key modes retain the original callback owner and publish
+launch_pending rather than claiming a nil application has terminated. A genuinely
+stuck launch/exit may therefore outlive the diagnostic deadline; no bounded
+successful cleanup is claimed.
+
+Pure Python coverage now passes 106 tests. Native nonposting coverage includes
+83 constructor, receipt, ordering and cleanup-policy cases. The unchanged Rust
+implementation tree retains the full successful local battery recorded above.

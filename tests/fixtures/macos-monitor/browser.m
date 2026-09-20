@@ -283,6 +283,16 @@ int main(int argc, const char **argv) {
             NSData *data = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
             if (data.length > 16384 || ![data writeToFile:statusPath atomically:YES]) { stopping = YES; if (!keyLifecycle || key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate]; }
         }
+        if (key_launch_cleanup_pending(keyLifecycle,launchFinished)) {
+            // Deadline expiry is not launch failure. Keep the original callback
+            // owner alive; never relaunch or report an unknown browser terminated.
+            NSDictionary *pending=@{@"supervisor_pid":@(getpid()),@"browser_pid":@0,
+                @"launch_finished":@NO,@"browser_terminated":@NO,@"cleanup_pending":@YES,
+                @"launch_pending":@YES,@"tick":@(++tick)};
+            [[NSJSONSerialization dataWithJSONObject:pending options:0 error:nil] writeToFile:statusPath atomically:YES];
+            while(!launchFinished)
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        }
         if (browser && !browser.terminated && key_shutdown_force_allowed(keyLifecycle)) [browser forceTerminate];
         if (keyLifecycle && key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
         NSTimeInterval end = NSProcessInfo.processInfo.systemUptime + 5;

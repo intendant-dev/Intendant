@@ -55,6 +55,20 @@ def encode_plan(plan):
     return b'k'+struct.pack('<II4dq',1,plan['window_id'],b['X'],b['Y'],b['Width'],b['Height'],plan['tag'])
 
 
+def request_owned_browser_close(cdp, ownership_verified):
+    """One orderly close over this fixture's PID-verified private connection."""
+    result={'requested':False}
+    if cdp is None or not ownership_verified:
+        return result
+    result['requested']=True
+    try:
+        cdp.call('Browser.close')
+    except Exception as error:
+        # Closing may drop the socket before a reply; native exit remains the proof.
+        result['reply_error']=str(error)
+    return result
+
+
 def close_control_input(child):
     try:
         child.stdin.close()
@@ -147,7 +161,7 @@ def main():
     report={'passed':False,'production_dispatch_enabled':False,'browser_version':info['CFBundleShortVersionString'],
             'checks':{},'cleanup':{},'on_virtual_monitor':False, 'native_click_first':args.native_click_first}
     root=None
-    child=cdp=None; status_path=None; receiver=None
+    child=cdp=None; status_path=None; receiver=None; cdp_owned=False
     last_tick=-1; last_tick_time=time.monotonic()
     try:
         root=Path(tempfile.mkdtemp(prefix='intendant-chromium-click-key-'))
@@ -189,6 +203,7 @@ def main():
         report['before']=current['before']; report['receiver_pid']=receiver; report['sender_pid']=child.pid
         processes=cdp.call('SystemInfo.getProcessInfo')['processInfo']
         require(any(x['type']=='browser' and x['id']==receiver for x in processes),'CDP ownership mismatch')
+        cdp_owned=True
         target=cdp.call('Target.createTarget',{'url':page,'newWindow':True,'background':True,'width':720,'height':530})['targetId']
         session=cdp.call('Target.attachToTarget',{'targetId':target,'flatten':True})['sessionId']
         def evaluate(expression):
@@ -281,6 +296,7 @@ def main():
         report['error']=str(error)
     finally:
         if cdp:
+            report['cleanup']['browser_close_request']=request_owned_browser_close(cdp,cdp_owned)
             try: cdp.close()
             except OSError as error:
                 report['cleanup']['cdp_error']=str(error); report['passed']=False

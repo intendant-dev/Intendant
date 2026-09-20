@@ -89,6 +89,26 @@ class Bootstrap(unittest.TestCase):
         self.assertEqual(b.freeze_click_tag(77,77),78)
         self.assertEqual(b.freeze_click_tag(b.MAX_TAG,b.MAX_TAG),1)
 
+class OrderlyBrowserClose(unittest.TestCase):
+    def test_unverified_connection_is_never_closed_remotely(self):
+        verifier=load('verify-macos-chromium-key')
+        class CDP:
+            def call(self,method):raise AssertionError('must not call')
+        self.assertEqual(verifier.request_owned_browser_close(CDP(),False),{'requested':False})
+    def test_verified_connection_gets_one_orderly_close(self):
+        verifier=load('verify-macos-chromium-key');calls=[]
+        class CDP:
+            def call(self,method):calls.append(method)
+        self.assertEqual(verifier.request_owned_browser_close(CDP(),True),{'requested':True})
+        self.assertEqual(calls,['Browser.close'])
+    def test_lost_close_reply_is_not_retried_or_exit_evidence(self):
+        verifier=load('verify-macos-chromium-key');calls=[]
+        class CDP:
+            def call(self,method):calls.append(method);raise OSError('socket closed')
+        result=verifier.request_owned_browser_close(CDP(),True)
+        self.assertTrue(result['requested']);self.assertIn('reply_error',result)
+        self.assertNotIn('browser_terminated',result);self.assertEqual(calls,['Browser.close'])
+
 class LateReceipt(unittest.TestCase):
     def test_late_receipt_preserved_without_effect_claim(self):
         verifier=load('verify-macos-chromium-key')

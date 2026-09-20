@@ -105,6 +105,10 @@ int main(int argc,const char **argv) {
         ok &= key_shutdown_request(&requested,YES,NO);++cases;
         requested=NO;ok &= !key_shutdown_request(&requested,YES,YES);++cases;
         ok &= key_shutdown_force_allowed(NO);++cases;
+        ok &= key_launch_cleanup_pending(YES,NO);++cases;
+        ok &= !key_launch_cleanup_pending(YES,YES);++cases;
+        ok &= !key_launch_cleanup_pending(NO,NO);++cases;
+        ok &= !key_launch_cleanup_pending(NO,YES);++cases;
         CGEventFlags flags[]={kCGEventFlagMaskShift,kCGEventFlagMaskControl,kCGEventFlagMaskAlternate,
             kCGEventFlagMaskCommand,kCGEventFlagMaskSecondaryFn};
         for(unsigned i=0;i<5;++i) { ok &= key_shortcut_held(flags[i]);++cases; }
