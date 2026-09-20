@@ -30,7 +30,8 @@ def assess_routing(native, pid, route):
                              native.get('target_ever_front'))
     result['desktop_observation_assessment'] = desktop
     traces = native.get('routing')
-    if (not queue or not isinstance(traces, list) or len(traces) != 2
+    if (not integer(native.get('unrelated_events'), 0, 0)
+            or not queue or not isinstance(traces, list) or len(traces) != 2
             or any(not isinstance(t, dict) or t.get('app_active') is not False
                    or not integer(t.get('key_window_id'), 0, 0)
                    or not integer(t.get('main_window_id'), 0, 0)

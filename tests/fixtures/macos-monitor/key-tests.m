@@ -90,6 +90,21 @@ int main(int argc,const char **argv) {
         ok &= click_receipt_accept(&state,receipt,click,777,YES);++cases;
         ok &= !click_receipt_accept(&state,receipt,click,777,YES);++cases;
         ok &= !click_receipt_take(&state,p.tag);++cases;
+        ok &= click_key_click_allowed(NO,NO,NO);++cases;
+        ok &= !click_key_click_allowed(YES,NO,NO);++cases;
+        ok &= !click_key_click_allowed(NO,YES,NO);++cases;
+        ok &= !click_key_click_allowed(NO,NO,YES);++cases;
+        BOOL requested=NO; NSUInteger shutdownCalls=0,forceCalls=0;
+        for(unsigned tick=0;tick<10;tick++) {
+            if(key_shutdown_request(&requested,YES,NO)) shutdownCalls++;
+            if(key_shutdown_force_allowed(YES)) forceCalls++;
+        }
+        ok &= shutdownCalls==1 && forceCalls==0; ++cases;
+        ok &= !key_shutdown_request(&requested,YES,NO);++cases;
+        requested=NO;ok &= !key_shutdown_request(&requested,NO,NO) && !requested;++cases;
+        ok &= key_shutdown_request(&requested,YES,NO);++cases;
+        requested=NO;ok &= !key_shutdown_request(&requested,YES,YES);++cases;
+        ok &= key_shutdown_force_allowed(NO);++cases;
         CGEventFlags flags[]={kCGEventFlagMaskShift,kCGEventFlagMaskControl,kCGEventFlagMaskAlternate,
             kCGEventFlagMaskCommand,kCGEventFlagMaskSecondaryFn};
         for(unsigned i=0;i<5;++i) { ok &= key_shortcut_held(flags[i]);++cases; }

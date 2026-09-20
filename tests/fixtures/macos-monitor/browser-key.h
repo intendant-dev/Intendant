@@ -118,3 +118,14 @@ static NSDictionary *key_send(NSRunningApplication *browser, BrowserKeyPlan p, C
 static BOOL key_cleanup_pending(BOOL keyMode, BOOL hasBrowser, BOOL terminated) {
     return keyMode && hasBrowser && !terminated;
 }
+
+// A refused key seals the click opportunity; never turn a key failure into a click.
+static BOOL click_key_click_allowed(BOOL keyConsumed, BOOL stopping, BOOL front) {
+    return !keyConsumed && !stopping && !front;
+}
+// Key diagnostics request normal termination once, then retain the owner if pending.
+static BOOL key_shutdown_request(BOOL *requested, BOOL hasBrowser, BOOL terminated) {
+    if(!requested || *requested || !hasBrowser || terminated) return NO;
+    *requested=YES; return YES;
+}
+static BOOL key_shutdown_force_allowed(BOOL keyLifecycle) { return !keyLifecycle; }

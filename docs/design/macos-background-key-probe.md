@@ -176,3 +176,21 @@ paths. Native constructor tests compile with warnings denied.
 
 Reference for viewport scale and device pixel ratio:
 https://www.w3.org/TR/cssom-view-1/
+
+
+## Final review corrections
+
+The resumed independent review found three additional defects. A first key
+attempt now seals the later click opportunity before plan freezing, challenge
+creation or native posting; key-before-click cannot become a hidden click
+fallback. Key-mode shutdown makes at most one ordinary terminate request and
+never force-terminates the browser. A late-created browser still receives that
+single request; an unconfirmed exit preserves its native owner and source.
+The existing pointer-only supervisor cleanup policy is unchanged.
+
+Both AppKit evidence assessors now require unrelated_events to be an exact
+integer zero. Missing, boolean, floating-point or nonzero values cannot produce
+a clean diagnostic or verified effect. Regression coverage includes the ordering
+gate, repeated shutdown-policy evaluation, late browser availability and mutated
+evidence. The updated pure Python suite passes 103 tests, and the native
+nonposting suite passes 79 cases. No genuinely hung browser was injected.

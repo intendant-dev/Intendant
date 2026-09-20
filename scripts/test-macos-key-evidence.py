@@ -19,7 +19,7 @@ class Evidence(unittest.TestCase):
                        for k in ('key_down','key_up')]
         self.native={'mode':'self_process_key','ok':True,'posted_events':2,'error':'',
             'plan':self.plan,'queue_receipts':self.receipts,'receipts':self.receipts,
-            'effect_count':1,'overflow':False,'window_closed':True,'responder_unchanged':True,
+            'effect_count':1,'unrelated_events':0,'overflow':False,'window_closed':True,'responder_unchanged':True,
             'observations_complete':True,'target_ever_front':False,'before':self.sample,'after':self.sample}
         self.nonce='a'*32
         self.browser={'dispatch_attempted':True,'posted_events':2,'effect_verified':False,
@@ -27,6 +27,13 @@ class Evidence(unittest.TestCase):
         self.dom={'nonce':self.nonce,'count':1,'active':True,'overflow':False,'unrelated':0,
             'events':[dict(type=k,key='ArrowRight',code='ArrowRight',trusted=True,repeat=False,
                 shift=False,ctrl=False,alt=False,meta=False,target='receiver') for k in ('keydown','keyup')]}
+
+    def test_unrelated_or_missing_receiver_input_refuses(self):
+        for value in [1,-1,True,False,0.0,None,'0']:
+            result=assess_self(dict(self.native,unrelated_events=value),100)
+            self.assertFalse(result['passed']);self.assertFalse(result['effect_verified'])
+        missing=dict(self.native);del missing['unrelated_events']
+        self.assertFalse(assess_self(missing,100)['passed'])
 
     def test_exact_self_evidence(self):
         r=assess_self(self.native,100)

@@ -68,7 +68,8 @@ def assess_self(native, supervised_pid):
     result['queue_delivery_verified'] = key_receipts(plan, native.get('queue_receipts'))
     result['receiver_delivery_verified'] = key_receipts(plan, native.get('receipts'))
     result['effect_verified'] = (result['receiver_delivery_verified']
-                                 and integer(native.get('effect_count'), 1, 1))
+                                 and integer(native.get('effect_count'), 1, 1)
+                                 and integer(native.get('unrelated_events'), 0, 0))
     desktop = assess_desktop(native.get('before'), native.get('after'),
                              supervised_pid, native.get('target_ever_front'))
     result['desktop_observation_assessment'] = desktop

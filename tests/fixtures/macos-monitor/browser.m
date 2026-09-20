@@ -138,6 +138,7 @@ int main(int argc, const char **argv) {
     BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
     BOOL keyMode = strcmp(argv[1], "--disposable-chromium-key") == 0;
     BOOL clickKeyMode = browser_click_key_mode(argv[1]);
+    BOOL keyLifecycle = keyMode || clickKeyMode;
     if (!clickKeyMode && !keyMode && !pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
     @autoreleasepool {
         NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
@@ -177,7 +178,7 @@ int main(int argc, const char **argv) {
         BOOL clickConsumed=NO, clickPlanFrozen=NO; NSUInteger clickReplays=0;
         ClickReceiptState clickReceipt={0}; uint64_t clickChallenge=0; NSDictionary *clickReceiptResult=nil;
         NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
-        NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO;
+        NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO; BOOL keyShutdownRequested=NO;
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);
@@ -214,12 +215,13 @@ int main(int argc, const char **argv) {
                     if (clickConsumed) clickReplays++;
                     else {
                         clickConsumed=YES; // Invalid frames consume the one guarded click too.
-                        if (readOK && browser_pointer_valid(plan)) {
+                        BOOL clickAllowed=click_key_click_allowed(keyConsumed,stopping,browserEverFront);
+                        if (clickAllowed && readOK && browser_pointer_valid(plan)) {
                             clickPlan=plan; clickPlanFrozen=YES;
                             clickPlanEvidence=click_key_plan_evidence(plan);
                             do { arc4random_buf(&clickChallenge,sizeof(clickChallenge)); clickChallenge &= INT64_MAX; } while(!clickChallenge);
                         }
-                        clickResult = readOK && !stopping && !browserEverFront
+                        clickResult = clickAllowed && readOK
                             ? browser_pointer_send(browser,plan,&pointerSource)
                             : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
                                 @"error":@"click-key click frame or lifecycle refused"};
@@ -237,9 +239,10 @@ int main(int argc, const char **argv) {
             }
             if (!stopping && (n == 0 || command == 'q' || NSProcessInfo.processInfo.systemUptime - started > 180)) {
                 stopping = YES; stopAt = NSProcessInfo.processInfo.systemUptime;
-                [browser terminate];
+                if (!keyLifecycle || key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
             }
-            if (stopping && browser && !browser.terminated) {
+            if (stopping && keyLifecycle && key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
+            if (stopping && browser && !browser.terminated && key_shutdown_force_allowed(keyLifecycle)) {
                 if (NSProcessInfo.processInfo.systemUptime - stopAt > 4) [browser forceTerminate];
             }
             if (launchFinished && !browser) break;
@@ -278,9 +281,10 @@ int main(int argc, const char **argv) {
             }
             status[@"windows"] = owned; if (diagnostic) status[@"tree_diagnostic"] = diagnostic;
             NSData *data = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
-            if (data.length > 16384 || ![data writeToFile:statusPath atomically:YES]) { stopping = YES; [browser terminate]; }
+            if (data.length > 16384 || ![data writeToFile:statusPath atomically:YES]) { stopping = YES; if (!keyLifecycle || key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate]; }
         }
-        if (browser && !browser.terminated) [browser forceTerminate];
+        if (browser && !browser.terminated && key_shutdown_force_allowed(keyLifecycle)) [browser forceTerminate];
+        if (keyLifecycle && key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
         NSTimeInterval end = NSProcessInfo.processInfo.systemUptime + 5;
         while (browser && !browser.terminated && NSProcessInfo.processInfo.systemUptime < end)
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];

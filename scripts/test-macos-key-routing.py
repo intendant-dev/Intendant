@@ -16,7 +16,7 @@ class Routing(unittest.TestCase):
                      event_is_own_window=True,responder_is_view=True)
         self.negative = dict(mode=MODES['application'],cooperative_forwarding=False,
             plan=self.plan,queue_receipts=pair,window_receipts=[],receipts=[],
-            routing=[trace.copy(),trace.copy()],posted_events=2,effect_count=0,
+            routing=[trace.copy(),trace.copy()],posted_events=2,effect_count=0,unrelated_events=0,
             overflow=False,window_closed=True,responder_unchanged=True,
             observations_complete=True,target_ever_front=False,before=sample,after=sample,
             ok=False,error='receiver key delivery/effect not verified; queue receipt is insufficient')
@@ -27,6 +27,13 @@ class Routing(unittest.TestCase):
                  cooperative_forwarding=control,ok=True,error='',effect_count=1,
                  window_receipts=n['queue_receipts'],receipts=n['queue_receipts'])
         return n
+
+    def test_unrelated_or_missing_receiver_input_invalidates_diagnostic(self):
+        for value in [1,-1,True,False,0.0,None,'0']:
+            for n,route in [(self.negative,'application'),(self.positive(),'window-control')]:
+                self.assertFalse(assess_routing(dict(n,unrelated_events=value),100,route)['diagnostic_valid'])
+        n=self.positive();del n['unrelated_events']
+        self.assertFalse(assess_routing(n,100,'window-control')['diagnostic_valid'])
 
     def test_queue_only_pinpoints_application_boundary(self):
         for route in ('application','psn'):
