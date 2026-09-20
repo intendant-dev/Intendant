@@ -18,6 +18,10 @@ int main(int argc,const char **argv) {
         }
         if(argc!=1) return 2;
         BOOL ok=YES; NSUInteger cases=0;
+        ok &= key_cleanup_pending(YES,YES,NO);++cases;
+        ok &= !key_cleanup_pending(YES,YES,YES);++cases;
+        ok &= !key_cleanup_pending(YES,NO,NO);++cases;
+        ok &= !key_cleanup_pending(NO,YES,NO);++cases;
         BrowserKeyPlan p={.version=1,.window=12345,.bounds=CGRectMake(-800,20,720,530),.tag=999};
         ok &= key_plan_valid(p);++cases;
         BrowserKeyPlan invalid[8];for(unsigned i=0;i<8;++i) invalid[i]=p;

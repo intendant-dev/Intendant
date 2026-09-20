@@ -118,6 +118,16 @@ class Cleanup(unittest.TestCase):
         self.assertTrue(child.stdin.closed)
 
 class ShutdownEvidence(unittest.TestCase):
+    def test_broken_pipe_close_does_not_skip_final_evidence(self):
+        class Pipe:
+            def close(self): raise BrokenPipeError('fixture supervisor exited')
+        class Child: stdin=Pipe()
+        self.assertIn('exited',probe.close_control_input(Child()))
+        result={'passed':False,'cleanup':{}}
+        final={'supervisor_pid':10,'browser_pid':11,'key_result':{'posted_events':2},'key_replays_refused':0}
+        probe.retain_final_evidence(result,final,10,11)
+        self.assertEqual(result['native_dispatch'],{'posted_events':2})
+
     def test_unconfirmed_browser_keeps_its_native_owner_alive(self):
         child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],stdin=subprocess.PIPE)
         try:

@@ -72,3 +72,8 @@ static NSDictionary *key_send(NSRunningApplication *browser, BrowserKeyPlan p, C
     r[@"posted_events"]=@(calls); r[@"dispatch_attempted"]=calls?@YES:@NO;
     return r;
 }
+
+// A diagnostic deadline is not evidence that a separately launched app exited.
+static BOOL key_cleanup_pending(BOOL keyMode, BOOL hasBrowser, BOOL terminated) {
+    return keyMode && hasBrowser && !terminated;
+}

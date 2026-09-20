@@ -242,6 +242,17 @@ int main(int argc, const char **argv) {
         if(keyResult) final[@"key_result"]=keyResult;
         final[@"key_replays_refused"]=@(keyReplays);
         [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+        if(key_cleanup_pending(keyMode,browser != nil,browser.terminated)) {
+            final[@"cleanup_pending"]=@YES;
+            [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+            // No more input, retries or force-termination calls. Keep the exact
+            // cleanup owner and source until native process exit is confirmed.
+            while(!browser.terminated)
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            final[@"browser_terminated"]=@YES;
+            final[@"cleanup_pending"]=@NO;
+            [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+        }
         if (pointerSource) CFRelease(pointerSource);
         if (keySource) CFRelease(keySource);
         return browser && browser.terminated ? 0 : 6;

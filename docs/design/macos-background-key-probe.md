@@ -152,9 +152,28 @@ original. Hermetic tests cover this distinction and owner retention.
 
 The unchanged production Rust tree passed 6,614 binary tests (10 existing ignores),
 1,022 required library/acceptance tests (3 existing ignores), 57 E2E tests, workspace
-Clippy with warnings denied, formatting and whitespace. Sixteen new Python
+Clippy with warnings denied, formatting and whitespace. Seventeen new Python
 evidence/cleanup tests and all 61 existing input/scroll/harness tests passed.
-Native nonposting checks passed seven basic construction cases, twenty
-plan/modifier/constructor checks, and six pipe cases. These passes are not
+Native nonposting checks passed seven basic construction cases, twenty-four
+plan/modifier/constructor/cleanup-policy checks, and six pipe cases. These passes are not
 positive native keyboard acceptance. The existing standalone Chromium click
 regression passed using the rebuilt supervisor, with complete cleanup.
+
+
+## Follow-up shutdown corrections
+
+Read-only follow-up identified two additional shutdown paths. In key-probe mode,
+a native cleanup deadline no longer releases the browser owner/source when exit
+is unconfirmed. It writes cleanup_pending and remains a read-only cleanup owner
+until that exact NSRunningApplication reports termination. This residual cleanup
+state deliberately has no absolute lifetime guarantee; the bounded Python
+harness reports failure and retains its profile/owner reference rather than
+claiming completion or killing the owner. No further input or termination retries
+are issued in this state. Ordinary pointer/non-input supervisor modes are unchanged.
+
+Closing a broken control pipe now preserves the error and proceeds to recover
+final native dispatch evidence. The extra Python regression covers this close
+race; the native nonposting regression covers the pending-owner policy. Actual
+hung-browser lifecycle behavior has not been injected, and these final shutdown
+changes have not received another independent follow-up review. The PR remains
+draft for both keyboard routing acceptance and that final review.

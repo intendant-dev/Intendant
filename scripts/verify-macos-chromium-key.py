@@ -54,6 +54,14 @@ def encode_plan(plan):
     return b'k'+struct.pack('<II4dq',1,plan['window_id'],b['X'],b['Y'],b['Width'],b['Height'],plan['tag'])
 
 
+def close_control_input(child):
+    try:
+        child.stdin.close()
+    except (BrokenPipeError, OSError) as error:
+        return str(error)
+    return None
+
+
 def reap_supervisor(child, browser_terminated=False, grace=2):
     """Never kill the only cleanup owner of a separately launched browser."""
     if child.stdin is not None and not child.stdin.closed:
@@ -203,7 +211,9 @@ def main():
                     except (BrokenPipeError,OSError):
                         pass
                     finally:
-                        child.stdin.close()
+                        close_error=close_control_input(child)
+                        if close_error:
+                            report['cleanup']['input_close_error']=close_error
                 child.wait(timeout=20)
                 require(status_path.exists() and status_path.stat().st_size<=16384,'final status unavailable')
                 final=raw.strict_json(status_path.read_text())
