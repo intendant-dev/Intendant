@@ -133,3 +133,7 @@ static BOOL key_shutdown_force_allowed(BOOL keyLifecycle) { return !keyLifecycle
 static BOOL key_launch_cleanup_pending(BOOL keyLifecycle, BOOL launchFinished) {
     return keyLifecycle && !launchFinished;
 }
+
+static BOOL browser_exit_verified(BOOL hasBrowser, BOOL terminated) {
+    return hasBrowser && terminated;
+}

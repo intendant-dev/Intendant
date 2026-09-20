@@ -109,6 +109,10 @@ int main(int argc,const char **argv) {
         ok &= !key_launch_cleanup_pending(YES,YES);++cases;
         ok &= !key_launch_cleanup_pending(NO,NO);++cases;
         ok &= !key_launch_cleanup_pending(NO,YES);++cases;
+        ok &= browser_exit_verified(YES,YES);++cases;
+        ok &= !browser_exit_verified(YES,NO);++cases;
+        ok &= !browser_exit_verified(NO,YES);++cases;
+        ok &= !browser_exit_verified(NO,NO);++cases;
         CGEventFlags flags[]={kCGEventFlagMaskShift,kCGEventFlagMaskControl,kCGEventFlagMaskAlternate,
             kCGEventFlagMaskCommand,kCGEventFlagMaskSecondaryFn};
         for(unsigned i=0;i<5;++i) { ok &= key_shortcut_held(flags[i]);++cases; }

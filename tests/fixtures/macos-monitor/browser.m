@@ -299,7 +299,7 @@ int main(int argc, const char **argv) {
         while (browser && !browser.terminated && NSProcessInfo.processInfo.systemUptime < end)
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
         NSMutableDictionary *final = [@{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
-            @"browser_terminated": (!browser || browser.terminated ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
+            @"browser_terminated": (browser_exit_verified(browser!=nil,browser.terminated) ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
             @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}} mutableCopy];
         if(keyResult) final[@"key_result"]=keyResult;
         final[@"key_replays_refused"]=@(keyReplays);
