@@ -15,6 +15,7 @@ pub(crate) mod placement;
 pub(crate) mod pointer;
 mod process;
 mod protocol;
+pub(crate) mod scroll;
 mod smoke;
 mod window_broker;
 pub(crate) use window_broker::{WindowAction, WindowValue};
@@ -337,10 +338,17 @@ impl Broker {
             .as_ref()
             .map_err(Clone::clone)?;
         let placement = matches!(action, Action::Window(WindowAction::Place { .. }));
-        let pointer_action = matches!(action, Action::Window(WindowAction::Click { .. }));
+        let pointer_action = matches!(
+            action,
+            Action::Window(WindowAction::Click { .. } | WindowAction::Scroll { .. })
+        );
         let element_dispatch = matches!(
             action,
-            Action::Window(WindowAction::ActElement { .. } | WindowAction::Click { .. })
+            Action::Window(
+                WindowAction::ActElement { .. }
+                    | WindowAction::Click { .. }
+                    | WindowAction::Scroll { .. }
+            )
         )
         .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (reply, receive) = oneshot::channel();
@@ -578,6 +586,12 @@ where
                         }
                         Value::Window(WindowValue::Clicked(result)) => {
                             Some(WindowValue::ClickUnconfirmed {
+                                result,
+                                error: error.clone(),
+                            })
+                        }
+                        Value::Window(WindowValue::Scrolled(result)) => {
+                            Some(WindowValue::ScrollUnconfirmed {
                                 result,
                                 error: error.clone(),
                             })
@@ -865,6 +879,8 @@ mod tests {
         next_binding: u32,
         element_token: Option<(u32, String)>,
         pointer_plan: Option<(u32, pointer::Prepared)>,
+        pointer_delta: Option<i32>,
+        scroll_reply_patch: Option<serde_json::Value>,
         die_after_place: bool,
         verified_place: bool,
         window_started: Option<oneshot::Sender<()>>,
@@ -895,6 +911,11 @@ mod tests {
         }
         async fn exchange(&mut self, op: Operation) -> Result<Outcome, String> {
             self.live()?;
+            let scroll_delta = match &op {
+                Operation::PrepareScroll { delta_y, .. } => Some(*delta_y),
+                _ => None,
+            };
+            let scrolling = matches!(&op, Operation::ScrollPointer { .. });
             match op {
                 Operation::Create { width, height } => {
                     self.log.lock().unwrap().push("create");
@@ -935,7 +956,8 @@ mod tests {
                         height: 480,
                     })
                 }
-                Operation::PreparePointer { binding, point } => {
+                Operation::PreparePointer { binding, point }
+                | Operation::PrepareScroll { binding, point, .. } => {
                     self.log.lock().unwrap().push("pointer_prepare");
                     let bounds = placement::tests::monitor();
                     let prepared = pointer::Prepared {
@@ -952,16 +974,24 @@ mod tests {
                         expires_in_ms: pointer::TOKEN_TTL_MS,
                     };
                     self.pointer_plan = Some((binding, prepared.clone()));
-                    Ok(Outcome::PreparedPointer { prepared })
+                    self.pointer_delta = scroll_delta;
+                    Ok(match scroll_delta {
+                        Some(delta_y) => Outcome::PreparedScroll {
+                            prepared: scroll::PreparedScroll::new(prepared, delta_y),
+                        },
+                        None => Outcome::PreparedPointer { prepared },
+                    })
                 }
-                Operation::ClickPointer { binding, token } => {
+                Operation::ClickPointer { binding, token }
+                | Operation::ScrollPointer { binding, token } => {
+                    let delta_y = self.pointer_delta.take();
                     let Some((b, p)) = self.pointer_plan.take() else {
                         return Ok(Outcome::Error {
                             message: "consumed pointer token".into(),
                             fatal: false,
                         });
                     };
-                    if b != binding || p.token != token {
+                    if b != binding || p.token != token || scrolling != delta_y.is_some() {
                         return Ok(Outcome::Error {
                             message: "stale pointer token".into(),
                             fatal: false,
@@ -975,20 +1005,32 @@ mod tests {
                         let _ = release.await;
                     }
                     self.dead = self.die_after_place;
-                    Ok(Outcome::ClickedPointer {
-                        result: pointer::ClickResult {
-                            status: pointer::ClickStatus::Dispatched,
-                            action_attempted: true,
-                            posting_calls: 2,
-                            effects_unconfirmed: true,
-                            effect_verified: false,
-                            point: p.point,
-                            global: p.global,
-                            before: p.window,
-                            after: Some(p.window),
-                            focus_interference: Some(false),
-                            detail: None,
-                        },
+                    let result = pointer::ClickResult {
+                        status: pointer::ClickStatus::Dispatched,
+                        action_attempted: true,
+                        posting_calls: if scrolling { 1 } else { 2 },
+                        effects_unconfirmed: true,
+                        effect_verified: false,
+                        point: p.point,
+                        global: p.global,
+                        before: p.window,
+                        after: Some(p.window),
+                        focus_interference: Some(false),
+                        detail: None,
+                    };
+                    Ok(if let Some(delta_y) = delta_y {
+                        let result = scroll::ScrollResult::new(result, delta_y);
+                        let mut wire = serde_json::to_value(result).unwrap();
+                        if let Some(patch) = self.scroll_reply_patch.take() {
+                            wire.as_object_mut()
+                                .unwrap()
+                                .extend(patch.as_object().unwrap().clone());
+                        }
+                        Outcome::ScrolledPointer {
+                            result: serde_json::from_value(wire).unwrap(),
+                        }
+                    } else {
+                        Outcome::ClickedPointer { result }
                     })
                 }
                 Operation::ListWindows { .. } => Ok(Outcome::Windows { candidates: vec![] }),
@@ -2700,6 +2742,274 @@ mod tests {
                 1
             );
             assert!(!log.lock().unwrap().contains(&"unbind"));
+        }
+    }
+
+    mod scroll_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        fn action(binding: &str, token: &str) -> Action {
+            Action::Window(WindowAction::Scroll {
+                binding: binding.into(),
+                token: token.into(),
+            })
+        }
+        async fn prepared(tx: &mpsc::Sender<Request>, binding: &str) -> (Receipt, String) {
+            let receipt = send(
+                tx,
+                Action::Window(WindowAction::PrepareScroll {
+                    binding: binding.into(),
+                    point: pointer::Point { x: 37.25, y: 123.5 },
+                    delta_y: 73,
+                }),
+                authority(true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let Value::Window(WindowValue::PreparedScroll(p)) = &receipt.value else {
+                panic!("scroll preparation")
+            };
+            let token = p.token.clone();
+            (receipt, token)
+        }
+        #[tokio::test]
+        async fn scroll_is_owner_only_even_with_display_grant_and_cannot_start_broker() {
+            for owner in [false, true] {
+                let broker = Broker::default();
+                let a = authority(owner);
+                a.autonomy.write().await.user_display_granted = true;
+                for op in [
+                    Action::Window(WindowAction::PrepareScroll {
+                        binding: "macos_window:fixture:1".into(),
+                        point: pointer::Point { x: 1., y: 1. },
+                        delta_y: 1,
+                    }),
+                    action(
+                        "macos_window:fixture:1",
+                        &format!("macos_pointer:{}", "a".repeat(32)),
+                    ),
+                ] {
+                    let error = broker.request(op, a.clone()).await.err().unwrap();
+                    assert!(
+                        error.contains(if owner { "no owned" } else { "owner surface" }),
+                        "{error}"
+                    );
+                    assert!(broker.not_started());
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        #[tokio::test]
+        async fn scroll_refuses_unsupported_os_before_sending_to_an_existing_broker() {
+            let broker = Broker::default();
+            let (tx, mut rx) = mpsc::channel(QUEUE_SIZE);
+            assert!(broker.sender.set(Ok(tx)).is_ok());
+            for op in [
+                Action::Window(WindowAction::PrepareScroll {
+                    binding: "macos_window:fixture:1".into(),
+                    point: pointer::Point { x: 1., y: 1. },
+                    delta_y: 1,
+                }),
+                action(
+                    "macos_window:fixture:1",
+                    &format!("macos_pointer:{}", "a".repeat(32)),
+                ),
+            ] {
+                assert!(broker
+                    .request(op, authority(true))
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains("require macOS"));
+                assert!(rx.try_recv().is_err());
+            }
+        }
+        #[tokio::test]
+        async fn queued_scope_rejection_never_reaches_helper() {
+            let fake = Fake::default();
+            let log = fake.log.clone();
+            let (tx, worker) = runner(fake);
+            let binding = bound_fixture(&tx).await;
+            let (receipt, token) = prepared(&tx, &binding).await;
+            assert!(receipt.commit());
+            let scoped = authority(false);
+            scoped.autonomy.write().await.user_display_granted = true;
+            assert!(send(&tx, action(&binding, &token), scoped)
+                .await
+                .unwrap()
+                .err()
+                .unwrap()
+                .contains("owner surface"));
+            assert!(!log.lock().unwrap().contains(&"pointer_action"));
+            assert!(send(&tx, action(&binding, &token), authority(true))
+                .await
+                .unwrap()
+                .unwrap()
+                .commit());
+            drop(tx);
+            worker.await.unwrap().unwrap();
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&v| v == "pointer_action")
+                    .count(),
+                1
+            );
+        }
+        #[tokio::test]
+        async fn scroll_cancellation_before_dispatch_is_no_effect_and_after_never_replays() {
+            let (started, begin) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            let fake = Fake {
+                place_started: Some(started),
+                place_release: Some(wait),
+                ..Default::default()
+            };
+            let log = fake.log.clone();
+            let (tx, worker) = runner(fake);
+            let binding = bound_fixture(&tx).await;
+            let (receipt, token) = prepared(&tx, &binding).await;
+            let progress = Arc::new(AtomicBool::new(false));
+            let (reply, receive) = oneshot::channel();
+            tx.send(Request {
+                action: action(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .ok()
+            .unwrap();
+            let error =
+                await_pointer_reply(receive, &progress, std::time::Duration::from_millis(1))
+                    .await
+                    .err()
+                    .unwrap();
+            assert!(!error.starts_with(POINTER_UNCONFIRMED));
+            assert!(!progress.load(Ordering::SeqCst));
+            assert!(receipt.commit());
+            let (reply, receive) = oneshot::channel();
+            tx.send(Request {
+                action: action(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .ok()
+            .unwrap();
+            begin.await.unwrap();
+            let error =
+                await_pointer_reply(receive, &progress, std::time::Duration::from_millis(1))
+                    .await
+                    .err()
+                    .unwrap();
+            assert!(error.starts_with(POINTER_UNCONFIRMED));
+            release.send(()).unwrap();
+            assert!(send(&tx, action(&binding, &token), authority(true))
+                .await
+                .unwrap()
+                .is_err());
+            drop(tx);
+            worker.await.unwrap().unwrap();
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&v| v == "pointer_action")
+                    .count(),
+                1
+            );
+        }
+        #[tokio::test]
+        async fn scroll_late_liveness_and_receipt_loss_preserve_observed_evidence() {
+            for dead in [false, true] {
+                let fake = Fake {
+                    die_after_place: dead,
+                    ..Default::default()
+                };
+                let log = fake.log.clone();
+                let (tx, worker) = runner(fake);
+                let binding = bound_fixture(&tx).await;
+                let (receipt, token) = prepared(&tx, &binding).await;
+                assert!(receipt.commit());
+                let receipt = send(&tx, action(&binding, &token), authority(true))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match &receipt.value {
+                    Value::Window(WindowValue::Scrolled(r)) if !dead => {
+                        assert_eq!(r.posting_calls, 1);
+                        assert!(r.valid_reply() && !r.effect_verified);
+                    }
+                    Value::Window(WindowValue::ScrollUnconfirmed { result, error }) if dead => {
+                        assert!(result.valid_reply() && result.after.is_some());
+                        assert_eq!(result.posting_calls, 1);
+                        assert!(error.contains("died"));
+                    }
+                    _ => panic!("scroll evidence lost"),
+                }
+                assert!(send(&tx, action(&binding, &token), authority(true))
+                    .await
+                    .unwrap()
+                    .is_err());
+                assert!(!receipt.commit());
+                drop(tx);
+                assert_eq!(worker.await.unwrap().is_err(), dead);
+                assert_eq!(
+                    log.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&v| v == "pointer_action")
+                        .count(),
+                    1
+                );
+                assert!(!log.lock().unwrap().contains(&"unbind"));
+            }
+        }
+        #[tokio::test]
+        async fn malformed_scroll_success_retires_broker_without_replay() {
+            for patch in [
+                serde_json::json!({"posting_calls":0}),
+                serde_json::json!({"posting_calls":2}),
+                serde_json::json!({"posting_calls":255,"status":"partial"}),
+                serde_json::json!({"effect_verified":true}),
+                serde_json::json!({"after":null}),
+                serde_json::json!({"focus_interference":true}),
+                serde_json::json!({"detail":"native exception"}),
+            ] {
+                let fake = Fake {
+                    scroll_reply_patch: Some(patch),
+                    ..Default::default()
+                };
+                let log = fake.log.clone();
+                let (tx, worker) = runner(fake);
+                let binding = bound_fixture(&tx).await;
+                let (receipt, token) = prepared(&tx, &binding).await;
+                assert!(receipt.commit());
+                let error = send(&tx, action(&binding, &token), authority(true))
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                assert!(error.starts_with(POINTER_UNCONFIRMED), "{error}");
+                assert!(send(&tx, action(&binding, &token), authority(true))
+                    .await
+                    .unwrap()
+                    .is_err());
+                drop(tx);
+                assert!(worker.await.unwrap().is_err());
+                assert_eq!(
+                    log.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&v| v == "pointer_action")
+                        .count(),
+                    1
+                );
+            }
         }
     }
 }

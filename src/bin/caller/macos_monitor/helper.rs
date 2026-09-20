@@ -197,6 +197,24 @@ fn serve_with_windows<O: Owner, N: Native>(
                         })
                         .map(|result| Outcome::ClickedPointer { result }),
                 ),
+                Operation::PrepareScroll {
+                    binding,
+                    point,
+                    delta_y,
+                } => window_outcome(
+                    windows
+                        .prepare_scroll(binding, point, delta_y, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|prepared| Outcome::PreparedScroll { prepared }),
+                ),
+                Operation::ScrollPointer { binding, token } => window_outcome(
+                    windows
+                        .scroll(binding, &token, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|result| Outcome::ScrolledPointer { result }),
+                ),
                 Operation::UnbindWindow { binding } => window_outcome(
                     windows
                         .unbind(binding)

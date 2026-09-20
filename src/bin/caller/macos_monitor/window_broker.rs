@@ -33,6 +33,15 @@ pub(crate) enum WindowAction {
         binding: String,
         token: String,
     },
+    PrepareScroll {
+        binding: String,
+        point: pointer::Point,
+        delta_y: i32,
+    },
+    Scroll {
+        binding: String,
+        token: String,
+    },
     Unbind {
         binding: String,
     },
@@ -58,7 +67,16 @@ impl WindowAction {
                 valid_binding(binding)?;
                 point.validate()
             }
-            Self::Click { binding, token } => {
+            Self::PrepareScroll {
+                binding,
+                point,
+                delta_y,
+            } => {
+                valid_binding(binding)?;
+                point.validate()?;
+                scroll::validate_delta(*delta_y)
+            }
+            Self::Click { binding, token } | Self::Scroll { binding, token } => {
                 valid_binding(binding)?;
                 pointer::validate_token(token)
             }
@@ -112,6 +130,12 @@ pub(crate) enum WindowValue {
     Clicked(pointer::ClickResult),
     ClickUnconfirmed {
         result: pointer::ClickResult,
+        error: String,
+    },
+    PreparedScroll(scroll::PreparedScroll),
+    Scrolled(scroll::ScrollResult),
+    ScrollUnconfirmed {
+        result: scroll::ScrollResult,
         error: String,
     },
     Unbound,
@@ -174,7 +198,9 @@ pub(super) async fn execute_window(
         WindowAction::ReadElements { binding }
         | WindowAction::ActElement { binding, .. }
         | WindowAction::PrepareClick { binding, .. }
-        | WindowAction::Click { binding, .. } => {
+        | WindowAction::Click { binding, .. }
+        | WindowAction::PrepareScroll { binding, .. }
+        | WindowAction::Scroll { binding, .. } => {
             let bound = state
                 .bindings
                 .get(binding)
@@ -188,6 +214,15 @@ pub(super) async fn execute_window(
                     point: *point,
                 },
                 WindowAction::Click { token, .. } => Operation::ClickPointer {
+                    binding: bound.helper_binding,
+                    token: token.clone(),
+                },
+                WindowAction::PrepareScroll { point, delta_y, .. } => Operation::PrepareScroll {
+                    binding: bound.helper_binding,
+                    point: *point,
+                    delta_y: *delta_y,
+                },
+                WindowAction::Scroll { token, .. } => Operation::ScrollPointer {
                     binding: bound.helper_binding,
                     token: token.clone(),
                 },
@@ -229,7 +264,10 @@ pub(super) async fn execute_window(
     let outcome = child.exchange(op).await.map_err(|e| {
         Failure::Retire(if matches!(action, WindowAction::Place { .. }) {
             placement_unconfirmed(&e)
-        } else if matches!(action, WindowAction::Click { .. }) {
+        } else if matches!(
+            action,
+            WindowAction::Click { .. } | WindowAction::Scroll { .. }
+        ) {
             pointer_unconfirmed(&e)
         } else if matches!(action, WindowAction::ActElement { .. }) {
             element_unconfirmed(&e)
@@ -308,6 +346,17 @@ pub(super) async fn execute_window(
         {
             WindowValue::Clicked(result)
         }
+        (
+            WindowAction::PrepareScroll { point, delta_y, .. },
+            Outcome::PreparedScroll { prepared },
+        ) if prepared.valid_reply() && prepared.point == *point && prepared.delta_y == *delta_y => {
+            WindowValue::PreparedScroll(prepared)
+        }
+        (WindowAction::Scroll { .. }, Outcome::ScrolledPointer { result })
+            if result.valid_reply() =>
+        {
+            WindowValue::Scrolled(result)
+        }
         (WindowAction::Unbind { binding }, Outcome::UnboundWindow { binding: helper })
             if state
                 .bindings
@@ -322,7 +371,10 @@ pub(super) async fn execute_window(
             return Err(Failure::Retire(
                 if matches!(action, WindowAction::Place { .. }) {
                     placement_unconfirmed(error)
-                } else if matches!(action, WindowAction::Click { .. }) {
+                } else if matches!(
+                    action,
+                    WindowAction::Click { .. } | WindowAction::Scroll { .. }
+                ) {
                     pointer_unconfirmed(error)
                 } else if matches!(action, WindowAction::ActElement { .. }) {
                     element_unconfirmed(error)

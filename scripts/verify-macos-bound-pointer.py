@@ -2,8 +2,9 @@
 """Opt-in owned-monitor HTTP pointer acceptance; no CDP/native-fixture input.
 
 Only an explicit Chrome for Testing bundle and new private profile are used.
-A successful post is not a successful click. Native dispatch, independent DOM
+A successful post is not a verified click or scroll. Native dispatch, independent DOM
 observations, cleanup and sampled desktop changes are reported separately.
+Each scroll sign needs a separate invocation with a fresh fixture/profile.
 """
 import argparse
 import importlib.util
@@ -20,6 +21,8 @@ import subprocess
 import tempfile
 import time
 from macos_input_evidence import assess_desktop
+from macos_scroll_evidence import (INITIAL_SCROLL_TOP, assess_scroll, certain_refusal,
+                                   matches_window_observation, parse_scroll_delta)
 
 
 def load(name, filename):
@@ -109,7 +112,7 @@ def assess_bound(plan, native, state, nonce):
     return result
 
 
-def main():
+def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin', required=True, type=Path)
     parser.add_argument('--port', required=True, type=int)
@@ -118,9 +121,18 @@ def main():
     parser.add_argument('--supervisor',required=True,type=Path)
     parser.add_argument('--report',required=True,type=Path)
     parser.add_argument('--allow-disposable-chromium',action='store_true')
-    args=parser.parse_args()
+    parser.add_argument('--scroll-delta', type=parse_scroll_delta, help='Instead test one vertical wheel event; positive down, nonzero abs <= 600')
+    args=parser.parse_args(argv)
     if platform.system()!='Darwin' or not args.allow_disposable_chromium:
-        parser.error('requires macOS and explicit disposable Chromium click opt-in')
+        parser.error('requires macOS and explicit disposable Chromium opt-in')
+    return args
+
+
+def main():
+    args=parse_args()
+    scrolling=args.scroll_delta is not None
+    prepare_tool='prepare_macos_window_scroll' if scrolling else 'prepare_macos_window_click'
+    dispatch_tool='scroll_macos_window' if scrolling else 'click_macos_window'
     binary=args.bin.resolve(strict=True)
     require(1 <= args.port <= 65535 and args.monitor.startswith('macos_virtual:'), 'exact isolated daemon monitor/port required')
     require(not os.getenv('INTENDANT_MCP_URL'), 'refuse remote ambient daemon')
@@ -130,6 +142,8 @@ def main():
     fd=raw.reserve_report(args.report)
     report={'passed':False,'uses_daemon_tool':True,'browser_version':info['CFBundleShortVersionString'],
             'checks':{},'cleanup':{},'on_virtual_monitor':True}
+    if scrolling:
+        report.update(scroll_delta_y=args.scroll_delta, negative_checks={}, preparations=[])
     root=None
     child=cdp=None; status_path=None; receiver=None; binding=None
     end=time.monotonic()+180
@@ -142,10 +156,11 @@ def main():
     try:
         owned=call('list_macos_monitors').get('monitors',[])
         require(sum(m.get('display_target')==args.monitor for m in owned)==1,'exact monitor not owned by isolated daemon')
+        owned_monitor=next(m for m in owned if m.get('display_target')==args.monitor)
         root=Path(tempfile.mkdtemp(prefix='intendant-chromium-pointer-'))
         status_path=root/'status.json'
         profile=root/'profile'; profile.mkdir(mode=0o700)
-        page=(Path(__file__).resolve().parent.parent/'tests/fixtures/macos-monitor/browser-pointer.html').as_uri()
+        page=(Path(__file__).resolve().parent.parent/('tests/fixtures/macos-monitor/browser-scroll.html' if scrolling else 'tests/fixtures/macos-monitor/browser-pointer.html')).as_uri()
         child=subprocess.Popen([str(supervisor),'--disposable-chromium',str(bundle),str(profile),str(status_path),page],
                                stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         end=time.monotonic()+180
@@ -178,7 +193,9 @@ def main():
         require(active.stat().st_size<=8192,'CDP address limit')
         port,path=active.read_text().splitlines()[:2]; cdp=transport.CDP(int(port),path)
         current=status(); receiver=current['browser_pid']
-        report['before']=current['before']; report['receiver_pid']=receiver; report['sender_pid']=child.pid
+        report['before']=current['before']; report['receiver_pid']=receiver
+        # The supervisor launches/observes Chromium; the daemon owns posting.
+        report['supervisor_pid' if scrolling else 'sender_pid']=child.pid
         processes=cdp.call('SystemInfo.getProcessInfo')['processInfo']
         require(any(x['type']=='browser' and x['id']==receiver for x in processes),'CDP ownership mismatch')
         target=cdp.call('Target.createTarget',{'url':page,'newWindow':True,'background':True,'width':720,'height':530})['targetId']
@@ -201,9 +218,20 @@ def main():
             time.sleep(.05)
         report['window_listing_attempts']=attempts
         require(candidate is not None,'exact disposable browser AX window unavailable')
+        if scrolling:
+            identity=candidate['identity']
+            require(type(identity.get('pid')) is int and identity['pid']==receiver
+                    and type(identity.get('window_id')) is int and identity['window_id']==window['window_id']
+                    and type(identity.get('start_seconds')) is int and identity['start_seconds']>0
+                    and type(identity.get('start_micros')) is int and 0<=identity['start_micros']<1000000,
+                    'candidate process/window identity mismatch')
         bound=call('bind_macos_window',display_target=args.monitor,**{k:candidate[k] for k in ('candidate','identity')})
         report['binding']=bound;require(bound.get('ok') is True,bound)
         binding=bound['bound_window']['binding']
+        if scrolling:
+            require(isinstance(binding,str) and binding.startswith('macos_window:')
+                    and bound['bound_window'].get('display_target')==args.monitor
+                    and bound['bound_window'].get('identity')==identity,'bound identity/monitor mismatch')
         rectangle={'x':30,'y':30,'width':720,'height':530}
         placed=call('place_macos_window',binding=binding,bounds=rectangle)
         report['placement']=placed;require(placed.get('ok') is True,placed)
@@ -218,63 +246,160 @@ def main():
         require(all(abs(browser_bounds[a]-bounds[b])<=1 for a,b in
                     [('left','X'),('top','Y'),('width','Width'),('height','Height')]),'independent geometry mismatch')
         initial=evaluate('pointerFixtureState()'); report['initial']=initial
-        require(initial['clicks']==0 and initial['events']==[] and initial['nonce'] is None,'fixture not pristine')
+        require(initial['wheels' if scrolling else 'clicks']==0 and initial['events']==[] and initial['nonce'] is None,'fixture not pristine')
+        if scrolling:
+            require(type(initial['wheels']) is int and initial['scroll_top']==INITIAL_SCROLL_TOP
+                    and number(initial['scroll_top']) and number(initial['scroll_left'])
+                    and initial['scroll_left']==0 and type(initial.get('unrelated')) is int and initial['unrelated']==0
+                    and initial.get('overflow') is False and initial.get('ready')=='complete','scroll fixture not pristine')
         r=initial['metrics']['canvas']; cx=round(r['x']+r['width']/2)+secrets.randbelow(31)-15
         cy=round(r['y']+r['height']/3)+secrets.randbelow(31)-15
         plan=plan_pointer(initial['metrics'],bounds,window['window_id'],cx,cy,secrets.randbelow(2**63-1)+1)
         report['plan']=plan; nonce=secrets.token_hex(16)
         point={'x':plan['local_x'],'y':plan['local_y']}
-        def prepare():
-            prepared=call('prepare_macos_window_click',binding=binding,point=point)
+
+        def unchanged(before, label, evidence=None):
+            # Observation only: allow delayed unexpected input to become visible.
+            stop=min(end,time.monotonic()+.25)
+            while True:
+                require(status()['windows']==[window],label+': native window changed')
+                after=evaluate('pointerFixtureState()')
+                if evidence is not None: evidence['after']=after
+                require(after==before,label+': semantic snapshot changed')
+                if time.monotonic()>=stop: return after
+                time.sleep(.05)
+
+        def refused(label, tool, dispatch=True, **arguments):
+            before=evaluate('pointerFixtureState()') if scrolling else None
+            receipt=call(tool,**arguments)
+            if scrolling:
+                evidence={'tool':tool,'before':before,'receipt':receipt}
+                report['negative_checks'][label]=evidence
+                evidence['certain_refusal']=certain_refusal(receipt,dispatch=dispatch)
+                unchanged(before,label,evidence)
+                require(evidence['certain_refusal'],receipt)
+            else:
+                require(receipt.get('ok') is False and
+                        (not dispatch or receipt.get('action_attempted') is False),receipt)
+            return receipt
+
+        baseline=initial
+        if scrolling:
+            # Arm once before negatives, so a wrongly accepted cross-kind click
+            # cannot disappear just because the positive scroll has not begun.
+            require(evaluate('armPointer('+json.dumps(nonce)+')') is True,'fixture arm failed')
+            baseline=dict(initial,nonce=nonce)
+            report['armed']=unchanged(baseline,'arming')
+
+        def prepare(tool=prepare_tool):
+            delta={'delta_y':args.scroll_delta} if tool=='prepare_macos_window_scroll' else {}
+            prepared=call(tool,binding=binding,point=point,**delta)
             report['last_preparation']=prepared
+            if scrolling: report['preparations'].append({'tool':tool,'receipt':prepared})
             require(prepared.get('ok') is True,prepared)
             require(prepared['prepared']['global']=={'x':plan['x'],'y':plan['y']},'prepared global coordinate mismatch')
+            if scrolling:
+                p=prepared['prepared']; token=p.get('token')
+                require(prepared.get('error') is None and prepared.get('action') is None
+                        and prepared.get('action_attempted') is False
+                        and prepared.get('effects_unconfirmed',False) is False
+                        and p.get('point')==point and matches_window_observation(p.get('window'),bounds)
+                        and all(number(p[field].get(axis)) for field in ('point','global') for axis in ('x','y'))
+                        and type(p.get('expires_in_ms')) is int and p['expires_in_ms']==10000
+                        and isinstance(token,str) and token.startswith('macos_pointer:')
+                        and len(token)==46 and all(c in '0123456789abcdef' for c in token[14:]),
+                        'incomplete or mismatched preparation')
+                if delta:
+                    require(type(p.get('delta_y')) is int and p['delta_y']==args.scroll_delta,'prepared delta mismatch')
+                else:
+                    require('delta_y' not in p,'click preparation returned scroll fields')
             return prepared['prepared']['token']
         old=prepare();fresh=prepare()
-        rejected=call('click_macos_window',binding=binding,token=old)
-        require(rejected.get('ok') is False and rejected.get('action_attempted') is False,rejected)
-        rejected=call('click_macos_window',binding=binding,token=fresh)
-        require(rejected.get('ok') is False and rejected.get('action_attempted') is False,rejected)
-        require(evaluate('pointerFixtureState()')==initial,'rejected preparation changed fixture')
+        if scrolling: require(old!=fresh,'refresh reused a preparation token')
+        refused('refresh_old_token',dispatch_tool,binding=binding,token=old)
+        refused('refresh_consumed_fresh_token',dispatch_tool,binding=binding,token=fresh)
+        require(evaluate('pointerFixtureState()')==baseline,'rejected preparation changed fixture')
         report['checks']['refresh_and_consumed_snapshot_refused']=True
-        invalid=call('prepare_macos_window_click',binding=binding,point={'x':720,'y':10})
-        require(invalid.get('ok') is False,invalid)
+        refused('out_of_bounds',prepare_tool,dispatch=False,binding=binding,point={'x':720,'y':10},
+                **({'delta_y':args.scroll_delta} if scrolling else {}))
         report['checks']['out_of_bounds_refused']=True
+        if scrolling:
+            for bad in (0,601,-601):
+                refused('delta_'+str(bad),prepare_tool,dispatch=False,binding=binding,point=point,delta_y=bad)
+            token=prepare()
+            refused('scroll_token_into_click','click_macos_window',binding=binding,token=token)
+            refused('scroll_token_consumed',dispatch_tool,binding=binding,token=token)
+            click_token=prepare('prepare_macos_window_click')
+            refused('click_token_into_scroll',dispatch_tool,binding=binding,token=click_token)
+            refused('click_token_consumed','click_macos_window',binding=binding,token=click_token)
+            require(evaluate('pointerFixtureState()')==baseline,'cross-kind negative dispatched input')
+            report['checks']['delta_bounds_and_cross_kind_refused']=True
+            owned_now=call('list_macos_monitors').get('monitors',[])
+            require([m for m in owned_now if m.get('display_target')==args.monitor]==[owned_monitor],
+                    'owned monitor generation changed before dispatch')
         token=prepare()
-        require(evaluate('armPointer('+json.dumps(nonce)+')') is True,'fixture arm failed')
+        if not scrolling:
+            require(evaluate('armPointer('+json.dumps(nonce)+')') is True,'fixture arm failed')
+        else:
+            require(evaluate('pointerFixtureState()')==baseline,'preparation changed scroll fixture')
         require(evaluate('pointerFixtureState().metrics')==initial['metrics'],'viewport changed before dispatch')
         require(status()['windows']==[window],'native window changed before dispatch')
         # The supervisor is launched in semantic-only mode and receives no input
-        # commands. The tested pair MUST go through ctl -> HTTP -> owned helper.
-        native=call('click_macos_window',binding=binding,token=token)
+        # commands. The tested input MUST go through ctl -> HTTP -> owned helper.
+        native=(call('scroll_macos_window',binding=binding,token=token) if scrolling else
+                call('click_macos_window',binding=binding,token=token))
         report['native_dispatch']=native
         stop=time.monotonic()+2
         observed=evaluate('pointerFixtureState()')
-        while len(observed['events'])<3 and time.monotonic()<stop:
+        # Observe the entire scroll window, including after the first correct
+        # effect, so a delayed second wheel cannot masquerade as a single wheel.
+        while (scrolling or len(observed['events'])<3) and time.monotonic()<stop:
+            if scrolling: require(status()['windows']==[window],'native window changed during scroll observation')
             time.sleep(.05);observed=evaluate('pointerFixtureState()')
         report['dom_after']=observed
-        assessment=assess_bound(plan,native,observed,nonce);report['assessment']=assessment
+        assessment=(assess_scroll(plan,native,observed,nonce,args.scroll_delta,initial['scroll_top']) if scrolling else assess_bound(plan,native,observed,nonce));report['assessment']=assessment
         require(assessment['passed'],'HTTP dispatch/independent DOM evidence did not verify')
         require(observed['metrics']==initial['metrics'],'viewport changed during dispatch')
         require(status()['windows']==[window],'native window changed during dispatch')
-        replay=call('click_macos_window',binding=binding,token=token)
-        require(replay.get('ok') is False and replay.get('action_attempted') is False,replay)
+        refused('replay',dispatch_tool,binding=binding,token=token)
         require(evaluate('pointerFixtureState()')==observed,'replay changed canvas evidence')
         report['checks']['replay_refused']=True
         token=prepare()
+        placement_before=evaluate('pointerFixtureState()') if scrolling else None
         noop=call('place_macos_window',binding=binding,bounds=rectangle)
         require(noop.get('ok') is True and noop['placement']['writes_attempted']==0,noop)
-        replay=call('click_macos_window',binding=binding,token=token)
-        require(replay.get('ok') is False and replay.get('action_attempted') is False,replay)
+        if scrolling:
+            report['noop_placement']=noop
+            evidence={'before':placement_before,'receipt':noop}
+            report['negative_checks']['no_op_placement']=evidence
+            require(type(noop['placement']['writes_attempted']) is int
+                    and noop['placement'].get('status')=='verified'
+                    and noop['placement'].get('focus_interference') is False
+                    and 'detail' in noop['placement'] and noop['placement']['detail'] is None
+                    and all(matches_window_observation(noop['placement'].get(field),bounds)
+                            for field in ('before','after')),noop)
+            unchanged(placement_before,'no-op placement',evidence)
+        refused('placement_invalidated_token',dispatch_tool,binding=binding,token=token)
         report['checks']['placement_invalidated_preparation']=True
         token=prepare()
+        unbind_before=evaluate('pointerFixtureState()') if scrolling else None
         unbound=call('unbind_macos_window',binding=binding)
         require(unbound.get('ok') is True,unbound)
-        replay=call('click_macos_window',binding=binding,token=token)
-        require(replay.get('ok') is False and replay.get('action_attempted') is False,replay)
+        if scrolling:
+            report['unbind']=unbound
+            require(unbound.get('unbound') is True,unbound)
+            evidence={'before':unbind_before,'receipt':unbound}
+            report['negative_checks']['unbind']=evidence
+            unchanged(unbind_before,'unbind',evidence)
+        refused('unbound_token',dispatch_tool,binding=binding,token=token)
         binding=None
         report['checks']['unbind_refused']=True
         require(evaluate('pointerFixtureState()')==observed,'negative checks changed canvas')
+        if scrolling:
+            owned_after=call('list_macos_monitors').get('monitors',[])
+            require([m for m in owned_after if m.get('display_target')==args.monitor]==[owned_monitor],
+                    'owned monitor generation changed during scroll run')
+            unchanged(observed,'final scroll evidence')
         report['passed']=True
     except Exception as error:
         report['error']=str(error)

@@ -195,6 +195,17 @@ pub(crate) trait Native {
     ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
         Err("native bound-window pointer input unavailable".into())
     }
+    /// Preallocate one addressed vertical wheel event without posting.
+    fn pointer_scroll(
+        &mut self,
+        _window: &Self::Window,
+        _point: crate::macos_monitor::pointer::Point,
+        _global: crate::macos_monitor::pointer::Point,
+        _delta_y: i32,
+        _deadline: Instant,
+    ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
+        Err("native bound-window scrolling unavailable".into())
+    }
     /// Readback-only settling never repeats a setter or changes focus.
     /// Fakes override this pacing hook; native work retains the operation budget.
     fn pause_readback(&mut self, deadline: Instant) -> Result<(), String> {

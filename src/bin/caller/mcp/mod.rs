@@ -1169,6 +1169,33 @@ impl IntendantServer {
                     .await,
                 ))
             }
+            "prepare_macos_window_scroll" => {
+                let Parameters(p) = parse_params::<PrepareMacosWindowScrollParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::PrepareScroll {
+                            binding: p.binding,
+                            point: p.point,
+                            delta_y: p.delta_y,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "scroll_macos_window" => {
+                let Parameters(p) = parse_params::<ScrollMacosWindowParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::Scroll {
+                            binding: p.binding,
+                            token: p.token,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "unbind_macos_window" => {
                 let Parameters(p) = parse_params::<UnbindMacosWindowParams>(args)?;
                 Ok(text_tool_result(
@@ -1997,6 +2024,40 @@ impl IntendantServer {
     ) -> String {
         self.macos_window_as_caller(
             crate::macos_monitor::WindowAction::Click {
+                binding: p.binding,
+                token: p.token,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Prepare one bounded vertical scroll at a window-local top-left logical point on an exact retained window wholly inside its unchanged owned monitor. Owner-only DisplayView. delta_y is a signed integer in logical pixel scroll request units, positive down, nonzero abs <=600. No input posted. One-use 10-second token freezes kind, delta, geometry and exact observed focus. Refresh/semantic operations invalidate it. Native constructor is provisional pending independent acceptance.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn prepare_macos_window_scroll(
+        &self,
+        Parameters(p): Parameters<PrepareMacosWindowScrollParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::PrepareScroll {
+                binding: p.binding,
+                point: p.point,
+                delta_y: p.delta_y,
+            },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Consume an exact bound-window scroll preparation once. Owner-only DisplayInput; rechecks retained process/window/monitor, geometry, permissions and exact focus. Cross-kind tokens are consumed/refused. Posts one addressed vertical pixel wheel event; dispatched means one posting attempt, effect_verified is always false. No horizontal input, momentum, keyboard, drag, activation, global posting, corrective input or automatic retry. Lost replies are uncertain; native acceptance remains unverified."
+    )]
+    pub(crate) async fn scroll_macos_window(
+        &self,
+        Parameters(p): Parameters<ScrollMacosWindowParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::Scroll {
                 binding: p.binding,
                 token: p.token,
             },

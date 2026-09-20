@@ -1,0 +1,52 @@
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'">
+<title>Intendant disposable native scroll pane</title>
+<style>
+html,body{margin:0;overflow:hidden}
+body{font:18px system-ui;padding:24px}
+#receiver{display:block;margin-top:20px;width:400px;height:200px;border:0;
+  overflow-y:scroll;overflow-x:hidden;scroll-behavior:auto;scroll-snap-type:none;
+  overflow-anchor:none;overscroll-behavior:contain}
+#content{height:2000px;pointer-events:none;background:repeating-linear-gradient(
+  #284962 0px,#284962 99px,#86b6cc 99px,#86b6cc 100px)}
+</style>
+<p>Disposable native scroll receiver. No user content.</p>
+<div id="receiver"><div id="content"></div></div>
+<script>
+'use strict';
+const pane=document.querySelector('#receiver');
+let arm=null, wheels=0, unrelated=0, overflow=false;
+const events=[];
+// The only offset writes: initial configuration, before arming/listening.
+// After this, only the browser's native wheel default action moves the pane.
+pane.scrollTop=700;
+pane.scrollLeft=0;
+window.armPointer=nonce=>{
+  if(arm!==null || typeof nonce!=='string' || !/^[a-f0-9]{32}$/.test(nonce))throw Error('invalid/repeated arm');
+  if(pane.scrollTop!==700 || pane.scrollLeft!==0 || wheels!==0 || unrelated!==0 || overflow || events.length!==0)
+    throw Error('fixture not pristine; never reset or retry');
+  arm=nonce;return true;
+};
+// Record events even before arming so an early unexpected event cannot vanish.
+document.addEventListener('wheel',event=>{
+  if(event.target!==pane){unrelated++;return;}
+  wheels++;
+  if(events.length>=8){overflow=true;return;}
+  events.push({type:event.type,trusted:event.isTrusted,
+    delta_x:event.deltaX,delta_y:event.deltaY,delta_mode:event.deltaMode,
+    alt_key:event.altKey,ctrl_key:event.ctrlKey,meta_key:event.metaKey,shift_key:event.shiftKey,
+    client_x:event.clientX,client_y:event.clientY,screen_x:event.screenX,screen_y:event.screenY});
+},{capture:true,passive:true});
+for(const type of ['mousedown','mouseup','click','dblclick','auxclick','contextmenu',
+  'keydown','keyup','pointerdown','pointerup','pointercancel','touchstart','touchmove','touchend','touchcancel',
+  'beforeinput','input']) document.addEventListener(type,()=>{unrelated++;},{capture:true,passive:true});
+window.pointerFixtureState=()=>{
+  const r=pane.getBoundingClientRect();
+  // scrollTop/Left are independent observations, never sums of wheel deltas.
+  return {nonce:arm,wheels,unrelated,overflow,events:events.map(event=>({...event})),
+    scroll_top:pane.scrollTop,scroll_left:pane.scrollLeft,ready:document.readyState,
+    metrics:{screen_x:screenX,screen_y:screenY,outer_width:outerWidth,outer_height:outerHeight,
+      inner_width:innerWidth,inner_height:innerHeight,scale:visualViewport.scale,
+      scroll_x:scrollX,scroll_y:scrollY,canvas:{x:r.x,y:r.y,width:r.width,height:r.height}}};
+};
+</script>

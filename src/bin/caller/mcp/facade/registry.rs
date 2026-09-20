@@ -632,6 +632,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Consume one prepared pointer token for an exact paired click; reports dispatch, never verified effect",
     },
     CommandSpec {
+        path: &["display", "prepare-scroll"], lane: RiskLane::Inspect,
+        tool: "prepare_macos_window_scroll", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_json("POINT_JSON", "point", true), p_json("DELTA_Y", "delta_y", true)], flags: &[],
+        help: "Owner-only one-use vertical scroll preparation: signed logical pixel units, positive down, nonzero abs <=600",
+    },
+    CommandSpec {
+        path: &["display", "scroll-window"], lane: RiskLane::Act,
+        tool: "scroll_macos_window", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_str("TOKEN", "token", true, false)], flags: &[],
+        help: "Consume one exact scroll token for a single addressed wheel posting; never claims verified effect",
+    },
+    CommandSpec {
         path: &["display", "unbind-window"], lane: RiskLane::Act,
         tool: "unbind_macos_window", seed: "{}",
         positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],

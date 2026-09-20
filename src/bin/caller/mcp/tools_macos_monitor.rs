@@ -13,9 +13,12 @@ impl IntendantServer {
         action: WindowAction,
         caller: ToolCallerTrust,
     ) -> String {
+        let scroll_action = matches!(&action, WindowAction::Scroll { .. });
         let element_action = matches!(
             &action,
-            WindowAction::ActElement { .. } | WindowAction::Click { .. }
+            WindowAction::ActElement { .. }
+                | WindowAction::Click { .. }
+                | WindowAction::Scroll { .. }
         );
         let authority = self.macos_monitor_authority(caller).await;
         let receipt = match self
@@ -29,10 +32,18 @@ impl IntendantServer {
                 if element_action {
                     let uncertain = error.starts_with(crate::macos_monitor::ELEMENT_UNCONFIRMED)
                         || error.starts_with(crate::macos_monitor::POINTER_UNCONFIRMED);
-                    return serde_json::json!({"ok":false, "error":error,
+                    let mut response = serde_json::json!({"ok":false, "error":error,
                         "action_attempted": if uncertain { None } else { Some(false) },
-                        "effects_unconfirmed":uncertain, "focus_interference":null})
-                    .to_string();
+                        "effects_unconfirmed":uncertain, "focus_interference":null});
+                    if scroll_action {
+                        response["effect_verified"] = false.into();
+                        response["posting_calls"] = if uncertain {
+                            serde_json::Value::Null
+                        } else {
+                            0.into()
+                        };
+                    }
+                    return response.to_string();
                 }
                 return window_error(error);
             }
@@ -333,6 +344,19 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
                 "focus_interference":result.focus_interference})
         }
         Value::Window(WindowValue::ClickUnconfirmed { result, error }) => {
+            serde_json::json!({"ok":false,"action":result,"error":error,
+                "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,
+                "focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::PreparedScroll(prepared)) => {
+            serde_json::json!({"ok":true,"prepared":prepared,"action_attempted":false})
+        }
+        Value::Window(WindowValue::Scrolled(result)) => {
+            serde_json::json!({"ok":result.successful(),"action":result,
+                "action_attempted":result.action_attempted,"effects_unconfirmed":result.effects_unconfirmed,
+                "focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::ScrollUnconfirmed { result, error }) => {
             serde_json::json!({"ok":false,"action":result,"error":error,
                 "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,
                 "focus_interference":result.focus_interference})
@@ -1063,6 +1087,62 @@ mod tests {
         }
         assert!(events.try_recv().is_err());
     }
+    #[tokio::test]
+    async fn scroll_typed_and_facade_dispatch_never_elevate_scoped_display_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = super::super::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (_home, server) = super::super::tests::test_server(state, bus.clone());
+        for granted in [false, true] {
+            autonomy.write().await.user_display_granted = granted;
+            for (tool, args) in [
+                (
+                    "prepare_macos_window_scroll",
+                    serde_json::json!({"binding":"macos_window:fixture:1","point":{"x":10,"y":20},"delta_y":-73}),
+                ),
+                (
+                    "scroll_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1","token":"macos_pointer:00000000000000000000000000000001"}),
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","prepare-scroll","macos_window:fixture:1",r#"{"x":10,"y":20}"#,"-73"]}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","scroll-window","macos_window:fixture:1","macos_pointer:00000000000000000000000000000001"]}),
+                ),
+            ] {
+                let result = server
+                    .call_tool_by_name_as_caller(
+                        tool,
+                        args,
+                        None,
+                        None,
+                        ToolCaller {
+                            trust: ToolCallerTrust::Scoped,
+                            actor: crate::access::actor::ActorBinding::unattributed(),
+                            fs_scope: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert!(
+                    result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("owner surface"),
+                    "{result}"
+                );
+                assert!(bus.macos_monitors.not_started());
+                assert_eq!(autonomy.read().await.user_display_granted, granted);
+            }
+        }
+        assert!(events.try_recv().is_err());
+    }
     #[test]
     fn pointer_receipt_loss_never_promotes_posting_to_verified_effects() {
         use crate::macos_monitor::{placement::*, pointer::*, Receipt};
@@ -1102,6 +1182,59 @@ mod tests {
                     }
                 } else {
                     WindowValue::Clicked(r)
+                };
+                let (receipt, committed) = Receipt::fixture(Value::Window(value));
+                drop(committed);
+                let out: serde_json::Value =
+                    serde_json::from_str(&window_response(receipt)).unwrap();
+                assert_eq!(out["ok"], false);
+                assert_eq!(out["action"]["posting_calls"], calls);
+                assert_eq!(out["action_attempted"], calls > 0);
+                assert_eq!(out["effects_unconfirmed"], calls > 0);
+                assert_eq!(out["action"]["effect_verified"], false);
+            }
+        }
+    }
+    #[test]
+    fn scroll_receipt_loss_never_promotes_posting_to_verified_effects() {
+        use crate::macos_monitor::{placement::*, pointer::*, Receipt};
+        let b = Bounds {
+            x: -700.,
+            y: 20.,
+            width: 200.,
+            height: 100.,
+        };
+        for calls in [0, 1] {
+            for late in [false, true] {
+                let r = crate::macos_monitor::scroll::ScrollResult {
+                    delta_y: -73,
+                    status: if calls == 1 {
+                        ClickStatus::Dispatched
+                    } else {
+                        ClickStatus::Partial
+                    },
+                    action_attempted: calls > 0,
+                    posting_calls: calls,
+                    effects_unconfirmed: calls > 0,
+                    effect_verified: false,
+                    point: Point { x: 10., y: 20. },
+                    global: Point { x: -690., y: 40. },
+                    before: Observation { ax: b, cg: b },
+                    after: Some(Observation { ax: b, cg: b }),
+                    focus_interference: Some(false),
+                    detail: if calls == 1 {
+                        None
+                    } else {
+                        Some("fixture partial".into())
+                    },
+                };
+                let value = if late {
+                    WindowValue::ScrollUnconfirmed {
+                        result: r,
+                        error: "fixture late failure".into(),
+                    }
+                } else {
+                    WindowValue::Scrolled(r)
                 };
                 let (receipt, committed) = Receipt::fixture(Value::Window(value));
                 drop(committed);

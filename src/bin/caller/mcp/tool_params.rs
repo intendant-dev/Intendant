@@ -11,6 +11,9 @@ pub(crate) use crate::macos_monitor::placement::{
 pub(crate) use crate::macos_monitor::pointer::{
     ClickMacosWindowParams, PrepareMacosWindowClickParams,
 };
+pub(crate) use crate::macos_monitor::scroll::{
+    PrepareMacosWindowScrollParams, ScrollMacosWindowParams,
+};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmptyToolParams {}

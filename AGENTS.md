@@ -282,6 +282,21 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   exception authorizes no global posting, keyboard injection, activation,
   cursor warping, clipboard operation or focus restoration, and does not relax
   any other unsafe-island, runtime/key-custody or local-IAM boundary.
+  The bounded-scroll extension (2026-09-20) permits only one preallocated,
+  window-addressed vertical pixel-wheel event through this same island and
+  lifecycle. A private-source pixel wheel supplies documented wheel fields to an
+  addressed NSEvent seed converted to kCGEventScrollWheel; template coordinates
+  never supply the actual global/window-local position. Runtime window-location
+  SPI and exact window/source/target/delta/phase readbacks remain mandatory.
+  The signed request is nonzero and bounded to -600..=600 logical pixel scroll
+  request units (positive down, negated for Quartz). Modifiers, horizontal axes,
+  scroll phase and momentum phase are explicitly zero. Native acceptance must
+  independently verify delivery/effects; posting is one-use and reports attempts
+  separately from native failure and observed effects. This extension permits no
+  momentum sequence, horizontal input, keyboard, drag, activation, global posting,
+  corrective input or automatic retry. Existing click authority/behavior, retained
+  source capacity, exact focus (including validated fallback) and all other unsafe
+  and local-IAM boundaries remain unchanged.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

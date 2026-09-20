@@ -1247,3 +1247,30 @@ No global-input fallback, activation, keyboard, clipboard, retry or focus restor
 is provided. The generic monitor input/streaming capability flags remain false.
 See [bound-window pointer transactions](../design/macos-bound-window-click.md)
 for native SPI, source retention, authorization and shared-session limitations.
+
+
+### Owner-bound vertical window scroll
+
+`prepare_macos_window_scroll {binding,point:{x,y},delta_y}` and
+`scroll_macos_window {binding,token}` extend the exact owned-window pointer engine
+with one bounded vertical wheel posting. `delta_y` is a signed integer in logical
+pixel scroll request units, positive down, nonzero and within -600..=600. The point
+uses window-local top-left logical points. The facade routes are `inspect display
+prepare-scroll BINDING POINT_JSON DELTA_Y` and `act display scroll-window BINDING TOKEN`.
+Preparation needs OwnerSurface plus DisplayView; dispatch needs OwnerSurface plus
+DisplayInput. Ordinary scoped display grants remain insufficient.
+
+The one-use ten-second preparation and source retention inventory are shared with
+clicks. Cross-kind dispatch consumes/refuses a token; geometry/focus and semantic
+invalidation rules are identical. Click wire behavior is unchanged. A scroll
+receipt's `dispatched` requires exactly one posting attempt and successful state
+postchecks, with `effect_verified:false` and before/available-after evidence.
+There is no horizontal input, momentum, keyboard, drag, activation, global posting,
+corrective input or automatic retry. Generic `macos_virtual` input stays disabled.
+
+Native HTTP acceptance on 2026-09-20 verified both vertical directions and actual
+pane movement in disposable Chromium on an owned monitor. Replay/cross-kind
+refusals, cleanup and the existing click profile passed. This does not establish
+general application compatibility or continuous desktop isolation.
+See [bounded owned-window scrolling](../design/macos-bound-window-scroll.md) for
+construction/readback requirements, cancellation and the added hermetic regressions.
