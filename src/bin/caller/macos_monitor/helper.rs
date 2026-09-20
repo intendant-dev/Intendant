@@ -183,6 +183,20 @@ fn serve_with_windows<O: Owner, N: Native>(
                         })
                         .map(|result| Outcome::ActedWindowElement { result }),
                 ),
+                Operation::PreparePointer { binding, point } => window_outcome(
+                    windows
+                        .prepare_click(binding, point, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|prepared| Outcome::PreparedPointer { prepared }),
+                ),
+                Operation::ClickPointer { binding, token } => window_outcome(
+                    windows
+                        .click(binding, &token, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|result| Outcome::ClickedPointer { result }),
+                ),
                 Operation::UnbindWindow { binding } => window_outcome(
                     windows
                         .unbind(binding)

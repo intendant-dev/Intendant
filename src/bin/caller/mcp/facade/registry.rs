@@ -620,6 +620,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Owner-only one-use semantic action JSON: type press or type set_value with text; no focus restoration",
     },
     CommandSpec {
+        path: &["display", "prepare-click"], lane: RiskLane::Inspect,
+        tool: "prepare_macos_window_click", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_json("POINT_JSON", "point", true)], flags: &[],
+        help: "Prepare one-use window-local left click without posting input; exact owned-window binding required",
+    },
+    CommandSpec {
+        path: &["display", "click-window"], lane: RiskLane::Act,
+        tool: "click_macos_window", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false), p_str("TOKEN", "token", true, false)], flags: &[],
+        help: "Consume one prepared pointer token for an exact paired click; reports dispatch, never verified effect",
+    },
+    CommandSpec {
         path: &["display", "unbind-window"], lane: RiskLane::Act,
         tool: "unbind_macos_window", seed: "{}",
         positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],

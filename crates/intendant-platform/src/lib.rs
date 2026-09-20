@@ -4,6 +4,8 @@
 //! lifecycle management (`vision`). Like intendant-core, this crate is a
 //! leaf: things move *out* of the caller into here, never the other way.
 
+#[path = "bound_pointer.rs"]
+mod bound_pointer_ffi;
 pub mod cgvirtual;
 pub mod display_target;
 pub mod memory;

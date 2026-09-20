@@ -214,7 +214,9 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_monitors"
                     | "list_macos_windows"
                     | "read_macos_window_elements"
+                    | "prepare_macos_window_click"
                     | "act_macos_window_element"
+                    | "click_macos_window"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -258,7 +260,9 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_monitors"
                     | "list_macos_windows"
                     | "read_macos_window_elements"
+                    | "prepare_macos_window_click"
                     | "act_macos_window_element"
+                    | "click_macos_window"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -462,6 +466,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "list_macos_monitors"
         | "list_macos_windows"
         | "read_macos_window_elements"
+        | "prepare_macos_window_click"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -482,6 +487,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "place_macos_window"
         | "unbind_macos_window"
         | "act_macos_window_element"
+        | "click_macos_window"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -926,6 +932,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     );
     // Schemas/descriptions derive from the typed stdio declarations.
     for (name, tool) in [
+        (
+            "prepare_macos_window_click",
+            IntendantServer::prepare_macos_window_click_tool_attr(),
+        ),
+        (
+            "click_macos_window",
+            IntendantServer::click_macos_window_tool_attr(),
+        ),
         (
             "read_macos_window_elements",
             IntendantServer::read_macos_window_elements_tool_attr(),
@@ -2286,5 +2300,51 @@ mod tests {
             serde_json::json!({"binding":"b","pid":123})
         )
         .is_err());
+    }
+    #[test]
+    fn bound_pointer_tools_have_strict_schemas_and_separate_read_write_authority() {
+        let prepare =
+            serde_json::to_value(IntendantServer::prepare_macos_window_click_tool_attr()).unwrap();
+        let click = serde_json::to_value(IntendantServer::click_macos_window_tool_attr()).unwrap();
+        for schema in [&prepare["inputSchema"], &click["inputSchema"]] {
+            assert_eq!(schema["additionalProperties"], false);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "binding"));
+        }
+        let point = &prepare["inputSchema"]["properties"]["point"];
+        let resolved = if let Some(reference) = point["$ref"].as_str() {
+            prepare["inputSchema"]
+                .pointer(reference.strip_prefix('#').expect("local schema reference"))
+                .expect("point schema definition")
+        } else {
+            point
+        };
+        assert_eq!(resolved["type"], "object");
+        assert_eq!(resolved["additionalProperties"], false);
+        for field in ["x", "y"] {
+            assert!(resolved["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == field));
+        }
+
+        assert!(click["inputSchema"]["properties"].get("point").is_none());
+        assert!(click["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "token"));
+        for selector in [
+            "macos_pointer:abc",
+            " MACOS_POINTER:abc ",
+            "user_session:macos_pointer:abc",
+        ] {
+            assert!(crate::macos_monitor::reserved(selector));
+            assert!(crate::macos_monitor::reject_unsupported(Some(selector), None).is_err());
+        }
     }
 }

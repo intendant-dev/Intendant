@@ -8,6 +8,9 @@ pub(crate) use crate::macos_monitor::controls::{
 pub(crate) use crate::macos_monitor::placement::{
     BindMacosWindowParams, ListMacosWindowsParams, PlaceMacosWindowParams, UnbindMacosWindowParams,
 };
+pub(crate) use crate::macos_monitor::pointer::{
+    ClickMacosWindowParams, PrepareMacosWindowClickParams,
+};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmptyToolParams {}

@@ -1823,6 +1823,30 @@ mod tests {
                 == crate::mcp::ToolCallerTrust::OwnerSurface;
             for (tool, args, operation, label) in [
                 (
+                    "prepare_macos_window_click",
+                    serde_json::json!({"binding":"macos_window:fixture:1","point":{"x":10,"y":20}}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "click_macos_window",
+                    serde_json::json!({"binding":"macos_window:fixture:1","token":"macos_pointer:00000000000000000000000000000001"}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","prepare-click","macos_window:fixture:1",r#"{"x":10,"y":20}"#]}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","click-window","macos_window:fixture:1","macos_pointer:00000000000000000000000000000001"]}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
                     "read_macos_window_elements",
                     serde_json::json!({"binding":"macos_window:fixture:1"}),
                     DisplayView,

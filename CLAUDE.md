@@ -268,6 +268,20 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   refcount/ownership, buffer bounds, thread/apartment affinity). Do not
   introduce `unsafe` on the cross-platform or Unix paths beyond these
   documented exceptions.
+- **Narrow macOS bound-pointer exception (2026-09-20):**
+  `crates/intendant-platform/src/bound_pointer.rs` and its ARC/exception shim
+  `bound_pointer.m` are the dedicated native-input island for the retained-window
+  paired-left-click path. This permits only main-thread readiness, construction,
+  one-shot posting, and release of that exact owned native pair. The Rust owner
+  is not Send/Sync; every FFI call is typed and SAFETY-commented. Both events are
+  preallocated, native failures are preserved independently of attempted-call
+  counts, and cleanup sends no corrective input. The controller still owns all
+  current request authorization, exact process/window/monitor validation,
+  single-use preparations and before/after evidence. The `platform.rs` re-export
+  is compatibility only, not permission to add mutating input FFI there. This
+  exception authorizes no global posting, keyboard injection, activation,
+  cursor warping, clipboard operation or focus restoration, and does not relax
+  any other unsafe-island, runtime/key-custody or local-IAM boundary.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

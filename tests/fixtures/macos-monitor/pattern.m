@@ -31,7 +31,7 @@ int main(int argc, const char **argv) {
     [p setFrame:selected.frame display:NO]; [p orderFrontRegardless]; [p displayIfNeeded];
     NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"native_id":@(raw),@"window_id":@(p.windowNumber),@"pid":@([[NSProcessInfo processInfo] processIdentifier])} options:0 error:nil];
     if(![data writeToFile:[NSString stringWithUTF8String:argv[2]] atomically:YES]) return 5;
-    [NSTimer scheduledTimerWithTimeInterval:40 repeats:NO block:^(NSTimer *t){[p close];[app terminate:nil];}];
+    [NSTimer scheduledTimerWithTimeInterval:40 repeats:NO block:^(NSTimer *t){(void)t;[p close];[app terminate:nil];}];
     [app run];
  }
  return 0;

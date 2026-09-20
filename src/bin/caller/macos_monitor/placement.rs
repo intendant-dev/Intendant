@@ -181,6 +181,20 @@ pub(crate) fn time_left(deadline: Instant) -> Result<(), String> {
 pub(crate) trait Native {
     type Window;
     type Focus: PartialEq;
+    /// Read-only native readiness for exact background pointer input. Never prompt.
+    fn pointer_ready(&mut self, _window: &Self::Window, _deadline: Instant) -> Result<(), String> {
+        Err("native bound-window pointer input unavailable".into())
+    }
+    /// Construct both events without posting; default platforms fail closed.
+    fn pointer_pair(
+        &mut self,
+        _window: &Self::Window,
+        _point: crate::macos_monitor::pointer::Point,
+        _global: crate::macos_monitor::pointer::Point,
+        _deadline: Instant,
+    ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
+        Err("native bound-window pointer input unavailable".into())
+    }
     /// Readback-only settling never repeats a setter or changes focus.
     /// Fakes override this pacing hook; native work retains the operation budget.
     fn pause_readback(&mut self, deadline: Instant) -> Result<(), String> {
@@ -224,6 +238,7 @@ pub(super) struct Binding<W> {
 pub(super) struct Windows<N: super::controls::Native> {
     pub(super) native: N,
     pub(super) elements: super::controls::Inventory<N::Element, N::Focus>,
+    pub(super) pointers: super::pointer::Inventory<N::Focus>,
     next: u32,
     pub(super) bindings: BTreeMap<u32, Binding<N::Window>>,
     candidates: BTreeMap<String, ListedWindow<N::Window>>,
@@ -233,6 +248,7 @@ impl<N: super::controls::Native> Windows<N> {
         Self {
             native,
             elements: Default::default(),
+            pointers: Default::default(),
             next: 1,
             bindings: BTreeMap::new(),
             candidates: BTreeMap::new(),
@@ -313,6 +329,7 @@ impl<N: super::controls::Native> Windows<N> {
     }
     pub(super) fn unbind(&mut self, id: u32) -> Result<(), String> {
         self.elements.invalidate(id);
+        self.pointers.invalidate(id);
         self.bindings
             .remove(&id)
             .map(|_| ())
@@ -322,6 +339,7 @@ impl<N: super::controls::Native> Windows<N> {
         for (&id, b) in &self.bindings {
             if b.monitor == monitor {
                 self.elements.invalidate(id);
+                self.pointers.invalidate(id);
             }
         }
         self.bindings.retain(|_, b| b.monitor != monitor);
@@ -333,6 +351,7 @@ impl<N: super::controls::Native> Windows<N> {
         mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<PlacementResult, String> {
         self.elements.invalidate(id);
+        self.pointers.invalidate(id);
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         let deadline = Instant::now() + BUDGET;
         let target = b.geometry.target(local)?;

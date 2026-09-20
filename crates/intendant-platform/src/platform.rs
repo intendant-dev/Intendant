@@ -3210,3 +3210,18 @@ mod tests {
         assert_ne!(identity, FileIdentity::from_path(&other).unwrap());
     }
 }
+
+#[cfg(target_os = "macos")]
+pub use crate::bound_pointer_ffi::bound_pointer;
+
+/// Read-only main-thread foreground candidate; not an exact focus observation.
+#[cfg(target_os = "macos")]
+pub fn macos_foreground_pid() -> Option<i32> {
+    extern "C" {
+        fn intendant_foreground_pid() -> i32;
+    }
+    // SAFETY: argument-free read-only platform query; native shim checks main
+    // thread and catches Objective-C exceptions. No input or activation occurs.
+    let pid = unsafe { intendant_foreground_pid() };
+    (pid > 0).then_some(pid)
+}

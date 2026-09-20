@@ -37,7 +37,10 @@ def main():
     parser.add_argument('--chromium-app', help='Explicit Chrome for Testing bundle for disposable native AX acceptance')
     parser.add_argument('--chromium-supervisor', help='Supervisor built from tests/fixtures/macos-monitor/browser.m')
     parser.add_argument('--chromium-placement-only', action='store_true', help='Run only the browser placement/no-op acceptance profile')
+    parser.add_argument('--chromium-bound-pointer', action='store_true', help='Exercise owner-bound HTTP pointer tools on the created monitor')
     args = parser.parse_args()
+    if args.chromium_bound_pointer and (not args.chromium_app or args.chromium_placement_only):
+        parser.error('--chromium-bound-pointer requires Chromium and excludes placement-only')
     if args.chromium_placement_only and not args.chromium_app:
         parser.error('--chromium-placement-only requires the Chromium fixture')
     if bool(args.chromium_app) != bool(args.chromium_supervisor):
@@ -145,7 +148,7 @@ def main():
                 assert controls.returncode == 0, report["controls"]
             if args.chromium_app:
                 chromium_report = root / 'chromium.json'
-                chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-chromium-controls.py')),
+                chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer else 'verify-macos-chromium-controls.py')),
                     '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
                     '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
                     '--allow-disposable-chromium'] + (['--placement-only'] if args.chromium_placement_only else []), cwd=project, env=env, timeout=230)

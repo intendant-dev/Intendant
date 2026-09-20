@@ -7,9 +7,12 @@
 pub(crate) mod ancestry;
 mod capture;
 pub(crate) mod controls;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod focus;
 mod helper;
 mod inspection;
 pub(crate) mod placement;
+pub(crate) mod pointer;
 mod process;
 mod protocol;
 mod smoke;
@@ -39,6 +42,7 @@ pub(crate) fn reserved(value: &str) -> bool {
         "macos_window",
         "macos_candidate",
         "macos_element",
+        "macos_pointer",
     ]
     .iter()
     .any(|prefix| value.contains(prefix))
@@ -183,6 +187,10 @@ async fn await_commit(mut committed: oneshot::Receiver<()>) -> bool {
     }
 }
 
+pub(crate) const POINTER_UNCONFIRMED: &str = "pointer action effects unconfirmed";
+fn pointer_unconfirmed(error: &str) -> String {
+    format!("{POINTER_UNCONFIRMED}; paired input may already have applied or still be in progress; do not replay; {error}")
+}
 pub(crate) const ELEMENT_UNCONFIRMED: &str = "element action effects unconfirmed";
 fn element_unconfirmed(error: &str) -> String {
     format!("{ELEMENT_UNCONFIRMED}; action may already have applied or still be in progress; do not replay; {error}")
@@ -231,6 +239,22 @@ async fn await_element_reply(
             e
         }
     })
+}
+
+async fn await_pointer_reply(
+    receive: oneshot::Receiver<Result<Receipt, String>>,
+    dispatched: &std::sync::atomic::AtomicBool,
+    budget: std::time::Duration,
+) -> Result<Receipt, String> {
+    await_element_reply(receive, dispatched, budget)
+        .await
+        .map_err(|e| {
+            if e.starts_with(ELEMENT_UNCONFIRMED) {
+                pointer_unconfirmed(&e)
+            } else {
+                e
+            }
+        })
 }
 
 pub(crate) enum Action {
@@ -313,8 +337,12 @@ impl Broker {
             .as_ref()
             .map_err(Clone::clone)?;
         let placement = matches!(action, Action::Window(WindowAction::Place { .. }));
-        let element_dispatch = matches!(action, Action::Window(WindowAction::ActElement { .. }))
-            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let pointer_action = matches!(action, Action::Window(WindowAction::Click { .. }));
+        let element_dispatch = matches!(
+            action,
+            Action::Window(WindowAction::ActElement { .. } | WindowAction::Click { .. })
+        )
+        .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (reply, receive) = oneshot::channel();
         sender
             .try_send(Request {
@@ -327,7 +355,11 @@ impl Broker {
         // This deadline only cancels the caller's receipt. The worker retains
         // child/backend ownership through stop/rollback; it is never aborted.
         if let Some(progress) = element_dispatch {
-            await_element_reply(receive, &progress, std::time::Duration::from_secs(20)).await
+            if pointer_action {
+                await_pointer_reply(receive, &progress, std::time::Duration::from_secs(20)).await
+            } else {
+                await_element_reply(receive, &progress, std::time::Duration::from_secs(20)).await
+            }
         } else {
             await_reply(receive, placement, std::time::Duration::from_secs(20)).await
         }
@@ -540,6 +572,12 @@ where
                     let preserved = match value {
                         Value::Window(WindowValue::Placed(result)) => {
                             Some(WindowValue::PlacementUnconfirmed {
+                                result,
+                                error: error.clone(),
+                            })
+                        }
+                        Value::Window(WindowValue::Clicked(result)) => {
+                            Some(WindowValue::ClickUnconfirmed {
                                 result,
                                 error: error.clone(),
                             })
@@ -826,6 +864,7 @@ mod tests {
         next: u32,
         next_binding: u32,
         element_token: Option<(u32, String)>,
+        pointer_plan: Option<(u32, pointer::Prepared)>,
         die_after_place: bool,
         verified_place: bool,
         window_started: Option<oneshot::Sender<()>>,
@@ -894,6 +933,62 @@ mod tests {
                             + u32::from(self.captured && self.mismatch_after_capture),
                         width: 640,
                         height: 480,
+                    })
+                }
+                Operation::PreparePointer { binding, point } => {
+                    self.log.lock().unwrap().push("pointer_prepare");
+                    let bounds = placement::tests::monitor();
+                    let prepared = pointer::Prepared {
+                        token: format!("macos_pointer:{}", uuid::Uuid::new_v4().simple()),
+                        point,
+                        global: pointer::Point {
+                            x: bounds.x + point.x,
+                            y: bounds.y + point.y,
+                        },
+                        window: placement::Observation {
+                            ax: bounds,
+                            cg: bounds,
+                        },
+                        expires_in_ms: pointer::TOKEN_TTL_MS,
+                    };
+                    self.pointer_plan = Some((binding, prepared.clone()));
+                    Ok(Outcome::PreparedPointer { prepared })
+                }
+                Operation::ClickPointer { binding, token } => {
+                    let Some((b, p)) = self.pointer_plan.take() else {
+                        return Ok(Outcome::Error {
+                            message: "consumed pointer token".into(),
+                            fatal: false,
+                        });
+                    };
+                    if b != binding || p.token != token {
+                        return Ok(Outcome::Error {
+                            message: "stale pointer token".into(),
+                            fatal: false,
+                        });
+                    }
+                    self.log.lock().unwrap().push("pointer_action");
+                    if let Some(started) = self.place_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.place_release.take() {
+                        let _ = release.await;
+                    }
+                    self.dead = self.die_after_place;
+                    Ok(Outcome::ClickedPointer {
+                        result: pointer::ClickResult {
+                            status: pointer::ClickStatus::Dispatched,
+                            action_attempted: true,
+                            posting_calls: 2,
+                            effects_unconfirmed: true,
+                            effect_verified: false,
+                            point: p.point,
+                            global: p.global,
+                            before: p.window,
+                            after: Some(p.window),
+                            focus_interference: Some(false),
+                            detail: None,
+                        },
                     })
                 }
                 Operation::ListWindows { .. } => Ok(Outcome::Windows { candidates: vec![] }),
@@ -2383,6 +2478,224 @@ mod tests {
                     .unwrap()
                     .iter()
                     .filter(|&&x| x == "element_action")
+                    .count(),
+                1
+            );
+            assert!(!log.lock().unwrap().contains(&"unbind"));
+        }
+    }
+    async fn pointer_fixture(tx: &mpsc::Sender<Request>, binding: &str) -> (Receipt, String) {
+        let receipt = send(
+            tx,
+            Action::Window(WindowAction::PrepareClick {
+                binding: binding.into(),
+                point: pointer::Point { x: 37.25, y: 123.5 },
+            }),
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Value::Window(WindowValue::PreparedPointer(p)) = &receipt.value else {
+            panic!("pointer preparation")
+        };
+        let token = p.token.clone();
+        (receipt, token)
+    }
+    fn click_fixture(binding: &str, token: &str) -> Action {
+        Action::Window(WindowAction::Click {
+            binding: binding.into(),
+            token: token.into(),
+        })
+    }
+    #[tokio::test]
+    async fn pointer_operations_are_owner_only_and_never_start_an_unused_broker() {
+        for owner in [false, true] {
+            let broker = Broker::default();
+            let a = authority(owner);
+            a.autonomy.write().await.user_display_granted = true;
+            for action in [
+                WindowAction::PrepareClick {
+                    binding: "macos_window:fixture:1".into(),
+                    point: pointer::Point { x: 1., y: 1. },
+                },
+                WindowAction::Click {
+                    binding: "macos_window:fixture:1".into(),
+                    token: format!("macos_pointer:{}", "a".repeat(32)),
+                },
+            ] {
+                let error = broker
+                    .request(Action::Window(action), a.clone())
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.contains(if owner { "no owned" } else { "owner surface" }),
+                    "{error}"
+                );
+                assert!(broker.not_started());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_element_snapshot_replacement_and_cross_binding_tokens_do_not_dispatch_effects()
+    {
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let (receipt, old) = pointer_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        let (receipt, new) = pointer_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        assert_ne!(old, new);
+        assert!(send(&tx, click_fixture(&binding, &old), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        // The foreign-token attempt itself consumed the fresh snapshot.
+        assert!(send(&tx, click_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        let (receipt, new) = pointer_fixture(&tx, &binding).await;
+        assert!(receipt.commit());
+        assert!(send(
+            &tx,
+            click_fixture("macos_window:foreign:1", &new),
+            authority(true)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(send(&tx, click_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .unwrap()
+            .commit());
+        assert!(send(&tx, click_fixture(&binding, &new), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "pointer_action")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_cancellation_before_element_dispatch_is_no_effect_and_after_is_uncertain_once()
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started, begin) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let fake = Fake {
+            place_started: Some(started),
+            place_release: Some(wait),
+            ..Default::default()
+        };
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let (receipt, token) = pointer_fixture(&tx, &binding).await;
+        // Hold the read receipt so the action is definitely queued, then close.
+        let progress = Arc::new(AtomicBool::new(false));
+        let (reply, receive) = oneshot::channel();
+        assert!(tx
+            .send(Request {
+                action: click_fixture(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .is_ok());
+        let error = await_pointer_reply(receive, &progress, std::time::Duration::from_millis(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.starts_with(POINTER_UNCONFIRMED));
+        assert!(!progress.load(Ordering::SeqCst));
+        assert!(receipt.commit());
+        let (reply, receive) = oneshot::channel();
+        assert!(tx
+            .send(Request {
+                action: click_fixture(&binding, &token),
+                authority: authority(true),
+                reply,
+                element_dispatch: Some(progress.clone()),
+            })
+            .await
+            .is_ok());
+        begin.await.unwrap();
+        let error = await_pointer_reply(receive, &progress, std::time::Duration::from_millis(1))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with(POINTER_UNCONFIRMED));
+        release.send(()).unwrap();
+        // Serialized replay cannot duplicate the dispatched effect.
+        assert!(send(&tx, click_fixture(&binding, &token), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        drop(tx);
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "pointer_action")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_action_receipt_expiry_and_final_liveness_preserve_evidence_and_never_rollback()
+    {
+        for dead in [false, true] {
+            let fake = Fake {
+                die_after_place: dead,
+                ..Default::default()
+            };
+            let log = fake.log.clone();
+            let (tx, worker) = runner(fake);
+            let binding = bound_fixture(&tx).await;
+            let (receipt, token) = pointer_fixture(&tx, &binding).await;
+            assert!(receipt.commit());
+            let receipt = send(&tx, click_fixture(&binding, &token), authority(true))
+                .await
+                .unwrap()
+                .unwrap();
+            match &receipt.value {
+                Value::Window(WindowValue::Clicked(r)) if !dead => {
+                    assert!(r.action_attempted && r.successful())
+                }
+                Value::Window(WindowValue::ClickUnconfirmed { result, error }) if dead => {
+                    assert!(result.action_attempted && result.successful());
+                    assert!(error.contains("died"));
+                }
+                _ => panic!("lost evidence"),
+            }
+            // Exercise the actor's actual receipt expiry, not a synthetic error.
+            let replay = send(&tx, click_fixture(&binding, &token), authority(true));
+            assert!(replay.await.unwrap().is_err());
+            assert!(!receipt.commit());
+            drop(tx);
+            assert_eq!(worker.await.unwrap().is_err(), dead);
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&x| x == "pointer_action")
                     .count(),
                 1
             );
