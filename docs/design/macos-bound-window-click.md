@@ -198,10 +198,12 @@ documents, keyboard events or clipboard contents were read.
 
 Bound-window focus observation retains the system-wide path first. Only
 CannotComplete **without** a returned value admits an application-local read.
-Other errors, successful nulls, malformed types and contradictory Other errors, suche alternative requires the live foreground process start Other errors, successful n AXFrontmost property on its retained application object at three checkpoints.
-It reads the focused AX element twice, checks its process both times and requires
-exact object equality. A stale NSWorksexact object equality. A stale NSWorksexact object equality. A stale replaced focus, missing metadata and deadline expiry
-all refuse. The same exact element/PID/start identity is stored in preparations
+Other errors, successful nulls, malformed types and contradictory replies refuse.
+The alternative requires the same live foreground PID/start identity and a typed
+true AXFrontmost value at three checkpoints. It reads the focused AX element
+twice, verifies its process each time, and requires exact object equality. A stale
+NSWorkspace candidate cannot suffice: process reuse, changed foreground status,
+replaced focus, missing metadata and deadline expiry all refuse. The same exact element/PID/start identity is stored in preparations
 and compared around each action, regardless of which observation route succeeded.
 
 The four-second operation budget and existing 50-millisecond per-attribute timeout
