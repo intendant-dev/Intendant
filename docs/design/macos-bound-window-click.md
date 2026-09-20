@@ -53,7 +53,10 @@ path's protected-field exclusion or claim a sandbox against app-supplied content
 ## Native construction and lifetime
 
 The native ARC/exception shim lives in `intendant-platform`, alongside the existing
-CGVirtualDisplay shim; Rust ownership/FFI is confined to `platform.rs`. The helper
+CGVirtualDisplay shim; Rust ownership/FFI is confined to the dedicated `bound_pointer.rs` native-input
+island, with a compatibility-only re-export from `platform.rs`. The narrowly
+scoped exception is explicit in CLAUDE.md/AGENTS.md; other native-input mutations
+remain outside this exception. The helper
 invokes it only on the main thread. Native pairs are not Send/Sync.
 
 Public NSEvent construction carries the destination window. The pair uses a
@@ -157,3 +160,24 @@ harness/evidence checks and 9 nonposting native exception/replay cases passed.
 The focused read-only follow-up review confirmed both corrections and found no
 new concrete regressions in them. Final published-head native evidence is recorded
 on the PR alongside the separately retained earlier runs.
+
+
+## Hosted-review boundary correction and final-head gate
+
+Hosted review required a documented unsafe island rather than extending generic
+platform probes/signals to mutating pointer input. The entire Rust wrapper moved
+verbatim to `crates/intendant-platform/src/bound_pointer.rs` in a pure-move commit;
+`platform.rs` preserves its public path by re-export. A separate documentation
+commit defines only this main-thread, non-Send/Sync, exact-pair FFI exception and
+keeps CLAUDE.md/AGENTS.md identical. There is no dispatch behavior change.
+
+The first two native attempts on published `a3d0980` stopped before click dispatch
+because the existing system-wide focused-element observation was unavailable.
+Both cleaned up the browser/profile and restored the original display inventory.
+A three-read metadata-only diagnostic returned AX -25204 (CannotComplete) with no
+focused element while Accessibility, Screen Recording and PostEvent preflights
+passed. It read no labels, values or documents and made no input/activation calls.
+This is an observation failure, not proof that the owner caused it; it is not
+converted into a safe focus state. These failed runs remain separate from the
+successful development-tree acceptance. Published-head acceptance is still a
+landing gate unless a later independently recorded fresh run succeeds.
