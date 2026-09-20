@@ -873,3 +873,16 @@ authorizer and the owner-only broker boundary. These tools do not turn the gener
 `macos_virtual` selector into a globally routable input target. A successful
 posting result is not application-effect verification, and uncertain requests
 must not be retried automatically.
+
+
+The follow-up scroll tools are `prepare_macos_window_scroll` (OwnerSurface plus
+DisplayView) and `scroll_macos_window` (OwnerSurface plus DisplayInput), with schemas
+derived for HTTP from their typed stdio declarations. The signed `delta_y` request
+is nonzero and bounded to -600..=600 logical pixel scroll request units, positive
+down. Dispatch accepts only the binding and one-use token; click/scroll kind
+mismatches consume/refuse it. Facade routes and receipt semantics are documented in
+[Computer Use](./computer-use-and-audio.md#owner-bound-vertical-window-scroll).
+Both directions passed disposable native HTTP acceptance;
+`dispatched` means one posting attempt with successful state postchecks and always
+`effect_verified:false`. Ordinary display grants and generic `macos_virtual` input
+remain insufficient/disabled, respectively.

@@ -1,4 +1,4 @@
-/// Low-level, main-thread-only mouse pair. This is not an authority grant: the
+/// Low-level, main-thread-only mouse pair or vertical wheel. Not an authority grant: the
 /// controller must retain/revalidate the exact process/window and owned monitor.
 /// Native code uses an ARC/exception boundary, like the CGVirtualDisplay shim.
 #[cfg(target_os = "macos")]
@@ -16,6 +16,17 @@ pub mod bound_pointer {
         ) -> *mut c_void;
         fn intendant_pointer_post(pair: *mut c_void, failed: *mut u8) -> u8;
         fn intendant_pointer_release(pair: *mut c_void);
+        fn intendant_scroll_create(
+            pid: i32,
+            window: u32,
+            x: f64,
+            y: f64,
+            lx: f64,
+            ly: f64,
+            delta_y: i32,
+        ) -> *mut c_void;
+        fn intendant_scroll_post(scroll: *mut c_void, failed: *mut u8) -> u8;
+        fn intendant_scroll_release(scroll: *mut c_void);
     }
     pub fn ready(pid: i32) -> bool {
         // SAFETY: scalar-only read-only preflight; shim checks thread/TCC/focus.
@@ -73,6 +84,58 @@ pub mod bound_pointer {
             // SAFETY: exact owned pair released once on the same main thread.
             // Cleanup sends no input and releases every native reference.
             unsafe { intendant_pointer_release(self.raw.as_ptr()) }
+        }
+    }
+
+    /// One preallocated window-addressed wheel event and its private source.
+    /// Provisional constructor: actual native scroll acceptance is still unverified.
+    pub struct Scroll {
+        raw: NonNull<c_void>,
+        used: bool,
+        _thread: PhantomData<Rc<()>>,
+    }
+    impl Scroll {
+        pub fn create(
+            pid: i32,
+            window: u32,
+            global: (f64, f64),
+            local: (f64, f64),
+            delta_y: i32,
+        ) -> Result<Self, String> {
+            // SAFETY: typed scalar-only constructor checks the main thread and
+            // all bounds, catches exceptions, and returns one owned native object.
+            let raw = unsafe {
+                intendant_scroll_create(pid, window, global.0, global.1, local.0, local.1, delta_y)
+            };
+            Ok(Self {
+                raw: NonNull::new(raw).ok_or("exact scroll event construction/SPI unavailable")?,
+                used: false,
+                _thread: PhantomData,
+            })
+        }
+        pub fn post_once(&mut self) -> PostResult {
+            if self.used {
+                return PostResult {
+                    calls: 0,
+                    failed: true,
+                };
+            }
+            self.used = true;
+            let mut failed = 1u8;
+            // SAFETY: uniquely owned main-thread object and valid writable byte.
+            // Failure is independent of the single attempt count, even on exception.
+            let calls = unsafe { intendant_scroll_post(self.raw.as_ptr(), &mut failed) };
+            PostResult {
+                calls,
+                failed: failed != 0,
+            }
+        }
+    }
+    impl Drop for Scroll {
+        fn drop(&mut self) {
+            // SAFETY: owned wheel/source released exactly once on the same main
+            // thread. Release sends no input and never retries a failed posting.
+            unsafe { intendant_scroll_release(self.raw.as_ptr()) }
         }
     }
 }

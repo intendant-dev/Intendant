@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse, base64, contextlib, ctypes, http.client, io, json, os, re, subprocess, tempfile, time
 from pathlib import Path
-from PIL import Image
+from macos_scroll_evidence import parse_scroll_delta
 
 
 def inventory():
@@ -25,7 +25,7 @@ def terminate(child):
             child.kill(); child.wait(timeout=8)
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin', required=True)
     parser.add_argument('--fixture', required=True)
@@ -38,7 +38,11 @@ def main():
     parser.add_argument('--chromium-supervisor', help='Supervisor built from tests/fixtures/macos-monitor/browser.m')
     parser.add_argument('--chromium-placement-only', action='store_true', help='Run only the browser placement/no-op acceptance profile')
     parser.add_argument('--chromium-bound-pointer', action='store_true', help='Exercise owner-bound HTTP pointer tools on the created monitor')
-    args = parser.parse_args()
+    parser.add_argument('--chromium-scroll-delta', type=parse_scroll_delta, help='Test one owner-window vertical scroll through HTTP; positive down; each sign needs a fresh invocation')
+    args = parser.parse_args(argv)
+    scrolling = args.chromium_scroll_delta is not None
+    if scrolling and (not args.chromium_app or args.chromium_bound_pointer or args.chromium_placement_only):
+        parser.error('scroll test needs Chromium and excludes other Chromium pointer/placement profiles')
     if args.chromium_bound_pointer and (not args.chromium_app or args.chromium_placement_only):
         parser.error('--chromium-bound-pointer requires Chromium and excludes placement-only')
     if args.chromium_placement_only and not args.chromium_app:
@@ -49,6 +53,14 @@ def main():
         parser.error('Native monitor hotplug requires explicit opt-in')
     if not __debug__:
         parser.error("Run this assertion-based acceptance test without Python -O")
+    return args
+
+
+def main():
+    args = parse_args()
+    from PIL import Image
+
+    scrolling = args.chromium_scroll_delta is not None
     rig = tempfile.TemporaryDirectory(prefix="intendant-monitor-http-proof-")
     report = {'before': inventory(), 'checks': {}}
     daemon = fixture = None
@@ -148,12 +160,14 @@ def main():
                 assert controls.returncode == 0, report["controls"]
             if args.chromium_app:
                 chromium_report = root / 'chromium.json'
-                chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer else 'verify-macos-chromium-controls.py')),
+                chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer or scrolling else 'verify-macos-chromium-controls.py')),
                     '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
                     '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
-                    '--allow-disposable-chromium'] + (['--placement-only'] if args.chromium_placement_only else []), cwd=project, env=env, timeout=230)
+                    '--allow-disposable-chromium'] + (['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []), cwd=project, env=env, timeout=230)
                 report['chromium'] = json.loads(chromium_report.read_text()) if chromium_report.exists() else {'passed': False, 'error': 'Chromium fixture exited before producing a report; see stderr', 'exit_code': chromium.returncode}
                 assert chromium.returncode == 0, report['chromium']
+                if scrolling:
+                    assert report['chromium'].get('passed') is True, report['chromium']
             if args.check_recovery:
                 listed = recover()
                 assert len(listed) == 1, listed

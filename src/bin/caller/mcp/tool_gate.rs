@@ -215,8 +215,10 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_windows"
                     | "read_macos_window_elements"
                     | "prepare_macos_window_click"
+                    | "prepare_macos_window_scroll"
                     | "act_macos_window_element"
                     | "click_macos_window"
+                    | "scroll_macos_window"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -261,8 +263,10 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_windows"
                     | "read_macos_window_elements"
                     | "prepare_macos_window_click"
+                    | "prepare_macos_window_scroll"
                     | "act_macos_window_element"
                     | "click_macos_window"
+                    | "scroll_macos_window"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -467,6 +471,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "list_macos_windows"
         | "read_macos_window_elements"
         | "prepare_macos_window_click"
+        | "prepare_macos_window_scroll"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -488,6 +493,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "unbind_macos_window"
         | "act_macos_window_element"
         | "click_macos_window"
+        | "scroll_macos_window"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -932,6 +938,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     );
     // Schemas/descriptions derive from the typed stdio declarations.
     for (name, tool) in [
+        (
+            "prepare_macos_window_scroll",
+            IntendantServer::prepare_macos_window_scroll_tool_attr(),
+        ),
+        (
+            "scroll_macos_window",
+            IntendantServer::scroll_macos_window_tool_attr(),
+        ),
         (
             "prepare_macos_window_click",
             IntendantServer::prepare_macos_window_click_tool_attr(),
@@ -2345,6 +2359,63 @@ mod tests {
         ] {
             assert!(crate::macos_monitor::reserved(selector));
             assert!(crate::macos_monitor::reject_unsupported(Some(selector), None).is_err());
+        }
+    }
+    #[test]
+    fn scroll_schemas_derive_http_and_stdio_with_bounded_integer_and_iam_split() {
+        use crate::peer::access_policy::PeerOperation::{DisplayInput, DisplayView};
+        for profile in [None, Some("core"), Some("screen")] {
+            let mut definitions = Vec::new();
+            append_manual_http_tool_definitions(&mut definitions, false, profile);
+            for (name, attr, operation) in [
+                (
+                    "prepare_macos_window_scroll",
+                    IntendantServer::prepare_macos_window_scroll_tool_attr(),
+                    DisplayView,
+                ),
+                (
+                    "scroll_macos_window",
+                    IntendantServer::scroll_macos_window_tool_attr(),
+                    DisplayInput,
+                ),
+            ] {
+                assert_eq!(mcp_tool_operation(name), operation);
+                let typed = serde_json::to_value(attr).unwrap();
+                assert_eq!(
+                    *definitions.iter().find(|d| d["name"] == name).unwrap(),
+                    typed
+                );
+                assert_eq!(typed["inputSchema"]["additionalProperties"], false);
+            }
+        }
+        let prepare =
+            serde_json::to_value(IntendantServer::prepare_macos_window_scroll_tool_attr()).unwrap();
+        let schema = &prepare["inputSchema"];
+        assert_eq!(schema["properties"]["delta_y"]["type"], "integer");
+        assert_eq!(
+            schema["properties"]["delta_y"]["minimum"].as_f64(),
+            Some(-600.0)
+        );
+        assert_eq!(
+            schema["properties"]["delta_y"]["maximum"].as_f64(),
+            Some(600.0)
+        );
+        assert_eq!(schema["properties"]["delta_y"]["not"]["const"], 0);
+        for key in ["binding", "point", "delta_y"] {
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(key)));
+        }
+        let dispatch =
+            serde_json::to_value(IntendantServer::scroll_macos_window_tool_attr()).unwrap();
+        let props = dispatch["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 2);
+        for key in ["binding", "token"] {
+            assert!(dispatch["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(key)));
         }
     }
 }

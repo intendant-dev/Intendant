@@ -58,6 +58,15 @@ pub(super) enum Operation {
         binding: u32,
         token: String,
     },
+    PrepareScroll {
+        binding: u32,
+        point: super::pointer::Point,
+        delta_y: i32,
+    },
+    ScrollPointer {
+        binding: u32,
+        token: String,
+    },
     UnbindWindow {
         binding: u32,
     },
@@ -105,6 +114,12 @@ pub(super) enum Outcome {
     },
     ClickedPointer {
         result: super::pointer::ClickResult,
+    },
+    PreparedScroll {
+        prepared: super::scroll::PreparedScroll,
+    },
+    ScrolledPointer {
+        result: super::scroll::ScrollResult,
     },
     UnboundWindow {
         binding: u32,
@@ -284,6 +299,37 @@ mod tests {
             assert!(
                 serde_json::from_value::<Request>(serde_json::json!({"seq":1,"op":op})).is_err()
             );
+        }
+    }
+    #[test]
+    fn scroll_protocol_has_no_retarget_defaults_or_type_coercion() {
+        for op in [
+            serde_json::json!({"op":"prepare_scroll","binding":1,"point":{"x":1,"y":2}}),
+            serde_json::json!({"op":"prepare_scroll","binding":1,"point":{"x":1,"y":2},"delta_y":1.5}),
+            serde_json::json!({"op":"prepare_scroll","binding":1,"point":{"x":1,"y":2},"delta_y":2147483648_i64}),
+            serde_json::json!({"op":"prepare_scroll","binding":1,"point":{"x":1,"y":2},"delta_y":1,"delta_x":0}),
+            serde_json::json!({"op":"scroll_pointer","binding":1}),
+            serde_json::json!({"op":"scroll_pointer","binding":1,"token":"t","delta_y":1}),
+            serde_json::json!({"op":"scroll_pointer","binding":1,"token":"t","pid":123}),
+            serde_json::json!({"op":"scroll_pointer","binding":1,"token":"t","point":{"x":1,"y":2}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(serde_json::json!({"seq":1,"op":op})).is_err()
+            );
+        }
+        for op in [
+            Operation::PrepareScroll {
+                binding: 1,
+                point: super::super::pointer::Point { x: 1., y: 2. },
+                delta_y: -600,
+            },
+            Operation::ScrollPointer {
+                binding: 1,
+                token: format!("macos_pointer:{}", "a".repeat(32)),
+            },
+        ] {
+            let bytes = encode(&Request { seq: 1, op }).unwrap();
+            assert!(serde_json::from_slice::<Request>(&bytes).is_ok());
         }
     }
 }

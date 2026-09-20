@@ -872,6 +872,27 @@ impl Native for PlacementNative {
         Ok(Box::new(pair))
     }
 
+    fn pointer_scroll(
+        &mut self,
+        window: &RetainedWindow,
+        point: crate::macos_monitor::pointer::Point,
+        global: crate::macos_monitor::pointer::Point,
+        delta_y: i32,
+        deadline: Instant,
+    ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
+        self.pointer_ready(window, deadline)?;
+        crate::macos_monitor::scroll::validate_delta(delta_y)?;
+        let scroll = intendant_platform::platform::bound_pointer::Scroll::create(
+            window.identity.pid,
+            window.identity.window_id,
+            (global.x, global.y),
+            (point.x, point.y),
+            delta_y,
+        )?;
+        placement::time_left(deadline)?;
+        Ok(Box::new(scroll))
+    }
+
     type Window = RetainedWindow;
     type Focus = PlacementFocus;
     fn candidates(
@@ -1792,6 +1813,13 @@ impl crate::macos_monitor::pointer::Pair for intendant_platform::platform::bound
     fn post(&mut self) -> crate::macos_monitor::pointer::Posting {
         let native = self.post_once();
         crate::macos_monitor::pointer::Posting::from_native(native.calls, native.failed)
+    }
+}
+
+impl crate::macos_monitor::pointer::Pair for intendant_platform::platform::bound_pointer::Scroll {
+    fn post(&mut self) -> crate::macos_monitor::pointer::Posting {
+        let native = self.post_once();
+        crate::macos_monitor::pointer::Posting::for_expected(native.calls, native.failed, 1)
     }
 }
 
