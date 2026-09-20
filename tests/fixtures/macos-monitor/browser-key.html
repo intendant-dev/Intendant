@@ -5,12 +5,22 @@
 'use strict';
 const receiver=document.getElementById('receiver');
 let nonce=null, count=0, events=[], unrelated=0, overflow=false;
+let clickEvents=[], clickUnrelated=0, clickOverflow=false;
 window.armKey=function(value) {
-  if(nonce!==null || count!==0 || events.length!==0 || !/^[0-9a-f]{32}$/.test(value)) return false;
-  receiver.focus({preventScroll:true}); // Fixture setup only; not a tested key or OS activation.
+  if(nonce!==null || count!==0 || events.length!==0 || clickEvents.length!==0 ||
+      clickUnrelated!==0 || clickOverflow || !/^[0-9a-f]{32}$/.test(value)) return false;
+  // Fixture setup only; DOM focus alone is not input acceptance or OS activation.
+  receiver.focus({preventScroll:true});
   if(document.activeElement!==receiver) return false;
   nonce=value; return true;
 };
+receiver.addEventListener('click',event=>{
+  if(!nonce) { ++clickUnrelated; return; }
+  if(clickEvents.length>=8) { clickOverflow=true; return; }
+  clickEvents.push({type:event.type,trusted:event.isTrusted,client_x:event.clientX,client_y:event.clientY,
+    screen_x:event.screenX,screen_y:event.screenY,button:event.button,buttons:event.buttons,
+    shift:event.shiftKey,ctrl:event.ctrlKey,alt:event.altKey,meta:event.metaKey});
+});
 for(const type of ['keydown','keyup']) receiver.addEventListener(type,event=>{
   if(!nonce || event.key!=='ArrowRight') { ++unrelated; return; }
   if(events.length>=8) { overflow=true; return; }
@@ -24,7 +34,9 @@ for(const type of ['keydown','keyup']) receiver.addEventListener(type,event=>{
   event.preventDefault();
 });
 window.keyFixtureState=()=>({nonce,count,events,unrelated,overflow,
+  click_events:clickEvents,click_unrelated:clickUnrelated,click_overflow:clickOverflow,
   active:document.activeElement===receiver,
+  receiver_rect:(()=>{const r=receiver.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};})(),
   metrics:{width:innerWidth,height:innerHeight,outer_width:outerWidth,outer_height:outerHeight,
-    screen_x:screenX,screen_y:screenY,scroll_x:scrollX,scroll_y:scrollY}});
+    screen_x:screenX,screen_y:screenY,scroll_x:scrollX,scroll_y:scrollY,scale:visualViewport ? visualViewport.scale : 0,device_scale_factor:devicePixelRatio}});
 </script>

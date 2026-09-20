@@ -1,8 +1,10 @@
 // Fixture-only key delivery to the browser owned by browser.m. No arbitrary PID.
 #pragma once
 #include "key-event.h"
+#include "browser-pointer.h"
 #include <poll.h>
 #include <sys/stat.h>
+#include <string.h>
 typedef struct { uint32_t version, window; CGRect bounds; int64_t tag; } BrowserKeyPlan;
 _Static_assert(sizeof(BrowserKeyPlan) == 48, "key fixture wire layout");
 static BOOL key_plan_valid(BrowserKeyPlan p) {
@@ -12,6 +14,45 @@ static BOOL key_plan_valid(BrowserKeyPlan p) {
     return p.bounds.size.width >= 200 && p.bounds.size.height >= 200 &&
         p.bounds.size.width <= 16384 && p.bounds.size.height <= 16384;
 }
+// The combined fixture is a distinct opt-in.  The existing key and pointer
+// modes never acquire one another's dispatch capability.
+static BOOL browser_click_key_mode(const char *mode) {
+    return mode && strcmp(mode,"--disposable-chromium-click-key") == 0;
+}
+static NSDictionary *click_key_plan_evidence(BrowserPointerPlan p) {
+    return @{@"window_id":@(p.window), @"tag":@(p.tag),
+        @"bounds":@{@"X":@(p.bounds.origin.x), @"Y":@(p.bounds.origin.y),
+            @"Width":@(p.bounds.size.width), @"Height":@(p.bounds.size.height)},
+        @"screen_x":@(p.global.x), @"screen_y":@(p.global.y),
+        @"local_x":@(p.local.x), @"local_y":@(p.local.y)};
+}
+static BOOL click_key_integer(id value, int64_t expected) {
+    if (![value isKindOfClass:NSNumber.class] ||
+        CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return NO;
+    const char *type=[(NSNumber *)value objCType];
+    if (!strchr("cislqCISLQ",type[0]) || type[1]) return NO;
+    return [(NSNumber *)value longLongValue] == expected;
+}
+static BOOL click_key_boolean(id value, BOOL expected) {
+    return value && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID() &&
+        [(NSNumber *)value boolValue] == expected;
+}
+// A successful native click means exactly one address-validated down/up pair.
+// A separate exact-plan DOM acknowledgement must also be consumed before a key.
+static BOOL click_key_gate(BrowserPointerPlan click, BrowserKeyPlan key,
+                           NSDictionary *clickResult, pid_t source, pid_t target) {
+    return browser_pointer_valid(click) && key_plan_valid(key) && clickResult &&
+        click.window == key.window && click.tag != key.tag &&
+        CGRectEqualToRect(click.bounds,key.bounds) &&
+        click_key_boolean(clickResult[@"dispatch_attempted"],YES) &&
+        click_key_boolean(clickResult[@"effect_verified"],NO) &&
+        click_key_integer(clickResult[@"posted_events"],2) &&
+        click_key_integer(clickResult[@"source_pid"],source) &&
+        click_key_integer(clickResult[@"target_pid"],target) &&
+        click_key_integer(clickResult[@"window_id"],click.window) &&
+        click_key_integer(clickResult[@"tag"],click.tag) && !clickResult[@"error"];
+}
+#include "click-key-receipt.h"
 static BOOL key_plan_read(BrowserKeyPlan *p) {
     struct stat info;
     if(fstat(STDIN_FILENO,&info) != 0 || !S_ISFIFO(info.st_mode)) return NO;

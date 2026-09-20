@@ -58,7 +58,8 @@ def assess_self(native, supervised_pid):
     result = {'passed': False, 'queue_delivery_verified': False,
               'receiver_delivery_verified': False, 'effect_verified': False,
               'production_dispatch_enabled': False, 'cross_process_verified': False}
-    if not isinstance(native, dict) or native.get('mode') != 'self_process_key':
+    if (not isinstance(native, dict) or native.get('mode') != 'self_process_key'
+            or native.get('cooperative_forwarding', False) is not False):
         return result
     plan = native.get('plan')
     if (not isinstance(plan, dict) or not integer(supervised_pid, 1, 2**31-1)

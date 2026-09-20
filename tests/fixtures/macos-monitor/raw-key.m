@@ -55,11 +55,28 @@ static int construction(void) {
         @"posted_events":@0,@"application_created":NSApp ? @YES : @NO},ok ? 0 : 1);
 }
 
+static NSDictionary *receipt(NSEvent *event);
+typedef NS_ENUM(NSUInteger, KeyRoute) { ApplicationRoute, PSNRoute, CooperativeWindowRoute };
+static NSString *route_mode(KeyRoute route) {
+    return route == PSNRoute ? @"self_process_key_psn" :
+        route == CooperativeWindowRoute ? @"self_process_key_window_control" : @"self_process_key";
+}
 @interface KeyPanel : NSPanel
+@property int64_t expectedTag;
+@property(strong) NSMutableArray *windowReceipts;
+@property BOOL traceOverflow;
 @end
 @implementation KeyPanel
 - (BOOL)canBecomeKeyWindow { return NO; }
 - (BOOL)canBecomeMainWindow { return NO; }
+- (void)sendEvent:(NSEvent *)event {
+    CGEventRef cg=event.CGEvent;
+    if(cg && self.expectedTag > 0 && CGEventGetIntegerValueField(cg,kCGEventSourceUserData)==self.expectedTag) {
+        if(self.windowReceipts.count < 8) [self.windowReceipts addObject:receipt(event)];
+        else self.traceOverflow=YES;
+    }
+    [super sendEvent:event]; // Observation only: never retarget inside the window.
+}
 @end
 @interface KeyCanvas : NSView
 @property int64_t eventTag;
@@ -117,9 +134,9 @@ static BOOL ready(void) {
     for(CGMouseButton b=0;b<5;++b) if(CGEventSourceButtonState(kCGEventSourceStateHIDSystemState,b)) return NO;
     return YES;
 }
-static int live(void) {
+static int live(KeyRoute route) {
     NSDictionary *before=sample();
-    if(before.count != 4 || !ready()) return emit(@{@"ok":@NO,@"mode":@"self_process_key",
+    if(before.count != 4 || !ready()) return emit(@{@"ok":@NO,@"mode":route_mode(route),
         @"posted_events":@0,@"error":@"permission, foreground or held-input preflight refused",
         @"ax_trusted":AXIsProcessTrusted()?@YES:@NO,@"post_access":CGPreflightPostEventAccess()?@YES:@NO,
         @"sample_available":(before.count==4 ? @YES : @NO),@"hid_flags":@(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState))},1);
@@ -135,9 +152,10 @@ static int live(void) {
     KeyCanvas *view=[[KeyCanvas alloc] initWithFrame:NSMakeRect(0,0,320,220)];
     view.receipts=[NSMutableArray array]; panel.contentView=view;
     do { int64_t tag; arc4random_buf(&tag,sizeof(tag)); view.eventTag=tag & INT64_MAX; } while(!view.eventTag);
+    panel.expectedTag=view.eventTag; panel.windowReceipts=[NSMutableArray array];
     [panel orderWindow:NSWindowBelow relativeTo:0];
     [panel makeFirstResponder:view]; // Only our private window's receiver; no key/activation request.
-    NSMutableArray *queue=[NSMutableArray array];
+    NSMutableArray *queue=[NSMutableArray array], *routing=[NSMutableArray array];
     BOOL front=NO, observed=YES, overflow=NO;
     NSTimeInterval start=NSProcessInfo.processInfo.systemUptime;
     while(!own_window(panel) && NSProcessInfo.processInfo.systemUptime-start < 0.5) {
@@ -156,10 +174,27 @@ static int live(void) {
             !matches(source,up,kCGEventKeyUp,(uint32_t)panel.windowNumber,getpid(),view.eventTag) ||
             !own_window(panel) || panel.firstResponder != view || !ready()) error=@"construction or final identity preflight refused";
         else {
-            // No global post, shortcut, input retry, window dispatch or focus restoration.
+            // Exactly one self-targeted pair. A separate cooperative control may
+            // forward matching queued events inside this disposable process only.
+            ProcessSerialNumber psn={0,0};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if(route == PSNRoute && GetProcessForPID(getpid(),&psn) != noErr)
+                error=@"self process serial number unavailable; no posting";
+#pragma clang diagnostic pop
             @try {
-                ++posted; CGEventPostToPid(getpid(),down);
-                ++posted; CGEventPostToPid(getpid(),up);
+                if(!error) {
+                    if(route == PSNRoute) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                        ++posted; CGEventPostToPSN(&psn,down);
+                        ++posted; CGEventPostToPSN(&psn,up);
+#pragma clang diagnostic pop
+                    } else {
+                        ++posted; CGEventPostToPid(getpid(),down);
+                        ++posted; CGEventPostToPid(getpid(),up);
+                    }
+                }
             } @catch(NSException *exception) { (void)exception; error=@"native posting exception; effects uncertain"; }
             NSTimeInterval stop=NSProcessInfo.processInfo.systemUptime+1.0;
             while(NSProcessInfo.processInfo.systemUptime < stop) {
@@ -167,10 +202,27 @@ static int live(void) {
                     inMode:NSDefaultRunLoopMode dequeue:YES];
                 if(event) {
                     CGEventRef cg=event.CGEvent;
-                    if(cg && CGEventGetIntegerValueField(cg,kCGEventSourceUserData) == view.eventTag) {
-                        if(queue.count < 8) [queue addObject:receipt(event)]; else overflow=YES;
+                    BOOL ours=cg && CGEventGetIntegerValueField(cg,kCGEventSourceUserData)==view.eventTag;
+                    if(ours) {
+                        if(queue.count < 8) {
+                            [queue addObject:receipt(event)];
+                            [routing addObject:@{@"app_active":@(app.active),
+                                @"key_window_id":@(app.keyWindow.windowNumber),
+                                @"main_window_id":@(app.mainWindow.windowNumber),
+                                @"event_is_own_window":(event.window==panel ? @YES : @NO),
+                                @"responder_is_view":(panel.firstResponder==view ? @YES : @NO)}];
+                        } else overflow=YES;
                     }
-                    [app sendEvent:event];
+                    if(ours && route == CooperativeWindowRoute) {
+                        if(!own_window(panel) || event.window != panel || panel.firstResponder != view ||
+                            panel.keyWindow || app.active || !ready() || !matches(source,cg,CGEventGetType(cg),(uint32_t)panel.windowNumber,getpid(),view.eventTag)) {
+                            error=@"cooperative control preflight changed; no local forwarding";
+                        } else {
+                            // Deliberate positive control, not an external keyboard fix.
+                            // No activation/key-window change, swizzle or direct view call.
+                            [panel sendEvent:event];
+                        }
+                    } else [app sendEvent:event];
                 }
                 NSRunningApplication *f=NSWorkspace.sharedWorkspace.frontmostApplication;
                 observed &= f != nil; front |= f && f.processIdentifier == getpid();
@@ -183,10 +235,12 @@ static int live(void) {
     [panel close]; BOOL closed=!panel.visible;
     if(down) CFRelease(down); if(up) CFRelease(up); if(source) CFRelease(source);
     BOOL ok=!error && posted == 2 && view.effects == 1 && view.receipts.count == 2 &&
-        !view.overflow && !overflow && !front && observed && responderUnchanged && closed;
+        !view.overflow && !panel.traceOverflow && !overflow && !front && observed && responderUnchanged && closed;
     if(!ok && !error) error=@"receiver key delivery/effect not verified; queue receipt is insufficient";
-    return emit(@{@"ok":@(ok),@"mode":@"self_process_key",@"posted_events":@(posted),
+    return emit(@{@"ok":@(ok),@"mode":route_mode(route),@"posted_events":@(posted),
         @"plan":@{@"pid":@(getpid()),@"source_pid":@(getpid()),@"window_id":@(window),@"tag":@(view.eventTag),@"keycode":@(ProbeKey)},
+        @"routing":routing,@"window_receipts":panel.windowReceipts,
+        @"cooperative_forwarding":(route==CooperativeWindowRoute ? @YES : @NO),
         @"queue_receipts":queue,@"receipts":view.receipts,@"effect_count":@(view.effects),
         @"unrelated_events":@(view.unrelated),@"overflow":(overflow||view.overflow ? @YES : @NO),
         @"target_ever_front":@(front),@"observations_complete":@(observed),
@@ -196,8 +250,10 @@ static int live(void) {
 int main(int argc,const char **argv) {
     @autoreleasepool {
         if(argc == 1 || (argc == 2 && !strcmp(argv[1],"--self-test"))) return construction();
-        if(argc == 2 && !strcmp(argv[1],"--allow-disposable-key")) return live();
-        fprintf(stderr,"Use --self-test or --allow-disposable-key; no target or key arguments accepted.\n");
+        if(argc == 2 && !strcmp(argv[1],"--allow-disposable-key")) return live(ApplicationRoute);
+        if(argc == 2 && !strcmp(argv[1],"--allow-disposable-key-psn")) return live(PSNRoute);
+        if(argc == 2 && !strcmp(argv[1],"--allow-disposable-key-window-control")) return live(CooperativeWindowRoute);
+        fprintf(stderr,"Use --self-test, --allow-disposable-key, --allow-disposable-key-psn or --allow-disposable-key-window-control; no target or key arguments accepted.\n");
         return 2;
     }
 }

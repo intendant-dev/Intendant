@@ -32,6 +32,7 @@ def load(name, filename):
 
 transport = load('chromium_transport', 'verify-macos-chromium-controls.py')
 raw = load('raw_pointer_supervisor', 'verify-macos-raw-pointer.py')
+bootstrap = load('macos_key_bootstrap', 'macos_key_bootstrap.py')
 
 
 def require(value, detail):
@@ -97,32 +98,63 @@ def retain_final_evidence(report, final, supervised_pid, receiver=None):
             report['passed']=False
             report['cleanup']['evidence_error']='native dispatch changed before shutdown'
     report['final_replays_refused']=final.get('key_replays_refused')
+    if 'click_result' in final:
+        report['final_native_click_dispatch']=final['click_result']
+        if 'native_click_dispatch' not in report:
+            report['native_click_dispatch']=final['click_result']
+        elif report['native_click_dispatch'] != final['click_result']:
+            report['passed']=False
+            report['cleanup']['click_evidence_error']='native click dispatch changed before shutdown'
+    if 'click_plan' in final:
+        report['final_native_click_plan']=final['click_plan']
+        if 'native_click_plan' not in report:
+            report['native_click_plan']=final['click_plan']
+        elif report['native_click_plan'] != final['click_plan']:
+            report['passed']=False
+            report['cleanup']['click_plan_error']='native click plan changed before shutdown'
+    if 'click_receipt' in final:
+        report['final_click_receipt']=final['click_receipt']
+        if 'click_receipt' not in report:
+            report['click_receipt']=final['click_receipt']
+        elif report['click_receipt'] != final['click_receipt']:
+            report['passed']=False
+            report['cleanup']['receipt_evidence_error']='click acknowledgement changed before shutdown'
+    if 'click_challenge' in final:
+        report['final_click_challenge']=final['click_challenge']
+    if 'click_replays_refused' in final:
+        report['final_click_replays_refused']=final['click_replays_refused']
 
 
-def main():
+def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--browser-app',required=True,type=Path)
     parser.add_argument('--supervisor',required=True,type=Path)
     parser.add_argument('--report',required=True,type=Path)
     parser.add_argument('--allow-disposable-chromium-key',action='store_true')
-    args=parser.parse_args()
+    parser.add_argument('--native-click-first',action='store_true')
+    args=parser.parse_args(argv)
     if platform.system()!='Darwin' or not args.allow_disposable_chromium_key:
         parser.error('requires macOS and explicit disposable Chromium key opt-in')
+    return args
+
+
+def main():
+    args=parse_args()
     bundle=args.browser_app.resolve(strict=True); supervisor=args.supervisor.resolve(strict=True)
     info=plistlib.loads((bundle/'Contents/Info.plist').read_bytes())
     require(info['CFBundleIdentifier']=='com.google.chrome.for.testing','only Chrome for Testing accepted')
     fd=raw.reserve_report(args.report)
     report={'passed':False,'production_dispatch_enabled':False,'browser_version':info['CFBundleShortVersionString'],
-            'checks':{},'cleanup':{},'on_virtual_monitor':False}
+            'checks':{},'cleanup':{},'on_virtual_monitor':False, 'native_click_first':args.native_click_first}
     root=None
     child=cdp=None; status_path=None; receiver=None
     last_tick=-1; last_tick_time=time.monotonic()
     try:
-        root=Path(tempfile.mkdtemp(prefix='intendant-chromium-key-'))
+        root=Path(tempfile.mkdtemp(prefix='intendant-chromium-click-key-'))
         status_path=root/'status.json'
         profile=root/'profile'; profile.mkdir(mode=0o700)
         page=(Path(__file__).resolve().parent.parent/'tests/fixtures/macos-monitor/browser-key.html').as_uri()
-        child=subprocess.Popen([str(supervisor),'--disposable-chromium-key',str(bundle),str(profile),str(status_path),page],
+        child=subprocess.Popen([str(supervisor),'--disposable-chromium-click-key' if args.native_click_first else '--disposable-chromium-key',str(bundle),str(profile),str(status_path),page],
                                stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         end=time.monotonic()+120
         def status():
@@ -170,13 +202,56 @@ def main():
         require(all(abs(browser_bounds[a]-bounds[b])<=1 for a,b in
                     [('left','X'),('top','Y'),('width','Width'),('height','Height')]),'independent geometry mismatch')
         initial=evaluate('keyFixtureState()'); report['initial']=initial
-        require(initial['count']==0 and initial['events']==[] and initial['nonce'] is None,'fixture not pristine')
+        require(initial['count']==0 and initial['events']==[] and initial['nonce'] is None
+                and initial['click_events']==[] and initial['click_unrelated']==0
+                and initial['click_overflow'] is False,'fixture not pristine')
         plan={'window_id':window['window_id'],'bounds':bounds,'tag':secrets.randbelow(2**63-1)+1}
         report['plan']=plan; nonce=secrets.token_hex(16)
+        if args.native_click_first:
+            click_tag=bootstrap.freeze_click_tag(plan['tag'],secrets.randbelow(2**63-1)+1)
+            click_plan=bootstrap.build_click_plan(initial['receiver_rect'],initial['metrics'],bounds,window['window_id'],click_tag)
+            report['click_plan']=click_plan
+            report['native_click_plan']=bootstrap.native_click_evidence(click_plan)
         require(evaluate('armKey('+json.dumps(nonce)+')') is True,'fixture arm failed')
         require(evaluate('keyFixtureState().metrics')==initial['metrics'],'viewport changed before dispatch')
         require(evaluate('keyFixtureState().active') is True,'fixture receiver not focused')
         require(status()['windows']==[window],'native window changed before dispatch')
+        if args.native_click_first:
+            # The only click frame is frozen from independent current DOM/native geometry.
+            child.stdin.write(bootstrap.encode_click_plan(click_plan)); child.stdin.flush()
+            wait(lambda:'click_result' in status(),5)
+            native_click=status()['click_result']; report['native_click_dispatch']=native_click
+            require(status().get('click_plan')==report['native_click_plan'],'native click plan changed or mismatched')
+            stop=time.monotonic()+2
+            click_observed=evaluate('keyFixtureState()')
+            while len(click_observed['click_events'])<1 and time.monotonic()<stop:
+                time.sleep(.05); click_observed=evaluate('keyFixtureState()')
+            report['dom_after_click']=click_observed
+            click_assessment=bootstrap.assess_click(click_plan,native_click,click_observed,nonce,receiver,child.pid,plan['tag'])
+            report['click_assessment']=click_assessment
+            require(click_assessment['passed'],'native click/DOM receipt did not verify')
+            require(status()['windows']==[window],'native window changed after click')
+            require(click_observed['metrics']==initial['metrics'] and click_observed['active'] is True,
+                    'browser layout or receiver changed after click')
+            # A replay is a negative test, never a retry or fallback.
+            child.stdin.write(bootstrap.encode_click_plan(click_plan)); child.stdin.flush()
+            wait(lambda:status().get('click_replays_refused')==1,5)
+            require(status()['click_result']==native_click and status().get('click_plan')==report['native_click_plan'],
+                    'click replay replaced original native evidence')
+            require(evaluate('keyFixtureState()')==click_observed,'click replay changed DOM evidence')
+            report['checks']['click_replay_refused']=True
+            challenge=status().get('click_challenge')
+            acknowledgement=bootstrap.encode_click_receipt(click_plan,native_click,
+                click_observed,nonce,receiver,child.pid,plan['tag'],challenge)
+            child.stdin.write(acknowledgement); child.stdin.flush()
+            wait(lambda:'click_receipt' in status(),5)
+            report['click_receipt']=status()['click_receipt']
+            require(report['click_receipt']=={'accepted':True,'key_tag':plan['tag'],
+                'challenge':challenge,'dom_provenance_authenticated':False},'native click acknowledgement refused')
+
+        require(status()['windows']==[window],'native window changed immediately before key')
+        require(evaluate('keyFixtureState().receiver_rect')==initial['receiver_rect'],
+                'receiver geometry changed immediately before key')
         child.stdin.write(encode_plan(plan)); child.stdin.flush()
         wait(lambda:'key_result' in status(),5)
         native=status()['key_result']; report['native_dispatch']=native
@@ -187,6 +262,11 @@ def main():
         report['dom_after']=observed
         assessment=assess(plan,native,observed,nonce,receiver,child.pid); report['assessment']=assessment
         require(observed['metrics']==initial['metrics'],'viewport changed during dispatch')
+        require(observed['receiver_rect']==initial['receiver_rect'],'receiver geometry changed during key')
+        if args.native_click_first:
+            require(observed['click_events']==click_observed['click_events'] and
+                    observed['click_unrelated']==0 and observed['click_overflow'] is False,
+                    'click evidence changed during key')
         require(status()['windows']==[window],'native window changed during dispatch')
         # Explicit replay negative: the supervisor must refuse a second frame, not post it.
         child.stdin.write(encode_plan(plan)); child.stdin.flush()
@@ -194,6 +274,7 @@ def main():
         require(status()['key_result']==native,'replay replaced original dispatch evidence')
         require(evaluate('keyFixtureState()')==observed,'replay changed keyboard evidence')
         report['checks']['replay_refused']=True
+        report['checks']['key_replay_refused']=True
         require(assessment['passed'],'native dispatch/DOM keyboard effect did not verify')
         report['passed']=True
     except Exception as error:
@@ -221,6 +302,18 @@ def main():
                 require(final.get('supervisor_pid')==child.pid and final.get('launch_finished') is True
                         and final.get('browser_pid',0)>0 and final.get('browser_terminated') is True,'browser cleanup unconfirmed')
                 report['cleanup'].update(browser_terminated=True,supervisor_reaped=True,exit_code=child.returncode)
+                if args.native_click_first:
+                    require(final.get('click_result')==report.get('native_click_dispatch'),
+                            'final click dispatch missing or contradictory')
+                    require(final.get('click_plan')==report.get('native_click_plan'),
+                            'final click plan missing or contradictory')
+                    require(final.get('click_receipt')==report.get('click_receipt'),
+                            'final click acknowledgement missing or contradictory')
+                if report['checks'].get('click_replay_refused'):
+                    require(final.get('click_replays_refused')==1,'final click replay evidence missing')
+                if report['checks'].get('key_replay_refused'):
+                    require(final.get('key_replays_refused')==1,'final key replay evidence missing')
+
                 report['after']=final.get('observation')
                 report['desktop_observation_assessment']=assess_desktop(report.get('before'),report['after'],
                                                                        final['browser_pid'],final.get('browser_ever_front'))
