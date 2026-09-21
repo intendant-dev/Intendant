@@ -2,6 +2,7 @@
 //! native display IDs. Length limits apply before JSON allocation/deserialization.
 
 use super::controls::{ActionResult, Control, ElementAction};
+use super::keyboard::KeyboardTarget;
 use super::placement::{Bounds, Candidate, PlacementResult, WindowIdentity};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -43,6 +44,9 @@ pub(super) enum Operation {
         bounds: Bounds,
     },
     ReadWindowElements {
+        binding: u32,
+    },
+    ReadKeyboardTarget {
         binding: u32,
     },
     ActWindowElement {
@@ -105,6 +109,9 @@ pub(super) enum Outcome {
     },
     WindowElements {
         controls: Vec<Control>,
+    },
+    KeyboardTarget {
+        target: KeyboardTarget,
     },
     ActedWindowElement {
         result: ActionResult,
@@ -287,6 +294,46 @@ mod tests {
             assert!(wire.len() <= MAX_LINE);
             assert!(serde_json::from_slice::<Request>(&wire).is_ok());
         }
+    }
+    #[test]
+    fn keyboard_target_protocol_carries_only_a_private_binding_and_bounded_observation() {
+        for op in [
+            serde_json::json!({"op":"read_keyboard_target"}),
+            serde_json::json!({"op":"read_keyboard_target","binding":1,"token":"t"}),
+            serde_json::json!({"op":"read_keyboard_target","binding":1,"pid":123}),
+            serde_json::json!({"op":"read_keyboard_target","binding":1,"element":"replacement"}),
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(serde_json::json!({"seq":1,"op":op})).is_err()
+            );
+        }
+        let request = Request {
+            seq: u64::MAX,
+            op: Operation::ReadKeyboardTarget { binding: u32::MAX },
+        };
+        let request_wire = encode(&request).unwrap();
+        assert!(serde_json::from_slice::<Request>(&request_wire).is_ok());
+        let reply = Reply {
+            seq: u64::MAX,
+            result: Outcome::KeyboardTarget {
+                target: KeyboardTarget {
+                    role: "A".repeat(64),
+                    bounds: Bounds {
+                        x: -1_000_000.0,
+                        y: 1_000_000.0,
+                        width: 16_384.0,
+                        height: 16_384.0,
+                    },
+                    enabled: true,
+                    keyboard_dispatch_supported: false,
+                },
+            },
+        };
+        let reply_wire = encode(&reply).unwrap();
+        assert!(reply_wire.len() < MAX_LINE);
+        assert!(serde_json::from_slice::<Reply>(&reply_wire).is_ok());
+        let leaked = serde_json::json!({"seq":1,"result":{"status":"keyboard_target","target":{"role":"AXTextField","bounds":{"x":0,"y":0,"width":1,"height":1},"enabled":true,"keyboard_dispatch_supported":false,"token":"forbidden"}}});
+        assert!(serde_json::from_value::<Reply>(leaked).is_err());
     }
     #[test]
     fn pointer_protocol_accepts_no_retarget_or_implicit_defaults() {

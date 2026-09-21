@@ -135,5 +135,26 @@ class Tests(unittest.TestCase):
             h.run_bounded([sys.executable, '-c', 'import time; time.sleep(30)'], time.monotonic() - 1)
 
 
+
+class KeyboardReceiverEvidence(unittest.TestCase):
+    def fixture(self):
+        window = dict(x=-770, y=30, width=720, height=530)
+        state = dict(active="first", rect=dict(x=30,y=60,width=348,height=32), metrics=dict(screen_x=-770,screen_y=30,outer_width=720,outer_height=530,inner_width=720,inner_height=443,scale=1,zoom=1,scroll_x=0,scroll_y=0))
+        target = dict(role="AXTextField",bounds=dict(x=-740,y=177,width=348,height=32),enabled=True,keyboard_dispatch_supported=False)
+        return target,state,window
+    def test_matching_field_geometry(self):
+        t,s,w=self.fixture(); self.assertEqual(h.validate_keyboard_receiver(t,s,w),t["bounds"])
+    def test_wrong_field_geometry_and_bad_numbers_refuse(self):
+        for k,v in (("y",200),("x",float("nan")),("width",False),("height",0)):
+            t,s,w=self.fixture(); t["bounds"][k]=v
+            with self.assertRaises(RuntimeError): h.validate_keyboard_receiver(t,s,w)
+    def test_wrong_identity_capability_or_zoom_refuse(self):
+        for k,v in (("role","AXWindow"),("enabled",False),("keyboard_dispatch_supported",True),("token","forbidden")):
+            t,s,w=self.fixture(); t[k]=v
+            with self.assertRaises(RuntimeError): h.validate_keyboard_receiver(t,s,w)
+        for k in ("scale","zoom","screen_x","scroll_y"):
+            t,s,w=self.fixture(); s["metrics"][k]+=2
+            with self.assertRaises(RuntimeError): h.validate_keyboard_receiver(t,s,w)
+
 if __name__ == '__main__':
     unittest.main()

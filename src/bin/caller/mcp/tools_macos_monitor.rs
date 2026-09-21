@@ -327,6 +327,9 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
         Value::Window(WindowValue::Elements(controls)) => {
             serde_json::json!({"ok":true,"controls":controls})
         }
+        Value::Window(WindowValue::KeyboardTarget(target)) => {
+            serde_json::json!({"ok":true,"keyboard_target":target})
+        }
         Value::Window(WindowValue::Acted(result)) => {
             serde_json::json!({"ok":result.successful(),"action":result,
             "action_attempted":result.action_attempted,"effects_unconfirmed":result.effects_unconfirmed,"focus_interference":result.focus_interference})
@@ -811,6 +814,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn keyboard_target_response_has_no_receiver_or_authority_handle() {
+        let (receipt, _committed) = crate::macos_monitor::Receipt::fixture(Value::Window(
+            WindowValue::KeyboardTarget(crate::macos_monitor::keyboard::KeyboardTarget {
+                role: "AXTextField".into(),
+                bounds: crate::macos_monitor::placement::Bounds {
+                    x: -760.0,
+                    y: -160.0,
+                    width: 120.0,
+                    height: 28.0,
+                },
+                enabled: true,
+                keyboard_dispatch_supported: false,
+            }),
+        ));
+        let response: serde_json::Value = serde_json::from_str(&window_response(receipt)).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response.as_object().unwrap().len(), 2);
+        let target = response["keyboard_target"].as_object().unwrap();
+        assert_eq!(target.len(), 4);
+        for forbidden in ["label", "value", "text", "element", "token", "pointer"] {
+            assert!(!target.contains_key(forbidden));
+        }
+        assert_eq!(target["keyboard_dispatch_supported"], false);
+    }
+
     #[tokio::test]
     async fn macos_monitor_scoped_lifecycle_and_capture_require_shared_session_grant() {
         let directory = tempfile::tempdir().unwrap();
@@ -1018,12 +1047,20 @@ mod tests {
                     serde_json::json!({"binding":"macos_window:fixture:1"}),
                 ),
                 (
+                    "read_macos_window_keyboard_target",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                ),
+                (
                     "act_macos_window_element",
                     serde_json::json!({"binding":"macos_window:fixture:1","element":"macos_element:00000000000000000000000000000001","action":{"type":"press"}}),
                 ),
                 (
                     "inspect",
                     serde_json::json!({"argv":["display","window-elements","macos_window:fixture:1"]}),
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","keyboard-target","macos_window:fixture:1"]}),
                 ),
                 (
                     "act",

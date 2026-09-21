@@ -614,6 +614,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Owner-only bounded control snapshot on a retained bound macOS window; refresh consumes old tokens",
     },
     CommandSpec {
+        path: &["display", "keyboard-target"], lane: RiskLane::Inspect,
+        tool: "read_macos_window_keyboard_target", seed: "{}",
+        positionals: &[p_str("BINDING", "binding", true, false)], flags: &[],
+        help: "Owner-only read-only application-local focused receiver report; no key delivery capability or token",
+    },
+    CommandSpec {
         path: &["display", "window-element"], lane: RiskLane::Act,
         tool: "act_macos_window_element", seed: "{}",
         positionals: &[p_str("BINDING", "binding", true, false), p_str("ELEMENT", "element", true, false), p_json("ACTION_JSON", "action", true)], flags: &[],

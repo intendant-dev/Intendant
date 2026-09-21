@@ -1,5 +1,6 @@
 //! Public binding generations never expose private helper handles/native IDs.
 use super::controls::{ActionResult, Control, ElementAction};
+use super::keyboard::KeyboardTarget;
 use super::placement::{Bounds, Candidate, PlacementResult, WindowIdentity, MAX_BINDINGS};
 use super::*;
 use serde::Serialize;
@@ -18,6 +19,9 @@ pub(crate) enum WindowAction {
         bounds: Bounds,
     },
     ReadElements {
+        binding: String,
+    },
+    ReadKeyboardTarget {
         binding: String,
     },
     ActElement {
@@ -84,7 +88,9 @@ impl WindowAction {
                 valid_binding(binding)?;
                 bounds.validate()
             }
-            Self::Unbind { binding } | Self::ReadElements { binding } => valid_binding(binding),
+            Self::Unbind { binding }
+            | Self::ReadElements { binding }
+            | Self::ReadKeyboardTarget { binding } => valid_binding(binding),
             Self::ActElement {
                 binding,
                 element,
@@ -121,6 +127,7 @@ pub(crate) enum WindowValue {
         error: String,
     },
     Elements(Vec<Control>),
+    KeyboardTarget(KeyboardTarget),
     Acted(ActionResult),
     ActionUnconfirmed {
         result: ActionResult,
@@ -196,6 +203,7 @@ pub(super) async fn execute_window(
             }
         }
         WindowAction::ReadElements { binding }
+        | WindowAction::ReadKeyboardTarget { binding }
         | WindowAction::ActElement { binding, .. }
         | WindowAction::PrepareClick { binding, .. }
         | WindowAction::Click { binding, .. }
@@ -227,6 +235,9 @@ pub(super) async fn execute_window(
                     token: token.clone(),
                 },
                 WindowAction::ReadElements { .. } => Operation::ReadWindowElements {
+                    binding: bound.helper_binding,
+                },
+                WindowAction::ReadKeyboardTarget { .. } => Operation::ReadKeyboardTarget {
                     binding: bound.helper_binding,
                 },
                 WindowAction::ActElement {
@@ -322,6 +333,11 @@ pub(super) async fn execute_window(
                     .all(|(i, c)| controls[..i].iter().all(|p| p.element != c.element)) =>
         {
             WindowValue::Elements(controls)
+        }
+        (WindowAction::ReadKeyboardTarget { .. }, Outcome::KeyboardTarget { target })
+            if target.valid_reply() =>
+        {
+            WindowValue::KeyboardTarget(target)
         }
         (WindowAction::ActElement { action, .. }, Outcome::ActedWindowElement { result })
             if result.valid_reply()

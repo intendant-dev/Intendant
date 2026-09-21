@@ -37,6 +37,7 @@ def parse_args(argv=None):
     parser.add_argument('--chromium-app', help='Explicit Chrome for Testing bundle for disposable native AX acceptance')
     parser.add_argument('--chromium-supervisor', help='Supervisor built from tests/fixtures/macos-monitor/browser.m')
     parser.add_argument('--chromium-placement-only', action='store_true', help='Run only the browser placement/no-op acceptance profile')
+    parser.add_argument('--chromium-keyboard-target', action='store_true', help='Run the read-only disposable browser keyboard-receiver inspection profile')
     parser.add_argument('--chromium-bound-pointer', action='store_true', help='Exercise owner-bound HTTP pointer tools on the created monitor')
     parser.add_argument('--chromium-scroll-delta', type=parse_scroll_delta, help='Test one owner-window vertical scroll through HTTP; positive down; each sign needs a fresh invocation')
     args = parser.parse_args(argv)
@@ -47,6 +48,9 @@ def parse_args(argv=None):
         parser.error('--chromium-bound-pointer requires Chromium and excludes placement-only')
     if args.chromium_placement_only and not args.chromium_app:
         parser.error('--chromium-placement-only requires the Chromium fixture')
+    if args.chromium_keyboard_target and (not args.chromium_app or args.chromium_placement_only
+                                          or args.chromium_bound_pointer or scrolling):
+        parser.error('--chromium-keyboard-target requires Chromium and excludes pointer, scroll and placement-only profiles')
     if bool(args.chromium_app) != bool(args.chromium_supervisor):
         parser.error('--chromium-app and --chromium-supervisor must be supplied together')
     if not args.allow_shared_session_monitor:
@@ -163,7 +167,7 @@ def main():
                 chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer or scrolling else 'verify-macos-chromium-controls.py')),
                     '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
                     '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
-                    '--allow-disposable-chromium'] + (['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []), cwd=project, env=env, timeout=230)
+                    '--allow-disposable-chromium'] + (['--keyboard-target'] if args.chromium_keyboard_target else ['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []), cwd=project, env=env, timeout=230)
                 report['chromium'] = json.loads(chromium_report.read_text()) if chromium_report.exists() else {'passed': False, 'error': 'Chromium fixture exited before producing a report; see stderr', 'exit_code': chromium.returncode}
                 assert chromium.returncode == 0, report['chromium']
                 if scrolling:

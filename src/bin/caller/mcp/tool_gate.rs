@@ -214,6 +214,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_monitors"
                     | "list_macos_windows"
                     | "read_macos_window_elements"
+                    | "read_macos_window_keyboard_target"
                     | "prepare_macos_window_click"
                     | "prepare_macos_window_scroll"
                     | "act_macos_window_element"
@@ -262,6 +263,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "list_macos_monitors"
                     | "list_macos_windows"
                     | "read_macos_window_elements"
+                    | "read_macos_window_keyboard_target"
                     | "prepare_macos_window_click"
                     | "prepare_macos_window_scroll"
                     | "act_macos_window_element"
@@ -470,6 +472,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "list_macos_monitors"
         | "list_macos_windows"
         | "read_macos_window_elements"
+        | "read_macos_window_keyboard_target"
         | "prepare_macos_window_click"
         | "prepare_macos_window_scroll"
         | "take_screenshot"
@@ -957,6 +960,10 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         (
             "read_macos_window_elements",
             IntendantServer::read_macos_window_elements_tool_attr(),
+        ),
+        (
+            "read_macos_window_keyboard_target",
+            IntendantServer::read_macos_window_keyboard_target_tool_attr(),
         ),
         (
             "act_macos_window_element",
@@ -2242,6 +2249,11 @@ mod tests {
                     DisplayView,
                 ),
                 (
+                    "read_macos_window_keyboard_target",
+                    IntendantServer::read_macos_window_keyboard_target_tool_attr(),
+                    DisplayView,
+                ),
+                (
                     "act_macos_window_element",
                     IntendantServer::act_macos_window_element_tool_attr(),
                     DisplayInput,
@@ -2314,6 +2326,20 @@ mod tests {
             serde_json::json!({"binding":"b","pid":123})
         )
         .is_err());
+        let keyboard =
+            serde_json::to_value(IntendantServer::read_macos_window_keyboard_target_tool_attr())
+                .unwrap();
+        assert_eq!(keyboard["inputSchema"]["additionalProperties"], false);
+        assert!(keyboard["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("binding")));
+        assert!(
+            serde_json::from_value::<ReadMacosWindowKeyboardTargetParams>(
+                serde_json::json!({"binding":"b","owner_surface":true})
+            )
+            .is_err()
+        );
     }
     #[test]
     fn bound_pointer_tools_have_strict_schemas_and_separate_read_write_authority() {

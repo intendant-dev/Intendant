@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'">
+<title>Intendant disposable keyboard receiver inspection</title>
+<style>
+  body { font: 18px system-ui; margin: 30px; }
+  label, input { display: block; margin: 12px 0; width: 340px; font-size: 18px; }
+</style>
+<label for="first">First synthetic nonsecret field</label>
+<input id="first" aria-label="First synthetic nonsecret field" value="fixture-a">
+<label for="second">Second synthetic nonsecret field</label>
+<input id="second" aria-label="Second synthetic nonsecret field" value="fixture-b">
+<label for="protected">Synthetic protected fixture field</label>
+<input id="protected" aria-label="Synthetic protected fixture field" type="password" value="synthetic-secret-never-return">
+<script>
+'use strict';
+const targets = Object.freeze({ first: 'first', second: 'second', protected: 'protected' });
+window.selectKeyboardTarget = name => {
+  const id = targets[name];
+  if (!id) throw new Error('unknown fixture focus target');
+  // Fixture-only DOM focus setup. This neither injects native input nor reads
+  // or mutates system-wide focus, and the synthetic password value is never
+  // returned by this fixture API.
+  document.getElementById(id).focus({preventScroll: true});
+  if (document.activeElement.id !== id) throw new Error('fixture DOM focus failed');
+  return window.keyboardTargetFixtureState();
+};
+window.keyboardTargetFixtureState = () => {
+  const active = document.activeElement;
+  const rect = active && active.getBoundingClientRect ? active.getBoundingClientRect() : null;
+  const selected = !!active && Object.prototype.hasOwnProperty.call(targets, active.id);
+  return {
+    active: selected ? active.id : null,
+    rect: rect && {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+    ready: document.readyState,
+    metrics: {screen_x: screenX, screen_y: screenY, outer_width: outerWidth, outer_height: outerHeight,
+      inner_width: innerWidth, inner_height: innerHeight, scale: devicePixelRatio, zoom: visualViewport.scale,
+      scroll_x: scrollX, scroll_y: scrollY},
+  };
+};
+</script>

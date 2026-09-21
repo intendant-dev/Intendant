@@ -5,7 +5,12 @@ Companion to verify-macos-monitor-http.py. The supplied native supervisor starts
 ONLY Chrome for Testing with a fresh profile and owns cleanup. CDP sets up and
 observes our synthetic fixture; it NEVER supplies text, clicks or canvas input.
 All tested semantic mutations go through Intendant's real HTTP/facade interface.
+
+The --keyboard-target profile uses disposable monitor/window placement as setup,
+then tests the read-only receiver API. CDP selects only a field in its own local
+page; the profile sends no native keys or system-wide focus operations. Its report is not a keyboard-delivery claim.
 """
+import math
 import argparse
 import base64
 import hashlib
@@ -172,6 +177,27 @@ def list_ready_fixture_window(call, status, initial, pause=time.sleep):
     return listed, candidates, attempts
 
 
+
+def validate_keyboard_receiver(target, state, window):
+    def number(value):
+        return type(value) in (int, float) and math.isfinite(value) and abs(value) <= 1000000
+    require(isinstance(target, dict) and set(target) == {"role", "bounds", "enabled", "keyboard_dispatch_supported"}, "unexpected keyboard receiver fields")
+    require(target["role"] == "AXTextField" and target["enabled"] is True and target["keyboard_dispatch_supported"] is False, "receiver role or capability mismatch")
+    require(isinstance(state, dict) and state.get("active") in ("first", "second"), "ordinary synthetic receiver required")
+    rect, metrics, bounds = state.get("rect"), state.get("metrics"), target["bounds"]
+    for geometry in (rect, bounds, window):
+        require(isinstance(geometry, dict) and set(geometry) == {"x", "y", "width", "height"} and all(number(v) for v in geometry.values()) and geometry["width"] > 0 and geometry["height"] > 0, "invalid receiver geometry")
+    keys = ("screen_x", "screen_y", "outer_width", "outer_height", "inner_width", "inner_height", "scale", "zoom", "scroll_x", "scroll_y")
+    require(isinstance(metrics, dict) and all(number(metrics.get(k)) for k in keys), "invalid fixture metrics")
+    require(metrics["scale"] == metrics["zoom"] == 1 and metrics["scroll_x"] == metrics["scroll_y"] == 0, "unsupported fixture zoom or scroll")
+    require(metrics["inner_width"] == metrics["outer_width"], "unsupported horizontal browser border")
+    require(all(abs(metrics[a] - window[b]) <= 1 for a,b in (("screen_x","x"),("screen_y","y"),("outer_width","width"),("outer_height","height"))), "native and DOM window geometry disagree")
+    top = metrics["outer_height"] - metrics["inner_height"]
+    require(0 <= top <= 200, "invalid browser content origin")
+    expected = dict(x=window["x"]+rect["x"], y=window["y"]+top+rect["y"], width=rect["width"], height=rect["height"])
+    require(all(abs(bounds[k]-expected[k]) <= 1 for k in expected), "AX receiver differs from independently focused DOM field")
+    return expected
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bin', required=True, type=Path)
@@ -182,6 +208,7 @@ def main():
     p.add_argument('--report', required=True, type=Path)
     p.add_argument('--allow-disposable-chromium', action='store_true')
     p.add_argument('--placement-only', action='store_true', help='Verify placement/no-op only; do not claim semantic actions')
+    p.add_argument('--keyboard-target', action='store_true', help='Run only the read-only focused-receiver inspection profile')
     args = p.parse_args()
     if platform.system() != 'Darwin' or not args.allow_disposable_chromium or os.getenv('INTENDANT_MCP_URL'):
         p.error('requires macOS owner shell and explicit disposable Chromium opt-in')
@@ -189,16 +216,20 @@ def main():
     bundle = args.browser_app.resolve(strict=True)
     supervisor = args.supervisor.resolve(strict=True)
     require(1 <= args.port <= 65535 and args.monitor.startswith('macos_virtual:'), 'exact monitor and port required')
+    require(not (args.placement_only and args.keyboard_target), 'keyboard target excludes placement-only profile')
     info = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
     require(info['CFBundleIdentifier'] == 'com.google.chrome.for.testing', 'only Chrome for Testing accepted')
-    fixture_page = Path(__file__).resolve().parent.parent / 'tests/fixtures/macos-monitor/browser.html'
+    fixture_page = Path(__file__).resolve().parent.parent / 'tests/fixtures/macos-monitor/' / (
+        'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
-              'browser_mode': 'background-window', 'profile': 'placement_only' if args.placement_only else 'semantic_controls',
+              'browser_mode': 'background-window',
+              'profile': 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
     child = None
     cdp = None
+    ownership_verified = False
     end = time.monotonic() + 150
     status_path = root / 'status.json'
 
@@ -249,6 +280,7 @@ def main():
         report['observations_before_launch'] = current['before']
         processes = cdp.call('SystemInfo.getProcessInfo')['processInfo']
         require(any(x['type'] == 'browser' and x['id'] == current['browser_pid'] for x in processes), 'CDP browser differs from retained supervisor child')
+        ownership_verified = True
         cdp.call('Target.createTarget', {'url': fixture_page.as_uri(), 'newWindow': True,
                                        'background': True, 'width': 720, 'height': 530})
         targets = []
@@ -268,12 +300,17 @@ def main():
 
         ready_deadline = time.monotonic() + 10
         while time.monotonic() < ready_deadline:
-            if evaluate("document.readyState === 'complete' && typeof fixtureStatus === 'function'"):
+            fixture_ready = ('typeof keyboardTargetFixtureState === \'function\'' if args.keyboard_target
+                             else 'typeof fixtureStatus === \'function\'')
+            if evaluate(f"document.readyState === 'complete' && {fixture_ready}"):
                 break
             time.sleep(.05)
-        require(evaluate("typeof fixtureStatus === 'function'"), 'synthetic fixture not ready')
-        initial = evaluate('fixtureStatus()')
-        require(initial['button_count'] == initial['canvas_count'] == 0, 'fixture is not pristine')
+        require(evaluate(fixture_ready), 'synthetic fixture not ready')
+        initial = evaluate('keyboardTargetFixtureState()' if args.keyboard_target else 'fixtureStatus()')
+        if args.keyboard_target:
+            require(initial['active'] is None and initial['ready'] == 'complete', 'keyboard fixture is not pristine')
+        else:
+            require(initial['button_count'] == initial['canvas_count'] == 0, 'fixture is not pristine')
         current = status()
         report['observations_after_launch'] = current['observation']
         report['browser_pid'] = current['browser_pid']
@@ -305,8 +342,60 @@ def main():
         report['checks']['no_op_placement'] = noop
         require(noop.get('ok') is True and noop['placement']['writes_attempted'] == 0, noop)
 
+        if args.keyboard_target:
+            def read_receiver(state):
+                result = call('read_macos_window_keyboard_target', binding=binding)
+                require(result.get('ok') is True, result)
+                target = result.get('keyboard_target')
+                require(isinstance(target, dict) and set(target) == {
+                    'role', 'bounds', 'enabled', 'keyboard_dispatch_supported'
+                }, 'unexpected keyboard-target report fields')
+                require(target['role'] == 'AXTextField' and target['enabled'] is True,
+                        'fixture receiver role or enabled state mismatched')
+                require(target['keyboard_dispatch_supported'] is False, target)
+                bounds = target['bounds']
+                require(set(bounds) == {'x', 'y', 'width', 'height'} and bounds['width'] > 0 and bounds['height'] > 0,
+                        'receiver geometry invalid')
+                wire = json.dumps(result)
+                require(all(forbidden not in wire for forbidden in (
+                    'synthetic-secret', 'fixture-a', 'fixture-b', 'label', 'value', 'token', 'pointer')),
+                    'receiver report leaked content or capability')
+                validate_keyboard_receiver(target, state, expected)
+                return target
 
-        if not args.placement_only:
+            first_state = evaluate("selectKeyboardTarget('first')")
+            require(first_state['active'] == 'first', 'fixture-only DOM focus setup failed for first field')
+            first_receiver = read_receiver(first_state)
+            report['checks']['first_receiver'] = first_receiver
+            second_state = evaluate("selectKeyboardTarget('second')")
+            require(second_state['active'] == 'second', 'fixture-only DOM focus setup failed for second field')
+            second = call('inspect', argv=['display', 'keyboard-target', binding])
+            require(second.get('ok') is True, second)
+            second_receiver = second.get('keyboard_target')
+            require(isinstance(second_receiver, dict) and set(second_receiver) == set(first_receiver), second)
+            require(second_receiver['role'] == 'AXTextField' and second_receiver['enabled'] is True
+                    and second_receiver['keyboard_dispatch_supported'] is False, second)
+            require(second_receiver['bounds'] != first_receiver['bounds'],
+                    'changed fixture receiver did not change reported geometry')
+            report['checks']['changed_receiver'] = second_receiver
+            validate_keyboard_receiver(second_receiver, second_state, expected)
+            protected_state = evaluate("selectKeyboardTarget('protected')")
+            require(protected_state['active'] == 'protected', 'fixture-only DOM focus setup failed for password field')
+            protected = call('read_macos_window_keyboard_target', binding=binding)
+            protected_wire = json.dumps(protected)
+            require(protected.get('ok') is False and 'synthetic-secret' not in protected_wire, protected)
+            report['checks']['protected_receiver_refused'] = True
+            require(any(word in str(protected.get("error", "")).lower() for word in ("protected", "absent")), "protected refusal reason was not established")
+            report["checks"]["protected_receiver_result"] = protected
+            stale_binding = binding
+            unbound = call('unbind_macos_window', binding=stale_binding)
+            require(unbound.get('ok') is True, unbound)
+            binding = None
+            stale = call('read_macos_window_keyboard_target', binding=stale_binding)
+            require(stale.get('ok') is False and 'stale' in json.dumps(stale).lower(), stale)
+            report['checks']['stale_binding_refused'] = True
+            report['checks']['dom_focus_only'] = 'fixture setup used CDP DOM focus; no native key input or global focus operation was requested'
+        elif not args.placement_only:
             def read():
                 result = call('read_macos_window_elements', binding=binding)
                 report['last_inventory'] = result
@@ -401,11 +490,26 @@ def main():
                 report['cleanup']['unbind_error'] = str(error)
                 report['passed'] = False
         if cdp:
-            cdp.close()
+            if args.keyboard_target and ownership_verified:
+                try:
+                    cdp.call("Browser.close")
+                except (OSError, RuntimeError):
+                    pass  # Native termination, not a CDP acknowledgement, proves exit.
+            try:
+                cdp.close()
+            except OSError as error:
+                report["cleanup"]["cdp_error"] = str(error)
+                report["passed"] = False
         if child:
             try:
                 if child.poll() is None:
-                    child.stdin.write(b'q'); child.stdin.flush(); child.stdin.close()
+                    try:
+                        child.stdin.write(b"q"); child.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        pass
+                    finally:
+                        try: child.stdin.close()
+                        except (BrokenPipeError, OSError): pass
                 child.wait(timeout=12)
                 require(not status_path.exists() or status_path.stat().st_size <= 16384,
                         'final supervisor output limit')
@@ -418,6 +522,7 @@ def main():
                 require(final.get('supervisor_pid') == child.pid and final.get('launch_finished') is True
                         and final.get('browser_pid', 0) > 0 and final.get('browser_terminated') is True,
                         'browser cleanup unconfirmed')
+                require(final.get("browser_ever_front") is False, "fixture was observed foreground before cleanup")
             except Exception as error:
                 report['cleanup']['error'] = str(error)
                 report['passed'] = False

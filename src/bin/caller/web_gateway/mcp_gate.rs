@@ -1853,6 +1853,12 @@ mod tests {
                     "display.view",
                 ),
                 (
+                    "read_macos_window_keyboard_target",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
                     "act_macos_window_element",
                     serde_json::json!({"binding":"macos_window:fixture:1","element":"macos_element:00000000000000000000000000000001","action":{"type":"press"}}),
                     DisplayInput,
@@ -1861,6 +1867,12 @@ mod tests {
                 (
                     "inspect",
                     serde_json::json!({"argv":["display","window-elements","macos_window:fixture:1"]}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
+                    "inspect",
+                    serde_json::json!({"argv":["display","keyboard-target","macos_window:fixture:1"]}),
                     DisplayView,
                     "display.view",
                 ),
@@ -1921,6 +1933,7 @@ mod tests {
                 // only Create can start a helper. No test invokes native APIs.
             }
         }
+        assert!(bus.macos_monitors.not_started());
     }
 
     #[tokio::test]

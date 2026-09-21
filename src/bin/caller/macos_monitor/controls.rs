@@ -155,6 +155,13 @@ pub(crate) struct Metadata {
     pub press: bool,
     pub value_settable: bool,
 }
+/// The keyboard-target inspection reads only the receiver geometry and enabled
+/// state. It deliberately has no label, value, operation or token field.
+#[derive(Clone)]
+pub(crate) struct KeyboardMetadata {
+    pub bounds: Bounds,
+    pub enabled: bool,
+}
 /// Implementations may not resolve replacements by title, identifier or path.
 /// No Send/Sync bound: Elements can be !Send AX wrappers retained on main.
 pub(crate) trait Native: placement::Native {
@@ -214,6 +221,33 @@ pub(crate) trait Native: placement::Native {
     ) -> Result<bool, String> {
         Err("semantic AX controls unavailable".into())
     }
+    /// Application-local focused receiver for the exact retained process and
+    /// window. Implementations must use strict typed AX copies and never
+    /// substitute system-wide focus or a replacement selected by metadata.
+    fn keyboard_focused(
+        &mut self,
+        _window: &Self::Window,
+        _identity: WindowIdentity,
+        _deadline: Instant,
+    ) -> Result<Self::Element, String> {
+        Err("macOS keyboard receiver inspection unavailable".into())
+    }
+    /// Read only enabled state and geometry after the caller has checked the
+    /// receiver's non-protected role. Labels, AXValue and action capabilities
+    /// are intentionally outside this observation.
+    fn keyboard_metadata(
+        &mut self,
+        _element: &Self::Element,
+        _role: &str,
+        _deadline: Instant,
+    ) -> Result<KeyboardMetadata, String> {
+        Err("macOS keyboard receiver inspection unavailable".into())
+    }
+    /// Human global focus is a stability witness only. The reported receiver
+    /// comes from application-local focus, never from this observation.
+    fn keyboard_human_focus(&mut self, deadline: Instant) -> Result<Self::Focus, String> {
+        placement::Native::focus(self, deadline)
+    }
 }
 struct Retained<E> {
     control: Control,
@@ -252,7 +286,7 @@ fn operations(s: &Safety, m: &Metadata) -> Vec<SupportedOperation> {
         _ => vec![],
     }
 }
-fn check_window<N: Native>(
+pub(super) fn check_window<N: Native>(
     native: &mut N,
     window: &N::Window,
     identity: WindowIdentity,
@@ -271,7 +305,7 @@ fn check_window<N: Native>(
     placement::time_left(deadline)?;
     Ok(o)
 }
-fn same_window(a: Observation, b: Observation) -> Result<(), String> {
+pub(super) fn same_window(a: Observation, b: Observation) -> Result<(), String> {
     if a.ax != b.ax || a.cg != b.cg {
         return Err("window moved since element snapshot".into());
     }
