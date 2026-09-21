@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <string.h>
 #include "browser-pointer.h"
+#include "browser-key.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -126,10 +127,19 @@ static NSDictionary *tree_probe(pid_t pid) {
         @"complete":error ? @NO : @YES, @"error":error ?: @"", @"parent_mismatches":mismatches, @"geometries":geometries };
 }
 
+static NSDictionary *key_refused(NSRunningApplication *browser, BrowserKeyPlan plan, NSString *error) {
+    return @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+        @"source_pid":@(getpid()),@"target_pid":@(browser ? browser.processIdentifier : 0),
+        @"window_id":@(plan.window),@"tag":@(plan.tag),@"keycode":@(ProbeKey),@"error":error};
+}
+
 int main(int argc, const char **argv) {
     if (argc != 6) return 2;
     BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
-    if (!pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
+    BOOL keyMode = strcmp(argv[1], "--disposable-chromium-key") == 0;
+    BOOL clickKeyMode = browser_click_key_mode(argv[1]);
+    BOOL keyLifecycle = keyMode || clickKeyMode;
+    if (!clickKeyMode && !keyMode && !pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
     @autoreleasepool {
         NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
         NSString *profile = [NSString stringWithUTF8String:argv[3]];
@@ -162,29 +172,77 @@ int main(int argc, const char **argv) {
                 });
             }];
         NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
-        CGEventSourceRef pointerSource = NULL;
+        CGEventSourceRef pointerSource = NULL, keySource = NULL;
+        NSDictionary *keyResult=nil; BOOL keyConsumed=NO; NSUInteger keyReplays=0;
+        NSDictionary *clickResult=nil, *clickPlanEvidence=nil; BrowserPointerPlan clickPlan={0};
+        BOOL clickConsumed=NO, clickPlanFrozen=NO; NSUInteger clickReplays=0;
+        ClickReceiptState clickReceipt={0}; uint64_t clickChallenge=0; NSDictionary *clickReceiptResult=nil;
         NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
-        NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO;
+        NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO; BOOL keyShutdownRequested=NO;
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);
             if (command == 'd' && browser && !browser.terminated) diagnostic = tree_probe(browser.processIdentifier);
+            if (command == 'a') {
+                BrowserClickReceipt receipt={0}; BOOL readOK=click_receipt_read(&receipt);
+                BOOL accepted=click_receipt_accept(&clickReceipt,receipt,clickPlan,clickChallenge,
+                    clickKeyMode && readOK && clickPlanFrozen && !keyConsumed && !stopping && !browserEverFront);
+                if(!clickReceiptResult) clickReceiptResult=@{@"accepted":accepted?@YES:@NO,
+                    @"key_tag":@(receipt.key_tag),@"challenge":@(receipt.challenge),
+                    @"dom_provenance_authenticated":@NO};
+            }
+            if (command == 'k') {
+                BrowserKeyPlan plan={0}; BOOL readOK=key_plan_read(&plan);
+                if(keyConsumed) ++keyReplays;
+                else {
+                    keyConsumed=YES;
+                    if (clickKeyMode) {
+                        pid_t target=browser ? browser.processIdentifier : 0;
+                        BOOL receiptReady=click_receipt_take(&clickReceipt,plan.tag);
+                        keyResult=receiptReady && readOK && clickConsumed && clickPlanFrozen && !stopping && !browserEverFront &&
+                            click_key_gate(clickPlan,plan,clickResult,getpid(),target)
+                            ? key_send(browser,plan,&keySource)
+                            : key_refused(browser,plan,@"click receipt, exact plan, identity or lifecycle refused");
+                    } else keyResult=keyMode && readOK && !stopping && !browserEverFront
+                        ? key_send(browser,plan,&keySource)
+                        : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+                            @"error":@"key mode, plan or lifecycle refused"};
+                }
+            }
             if (command == 'p') {
                 BrowserPointerPlan plan={0}; BOOL readOK=browser_pointer_read(&plan);
-                if (pointerConsumed) pointerReplays++;
-                else {
-                    pointerConsumed=YES; // Invalid frames consume the one attempt too.
-                    pointerResult = pointerMode && readOK && !stopping && !browserEverFront
-                        ? browser_pointer_send(browser,plan,&pointerSource)
-                        : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
-                            @"error":@"pointer mode, frame or lifecycle refused"};
+                if (clickKeyMode) {
+                    if (clickConsumed) clickReplays++;
+                    else {
+                        clickConsumed=YES; // Invalid frames consume the one guarded click too.
+                        BOOL clickAllowed=click_key_click_allowed(keyConsumed,stopping,browserEverFront);
+                        if (clickAllowed && readOK && browser_pointer_valid(plan)) {
+                            clickPlan=plan; clickPlanFrozen=YES;
+                            clickPlanEvidence=click_key_plan_evidence(plan);
+                            do { arc4random_buf(&clickChallenge,sizeof(clickChallenge)); clickChallenge &= INT64_MAX; } while(!clickChallenge);
+                        }
+                        clickResult = clickAllowed && readOK
+                            ? browser_pointer_send(browser,plan,&pointerSource)
+                            : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+                                @"error":@"click-key click frame or lifecycle refused"};
+                    }
+                } else {
+                    if (pointerConsumed) pointerReplays++;
+                    else {
+                        pointerConsumed=YES; // Invalid frames consume the one attempt too.
+                        pointerResult = pointerMode && readOK && !stopping && !browserEverFront
+                            ? browser_pointer_send(browser,plan,&pointerSource)
+                            : @{@"posted_events":@0,@"dispatch_attempted":@NO,@"effect_verified":@NO,
+                                @"error":@"pointer mode, frame or lifecycle refused"};
+                    }
                 }
             }
             if (!stopping && (n == 0 || command == 'q' || NSProcessInfo.processInfo.systemUptime - started > 180)) {
                 stopping = YES; stopAt = NSProcessInfo.processInfo.systemUptime;
-                [browser terminate];
+                if (!keyLifecycle || key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
             }
-            if (stopping && browser && !browser.terminated) {
+            if (stopping && keyLifecycle && key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
+            if (stopping && browser && !browser.terminated && key_shutdown_force_allowed(keyLifecycle)) {
                 if (NSProcessInfo.processInfo.systemUptime - stopAt > 4) [browser forceTerminate];
             }
             if (launchFinished && !browser) break;
@@ -199,6 +257,15 @@ int main(int argc, const char **argv) {
                 browserEverFront |= [current[@"front_pid"] intValue] == browser.processIdentifier;
             }
             status[@"tick"] = @(++tick);
+            if(keyResult) status[@"key_result"]=keyResult;
+            status[@"key_replays_refused"]=@(keyReplays);
+            if (clickKeyMode) {
+                if (clickResult) status[@"click_result"]=clickResult;
+                status[@"click_challenge"]=@(clickChallenge);
+                if(clickReceiptResult) status[@"click_receipt"]=clickReceiptResult;
+                if (clickPlanEvidence) status[@"click_plan"]=clickPlanEvidence;
+                status[@"click_replays_refused"]=@(clickReplays);
+            }
             if (pointerResult) status[@"pointer_result"] = pointerResult;
             status[@"pointer_replays_refused"] = @(pointerReplays);
             status[@"browser_ever_front"] = browserEverFront ? @YES : @NO;
@@ -214,17 +281,49 @@ int main(int argc, const char **argv) {
             }
             status[@"windows"] = owned; if (diagnostic) status[@"tree_diagnostic"] = diagnostic;
             NSData *data = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
-            if (data.length > 16384 || ![data writeToFile:statusPath atomically:YES]) { stopping = YES; [browser terminate]; }
+            if (data.length > 16384 || ![data writeToFile:statusPath atomically:YES]) { stopping = YES; if (!keyLifecycle || key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate]; }
         }
-        if (browser && !browser.terminated) [browser forceTerminate];
+        if (key_launch_cleanup_pending(keyLifecycle,launchFinished)) {
+            // Deadline expiry is not launch failure. Keep the original callback
+            // owner alive; never relaunch or report an unknown browser terminated.
+            NSDictionary *pending=@{@"supervisor_pid":@(getpid()),@"browser_pid":@0,
+                @"launch_finished":@NO,@"browser_terminated":@NO,@"cleanup_pending":@YES,
+                @"launch_pending":@YES,@"tick":@(++tick)};
+            [[NSJSONSerialization dataWithJSONObject:pending options:0 error:nil] writeToFile:statusPath atomically:YES];
+            while(!launchFinished)
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        }
+        if (browser && !browser.terminated && key_shutdown_force_allowed(keyLifecycle)) [browser forceTerminate];
+        if (keyLifecycle && key_shutdown_request(&keyShutdownRequested,browser!=nil,browser.terminated)) [browser terminate];
         NSTimeInterval end = NSProcessInfo.processInfo.systemUptime + 5;
         while (browser && !browser.terminated && NSProcessInfo.processInfo.systemUptime < end)
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-        NSDictionary *final = @{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
-            @"browser_terminated": (!browser || browser.terminated ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
-            @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}};
+        NSMutableDictionary *final = [@{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
+            @"browser_terminated": (browser_exit_verified(browser!=nil,browser.terminated) ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
+            @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}} mutableCopy];
+        if(keyResult) final[@"key_result"]=keyResult;
+        final[@"key_replays_refused"]=@(keyReplays);
+        if (clickKeyMode) {
+            if (clickResult) final[@"click_result"]=clickResult;
+            final[@"click_challenge"]=@(clickChallenge);
+            if(clickReceiptResult) final[@"click_receipt"]=clickReceiptResult;
+            if (clickPlanEvidence) final[@"click_plan"]=clickPlanEvidence;
+            final[@"click_replays_refused"]=@(clickReplays);
+        }
         [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+        if(key_cleanup_pending(keyMode || clickKeyMode,browser != nil,browser.terminated)) {
+            final[@"cleanup_pending"]=@YES;
+            [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+            // No more input, retries or force-termination calls. Keep the exact
+            // cleanup owner and source until native process exit is confirmed.
+            while(!browser.terminated)
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            final[@"browser_terminated"]=@YES;
+            final[@"cleanup_pending"]=@NO;
+            [[NSJSONSerialization dataWithJSONObject:final options:0 error:nil] writeToFile:statusPath atomically:YES];
+        }
         if (pointerSource) CFRelease(pointerSource);
+        if (keySource) CFRelease(keySource);
         return browser && browser.terminated ? 0 : 6;
     }
 }
