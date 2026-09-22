@@ -15,7 +15,9 @@ impl IntendantServer {
     ) -> String {
         let scroll_action = matches!(
             &action,
-            WindowAction::Scroll { .. } | WindowAction::PressArrow { .. }
+            WindowAction::Scroll { .. }
+                | WindowAction::PressArrow { .. }
+                | WindowAction::PressArrowLeft { .. }
         );
         let element_action = matches!(
             &action,
@@ -23,6 +25,7 @@ impl IntendantServer {
                 | WindowAction::Click { .. }
                 | WindowAction::Scroll { .. }
                 | WindowAction::PressArrow { .. }
+                | WindowAction::PressArrowLeft { .. }
         );
         let authority = self.macos_monitor_authority(caller).await;
         let receipt = match self

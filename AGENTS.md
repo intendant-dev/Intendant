@@ -310,6 +310,13 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   shortcut, focus change, hidden click, activation, global post or corrective
   input. Observations are not atomic OS routing locks; results never claim
   verified receiver delivery or application effects from posting alone.
+  The horizontal-arrow extension permits fixed unmodified ArrowLeft through
+  the SAME retained-receiver engine and native island. The internal direction
+  selector is closed to Left/Right, pinned in the preparation and checked on
+  dispatch and helper receipts. Cross-direction dispatch consumes/refuses; it
+  never changes the frozen key. SDK keycode and Unicode readbacks must agree.
+  All existing protections, bounds, one-shot lifetime and effect caveats remain.
+  No other key, text, shortcut, activation, implicit click or global input is added.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

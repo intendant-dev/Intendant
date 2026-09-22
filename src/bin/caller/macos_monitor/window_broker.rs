@@ -24,6 +24,13 @@ pub(crate) enum WindowAction {
     ReadKeyboardTarget {
         binding: String,
     },
+    PrepareArrowLeft {
+        binding: String,
+    },
+    PressArrowLeft {
+        binding: String,
+        token: String,
+    },
     PrepareArrow {
         binding: String,
     },
@@ -58,6 +65,15 @@ pub(crate) enum WindowAction {
     },
 }
 impl WindowAction {
+    fn arrow_key(&self) -> Option<arrow::Key> {
+        match self {
+            Self::PrepareArrow { .. } | Self::PressArrow { .. } => Some(arrow::Key::ArrowRight),
+            Self::PrepareArrowLeft { .. } | Self::PressArrowLeft { .. } => {
+                Some(arrow::Key::ArrowLeft)
+            }
+            _ => None,
+        }
+    }
     pub(super) fn validate(&self) -> Result<(), String> {
         match self {
             Self::List { pid } if *pid <= 0 => {
@@ -87,7 +103,7 @@ impl WindowAction {
                 point.validate()?;
                 scroll::validate_delta(*delta_y)
             }
-            Self::PressArrow { binding, token } => {
+            Self::PressArrow { binding, token } | Self::PressArrowLeft { binding, token } => {
                 valid_binding(binding)?;
                 arrow::validate_token(token)
             }
@@ -102,7 +118,8 @@ impl WindowAction {
             Self::Unbind { binding }
             | Self::ReadElements { binding }
             | Self::ReadKeyboardTarget { binding }
-            | Self::PrepareArrow { binding } => valid_binding(binding),
+            | Self::PrepareArrow { binding }
+            | Self::PrepareArrowLeft { binding } => valid_binding(binding),
             Self::ActElement {
                 binding,
                 element,
@@ -223,7 +240,9 @@ pub(super) async fn execute_window(
         WindowAction::ReadElements { binding }
         | WindowAction::ReadKeyboardTarget { binding }
         | WindowAction::PrepareArrow { binding }
+        | WindowAction::PrepareArrowLeft { binding }
         | WindowAction::PressArrow { binding, .. }
+        | WindowAction::PressArrowLeft { binding, .. }
         | WindowAction::ActElement { binding, .. }
         | WindowAction::PrepareClick { binding, .. }
         | WindowAction::Click { binding, .. }
@@ -237,6 +256,13 @@ pub(super) async fn execute_window(
             // snapshot/action budget. Do not dispatch a separate native resolve
             // ahead of consuming the element inventory.
             match action {
+                WindowAction::PrepareArrowLeft { .. } => Operation::PrepareArrowLeft {
+                    binding: bound.helper_binding,
+                },
+                WindowAction::PressArrowLeft { token, .. } => Operation::PressArrowLeft {
+                    binding: bound.helper_binding,
+                    token: token.clone(),
+                },
                 WindowAction::PrepareArrow { .. } => Operation::PrepareArrow {
                     binding: bound.helper_binding,
                 },
@@ -302,7 +328,10 @@ pub(super) async fn execute_window(
     let outcome = child.exchange(op).await.map_err(|e| {
         Failure::Retire(if matches!(action, WindowAction::Place { .. }) {
             placement_unconfirmed(&e)
-        } else if matches!(action, WindowAction::PressArrow { .. }) {
+        } else if matches!(
+            action,
+            WindowAction::PressArrow { .. } | WindowAction::PressArrowLeft { .. }
+        ) {
             key_unconfirmed(&e)
         } else if matches!(
             action,
@@ -363,14 +392,16 @@ pub(super) async fn execute_window(
         {
             WindowValue::Elements(controls)
         }
-        (WindowAction::PrepareArrow { .. }, Outcome::PreparedArrow { prepared })
-            if prepared.valid_reply() =>
-        {
+        (
+            WindowAction::PrepareArrow { .. } | WindowAction::PrepareArrowLeft { .. },
+            Outcome::PreparedArrow { prepared },
+        ) if prepared.valid_reply() && Some(prepared.key) == action.arrow_key() => {
             WindowValue::PreparedArrow(prepared)
         }
-        (WindowAction::PressArrow { .. }, Outcome::PressedArrow { result })
-            if result.valid_reply() =>
-        {
+        (
+            WindowAction::PressArrow { .. } | WindowAction::PressArrowLeft { .. },
+            Outcome::PressedArrow { result },
+        ) if result.valid_reply() && Some(result.key) == action.arrow_key() => {
             WindowValue::Arrowed(Box::new(result))
         }
         (WindowAction::ReadKeyboardTarget { .. }, Outcome::KeyboardTarget { target })
@@ -426,7 +457,10 @@ pub(super) async fn execute_window(
             return Err(Failure::Retire(
                 if matches!(action, WindowAction::Place { .. }) {
                     placement_unconfirmed(error)
-                } else if matches!(action, WindowAction::PressArrow { .. }) {
+                } else if matches!(
+                    action,
+                    WindowAction::PressArrow { .. } | WindowAction::PressArrowLeft { .. }
+                ) {
                     key_unconfirmed(error)
                 } else if matches!(
                     action,

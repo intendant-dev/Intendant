@@ -1181,6 +1181,29 @@ impl IntendantServer {
                     .await,
                 ))
             }
+            "prepare_macos_window_arrowleft" => {
+                let Parameters(p) = parse_params::<PrepareMacosWindowArrowleftParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::PrepareArrowLeft { binding: p.binding },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
+            "press_macos_window_arrowleft" => {
+                let Parameters(p) = parse_params::<PressMacosWindowArrowleftParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::PressArrowLeft {
+                            binding: p.binding,
+                            token: p.token,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "prepare_macos_window_arrowright" => {
                 let Parameters(p) = parse_params::<PrepareMacosWindowArrowrightParams>(args)?;
                 Ok(text_tool_result(
@@ -2115,6 +2138,20 @@ impl IntendantServer {
         .await
     }
     #[tool(
+        description = "Owner-only DisplayView. Prepare one unmodified ArrowLeft for the exact enabled nonprotected text receiver in an owned-monitor window. Retains receiver/ancestry, process/window/monitor, geometry and human-focus witness for ten seconds. No keys, clicks or activation. Replaces other input preparations.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn prepare_macos_window_arrowleft(
+        &self,
+        Parameters(p): Parameters<PrepareMacosWindowArrowleftParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::PrepareArrowLeft { binding: p.binding },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
         description = "Owner-only DisplayView. Prepare one unmodified ArrowRight for the exact enabled nonprotected text receiver in an owned-monitor window. Retains receiver/ancestry, process/window/monitor, geometry and human-focus witness for ten seconds. No keys, clicks or activation. Replaces other input preparations.",
         annotations(read_only_hint = true)
     )]
@@ -2124,6 +2161,22 @@ impl IntendantServer {
     ) -> String {
         self.macos_window_as_caller(
             crate::macos_monitor::WindowAction::PrepareArrow { binding: p.binding },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Owner-only DisplayInput. Consume one exact ArrowLeft preparation; recheck receiver, original ancestry, protected state, geometry, identity, permissions and human focus. Only AXTextField/AXTextArea; no text/chords, hidden click, activation or global fallback. Two adjacent posting attempts never prove application effects. Partial/lost replies must not be retried."
+    )]
+    pub(crate) async fn press_macos_window_arrowleft(
+        &self,
+        Parameters(p): Parameters<PressMacosWindowArrowleftParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::PressArrowLeft {
+                binding: p.binding,
+                token: p.token,
+            },
             ToolCallerTrust::OwnerSurface,
         )
         .await

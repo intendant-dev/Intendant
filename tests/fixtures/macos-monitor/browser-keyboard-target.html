@@ -38,7 +38,7 @@ for(const kind of ['keydown','keyup']) document.addEventListener(kind,event=>{
   if(arrowEvents.length>=8){arrowOverflow=true;return;}
   arrowEvents.push({kind,target:event.target.id,key:event.key,code:event.code,
     trusted:event.isTrusted,repeat:event.repeat,alt:event.altKey,control:event.ctrlKey,meta:event.metaKey,shift:event.shiftKey});
-  if(kind==='keyup' && event.target.id==='first' && event.key==='ArrowRight' && event.isTrusted) arrowCount++;
+  if(kind==='keyup' && event.target.id==='first' && ['ArrowRight','ArrowLeft'].includes(event.key) && event.isTrusted) arrowCount++;
 });
 window.armArrowFixture=()=>{
   const field=document.getElementById('first');

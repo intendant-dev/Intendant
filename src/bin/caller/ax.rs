@@ -852,7 +852,7 @@ impl crate::macos_monitor::pointer::Pair for intendant_platform::bound_arrow::Pa
             calls: r.calls,
             detail: if r.failed || r.calls != 2 {
                 Some(
-                    "native ArrowRight refused or failed; attempted calls retained; no retry"
+                    "native horizontal arrow refused or failed; attempted calls retained; no retry"
                         .into(),
                 )
             } else {
@@ -866,20 +866,26 @@ impl Native for PlacementNative {
         placement_permissions(deadline)?;
         placement_generation(window.identity)?;
         if !intendant_platform::bound_arrow::ready(window.identity.pid) {
-            return Err("ArrowRight requires existing post-event permission, a background target, and no held human keys/buttons/modifiers".into());
+            return Err("horizontal arrow requires existing post-event permission, a background target, and no held human keys/buttons/modifiers".into());
         }
         placement::time_left(deadline)
     }
     fn arrow_pair(
         &mut self,
         window: &RetainedWindow,
+        key: crate::macos_monitor::arrow::Key,
         deadline: Instant,
     ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
         self.arrow_ready(window, deadline)?;
-        let pair = intendant_platform::bound_arrow::Pair::create(
-            window.identity.pid,
-            window.identity.window_id,
-        )?;
+        let create = match key {
+            crate::macos_monitor::arrow::Key::ArrowRight => {
+                intendant_platform::bound_arrow::Pair::create
+            }
+            crate::macos_monitor::arrow::Key::ArrowLeft => {
+                intendant_platform::bound_arrow::Pair::create_left
+            }
+        };
+        let pair = create(window.identity.pid, window.identity.window_id)?;
         placement::time_left(deadline)?;
         Ok(Box::new(pair))
     }

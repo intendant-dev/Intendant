@@ -39,4 +39,45 @@ class Evidence(unittest.TestCase):
             with self.assertRaises(SystemExit):m.parse_args(base+flags+['--chromium-arrowright'])
         self.assertTrue(m.parse_args(base+['--chromium-keyboard-target','--chromium-keyboard-target-click-first','--chromium-arrowright']).chromium_arrowright)
 
+
+class Directions(unittest.TestCase):
+    def fixture(self, key):
+        native, before, after = Evidence().fixture()
+        native['action']['key'] = key
+        after['caret'] = after['end'] = 1 if key == 'ArrowLeft' else 3
+        for event in after['events']: event['key'] = event['code'] = key
+        return native, before, after
+
+    def test_both_fixed_directions_verify_their_own_effect(self):
+        for key in ('ArrowLeft','ArrowRight'):
+            n,b,e=self.fixture(key)
+            self.assertTrue(a.verify_effect(n,b,e,key)['effect_verified'])
+
+    def test_wrong_native_direction_never_passes_even_with_matching_dom(self):
+        for key,other in [('ArrowLeft','ArrowRight'),('ArrowRight','ArrowLeft')]:
+            n,b,e=self.fixture(key);n['action']['key']=other
+            with self.assertRaises(RuntimeError): a.verify_effect(n,b,e,key)
+
+    def test_opposite_dom_pair_and_caret_never_pass(self):
+        for key,other in [('ArrowLeft','ArrowRight'),('ArrowRight','ArrowLeft')]:
+            for change in ('event','caret'):
+                n,b,e=self.fixture(key)
+                if change=='event':e['events'][0]['key']=e['events'][0]['code']=other
+                else:e['caret']=e['end']=3 if key=='ArrowLeft' else 1
+                with self.assertRaises(RuntimeError):a.verify_effect(n,b,e,key)
+
+    def test_no_other_keys_are_accepted(self):
+        for key in ('Home','ArrowUp','a','',None,False):
+            n,b,e=self.fixture('ArrowLeft')
+            with self.assertRaises(RuntimeError):a.verify_effect(n,b,e,key)
+
+    def test_left_cli_requires_explicit_exclusive_selection(self):
+        spec=importlib.util.spec_from_file_location('left_http',Path(__file__).with_name('verify-macos-monitor-http.py'))
+        h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
+        base=['--bin','fixture','--fixture','fixture','--report','fixture','--allow-shared-session-monitor','--chromium-app','fixture','--chromium-supervisor','fixture']
+        for extra in (['--chromium-arrowleft'],['--chromium-arrowleft','--chromium-keyboard-target'],['--chromium-arrowleft','--chromium-keyboard-target','--chromium-keyboard-target-click-first','--chromium-arrowright']):
+            with self.assertRaises(SystemExit):h.parse_args(base+extra)
+        args=h.parse_args(base+['--chromium-arrowleft','--chromium-keyboard-target','--chromium-keyboard-target-click-first'])
+        self.assertTrue(args.chromium_arrowleft);self.assertFalse(args.chromium_arrowright)
+
 if __name__=='__main__':unittest.main()

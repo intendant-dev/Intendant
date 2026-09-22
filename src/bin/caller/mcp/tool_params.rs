@@ -3,7 +3,8 @@
 
 use super::*;
 pub(crate) use crate::macos_monitor::arrow::{
-    PrepareMacosWindowArrowrightParams, PressMacosWindowArrowrightParams,
+    PrepareMacosWindowArrowleftParams, PrepareMacosWindowArrowrightParams,
+    PressMacosWindowArrowleftParams, PressMacosWindowArrowrightParams,
 };
 pub(crate) use crate::macos_monitor::controls::{
     ActMacosWindowElementParams, ReadMacosWindowElementsParams,

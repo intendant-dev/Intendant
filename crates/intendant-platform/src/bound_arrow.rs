@@ -1,9 +1,9 @@
-//! Main-thread-only fixed ArrowRight ownership. The controller owns all authority
+//! Main-thread-only fixed horizontal-arrow ownership. The controller owns all authority
 //! and retained-receiver checks. Construction never posts; Drop only releases.
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 extern "C" {
     fn intendant_arrow_ready(pid: i32) -> u8;
-    fn intendant_arrow_create(pid: i32, window: u32) -> *mut c_void;
+    fn intendant_arrow_create(pid: i32, window: u32, left: u8) -> *mut c_void;
     fn intendant_arrow_post(pair: *mut c_void, failed: *mut u8) -> u8;
     fn intendant_arrow_release(pair: *mut c_void);
 }
@@ -22,11 +22,17 @@ pub struct Pair {
 }
 impl Pair {
     pub fn create(pid: i32, window: u32) -> Result<Self, String> {
+        Self::create_direction(pid, window, false)
+    }
+    pub fn create_left(pid: i32, window: u32) -> Result<Self, String> {
+        Self::create_direction(pid, window, true)
+    }
+    fn create_direction(pid: i32, window: u32, left: bool) -> Result<Self, String> {
         // SAFETY: scalar constructor, main-thread check and exception boundary;
         // the non-null Create-rule result is owned exactly once by this wrapper.
-        let raw = unsafe { intendant_arrow_create(pid, window) };
+        let raw = unsafe { intendant_arrow_create(pid, window, u8::from(left)) };
         Ok(Self {
-            raw: NonNull::new(raw).ok_or("exact ArrowRight construction unavailable")?,
+            raw: NonNull::new(raw).ok_or("exact horizontal arrow construction unavailable")?,
             used: false,
             _thread: PhantomData,
         })

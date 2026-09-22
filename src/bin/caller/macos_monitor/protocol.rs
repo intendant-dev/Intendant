@@ -71,6 +71,13 @@ pub(super) enum Operation {
         binding: u32,
         token: String,
     },
+    PrepareArrowLeft {
+        binding: u32,
+    },
+    PressArrowLeft {
+        binding: u32,
+        token: String,
+    },
     PrepareArrow {
         binding: u32,
     },
@@ -419,6 +426,40 @@ mod tests {
         for op in [
             Operation::PrepareArrow { binding: 1 },
             Operation::PressArrow {
+                binding: 1,
+                token: "macos_key:00000000000000000000000000000001".into(),
+            },
+        ] {
+            let wire = encode(&Request { seq: 1, op }).unwrap();
+            assert!(serde_json::from_slice::<Request>(&wire).is_ok());
+        }
+    }
+    #[test]
+    fn arrowleft_protocol_and_public_params_reject_key_text_or_target_overrides() {
+        use super::super::arrow::{
+            PrepareMacosWindowArrowleftParams as P, PressMacosWindowArrowleftParams as A,
+        };
+        for extra in [
+            "key",
+            "text",
+            "pid",
+            "window",
+            "point",
+            "activate",
+            "modifiers",
+        ] {
+            let mut p = serde_json::json!({"binding":"binding"});
+            p[extra] = serde_json::json!("override");
+            assert!(serde_json::from_value::<P>(p).is_err());
+            let mut a = serde_json::json!({"binding":"binding","token":"token"});
+            a[extra] = serde_json::json!("override");
+            assert!(serde_json::from_value::<A>(a).is_err());
+            let op = serde_json::json!({"seq":1,"op":{"op":"press_arrow_left","binding":1,"token":"token",extra:0}});
+            assert!(serde_json::from_value::<Request>(op).is_err());
+        }
+        for op in [
+            Operation::PrepareArrowLeft { binding: 1 },
+            Operation::PressArrowLeft {
                 binding: 1,
                 token: "macos_key:00000000000000000000000000000001".into(),
             },
