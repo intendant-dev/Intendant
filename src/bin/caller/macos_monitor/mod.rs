@@ -5,6 +5,7 @@
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod ancestry;
+pub(crate) mod arrow;
 mod capture;
 pub(crate) mod controls;
 #[cfg(any(target_os = "macos", test))]
@@ -45,6 +46,7 @@ pub(crate) fn reserved(value: &str) -> bool {
         "macos_candidate",
         "macos_element",
         "macos_pointer",
+        "macos_key",
     ]
     .iter()
     .any(|prefix| value.contains(prefix))
@@ -189,6 +191,11 @@ async fn await_commit(mut committed: oneshot::Receiver<()>) -> bool {
     }
 }
 
+pub(crate) const KEY_UNCONFIRMED: &str = "ArrowRight effects unconfirmed";
+fn key_unconfirmed(error: &str) -> String {
+    format!("{KEY_UNCONFIRMED}; input may already have applied or be in progress; do not replay; {error}")
+}
+
 pub(crate) const POINTER_UNCONFIRMED: &str = "pointer action effects unconfirmed";
 fn pointer_unconfirmed(error: &str) -> String {
     format!("{POINTER_UNCONFIRMED}; paired input may already have applied or still be in progress; do not replay; {error}")
@@ -327,6 +334,13 @@ impl Broker {
         {
             return Err("read_macos_window_keyboard_target requires macOS owned monitors".into());
         }
+        if matches!(
+            action,
+            Action::Window(WindowAction::PrepareArrow { .. } | WindowAction::PressArrow { .. })
+        ) && !cfg!(target_os = "macos")
+        {
+            return Err("ArrowRight tools require macOS owned monitors".into());
+        }
         if matches!(action, Action::Window(_)) && self.sender.get().is_none() {
             return Err("no owned macOS monitor generation".into());
         }
@@ -355,6 +369,7 @@ impl Broker {
             })
             .as_ref()
             .map_err(Clone::clone)?;
+        let key_action = matches!(action, Action::Window(WindowAction::PressArrow { .. }));
         let placement = matches!(action, Action::Window(WindowAction::Place { .. }));
         let pointer_action = matches!(
             action,
@@ -366,6 +381,7 @@ impl Broker {
                 WindowAction::ActElement { .. }
                     | WindowAction::Click { .. }
                     | WindowAction::Scroll { .. }
+                    | WindowAction::PressArrow { .. }
             )
         )
         .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
@@ -381,7 +397,17 @@ impl Broker {
         // This deadline only cancels the caller's receipt. The worker retains
         // child/backend ownership through stop/rollback; it is never aborted.
         if let Some(progress) = element_dispatch {
-            if pointer_action {
+            if key_action {
+                await_element_reply(receive, &progress, std::time::Duration::from_secs(20))
+                    .await
+                    .map_err(|e| {
+                        if e.starts_with(ELEMENT_UNCONFIRMED) {
+                            key_unconfirmed(&e)
+                        } else {
+                            e
+                        }
+                    })
+            } else if pointer_action {
                 await_pointer_reply(receive, &progress, std::time::Duration::from_secs(20)).await
             } else {
                 await_element_reply(receive, &progress, std::time::Duration::from_secs(20)).await
@@ -604,6 +630,12 @@ where
                         }
                         Value::Window(WindowValue::Clicked(result)) => {
                             Some(WindowValue::ClickUnconfirmed {
+                                result,
+                                error: error.clone(),
+                            })
+                        }
+                        Value::Window(WindowValue::Arrowed(result)) => {
+                            Some(WindowValue::ArrowUnconfirmed {
                                 result,
                                 error: error.clone(),
                             })
@@ -899,6 +931,8 @@ mod tests {
         pointer_plan: Option<(u32, pointer::Prepared)>,
         pointer_delta: Option<i32>,
         scroll_reply_patch: Option<serde_json::Value>,
+        arrow_plan: Option<(u32, arrow::Prepared)>,
+        arrow_reply_patch: Option<serde_json::Value>,
         die_after_place: bool,
         verified_place: bool,
         window_started: Option<oneshot::Sender<()>>,
@@ -1077,6 +1111,73 @@ mod tests {
                             bounds: placement::tests::monitor(),
                             operations: vec![controls::SupportedOperation::Press],
                         }],
+                    })
+                }
+                Operation::PrepareArrow { binding } => {
+                    self.log.lock().unwrap().push("prepare_arrow");
+                    let bounds = placement::tests::monitor();
+                    let prepared = arrow::Prepared {
+                        token: format!("macos_key:{}", uuid::Uuid::new_v4().simple()),
+                        key: arrow::Key::ArrowRight,
+                        receiver: arrow::Receiver {
+                            role: "AXTextField".into(),
+                            bounds,
+                            enabled: true,
+                        },
+                        window: placement::Observation {
+                            ax: bounds,
+                            cg: bounds,
+                        },
+                        expires_in_ms: arrow::TTL_MS,
+                    };
+                    self.arrow_plan = Some((binding, prepared.clone()));
+                    Ok(Outcome::PreparedArrow { prepared })
+                }
+                Operation::PressArrow { binding, token } => {
+                    let Some((id, p)) = self.arrow_plan.take() else {
+                        return Ok(Outcome::Error {
+                            message: "stale key token".into(),
+                            fatal: false,
+                        });
+                    };
+                    if binding != id || token != p.token {
+                        return Ok(Outcome::Error {
+                            message: "foreign key token".into(),
+                            fatal: false,
+                        });
+                    }
+                    self.log.lock().unwrap().push("press_arrow");
+                    if let Some(started) = self.place_started.take() {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = self.place_release.take() {
+                        let _ = release.await;
+                    }
+                    self.dead = self.die_after_place;
+                    let result = arrow::ArrowResult {
+                        key: arrow::Key::ArrowRight,
+                        status: pointer::ClickStatus::Dispatched,
+                        posting_calls: 2,
+                        action_attempted: true,
+                        effects_unconfirmed: true,
+                        effect_verified: false,
+                        receiver: p.receiver.clone(),
+                        after_receiver: Some(p.receiver),
+                        receiver_unchanged: Some(true),
+                        before: p.window,
+                        after: Some(p.window),
+                        focus_interference: Some(false),
+                        detail: None,
+                    };
+                    let mut value = serde_json::to_value(result).unwrap();
+                    if let Some(patch) = self.arrow_reply_patch.take() {
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .extend(patch.as_object().unwrap().clone());
+                    }
+                    Ok(Outcome::PressedArrow {
+                        result: serde_json::from_value(value).unwrap(),
                     })
                 }
                 Operation::ReadKeyboardTarget { .. } => {
@@ -3118,6 +3219,151 @@ mod tests {
                     1
                 );
             }
+        }
+    }
+
+    async fn arrow_prepared(tx: &mpsc::Sender<Request>, binding: &str) -> arrow::Prepared {
+        let receipt = send(
+            tx,
+            Action::Window(WindowAction::PrepareArrow {
+                binding: binding.into(),
+            }),
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Value::Window(WindowValue::PreparedArrow(p)) = &receipt.value else {
+            panic!("arrow preparation")
+        };
+        let p = p.clone();
+        assert!(receipt.commit());
+        p
+    }
+    fn arrow_action(binding: &str, token: &str) -> Action {
+        Action::Window(WindowAction::PressArrow {
+            binding: binding.into(),
+            token: token.into(),
+        })
+    }
+    #[tokio::test]
+    async fn arrowright_broker_owner_gate_replay_and_cancel_before_dispatch() {
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let scoped = authority(false);
+        scoped.autonomy.write().await.user_display_granted = true;
+        let p = arrow_prepared(&tx, &binding).await;
+        let e = send(&tx, arrow_action(&binding, &p.token), scoped)
+            .await
+            .unwrap()
+            .err()
+            .expect("owner gate");
+        assert!(e.contains("owner surface"));
+        // A held read receipt serializes the actor; dropping a queued key cannot post.
+        let held = keyboard_fixture(&tx, &binding).await;
+        let pending = send(&tx, arrow_action(&binding, &p.token), authority(true));
+        drop(pending);
+        assert!(held.commit());
+        let barrier = keyboard_fixture(&tx, &binding).await;
+        assert!(barrier.commit());
+        assert!(!log.lock().unwrap().contains(&"press_arrow"));
+        let receipt = send(&tx, arrow_action(&binding, &p.token), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&receipt.value,Value::Window(WindowValue::Arrowed(r)) if r.successful()));
+        assert!(receipt.commit());
+        assert!(send(&tx, arrow_action(&binding, &p.token), authority(true))
+            .await
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "press_arrow")
+                .count(),
+            1
+        );
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn arrowright_broker_late_liveness_preserves_attempts_without_replay() {
+        let fake = Fake {
+            die_after_place: true,
+            ..Default::default()
+        };
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let p = arrow_prepared(&tx, &binding).await;
+        let receipt = send(&tx, arrow_action(&binding, &p.token), authority(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&receipt.value,Value::Window(WindowValue::ArrowUnconfirmed {result,..}) if result.posting_calls==2 && !result.effect_verified)
+        );
+        let _ = receipt.commit();
+        drop(tx);
+        let _ = worker.await.unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == "press_arrow")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn arrowright_broker_lying_reply_retires_with_uncertain_effects() {
+        for patch in [
+            serde_json::json!({"effect_verified":true}),
+            serde_json::json!({"posting_calls":3}),
+            serde_json::json!({"receiver_unchanged":false}),
+        ] {
+            let fake = Fake {
+                arrow_reply_patch: Some(patch),
+                ..Default::default()
+            };
+            let (tx, worker) = runner(fake);
+            let binding = bound_fixture(&tx).await;
+            let p = arrow_prepared(&tx, &binding).await;
+            let e = send(&tx, arrow_action(&binding, &p.token), authority(true))
+                .await
+                .unwrap()
+                .err()
+                .expect("lying result refused");
+            assert!(e.starts_with(KEY_UNCONFIRMED), "{e}");
+            drop(tx);
+            let _ = worker.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn arrowright_tools_never_start_broker_or_adopt_raw_targets() {
+        let broker = Broker::default();
+        for action in [
+            WindowAction::PrepareArrow {
+                binding: "macos_window:fixture:1".into(),
+            },
+            WindowAction::PressArrow {
+                binding: "macos_window:fixture:1".into(),
+                token: "macos_key:00000000000000000000000000000001".into(),
+            },
+        ] {
+            assert!(broker
+                .request(Action::Window(action), authority(true))
+                .await
+                .is_err());
+            assert!(broker.not_started());
+        }
+        for s in ["macos_key:bad", " MACOS_KEY:bad ", "display_macos_key:1"] {
+            assert!(reserved(s));
+            assert!(reject_unsupported(Some(s), None).is_err());
         }
     }
 }

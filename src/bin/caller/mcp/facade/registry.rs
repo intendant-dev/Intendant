@@ -638,6 +638,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Consume one prepared pointer token for an exact paired click; reports dispatch, never verified effect",
     },
     CommandSpec {
+        path: &["display", "prepare-arrowright"], lane: RiskLane::Inspect,
+        tool: "prepare_macos_window_arrowright", seed: "{}",
+        positionals: &[p_str("BINDING","binding",true,false)], flags: &[],
+        help: "Prepare one fixed ArrowRight on an exact retained nonprotected text receiver; no input",
+    },
+    CommandSpec {
+        path: &["display", "arrowright"], lane: RiskLane::Act,
+        tool: "press_macos_window_arrowright", seed: "{}",
+        positionals: &[p_str("BINDING","binding",true,false),p_str("TOKEN","token",true,false)], flags: &[],
+        help: "Consume one fixed ArrowRight preparation; no hidden click or general keyboard fallback",
+    },
+    CommandSpec {
         path: &["display", "prepare-scroll"], lane: RiskLane::Inspect,
         tool: "prepare_macos_window_scroll", seed: "{}",
         positionals: &[p_str("BINDING", "binding", true, false), p_json("POINT_JSON", "point", true), p_json("DELTA_Y", "delta_y", true)], flags: &[],

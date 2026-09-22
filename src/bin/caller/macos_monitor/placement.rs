@@ -206,6 +206,16 @@ pub(crate) trait Native {
     ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
         Err("native bound-window scrolling unavailable".into())
     }
+    fn arrow_ready(&mut self, _window: &Self::Window, _deadline: Instant) -> Result<(), String> {
+        Err("native bound ArrowRight unavailable".into())
+    }
+    fn arrow_pair(
+        &mut self,
+        _window: &Self::Window,
+        _deadline: Instant,
+    ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
+        Err("native bound ArrowRight unavailable".into())
+    }
     /// Readback-only settling never repeats a setter or changes focus.
     /// Fakes override this pacing hook; native work retains the operation budget.
     fn pause_readback(&mut self, deadline: Instant) -> Result<(), String> {
@@ -250,6 +260,7 @@ pub(super) struct Windows<N: super::controls::Native> {
     pub(super) native: N,
     pub(super) elements: super::controls::Inventory<N::Element, N::Focus>,
     pub(super) pointers: super::pointer::Inventory<N::Focus>,
+    pub(super) arrows: super::arrow::Inventory<N::Element, N::Focus>,
     next: u32,
     pub(super) bindings: BTreeMap<u32, Binding<N::Window>>,
     candidates: BTreeMap<String, ListedWindow<N::Window>>,
@@ -260,6 +271,7 @@ impl<N: super::controls::Native> Windows<N> {
             native,
             elements: Default::default(),
             pointers: Default::default(),
+            arrows: Default::default(),
             next: 1,
             bindings: BTreeMap::new(),
             candidates: BTreeMap::new(),
@@ -341,6 +353,7 @@ impl<N: super::controls::Native> Windows<N> {
     pub(super) fn unbind(&mut self, id: u32) -> Result<(), String> {
         self.elements.invalidate(id);
         self.pointers.invalidate(id);
+        self.arrows.invalidate(id);
         self.bindings
             .remove(&id)
             .map(|_| ())
@@ -351,6 +364,7 @@ impl<N: super::controls::Native> Windows<N> {
             if b.monitor == monitor {
                 self.elements.invalidate(id);
                 self.pointers.invalidate(id);
+                self.arrows.invalidate(id);
             }
         }
         self.bindings.retain(|_, b| b.monitor != monitor);
@@ -363,6 +377,7 @@ impl<N: super::controls::Native> Windows<N> {
     ) -> Result<PlacementResult, String> {
         self.elements.invalidate(id);
         self.pointers.invalidate(id);
+        self.arrows.invalidate(id);
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         let deadline = Instant::now() + BUDGET;
         let target = b.geometry.target(local)?;

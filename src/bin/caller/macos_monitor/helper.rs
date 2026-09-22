@@ -222,6 +222,20 @@ fn serve_with_windows<O: Owner, N: Native>(
                         })
                         .map(|result| Outcome::ScrolledPointer { result }),
                 ),
+                Operation::PrepareArrow { binding } => window_outcome(
+                    windows
+                        .prepare_arrow(binding, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|prepared| Outcome::PreparedArrow { prepared }),
+                ),
+                Operation::PressArrow { binding, token } => window_outcome(
+                    windows
+                        .press_arrow(binding, &token, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|result| Outcome::PressedArrow { result }),
+                ),
                 Operation::UnbindWindow { binding } => window_outcome(
                     windows
                         .unbind(binding)

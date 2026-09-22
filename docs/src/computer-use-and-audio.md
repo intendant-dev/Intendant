@@ -1303,3 +1303,17 @@ refusals, cleanup and the existing click profile passed. This does not establish
 general application compatibility or continuous desktop isolation.
 See [bounded owned-window scrolling](../design/macos-bound-window-scroll.md) for
 construction/readback requirements, cancellation and the added hermetic regressions.
+
+
+### Exact bound-receiver ArrowRight
+
+The explicit owner-only `prepare_macos_window_arrowright {binding}` and
+`press_macos_window_arrowright {binding,token}` operations prepare/attempt one
+fixed unmodified ArrowRight pair. The ten-second one-use preparation retains
+the exact enabled nonprotected text receiver and original ancestors, window,
+process/monitor generations, geometry and human-focus witness. Preparation
+requires DisplayView; dispatch requires DisplayInput. No hidden click, text,
+chords, activation or global-input fallback is supplied. A dispatched pair
+does not verify application effects, and uncertain replies must not be replayed.
+The receiver-inspection tool remains read-only and does not grant key authority.
+See `docs/design/macos-bound-arrowright.md` for limits and acceptance.

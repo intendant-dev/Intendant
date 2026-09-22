@@ -33,6 +33,25 @@ window.selectKeyboardTarget = name => {
   if (document.activeElement.id !== id) throw new Error('fixture DOM focus failed');
   return window.keyboardTargetFixtureState();
 };
+const arrowEvents=[];let arrowOverflow=false;let arrowCount=0;
+for(const kind of ['keydown','keyup']) document.addEventListener(kind,event=>{
+  if(arrowEvents.length>=8){arrowOverflow=true;return;}
+  arrowEvents.push({kind,target:event.target.id,key:event.key,code:event.code,
+    trusted:event.isTrusted,repeat:event.repeat,alt:event.altKey,control:event.ctrlKey,meta:event.metaKey,shift:event.shiftKey});
+  if(kind==='keyup' && event.target.id==='first' && event.key==='ArrowRight' && event.isTrusted) arrowCount++;
+});
+window.armArrowFixture=()=>{
+  const field=document.getElementById('first');
+  if(field.type==='password'||arrowEvents.length) throw new Error('not a pristine nonsecret arrow fixture');
+  field.focus({preventScroll:true});field.setSelectionRange(2,2);
+  return window.arrowFixtureState();
+};
+window.arrowFixtureState=()=>{
+  const field=document.getElementById('first');const nonsecret=field.type==='text';
+  return {active:document.activeElement.id,events:arrowEvents.map(e=>({...e})),overflow:arrowOverflow,
+    count:arrowCount,caret:nonsecret?field.selectionStart:null,end:nonsecret?field.selectionEnd:null,
+    value:nonsecret?field.value:null};
+};
 window.keyboardTargetFixtureState = () => {
   const active = document.activeElement;
   const rect = active && active.getBoundingClientRect ? active.getBoundingClientRect() : null;
