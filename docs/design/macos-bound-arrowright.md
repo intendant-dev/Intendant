@@ -113,3 +113,28 @@ invocation failed before any daemon/browser/display launch and is retained.
 Final exact-head native results and local/CI status are recorded separately on
 PR #948. No running plugin daemon is upgraded by building or running this
 isolated temporary-HOME acceptance profile.
+
+## Development validation
+
+The complete local battery passed 6,640 binary tests (10 existing ignores),
+1,022 library/acceptance tests (3 existing ignores), 57 E2E tests and workspace
+Clippy with warnings denied, formatting and whitespace. All 123 Python checks
+and 24 native nonposting constructor/exception/replay cases passed.
+
+The full disposable HTTP/owned-monitor Chromium run passed: one exact trusted
+ArrowRight down/up pair moved the first field caret from 2 to 3 without changing
+its synthetic value. Refresh, wrong-token consumption, focused receiver change,
+same-geometry replacement, protected transition, replay and stale binding
+refused additional input. Browser/profile/supervisor cleanup and the original
+display inventory were verified. The first native run stopped before input at
+the existing placement focus guard; it remains a separate negative report.
+
+Clippy initially caught an oversized internal result enum. Only the new result
+variant was boxed; its wire representation and native behavior are unchanged,
+and the complete battery was rerun successfully. A fresh independent reviewer
+was unavailable because its account usage limit was reached. No independent
+review pass is claimed. App/OS-reported protection is not a content sandbox;
+observation-to-dispatch races and unauthenticated DOM evidence remain explicit.
+
+Final exact-published-commit native evidence and CI/review/landing status are
+recorded on the PR rather than inferred from the development test.
