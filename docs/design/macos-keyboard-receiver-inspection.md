@@ -150,3 +150,16 @@ owner operating the machine is treated as permission to weaken focus checks.
 The failed native run is retained separately; a complete published-head native
 receiver acceptance pass remains a merge gate. No live plugin daemon, user
 profile, TCC setting, CI policy or native input capability was changed.
+
+## Resumed portability correction (2026-09-22)
+
+The Ubuntu PR run exposed a compile error in the non-macOS refusal regression:
+Result::unwrap_err requires the successful Receipt type to implement Debug.
+That test is excluded on macOS, so the prior local battery did not compile it.
+The assertion now extracts the error with err().expect while retaining the
+required unsupported-platform message and the empty-queue assertion. No Debug
+implementation was added to the production receipt, and no runtime behavior,
+authorization, focus checks, traversal limits or CI policy changed.
+
+Published-head native acceptance and refreshed validation are recorded on PR
+#947 separately from the earlier focus-observation refusal.

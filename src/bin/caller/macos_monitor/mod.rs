@@ -2468,7 +2468,8 @@ mod tests {
                 authority(true),
             )
             .await
-            .unwrap_err()
+            .err()
+            .expect("unsupported keyboard receiver inspection must be refused")
             .contains("require macOS"));
         assert!(rx.try_recv().is_err());
     }
