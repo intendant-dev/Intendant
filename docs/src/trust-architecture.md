@@ -957,3 +957,15 @@ operation starts a helper, requests TCC, or mints a grant. Shared WindowServer
 remains one seat: these checks provide bounded observations, not atomic execution,
 exclusive focus or isolation. See [semantic controls](../design/macos-bound-window-actions.md)
 for the implemented contract and pending supervisor acceptance.
+
+The separate `read_macos_window_keyboard_target` inspection uses the same
+`DisplayView` + OwnerSurface boundary, including typed HTTP/facade ingress and
+broker admission/dequeue. Its private helper request can report only role, bounds,
+enabled and `keyboard_dispatch_supported:false` for an exact application-local
+focused receiver; it mints no receiver/authority token and changes no pending
+pointer or semantic token. Strict target-app focus is not human system-wide focus:
+the latter is only a before/after witness. No key posting, activation, click,
+focus restoration, privilege change or input capability follows from the report.
+The retained process/window/monitor, protected ancestry, membership and bounded
+geometry checks make it a momentary observation, not key-delivery proof or a
+durable receiver identity. See [keyboard receiver inspection](../design/macos-keyboard-receiver-inspection.md).

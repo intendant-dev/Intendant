@@ -1129,6 +1129,18 @@ impl IntendantServer {
                     .await,
                 ))
             }
+            "read_macos_window_keyboard_target" => {
+                let Parameters(p) = parse_params::<ReadMacosWindowKeyboardTargetParams>(args)?;
+                Ok(text_tool_result(
+                    self.macos_window_as_caller(
+                        crate::macos_monitor::WindowAction::ReadKeyboardTarget {
+                            binding: p.binding,
+                        },
+                        caller,
+                    )
+                    .await,
+                ))
+            }
             "act_macos_window_element" => {
                 let Parameters(p) = parse_params::<ActMacosWindowElementParams>(args)?;
                 Ok(text_tool_result(
@@ -1977,6 +1989,20 @@ impl IntendantServer {
     ) -> String {
         self.macos_window_as_caller(
             crate::macos_monitor::WindowAction::ReadElements { binding: p.binding },
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
+    }
+    #[tool(
+        description = "Read the actual application-local focused AX receiver only within an exact retained macOS bound window. DisplayView plus OwnerSurface required. The bounded report contains only native role, receiver bounds, enabled state and keyboard_dispatch_supported:false. It never posts keys, activates, clicks, restores focus, changes privilege, exposes labels/values/document text/native pointers, or returns a receiver/token. It requires unchanged exact process/window/monitor geometry, retained ancestry and human global focus before/after; protected, foreign, replaced, detached, oversized or contradictory observations refuse. This snapshot is not proof of keyboard delivery or durable receiver identity.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn read_macos_window_keyboard_target(
+        &self,
+        Parameters(p): Parameters<ReadMacosWindowKeyboardTargetParams>,
+    ) -> String {
+        self.macos_window_as_caller(
+            crate::macos_monitor::WindowAction::ReadKeyboardTarget { binding: p.binding },
             ToolCallerTrust::OwnerSurface,
         )
         .await

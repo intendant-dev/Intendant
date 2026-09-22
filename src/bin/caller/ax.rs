@@ -1025,13 +1025,50 @@ impl Native for PlacementNative {
 // Semantic controls use private retained AX references, on the SAME helper main
 // thread as monitors/windows. None of these wrappers sends global input.
 use crate::macos_monitor::ancestry;
-use crate::macos_monitor::controls::{self, Metadata, Safety};
+use crate::macos_monitor::controls::{self, KeyboardMetadata, Metadata, Safety};
 pub(crate) type RetainedElement = ancestry::Node<AXUIElement>;
 fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType, String> {
     placement_permissions(deadline)?;
     placement_timeout(e, deadline)?;
     copy_attr(e, key).ok_or_else(|| format!("required AX attribute {key} unavailable"))
 }
+/// Strict AX Copy-rule element read used by the bound receiver path. Unlike
+/// optional metadata, every non-success status, missing value or wrong type is
+/// a refusal; a malformed provider cannot be interpreted as an empty focus.
+fn control_strict_element_attr(
+    element: &AXUIElement,
+    attribute: &str,
+    deadline: Instant,
+) -> Result<AXUIElement, String> {
+    placement_permissions(deadline)?;
+    placement_timeout(element, deadline)?;
+    let key = CFString::new(attribute);
+    let mut raw = std::ptr::null();
+    // SAFETY: retained AX element/key and writable Copy-rule output. A non-null
+    // result is RAII-wrapped even for a contradictory native status.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValue(
+            element.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut raw,
+        )
+    };
+    let value = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: non-null Copy-rule CF object is released by CFType on every
+        // success/refusal path and dynamically checked below.
+        Some(unsafe { CFType::wrap_under_create_rule(raw) })
+    };
+    placement::time_left(deadline)?;
+    if status != kAXErrorSuccess {
+        return Err(format!("AX {attribute} copy failed or was contradictory"));
+    }
+    value
+        .and_then(|value| value.downcast_into::<AXUIElement>())
+        .ok_or_else(|| format!("AX {attribute} missing or not an AX element"))
+}
+
 fn control_string(value: CFType, cap: usize) -> Result<String, String> {
     let string = value
         .downcast_into::<CFString>()
@@ -1554,6 +1591,54 @@ impl controls::Native for PlacementNative {
         )?;
         placement::time_left(deadline)?;
         Ok(value == text)
+    }
+    fn keyboard_focused(
+        &mut self,
+        window: &RetainedWindow,
+        identity: WindowIdentity,
+        deadline: Instant,
+    ) -> Result<RetainedElement, String> {
+        placement_generation(identity)?;
+        let exact = placement_exact(identity, deadline)?;
+        if exact != window.element
+            || placement_pid(&window.element, deadline)? != identity.pid
+            || placement_window_id(&window.element, deadline)? != identity.window_id
+        {
+            return Err("retained keyboard target window was replaced or detached".into());
+        }
+        let app = placement_app(identity.pid, deadline)?;
+        if placement_pid(&app, deadline)? != identity.pid {
+            return Err("keyboard target application object identity changed".into());
+        }
+        let focused = control_strict_element_attr(&app, kAXFocusedUIElementAttribute, deadline)?;
+        if placement_pid(&focused, deadline)? != identity.pid {
+            return Err("application-local focused receiver belongs to another process".into());
+        }
+        let owner = control_strict_element_attr(&focused, "AXWindow", deadline)?;
+        if owner != window.element
+            || placement_pid(&owner, deadline)? != identity.pid
+            || placement_window_id(&owner, deadline)? != identity.window_id
+        {
+            return Err("application-local focused receiver left retained window".into());
+        }
+        placement_generation(identity)?;
+        placement::time_left(deadline)?;
+        Ok(RetainedElement::plain(focused))
+    }
+    fn keyboard_metadata(
+        &mut self,
+        e: &RetainedElement,
+        role: &str,
+        deadline: Instant,
+    ) -> Result<KeyboardMetadata, String> {
+        let safety = control_safety(&e.element, deadline)?;
+        if safety.secure || safety.role != role {
+            return Err("keyboard receiver safety changed before metadata".into());
+        }
+        let enabled = control_enabled(&e.element, deadline)?;
+        let bounds = placement_ax(&e.element, deadline)?;
+        placement::time_left(deadline)?;
+        Ok(KeyboardMetadata { bounds, enabled })
     }
 }
 

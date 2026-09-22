@@ -5,6 +5,7 @@ use super::*;
 pub(crate) use crate::macos_monitor::controls::{
     ActMacosWindowElementParams, ReadMacosWindowElementsParams,
 };
+pub(crate) use crate::macos_monitor::keyboard::ReadMacosWindowKeyboardTargetParams;
 pub(crate) use crate::macos_monitor::placement::{
     BindMacosWindowParams, ListMacosWindowsParams, PlaceMacosWindowParams, UnbindMacosWindowParams,
 };

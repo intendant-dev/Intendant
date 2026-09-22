@@ -172,6 +172,13 @@ fn serve_with_windows<O: Owner, N: Native>(
                         })
                         .map(|controls| Outcome::WindowElements { controls }),
                 ),
+                Operation::ReadKeyboardTarget { binding } => window_outcome(
+                    windows
+                        .read_keyboard_target(binding, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|target| Outcome::KeyboardTarget { target }),
+                ),
                 Operation::ActWindowElement {
                     binding,
                     element,

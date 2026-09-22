@@ -11,6 +11,7 @@ pub(crate) mod controls;
 pub(crate) mod focus;
 mod helper;
 mod inspection;
+pub(crate) mod keyboard;
 pub(crate) mod placement;
 pub(crate) mod pointer;
 mod process;
@@ -271,6 +272,13 @@ impl Action {
         match self {
             Self::Inspect(inspection) => inspection.check(authority).await,
             Self::Window(action) => {
+                // The keyboard receiver report is a DisplayView observation,
+                // but the shared WindowServer still requires an owner surface.
+                // Keep the existing display-authority check at admission and
+                // dequeue rather than allowing an owner-only broker bypass.
+                if matches!(action, WindowAction::ReadKeyboardTarget { .. }) {
+                    authority.check().await?;
+                }
                 if !authority.owner_surface {
                     return Err("macOS window operations require an owner surface; user-display grants do not authorize application window movement or enumeration".into());
                 }
@@ -308,6 +316,16 @@ impl Broker {
         }
         if let Action::Create { width, height } = action {
             validate_dimensions(width, height)?;
+        }
+        // This read-only slice has no meaningful non-macOS implementation.
+        // Name that explicitly before the generic unused-broker refusal while
+        // still never allocating a broker/helper on an unsupported host.
+        if matches!(
+            action,
+            Action::Window(WindowAction::ReadKeyboardTarget { .. })
+        ) && !cfg!(target_os = "macos")
+        {
+            return Err("read_macos_window_keyboard_target requires macOS owned monitors".into());
         }
         if matches!(action, Action::Window(_)) && self.sender.get().is_none() {
             return Err("no owned macOS monitor generation".into());
@@ -1059,6 +1077,17 @@ mod tests {
                             bounds: placement::tests::monitor(),
                             operations: vec![controls::SupportedOperation::Press],
                         }],
+                    })
+                }
+                Operation::ReadKeyboardTarget { .. } => {
+                    self.log.lock().unwrap().push("keyboard_target");
+                    Ok(Outcome::KeyboardTarget {
+                        target: keyboard::KeyboardTarget {
+                            role: "AXTextField".into(),
+                            bounds: placement::tests::monitor(),
+                            enabled: true,
+                            keyboard_dispatch_supported: false,
+                        },
                     })
                 }
                 Operation::ActWindowElement {
@@ -2009,6 +2038,9 @@ mod tests {
                 WindowAction::ReadElements {
                     binding: "macos_window:fixture:1".into(),
                 },
+                WindowAction::ReadKeyboardTarget {
+                    binding: "macos_window:fixture:1".into(),
+                },
                 WindowAction::ActElement {
                     binding: "macos_window:fixture:1".into(),
                     element: "macos_element:00000000000000000000000000000001".into(),
@@ -2344,6 +2376,25 @@ mod tests {
         let token = c[0].element.clone();
         (receipt, token)
     }
+    async fn keyboard_fixture(tx: &mpsc::Sender<Request>, binding: &str) -> Receipt {
+        let receipt = send(
+            tx,
+            Action::Window(WindowAction::ReadKeyboardTarget {
+                binding: binding.into(),
+            }),
+            authority(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let Value::Window(WindowValue::KeyboardTarget(target)) = &receipt.value else {
+            panic!("keyboard target")
+        };
+        assert_eq!(target.role, "AXTextField");
+        assert!(!target.keyboard_dispatch_supported);
+        assert!(target.valid_reply());
+        receipt
+    }
     fn press_fixture(binding: &str, element: &str) -> Action {
         Action::Window(WindowAction::ActElement {
             binding: binding.into(),
@@ -2358,6 +2409,9 @@ mod tests {
             Action::Window(WindowAction::ReadElements {
                 binding: "macos_window:fixture:1".into(),
             }),
+            Action::Window(WindowAction::ReadKeyboardTarget {
+                binding: "macos_window:fixture:1".into(),
+            }),
             press_fixture(
                 "macos_window:fixture:1",
                 "macos_element:00000000000000000000000000000001",
@@ -2366,6 +2420,60 @@ mod tests {
             assert!(broker.request(action, authority(true)).await.is_err());
             assert!(broker.not_started());
         }
+    }
+    #[tokio::test]
+    async fn keyboard_target_is_owner_and_display_authorized_at_dequeue_before_helper() {
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        let (tx, worker) = runner(fake);
+        let binding = bound_fixture(&tx).await;
+        let scoped = authority(false);
+        scoped.autonomy.write().await.user_display_granted = true;
+        assert!(send(
+            &tx,
+            Action::Window(WindowAction::ReadKeyboardTarget {
+                binding: binding.clone(),
+            }),
+            scoped,
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("scoped receiver inspection must be refused")
+        .contains("owner surface"));
+        assert!(!log.lock().unwrap().contains(&"keyboard_target"));
+        assert!(keyboard_fixture(&tx, &binding).await.commit());
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|&&entry| entry == "keyboard_target")
+                .count(),
+            1
+        );
+        drop(tx);
+        worker.await.unwrap().unwrap();
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn keyboard_target_refuses_unsupported_os_before_an_existing_broker_queue() {
+        let broker = Broker::default();
+        let (tx, mut rx) = mpsc::channel(QUEUE_SIZE);
+        assert!(broker.sender.set(Ok(tx)).is_ok());
+        assert_eq!(
+            broker
+                .request(
+                    Action::Window(WindowAction::ReadKeyboardTarget {
+                        binding: "macos_window:fixture:1".into(),
+                    }),
+                    authority(true),
+                )
+                .await
+                .err()
+                .expect("unsupported keyboard receiver inspection must be refused"),
+            "read_macos_window_keyboard_target requires macOS owned monitors"
+        );
+        assert!(rx.try_recv().is_err());
     }
     #[tokio::test]
     async fn element_snapshot_replacement_and_cross_binding_tokens_do_not_dispatch_effects() {

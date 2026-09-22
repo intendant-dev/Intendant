@@ -1128,6 +1128,35 @@ application metadata is claimed. Existing exact-identity, focus, containment,
 permission and single-use-token checks are unchanged.
 See the [bounded control design and supervisor harness](../design/macos-bound-window-actions.md).
 
+### Read-only bound-window keyboard receiver inspection
+
+`read_macos_window_keyboard_target {binding}` (`inspect display keyboard-target
+BINDING`) is an OwnerSurface + DisplayView observation of the exact retained
+window's **application-local** focused AX receiver. It returns only bounded
+native role, receiver geometry, enabled state, and the fixed flag
+`keyboard_dispatch_supported:false`. It contains no label, AXValue, document
+text, secret, native object pointer, unrelated app metadata, receiver identity
+or reusable authority/preparation token. A role, enabled state or bounds does
+not establish that a key could be delivered; the snapshot is neither key-delivery
+proof nor durable receiver identity.
+
+The helper strictly copies the target application's `AXFocusedUIElement`, checks
+its exact retained PID/window and retained ancestry, and reads the same receiver
+twice. It observes human global focus only as an unchanged before/after witness,
+never to pick the receiver. Full AX/CG window and receiver containment inside the
+same owned monitor, process generation, protected-content state, reciprocal
+membership (including the narrow Chromium bridge), geometry, focus and the
+existing four-second/node/depth/children budgets are rechecked throughout.
+Missing, foreign, replaced, detached, protected, changed, malformed or oversized
+state refuses. The operation retains no receiver and does not change existing
+semantic or pointer preparations.
+
+There is no key posting, activation, implicit click, focus restoration,
+privilege/TCC change, input capability or fallback to an ID/label-selected
+replacement. An unused or retired broker is refused without helper startup; other
+platforms report that macOS owned monitors are required. See the
+[keyboard receiver design and disposable acceptance profile](../design/macos-keyboard-receiver-inspection.md).
+
 ### Chromium acceptance and redundant placement writes
 
 Owned-window placement skips position or size only when both native observations

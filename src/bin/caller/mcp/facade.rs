@@ -3708,6 +3708,12 @@ mod tests {
                 DisplayView,
             ),
             (
+                "inspect",
+                vec!["display", "keyboard-target", "macos_window:fixture:1"],
+                "read_macos_window_keyboard_target",
+                DisplayView,
+            ),
+            (
                 "act",
                 vec![
                     "display",
