@@ -14,6 +14,14 @@
 <input id="protected" aria-label="Synthetic protected fixture field" type="password" value="synthetic-secret-never-return">
 <script>
 'use strict';
+const clickEvents = []; let clickOverflow = false;
+for (const kind of ['mousedown', 'mouseup', 'click']) document.addEventListener(kind, event => {
+  if (clickEvents.length >= 8) { clickOverflow = true; return; }
+  clickEvents.push({kind, target: event.target.id, trusted: event.isTrusted,
+    button: event.button, buttons: event.buttons, client_x: event.clientX,
+    client_y: event.clientY, screen_x: event.screenX, screen_y: event.screenY,
+    alt: event.altKey, control: event.ctrlKey, meta: event.metaKey, shift: event.shiftKey});
+});
 const targets = Object.freeze({ first: 'first', second: 'second', protected: 'protected' });
 window.selectKeyboardTarget = name => {
   const id = targets[name];
@@ -32,7 +40,7 @@ window.keyboardTargetFixtureState = () => {
   return {
     active: selected ? active.id : null,
     rect: rect && {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
-    ready: document.readyState,
+    ready: document.readyState, click_events: clickEvents.map(e => ({...e})), click_overflow: clickOverflow,
     metrics: {screen_x: screenX, screen_y: screenY, outer_width: outerWidth, outer_height: outerHeight,
       inner_width: innerWidth, inner_height: innerHeight, scale: devicePixelRatio, zoom: visualViewport.scale,
       scroll_x: scrollX, scroll_y: scrollY},

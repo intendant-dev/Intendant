@@ -163,3 +163,42 @@ authorization, focus checks, traversal limits or CI policy changed.
 
 Published-head native acceptance and refreshed validation are recorded on PR
 #947 separately from the earlier focus-observation refusal.
+
+## Explicit selection in native acceptance (2026-09-22)
+
+The resumed no-click profile completed placement but the strict target-application
+AXFocusedUIElement read refused. Its browser/profile cleanup and original display
+restoration passed; that negative report remains separate. DOM focus by itself
+was not sufficient in this tested Chromium instance. No production check was
+removed or converted into a successful empty receiver.
+
+A separately opted-in --chromium-keyboard-target-click-first profile now uses
+the existing owner-bound prepare/click tools for exactly one click on the first
+nonsecret fixture field. The inner spelling is --keyboard-target-click-first.
+Both require the keyboard-target profile; neither is enabled by default. The
+setup validates frozen native/DOM geometry, the returned preparation and actual
+dispatch, then independently verifies the exact trusted down/up/click sequence
+at the requested point. Uncertain results retain evidence and never retry. The
+inspection tool itself remains read-only and never performs a selection click.
+
+With that explicit setup, the native HTTP test passed both nonsecret receiver
+reads with independently matching geometry, the protected-password refusal and
+stale-binding refusal. No key was posted. The browser/supervisor/profile were
+cleaned up and original display inventory restored. Eight new hermetic tests
+cover selection planning, native/effect evidence, partial refusal, no retry and
+explicit option gates. The earlier floating-point test subtraction assertion
+was corrected without changing production or native acceptance tolerances.
+
+For the positive acceptance command above add the separate flag
+--chromium-keyboard-target-click-first. Omit it to retain the no-click comparison.
+These are observations of one disposable Chromium profile, not an authenticated
+DOM source, arbitrary-application compatibility or an independent keyboard seat.
+
+The next Ubuntu run compiled and exposed two test-only message mismatches:
+requires macOS was incorrectly checked as require macOS. The direct unsupported
+case now pins the exact existing error; HTTP acceptance recognizes that same
+existing tool-specific error while retaining IAM/owner checks. The fixed
+production error and behavior were not changed. The refreshed Python suite
+passes 117 tests. A new independent review of the fixture-only setup changes
+was unavailable because the reviewer reached its usage limit; the saved
+independent review covers the production receiver implementation.

@@ -156,5 +156,113 @@ class KeyboardReceiverEvidence(unittest.TestCase):
             t,s,w=self.fixture(); s["metrics"][k]+=2
             with self.assertRaises(RuntimeError): h.validate_keyboard_receiver(t,s,w)
 
+
+class KeyboardSetupEvidence(unittest.TestCase):
+    def fixture(self):
+        _, state, window = KeyboardReceiverEvidence().fixture()
+        state.update(click_events=[], click_overflow=False)
+        plan = h.keyboard_setup_plan(state, window)
+        native = {'ok': True, 'action': {'status':'dispatched', 'posting_calls':2,
+            'action_attempted':True, 'effect_verified':False, 'effects_unconfirmed':True,
+            'focus_interference':False, 'detail':None, 'point':plan['point'], 'global':plan['global']}}
+        after = json.loads(json.dumps(state))
+        after['click_events'] = [dict(kind=kind, target='first', trusted=True, button=0, buttons=buttons,
+            client_x=plan['client']['x'], client_y=plan['client']['y'],
+            screen_x=plan['global']['x'], screen_y=plan['global']['y'],
+            alt=False, control=False, meta=False, shift=False)
+            for kind,buttons in [('mousedown',1), ('mouseup',0), ('click',0)]]
+        return state, window, plan, native, after
+
+    def test_setup_plan_has_exact_negative_monitor_and_local_coordinates(self):
+        state, window, plan, native, after = self.fixture()
+        self.assertLess(plan['global']['x'], 0)
+        self.assertAlmostEqual(plan['point']['y'] - plan['client']['y'], 87)
+        self.assertEqual(plan['global']['x'], window['x'] + plan['point']['x'])
+        h.validate_keyboard_setup_click(plan, native, state, after)
+
+    def test_setup_plan_rejects_password_foreign_geometry_and_malformed_values(self):
+        for kind,key,value in [('state','active','protected'), ('state','active','second'),
+                ('rect','width',False), ('rect','x',float('nan')), ('rect','y',500),
+                ('metrics','screen_x',500), ('metrics','zoom',2), ('metrics','scale',2),
+                ('metrics','inner_width',600), ('rect','width',10**500)]:
+            state, window, *_ = self.fixture()
+            (state if kind == 'state' else state[kind])[key] = value
+            with self.assertRaises(RuntimeError): h.keyboard_setup_plan(state, window)
+
+    def test_posting_calls_alone_partial_or_failed_native_result_never_pass(self):
+        for key,value in [('status','partial'), ('posting_calls',True), ('posting_calls',1),
+                ('detail','native exception'), ('focus_interference',None),
+                ('effect_verified',True), ('point',{'x':0,'y':0})]:
+            state, window, plan, native, after = self.fixture()
+            native['action'][key] = value
+            with self.assertRaises(RuntimeError): h.validate_keyboard_setup_click(plan,native,state,after)
+
+    def test_exact_pair_effect_requires_order_trust_coordinates_and_no_modifiers(self):
+        for key,value in [('kind','mouseup'), ('trusted',False), ('target','second'),
+                ('button',True), ('buttons',False), ('meta',True), ('client_x',0),
+                ('screen_y',float('nan'))]:
+            state, window, plan, native, after = self.fixture()
+            after['click_events'][0][key] = value
+            with self.assertRaises(RuntimeError): h.validate_keyboard_setup_click(plan,native,state,after)
+        for mode in ('duplicate', 'partial', 'overflow', 'changed_receiver'):
+            state, window, plan, native, after = self.fixture()
+            if mode == 'duplicate': after['click_events'] *= 2
+            elif mode == 'partial': after['click_events'].pop()
+            elif mode == 'overflow': after['click_overflow'] = True
+            else: after['active'] = 'second'
+            with self.assertRaises(RuntimeError): h.validate_keyboard_setup_click(plan,native,state,after)
+
+    def fake_call(self, plan, window, native, calls, refuse=False):
+        def call(name, **kwargs):
+            calls.append((name,kwargs))
+            if name == 'prepare_macos_window_click':
+                if refuse: return {'ok':False,'error':'fixture preparation refused'}
+                return {'ok':True,'prepared':{'point':plan['point'],'global':plan['global'],
+                    'window':{'ax':window,'cg':window},'token':'macos_pointer:'+'1'*32}}
+            self.assertEqual(name,'click_macos_window')
+            self.assertEqual(kwargs,{'binding':'fixture-binding','token':'macos_pointer:'+'1'*32})
+            return native
+        return call
+
+    def test_one_preparation_and_one_click_with_independent_effects(self):
+        state, window, plan, native, after = self.fixture()
+        calls=[]; evidence={}
+        h.select_keyboard_fixture_with_click(self.fake_call(plan,window,native,calls),
+            lambda expression: after, 'fixture-binding',state,window,evidence)
+        self.assertEqual([c[0] for c in calls],['prepare_macos_window_click','click_macos_window'])
+        self.assertTrue(evidence['effect_verified'])
+        self.assertFalse(evidence['dom_tag_correlation'])
+
+    def test_preparation_refusal_never_clicks(self):
+        state, window, plan, native, after = self.fixture()
+        calls=[]; evidence={}
+        with self.assertRaises(RuntimeError):
+            h.select_keyboard_fixture_with_click(self.fake_call(plan,window,native,calls,True),
+                lambda expression: self.fail('must not observe after absent dispatch'), 'fixture-binding',state,window,evidence)
+        self.assertEqual(len(calls),1)
+        self.assertNotIn('dispatch',evidence)
+
+    def test_uncertain_dispatch_is_preserved_and_never_retried(self):
+        state, window, plan, native, after = self.fixture()
+        native['action']['status']='partial'; native['action']['detail']='fixture exception'
+        calls=[]; evidence={}
+        with self.assertRaises(RuntimeError):
+            h.select_keyboard_fixture_with_click(self.fake_call(plan,window,native,calls),
+                lambda expression: after, 'fixture-binding',state,window,evidence)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(evidence['dispatch'],native)
+        self.assertEqual(evidence['observed'],after)
+
+    def test_click_setup_requires_its_own_explicit_flag_and_receiver_profile(self):
+        spec=importlib.util.spec_from_file_location('monitor_fixture_args',Path(__file__).with_name('verify-macos-monitor-http.py'))
+        outer=importlib.util.module_from_spec(spec); spec.loader.exec_module(outer)
+        base=['--bin','unused','--fixture','unused','--report','unused',
+              '--allow-shared-session-monitor','--chromium-app','test.app','--chromium-supervisor','unused']
+        self.assertFalse(outer.parse_args(base+['--chromium-keyboard-target']).chromium_keyboard_target_click_first)
+        self.assertTrue(outer.parse_args(base+['--chromium-keyboard-target','--chromium-keyboard-target-click-first']).chromium_keyboard_target_click_first)
+        with patch.object(sys,'stderr'), self.assertRaises(SystemExit):
+            outer.parse_args(base+['--chromium-keyboard-target-click-first'])
+
+
 if __name__ == '__main__':
     unittest.main()

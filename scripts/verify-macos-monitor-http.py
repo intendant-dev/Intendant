@@ -40,7 +40,10 @@ def parse_args(argv=None):
     parser.add_argument('--chromium-keyboard-target', action='store_true', help='Run the read-only disposable browser keyboard-receiver inspection profile')
     parser.add_argument('--chromium-bound-pointer', action='store_true', help='Exercise owner-bound HTTP pointer tools on the created monitor')
     parser.add_argument('--chromium-scroll-delta', type=parse_scroll_delta, help='Test one owner-window vertical scroll through HTTP; positive down; each sign needs a fresh invocation')
+    parser.add_argument('--chromium-keyboard-target-click-first', action='store_true', help='Explicit first-field setup click; requires keyboard-target')
     args = parser.parse_args(argv)
+    if args.chromium_keyboard_target_click_first and not args.chromium_keyboard_target:
+        parser.error('--chromium-keyboard-target-click-first requires --chromium-keyboard-target')
     scrolling = args.chromium_scroll_delta is not None
     if scrolling and (not args.chromium_app or args.chromium_bound_pointer or args.chromium_placement_only):
         parser.error('scroll test needs Chromium and excludes other Chromium pointer/placement profiles')
@@ -167,7 +170,7 @@ def main():
                 chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer or scrolling else 'verify-macos-chromium-controls.py')),
                     '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
                     '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
-                    '--allow-disposable-chromium'] + (['--keyboard-target'] if args.chromium_keyboard_target else ['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []), cwd=project, env=env, timeout=230)
+                    '--allow-disposable-chromium'] + (['--keyboard-target'] if args.chromium_keyboard_target else ['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []) + (['--keyboard-target-click-first'] if args.chromium_keyboard_target_click_first else []), cwd=project, env=env, timeout=230)
                 report['chromium'] = json.loads(chromium_report.read_text()) if chromium_report.exists() else {'passed': False, 'error': 'Chromium fixture exited before producing a report; see stderr', 'exit_code': chromium.returncode}
                 assert chromium.returncode == 0, report['chromium']
                 if scrolling:
