@@ -217,9 +217,11 @@ pub(crate) fn tool_allowed_for_profile(
                     | "read_macos_window_keyboard_target"
                     | "prepare_macos_window_click"
                     | "prepare_macos_window_scroll"
+                    | "prepare_macos_window_arrowright"
                     | "act_macos_window_element"
                     | "click_macos_window"
                     | "scroll_macos_window"
+                    | "press_macos_window_arrowright"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -266,9 +268,11 @@ pub(crate) fn tool_allowed_for_profile(
                     | "read_macos_window_keyboard_target"
                     | "prepare_macos_window_click"
                     | "prepare_macos_window_scroll"
+                    | "prepare_macos_window_arrowright"
                     | "act_macos_window_element"
                     | "click_macos_window"
                     | "scroll_macos_window"
+                    | "press_macos_window_arrowright"
                     | "bind_macos_window"
                     | "place_macos_window"
                     | "unbind_macos_window"
@@ -475,6 +479,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "read_macos_window_keyboard_target"
         | "prepare_macos_window_click"
         | "prepare_macos_window_scroll"
+        | "prepare_macos_window_arrowright"
         | "take_screenshot"
         | "read_screen"
         | "display_readiness"
@@ -497,6 +502,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "act_macos_window_element"
         | "click_macos_window"
         | "scroll_macos_window"
+        | "press_macos_window_arrowright"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -941,6 +947,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
     );
     // Schemas/descriptions derive from the typed stdio declarations.
     for (name, tool) in [
+        (
+            "prepare_macos_window_arrowright",
+            IntendantServer::prepare_macos_window_arrowright_tool_attr(),
+        ),
+        (
+            "press_macos_window_arrowright",
+            IntendantServer::press_macos_window_arrowright_tool_attr(),
+        ),
         (
             "prepare_macos_window_scroll",
             IntendantServer::prepare_macos_window_scroll_tool_attr(),
@@ -2442,6 +2456,48 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!(key)));
+        }
+    }
+
+    #[test]
+    fn arrowright_schema_derivation_and_authority_split() {
+        use crate::peer::access_policy::PeerOperation::{DisplayInput, DisplayView};
+        for profile in [None, Some("core"), Some("screen")] {
+            let mut definitions = Vec::new();
+            append_manual_http_tool_definitions(&mut definitions, false, profile);
+            for (name, attr, op, count) in [
+                (
+                    "prepare_macos_window_arrowright",
+                    IntendantServer::prepare_macos_window_arrowright_tool_attr(),
+                    DisplayView,
+                    1,
+                ),
+                (
+                    "press_macos_window_arrowright",
+                    IntendantServer::press_macos_window_arrowright_tool_attr(),
+                    DisplayInput,
+                    2,
+                ),
+            ] {
+                let typed = serde_json::to_value(attr).unwrap();
+                assert_eq!(mcp_tool_operation(name), op);
+                assert_eq!(
+                    *definitions.iter().find(|v| v["name"] == name).unwrap(),
+                    typed
+                );
+                assert_eq!(typed["inputSchema"]["additionalProperties"], false);
+                assert_eq!(
+                    typed["inputSchema"]["properties"]
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    count
+                );
+                assert_eq!(
+                    typed["inputSchema"]["required"].as_array().unwrap().len(),
+                    count
+                );
+            }
         }
     }
 }

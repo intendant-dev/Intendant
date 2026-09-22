@@ -13,12 +13,16 @@ impl IntendantServer {
         action: WindowAction,
         caller: ToolCallerTrust,
     ) -> String {
-        let scroll_action = matches!(&action, WindowAction::Scroll { .. });
+        let scroll_action = matches!(
+            &action,
+            WindowAction::Scroll { .. } | WindowAction::PressArrow { .. }
+        );
         let element_action = matches!(
             &action,
             WindowAction::ActElement { .. }
                 | WindowAction::Click { .. }
                 | WindowAction::Scroll { .. }
+                | WindowAction::PressArrow { .. }
         );
         let authority = self.macos_monitor_authority(caller).await;
         let receipt = match self
@@ -31,7 +35,8 @@ impl IntendantServer {
             Err(error) => {
                 if element_action {
                     let uncertain = error.starts_with(crate::macos_monitor::ELEMENT_UNCONFIRMED)
-                        || error.starts_with(crate::macos_monitor::POINTER_UNCONFIRMED);
+                        || error.starts_with(crate::macos_monitor::POINTER_UNCONFIRMED)
+                        || error.starts_with(crate::macos_monitor::KEY_UNCONFIRMED);
                     let mut response = serde_json::json!({"ok":false, "error":error,
                         "action_attempted": if uncertain { None } else { Some(false) },
                         "effects_unconfirmed":uncertain, "focus_interference":null});
@@ -350,6 +355,15 @@ fn window_response(receipt: crate::macos_monitor::Receipt) -> String {
             serde_json::json!({"ok":false,"action":result,"error":error,
                 "action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,
                 "focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::PreparedArrow(prepared)) => {
+            serde_json::json!({"ok":true,"prepared":prepared,"action_attempted":false})
+        }
+        Value::Window(WindowValue::Arrowed(result)) => {
+            serde_json::json!({"ok":result.successful(),"action":result,"action_attempted":result.action_attempted,"effects_unconfirmed":result.effects_unconfirmed,"focus_interference":result.focus_interference})
+        }
+        Value::Window(WindowValue::ArrowUnconfirmed { result, error }) => {
+            serde_json::json!({"ok":false,"action":result,"error":error,"action_attempted":result.action_attempted,"effects_unconfirmed":result.action_attempted,"focus_interference":result.focus_interference})
         }
         Value::Window(WindowValue::PreparedScroll(prepared)) => {
             serde_json::json!({"ok":true,"prepared":prepared,"action_attempted":false})

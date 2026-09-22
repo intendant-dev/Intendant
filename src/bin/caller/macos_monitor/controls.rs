@@ -577,6 +577,7 @@ impl<N: Native> placement::Windows<N> {
     ) -> Result<Vec<Control>, String> {
         self.elements.clear();
         self.pointers.clear();
+        self.arrows.clear();
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         self.elements.read(
             &mut self.native,
@@ -595,6 +596,7 @@ impl<N: Native> placement::Windows<N> {
         mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<ActionResult, String> {
         self.pointers.clear();
+        self.arrows.clear();
         let Some(b) = self.bindings.get(&id) else {
             self.elements.clear();
             return Err("stale window binding".into());

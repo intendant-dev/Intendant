@@ -11,6 +11,7 @@ then tests the read-only receiver API. CDP selects only a field in its own local
 page; the profile sends no native keys or system-wide focus operations. Its report is not a keyboard-delivery claim.
 """
 import math
+import macos_arrow_acceptance as arrow_acceptance
 import argparse
 import base64
 import hashlib
@@ -289,7 +290,9 @@ def main():
     p.add_argument('--placement-only', action='store_true', help='Verify placement/no-op only; do not claim semantic actions')
     p.add_argument('--keyboard-target', action='store_true', help='Run only the read-only focused-receiver inspection profile')
     p.add_argument('--keyboard-target-click-first', action='store_true', help='Explicit single bound-window setup click on the first disposable nonsecret field')
+    p.add_argument('--arrowright',action='store_true',help='Explicit one-pair production ArrowRight acceptance after verified setup selection')
     args = p.parse_args()
+    require(not args.arrowright or (args.keyboard_target and args.keyboard_target_click_first), 'ArrowRight test requires explicit keyboard-target and click-first setup')
     require(not args.keyboard_target_click_first or args.keyboard_target, 'click-first requires keyboard-target')
     if platform.system() != 'Darwin' or not args.allow_disposable_chromium or os.getenv('INTENDANT_MCP_URL'):
         p.error('requires macOS owner shell and explicit disposable Chromium opt-in')
@@ -451,6 +454,10 @@ def main():
                 first_state = select_keyboard_fixture_with_click(call, evaluate, binding, first_state, expected, report['checks']['explicit_setup_click'])
             first_receiver = read_receiver(first_state)
             report['checks']['first_receiver'] = first_receiver
+            pending_arrow = None
+            if args.arrowright:
+                report['arrowright'] = {}
+                pending_arrow = arrow_acceptance.exercise(call,evaluate,binding,report['arrowright'])
             second_state = evaluate("selectKeyboardTarget('second')")
             require(second_state['active'] == 'second', 'fixture-only DOM focus setup failed for second field')
             second = call('inspect', argv=['display', 'keyboard-target', binding])
@@ -478,8 +485,12 @@ def main():
             stale = call('read_macos_window_keyboard_target', binding=stale_binding)
             require(stale.get('ok') is False and 'stale' in json.dumps(stale).lower(), stale)
             report['checks']['stale_binding_refused'] = True
+            if pending_arrow is not None:
+                refused=call('press_macos_window_arrowright',binding=stale_binding,token=pending_arrow)
+                require(refused.get('ok') is False and refused.get('action_attempted') is False and refused.get('effects_unconfirmed') is False,refused)
+                report['arrowright']['checks']['stale_binding_refused']=True
             report['checks']['fixture_setup'] = ('one explicit verified native click, then fixture-only DOM receiver changes' if args.keyboard_target_click_first else 'DOM focus only; no native click')
-            report['checks']['keyboard_input_requested'] = False
+            report['checks']['keyboard_input_requested'] = args.arrowright
         elif not args.placement_only:
             def read():
                 result = call('read_macos_window_elements', binding=binding)

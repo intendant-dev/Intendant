@@ -24,6 +24,13 @@ pub(crate) enum WindowAction {
     ReadKeyboardTarget {
         binding: String,
     },
+    PrepareArrow {
+        binding: String,
+    },
+    PressArrow {
+        binding: String,
+        token: String,
+    },
     ActElement {
         binding: String,
         element: String,
@@ -80,6 +87,10 @@ impl WindowAction {
                 point.validate()?;
                 scroll::validate_delta(*delta_y)
             }
+            Self::PressArrow { binding, token } => {
+                valid_binding(binding)?;
+                arrow::validate_token(token)
+            }
             Self::Click { binding, token } | Self::Scroll { binding, token } => {
                 valid_binding(binding)?;
                 pointer::validate_token(token)
@@ -90,7 +101,8 @@ impl WindowAction {
             }
             Self::Unbind { binding }
             | Self::ReadElements { binding }
-            | Self::ReadKeyboardTarget { binding } => valid_binding(binding),
+            | Self::ReadKeyboardTarget { binding }
+            | Self::PrepareArrow { binding } => valid_binding(binding),
             Self::ActElement {
                 binding,
                 element,
@@ -128,6 +140,12 @@ pub(crate) enum WindowValue {
     },
     Elements(Vec<Control>),
     KeyboardTarget(KeyboardTarget),
+    PreparedArrow(arrow::Prepared),
+    Arrowed(Box<arrow::ArrowResult>),
+    ArrowUnconfirmed {
+        result: Box<arrow::ArrowResult>,
+        error: String,
+    },
     Acted(ActionResult),
     ActionUnconfirmed {
         result: ActionResult,
@@ -204,6 +222,8 @@ pub(super) async fn execute_window(
         }
         WindowAction::ReadElements { binding }
         | WindowAction::ReadKeyboardTarget { binding }
+        | WindowAction::PrepareArrow { binding }
+        | WindowAction::PressArrow { binding, .. }
         | WindowAction::ActElement { binding, .. }
         | WindowAction::PrepareClick { binding, .. }
         | WindowAction::Click { binding, .. }
@@ -217,6 +237,13 @@ pub(super) async fn execute_window(
             // snapshot/action budget. Do not dispatch a separate native resolve
             // ahead of consuming the element inventory.
             match action {
+                WindowAction::PrepareArrow { .. } => Operation::PrepareArrow {
+                    binding: bound.helper_binding,
+                },
+                WindowAction::PressArrow { token, .. } => Operation::PressArrow {
+                    binding: bound.helper_binding,
+                    token: token.clone(),
+                },
                 WindowAction::PrepareClick { point, .. } => Operation::PreparePointer {
                     binding: bound.helper_binding,
                     point: *point,
@@ -275,6 +302,8 @@ pub(super) async fn execute_window(
     let outcome = child.exchange(op).await.map_err(|e| {
         Failure::Retire(if matches!(action, WindowAction::Place { .. }) {
             placement_unconfirmed(&e)
+        } else if matches!(action, WindowAction::PressArrow { .. }) {
+            key_unconfirmed(&e)
         } else if matches!(
             action,
             WindowAction::Click { .. } | WindowAction::Scroll { .. }
@@ -334,6 +363,16 @@ pub(super) async fn execute_window(
         {
             WindowValue::Elements(controls)
         }
+        (WindowAction::PrepareArrow { .. }, Outcome::PreparedArrow { prepared })
+            if prepared.valid_reply() =>
+        {
+            WindowValue::PreparedArrow(prepared)
+        }
+        (WindowAction::PressArrow { .. }, Outcome::PressedArrow { result })
+            if result.valid_reply() =>
+        {
+            WindowValue::Arrowed(Box::new(result))
+        }
         (WindowAction::ReadKeyboardTarget { .. }, Outcome::KeyboardTarget { target })
             if target.valid_reply() =>
         {
@@ -387,6 +426,8 @@ pub(super) async fn execute_window(
             return Err(Failure::Retire(
                 if matches!(action, WindowAction::Place { .. }) {
                     placement_unconfirmed(error)
+                } else if matches!(action, WindowAction::PressArrow { .. }) {
+                    key_unconfirmed(error)
                 } else if matches!(
                     action,
                     WindowAction::Click { .. } | WindowAction::Scroll { .. }

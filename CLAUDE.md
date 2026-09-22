@@ -297,6 +297,19 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   corrective input or automatic retry. Existing click authority/behavior, retained
   source capacity, exact focus (including validated fallback) and all other unsafe
   and local-IAM boundaries remain unchanged.
+- **Narrow retained-receiver ArrowRight exception (2026-09-22):**
+  `crates/intendant-platform/src/bound_arrow.rs` and its ARC/exception shim
+  `bound_arrow.m` permit only main-thread readiness, construction, one-shot
+  posting and release of one fixed unmodified ArrowRight down/up pair. The
+  Rust owner is not Send/Sync; FFI is typed and SAFETY-commented. The controller
+  retains/revalidates the exact enabled nonprotected AXTextField/AXTextArea
+  receiver, its original ancestry, window/process/monitor identity, geometry
+  and human-focus witness before construction and again before posting.
+  Preparations are one-use and expire after ten seconds. Native sources share
+  the pointer retention bound. This exception permits no other key, text,
+  shortcut, focus change, hidden click, activation, global post or corrective
+  input. Observations are not atomic OS routing locks; results never claim
+  verified receiver delivery or application effects from posting alone.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

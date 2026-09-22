@@ -225,6 +225,9 @@ impl<F> Default for Inventory<F> {
     }
 }
 impl<F> Inventory<F> {
+    pub(super) fn hold(&mut self, pair: Box<dyn Pair>) {
+        self.sources.push((Instant::now(), pair));
+    }
     pub(super) fn clear(&mut self) {
         self.pending = None;
     }
@@ -233,7 +236,7 @@ impl<F> Inventory<F> {
             self.clear();
         }
     }
-    fn capacity(&mut self) -> Result<(), String> {
+    pub(super) fn capacity(&mut self) -> Result<(), String> {
         self.sources.retain(|(t, _)| t.elapsed() < SOURCE_HOLD);
         if self.sources.len() >= MAX_SOURCES {
             return Err("pointer source retention busy; no events dispatched".into());
@@ -293,6 +296,7 @@ impl<N: super::controls::Native> placement::Windows<N> {
     ) -> Result<Prepared, String> {
         self.pointers.clear();
         self.elements.clear();
+        self.arrows.clear();
         self.pointers.capacity()?;
         point.validate()?;
         plan.validate()?;
@@ -359,6 +363,7 @@ impl<N: super::controls::Native> placement::Windows<N> {
         // a usable token. No raw coordinates or substitute window at dispatch.
         let pending = self.pointers.pending.take();
         self.elements.clear();
+        self.arrows.clear();
         validate_token(token)?;
         let s = pending.ok_or("stale or consumed pointer preparation")?;
         if s.binding != id || s.prepared.token != token {

@@ -21,7 +21,7 @@ pub(crate) struct ReadMacosWindowKeyboardTargetParams {
 /// Deliberately small public observation. In particular it never contains an
 /// AX label, AXValue, native pointer, document/app metadata or a reusable
 /// receiver/authority token.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeyboardTarget {
     pub role: String,
@@ -140,16 +140,35 @@ fn target_bounds(
     Ok(())
 }
 
+pub(super) struct ReceiverSnapshot<E, F> {
+    pub target: KeyboardTarget,
+    pub receiver: E,
+    pub path: Vec<E>,
+    pub focus: F,
+    pub window: Observation,
+}
+
 impl<N: Native> placement::Windows<N> {
     /// Reads current state without clearing semantic or pointer inventories and
     /// without retaining a receiver after return.
     pub(super) fn read_keyboard_target(
         &mut self,
         id: u32,
-        mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
+        geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<KeyboardTarget, String> {
+        self.keyboard_snapshot(id, geometry, Instant::now() + placement::BUDGET, None)
+            .map(|snapshot| snapshot.target)
+    }
+
+    pub(super) fn keyboard_snapshot(
+        &mut self,
+        id: u32,
+        mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
+        deadline: Instant,
+        retained: Option<&ReceiverSnapshot<N::Element, N::Focus>>,
+    ) -> Result<ReceiverSnapshot<N::Element, N::Focus>, String> {
         let binding = self.bindings.get(&id).ok_or("stale window binding")?;
-        let deadline = Instant::now() + placement::BUDGET;
+
         let before = controls::check_window(
             &mut self.native,
             &binding.window,
@@ -164,7 +183,14 @@ impl<N: Native> placement::Windows<N> {
         let receiver = self
             .native
             .keyboard_focused(&binding.window, binding.identity, deadline)?;
-        let path = locate(&mut self.native, &binding.window, &receiver, deadline)?;
+        let path = if let Some(retained) = retained {
+            if !self.native.equal(&receiver, &retained.receiver) {
+                return Err("prepared keyboard receiver changed; no replacement selected".into());
+            }
+            retained.path.clone()
+        } else {
+            locate(&mut self.native, &binding.window, &receiver, deadline)?
+        };
         let (safety, metadata) = current_target(
             &mut self.native,
             &binding.window,
@@ -298,7 +324,19 @@ impl<N: Native> placement::Windows<N> {
             },
         })?;
         placement::time_left(deadline)?;
-        Ok(result)
+        if let Some(retained) = retained {
+            controls::same_window(retained.window, before)?;
+            if result != retained.target || human_before != retained.focus {
+                return Err("prepared keyboard receiver metadata or human focus changed".into());
+            }
+        }
+        Ok(ReceiverSnapshot {
+            target: result,
+            receiver,
+            path,
+            focus: human_before,
+            window: before,
+        })
     }
 }
 
@@ -359,6 +397,13 @@ mod tests {
         postings: usize,
         protected_child_reads: usize,
         change: Change,
+        arrow_calls: u8,
+        arrow_failed: bool,
+        arrow_ready: bool,
+        arrow_construct_change: Change,
+        arrow_post_change: Change,
+        arrow_post_unready: bool,
+        arrow_constructs: usize,
     }
 
     #[derive(Clone)]
@@ -426,6 +471,13 @@ mod tests {
                 postings: 0,
                 protected_child_reads: 0,
                 change: Change::None,
+                arrow_calls: 2,
+                arrow_failed: false,
+                arrow_ready: true,
+                arrow_construct_change: Change::None,
+                arrow_post_change: Change::None,
+                arrow_post_unready: false,
+                arrow_constructs: 0,
             })))
         }
     }
@@ -467,7 +519,58 @@ mod tests {
         }
     }
 
+    struct FakeArrowPair {
+        fake: Fake,
+        used: bool,
+    }
+    impl Pair for FakeArrowPair {
+        fn post(&mut self) -> Posting {
+            if self.used {
+                return Posting {
+                    calls: 0,
+                    detail: Some("replay".into()),
+                };
+            }
+            self.used = true;
+            let mut m = self.fake.0.borrow_mut();
+            let calls = m.arrow_calls;
+            let failed = m.arrow_failed;
+            m.postings += calls as usize;
+            let old = m.change;
+            m.change = m.arrow_post_change;
+            Fake::apply_change(&mut m);
+            m.change = old;
+            if m.arrow_post_unready {
+                m.arrow_ready = false;
+            }
+            Posting {
+                calls,
+                detail: failed.then(|| "native exception".into()),
+            }
+        }
+    }
     impl PlacementNative for Fake {
+        fn arrow_ready(&mut self, window: &u64, deadline: Instant) -> Result<(), String> {
+            self.check(*window, identity(), deadline)?;
+            if !self.0.borrow().arrow_ready {
+                return Err("native ArrowRight readiness unavailable".into());
+            }
+            Ok(())
+        }
+        fn arrow_pair(&mut self, window: &u64, deadline: Instant) -> Result<Box<dyn Pair>, String> {
+            self.arrow_ready(window, deadline)?;
+            let mut m = self.0.borrow_mut();
+            m.arrow_constructs += 1;
+            let old = m.change;
+            m.change = m.arrow_construct_change;
+            Fake::apply_change(&mut m);
+            m.change = old;
+            drop(m);
+            Ok(Box::new(FakeArrowPair {
+                fake: self.clone(),
+                used: false,
+            }))
+        }
         type Window = u64;
         type Focus = u64;
 
@@ -981,5 +1084,194 @@ mod tests {
             .unwrap()
             .successful());
         assert_eq!(fake.0.borrow().postings, 1);
+    }
+
+    #[test]
+    fn arrowright_exact_receiver_is_one_shot_and_inspection_does_not_consume_it() {
+        let (mut w, f, id) = rig();
+        let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+        assert!(p.valid_reply());
+        assert_eq!(f.0.borrow().postings, 0);
+        inspect(&mut w, id, &f).unwrap();
+        let result = w.press_arrow(id, &p.token, |_| Ok(monitor())).unwrap();
+        assert!(result.successful());
+        assert!(result.valid_reply());
+        assert_eq!(result.posting_calls, 2);
+        assert!(!result.effect_verified);
+        assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+        assert_eq!(f.0.borrow().postings, 2);
+        assert_eq!(f.0.borrow().value_reads, 0);
+        assert_eq!(f.0.borrow().semantic_metadata_reads, 0);
+    }
+    #[test]
+    fn arrowright_refuses_replaced_protected_disabled_or_changed_receiver_before_dispatch() {
+        for change in [
+            Change::ReplaceWindow,
+            Change::Detach,
+            Change::Protect,
+            Change::Role,
+            Change::Receiver,
+            Change::MissingReceiver,
+            Change::ForeignReceiver,
+            Change::ReceiverGeometry,
+            Change::ReceiverEnabled,
+            Change::WindowGeometry,
+            Change::MonitorGeometry,
+            Change::HumanFocus,
+        ] {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            {
+                let mut m = f.0.borrow_mut();
+                m.change = change;
+                Fake::apply_change(&mut m);
+                m.change = Change::None;
+            }
+            assert!(w
+                .press_arrow(id, &p.token, |_| Ok(f.0.borrow().monitor))
+                .is_err());
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+    #[test]
+    fn arrowright_rechecks_receiver_after_native_construction() {
+        for change in [
+            Change::Protect,
+            Change::Receiver,
+            Change::HumanFocus,
+            Change::WindowGeometry,
+            Change::Detach,
+        ] {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            f.0.borrow_mut().arrow_construct_change = change;
+            assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+            assert_eq!(f.0.borrow().arrow_constructs, 1);
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+    #[test]
+    fn arrowright_expiry_refresh_and_invalid_token_consume_preparation() {
+        for mode in 0..4 {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            match mode {
+                0 => w.arrows.expire_for_test(),
+                1 => {
+                    w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+                }
+                2 => {
+                    assert!(w.press_arrow(id, "malformed", |_| Ok(monitor())).is_err());
+                }
+                _ => {
+                    assert!(w.press_arrow(id + 1, &p.token, |_| Ok(monitor())).is_err());
+                }
+            }
+            assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+    #[test]
+    fn arrowright_mutations_invalidate_but_read_only_inspection_does_not() {
+        for mode in 0..5 {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            match mode {
+                0 => {
+                    w.read_elements(id, |_| Ok(monitor())).unwrap();
+                }
+                1 => {
+                    w.prepare_click(id, Point { x: 20., y: 20. }, |_| Ok(monitor()))
+                        .unwrap();
+                }
+                2 => {
+                    let _ = w.place(
+                        id,
+                        Bounds {
+                            x: 0.,
+                            y: 0.,
+                            width: 100.,
+                            height: 100.,
+                        },
+                        |_| Ok(monitor()),
+                    );
+                }
+                3 => {
+                    w.unbind(id).unwrap();
+                }
+                _ => w.destroy_monitor(1),
+            }
+            assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+    #[test]
+    fn arrowright_partial_native_pairs_and_failed_readiness_preserve_evidence() {
+        for calls in 0..=2 {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            {
+                let mut m = f.0.borrow_mut();
+                m.arrow_calls = calls;
+                m.arrow_failed = true;
+                m.arrow_post_unready = true;
+            }
+            let result = w.press_arrow(id, &p.token, |_| Ok(monitor())).unwrap();
+            assert!(!result.successful());
+            assert!(result.valid_reply());
+            assert_eq!(result.posting_calls, calls);
+            assert!(result.after.is_some());
+            assert_eq!(result.focus_interference, Some(false));
+            assert_eq!(result.effects_unconfirmed, calls > 0);
+            assert!(!result.effect_verified);
+            assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+        }
+    }
+    #[test]
+    fn arrowright_post_effect_receiver_changes_are_partial_not_no_effect() {
+        for change in [
+            Change::Protect,
+            Change::Receiver,
+            Change::WindowGeometry,
+            Change::HumanFocus,
+            Change::Detach,
+        ] {
+            let (mut w, f, id) = rig();
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            f.0.borrow_mut().arrow_post_change = change;
+            let result = w.press_arrow(id, &p.token, |_| Ok(monitor())).unwrap();
+            assert!(!result.successful());
+            assert!(result.valid_reply());
+            assert!(result.effects_unconfirmed);
+            assert_eq!(result.posting_calls, 2);
+            assert!(result.after.is_some());
+        }
+    }
+    #[test]
+    fn arrowright_sources_share_bounded_capacity_and_preparation_checks_eligibility() {
+        let (mut w, f, id) = rig();
+        for _ in 0..8 {
+            let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+            assert!(w
+                .press_arrow(id, &p.token, |_| Ok(monitor()))
+                .unwrap()
+                .successful());
+        }
+        assert!(w.prepare_arrow(id, |_| Ok(monitor())).is_err());
+        assert_eq!(f.0.borrow().postings, 16);
+        for mode in 0..4 {
+            let (mut w, f, id) = rig();
+            {
+                let mut m = f.0.borrow_mut();
+                match mode {
+                    0 => m.nodes.get_mut(&1).unwrap().secure = true,
+                    1 => m.nodes.get_mut(&1).unwrap().enabled = false,
+                    2 => m.nodes.get_mut(&1).unwrap().role = "AXButton".into(),
+                    _ => m.arrow_ready = false,
+                }
+            }
+            assert!(w.prepare_arrow(id, |_| Ok(monitor())).is_err());
+            assert_eq!(f.0.borrow().postings, 0);
+        }
     }
 }
