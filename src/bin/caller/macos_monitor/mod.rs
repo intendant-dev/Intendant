@@ -2460,17 +2460,19 @@ mod tests {
         let broker = Broker::default();
         let (tx, mut rx) = mpsc::channel(QUEUE_SIZE);
         assert!(broker.sender.set(Ok(tx)).is_ok());
-        assert!(broker
-            .request(
-                Action::Window(WindowAction::ReadKeyboardTarget {
-                    binding: "macos_window:fixture:1".into(),
-                }),
-                authority(true),
-            )
-            .await
-            .err()
-            .expect("unsupported keyboard receiver inspection must be refused")
-            .contains("require macOS"));
+        assert_eq!(
+            broker
+                .request(
+                    Action::Window(WindowAction::ReadKeyboardTarget {
+                        binding: "macos_window:fixture:1".into(),
+                    }),
+                    authority(true),
+                )
+                .await
+                .err()
+                .expect("unsupported keyboard receiver inspection must be refused"),
+            "read_macos_window_keyboard_target requires macOS owned monitors"
+        );
         assert!(rx.try_recv().is_err());
     }
     #[tokio::test]

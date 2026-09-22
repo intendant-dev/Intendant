@@ -1925,7 +1925,10 @@ mod tests {
                 } else {
                     assert!(
                         text.contains("no owned macOS monitor generation")
-                            || text.contains("require macOS"),
+                            || text.contains("require macOS")
+                            || text.contains(
+                                "read_macos_window_keyboard_target requires macOS owned monitors"
+                            ),
                         "{text}"
                     );
                 }
