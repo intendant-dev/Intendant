@@ -491,16 +491,25 @@ fn placement_system_focus_result(
     status: accessibility_sys::AXError,
     value: Option<CFType>,
 ) -> Result<Option<AXUIElement>, String> {
+    let value_present = value.is_some();
     if status == accessibility_sys::kAXErrorCannotComplete && value.is_none() {
         return Ok(None);
     }
     if status != kAXErrorSuccess {
-        return Err("system focus reply unavailable or contradictory".into());
+        return Err(format!(
+            "system focus reply unavailable or contradictory; {}",
+            ax_copy_diagnostic(status, value_present)
+        ));
     }
     value
         .and_then(|v| v.downcast_into::<AXUIElement>())
         .map(Some)
-        .ok_or_else(|| "system focus element unavailable or malformed".into())
+        .ok_or_else(|| {
+            format!(
+                "system focus element unavailable or malformed; {}",
+                ax_copy_diagnostic(status, value_present)
+            )
+        })
 }
 fn placement_foreground_process(
     deadline: Instant,
@@ -1064,10 +1073,95 @@ impl Native for PlacementNative {
 use crate::macos_monitor::ancestry;
 use crate::macos_monitor::controls::{self, KeyboardMetadata, Metadata, Safety};
 pub(crate) type RetainedElement = ancestry::Node<AXUIElement>;
+/// Names come from AXError.h. Unknown statuses retain their exact numeric value.
+/// Diagnostics inspect only status/presence, never the returned object's content.
+fn ax_copy_diagnostic(status: accessibility_sys::AXError, value_present: bool) -> String {
+    use accessibility_sys::*;
+    let name = [
+        (kAXErrorSuccess, "kAXErrorSuccess"),
+        (kAXErrorFailure, "kAXErrorFailure"),
+        (kAXErrorIllegalArgument, "kAXErrorIllegalArgument"),
+        (kAXErrorInvalidUIElement, "kAXErrorInvalidUIElement"),
+        (
+            kAXErrorInvalidUIElementObserver,
+            "kAXErrorInvalidUIElementObserver",
+        ),
+        (kAXErrorCannotComplete, "kAXErrorCannotComplete"),
+        (kAXErrorAttributeUnsupported, "kAXErrorAttributeUnsupported"),
+        (kAXErrorActionUnsupported, "kAXErrorActionUnsupported"),
+        (
+            kAXErrorNotificationUnsupported,
+            "kAXErrorNotificationUnsupported",
+        ),
+        (kAXErrorNotImplemented, "kAXErrorNotImplemented"),
+        (
+            kAXErrorNotificationAlreadyRegistered,
+            "kAXErrorNotificationAlreadyRegistered",
+        ),
+        (
+            kAXErrorNotificationNotRegistered,
+            "kAXErrorNotificationNotRegistered",
+        ),
+        (kAXErrorAPIDisabled, "kAXErrorAPIDisabled"),
+        (kAXErrorNoValue, "kAXErrorNoValue"),
+        (
+            kAXErrorParameterizedAttributeUnsupported,
+            "kAXErrorParameterizedAttributeUnsupported",
+        ),
+        (kAXErrorNotEnoughPrecision, "kAXErrorNotEnoughPrecision"),
+    ]
+    .into_iter()
+    .find_map(|(code, name)| (code == status).then_some(name))
+    .unwrap_or("unknown AXError");
+    format!("{name} ({status}); value_present={value_present}")
+}
+
+/// One native Copy, with ownership even for an anomalous error-plus-value reply.
+/// Callers retain their original permission, timeout and deadline checkpoints.
+fn control_copy_attribute(
+    element: &AXUIElement,
+    attribute: &str,
+) -> (accessibility_sys::AXError, Option<CFType>) {
+    let key = CFString::new(attribute);
+    let mut raw = std::ptr::null();
+    // SAFETY: retained AX element/key and writable Copy-rule output. Every
+    // non-null result is owned below and released even when status is an error.
+    let status = unsafe {
+        accessibility_sys::AXUIElementCopyAttributeValue(
+            element.as_concrete_TypeRef(),
+            key.as_concrete_TypeRef(),
+            &mut raw,
+        )
+    };
+    let value = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: non-null Copy-rule CF object, independently owned and checked
+        // by the existing result/type decoders before any content is consumed.
+        Some(unsafe { CFType::wrap_under_create_rule(raw) })
+    };
+    (status, value)
+}
+
+fn control_required_result(
+    attribute: &str,
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+) -> Result<CFType, String> {
+    if status != kAXErrorSuccess || value.is_none() {
+        return Err(format!(
+            "required AX attribute {attribute} unavailable; {}",
+            ax_copy_diagnostic(status, value.is_some())
+        ));
+    }
+    Ok(value.expect("successful non-null Copy result checked"))
+}
+
 fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType, String> {
     placement_permissions(deadline)?;
     placement_timeout(e, deadline)?;
-    copy_attr(e, key).ok_or_else(|| format!("required AX attribute {key} unavailable"))
+    let (status, value) = control_copy_attribute(e, key);
+    control_required_result(key, status, value)
 }
 /// Strict AX Copy-rule element read used by the bound receiver path. Unlike
 /// optional metadata, every non-success status, missing value or wrong type is
@@ -1079,31 +1173,30 @@ fn control_strict_element_attr(
 ) -> Result<AXUIElement, String> {
     placement_permissions(deadline)?;
     placement_timeout(element, deadline)?;
-    let key = CFString::new(attribute);
-    let mut raw = std::ptr::null();
-    // SAFETY: retained AX element/key and writable Copy-rule output. A non-null
-    // result is RAII-wrapped even for a contradictory native status.
-    let status = unsafe {
-        accessibility_sys::AXUIElementCopyAttributeValue(
-            element.as_concrete_TypeRef(),
-            key.as_concrete_TypeRef(),
-            &mut raw,
-        )
-    };
-    let value = if raw.is_null() {
-        None
-    } else {
-        // SAFETY: non-null Copy-rule CF object is released by CFType on every
-        // success/refusal path and dynamically checked below.
-        Some(unsafe { CFType::wrap_under_create_rule(raw) })
-    };
+    let (status, value) = control_copy_attribute(element, attribute);
     placement::time_left(deadline)?;
+    control_strict_element_result(attribute, status, value)
+}
+fn control_strict_element_result(
+    attribute: &str,
+    status: accessibility_sys::AXError,
+    value: Option<CFType>,
+) -> Result<AXUIElement, String> {
+    let value_present = value.is_some();
     if status != kAXErrorSuccess {
-        return Err(format!("AX {attribute} copy failed or was contradictory"));
+        return Err(format!(
+            "AX {attribute} copy failed or was contradictory; {}",
+            ax_copy_diagnostic(status, value_present)
+        ));
     }
     value
         .and_then(|value| value.downcast_into::<AXUIElement>())
-        .ok_or_else(|| format!("AX {attribute} missing or not an AX element"))
+        .ok_or_else(|| {
+            format!(
+                "AX {attribute} missing or not an AX element; {}",
+                ax_copy_diagnostic(status, value_present)
+            )
+        })
 }
 
 fn control_string(value: CFType, cap: usize) -> Result<String, String> {
@@ -1133,7 +1226,10 @@ fn control_optional_result(
         return Ok(None);
     }
     if status != kAXErrorSuccess || value.is_none() {
-        return Err("optional AX metadata unavailable or contradictory".into());
+        return Err(format!(
+            "optional AX metadata unavailable or contradictory; {}",
+            ax_copy_diagnostic(status, value.is_some())
+        ));
     }
     Ok(value)
 }
@@ -1144,26 +1240,10 @@ fn control_optional_attr(
 ) -> Result<Option<CFType>, String> {
     placement_permissions(deadline)?;
     placement_timeout(element, deadline)?;
-    let key = CFString::new(attribute);
-    let mut raw = std::ptr::null();
-    // SAFETY: retained object/key and writable Copy-rule output. Every returned
-    // object is released even on failure, and typed only by the decoder below.
-    let status = unsafe {
-        accessibility_sys::AXUIElementCopyAttributeValue(
-            element.as_concrete_TypeRef(),
-            key.as_concrete_TypeRef(),
-            &mut raw,
-        )
-    };
-    let value = if raw.is_null() {
-        None
-    } else {
-        // SAFETY: non-null Copy-rule CF object, dynamically checked by caller.
-        Some(unsafe { CFType::wrap_under_create_rule(raw) })
-    };
+    let (status, value) = control_copy_attribute(element, attribute);
     placement::time_left(deadline)?;
     control_optional_result(status, value)
-        .map_err(|_| format!("AX {attribute} read failed; metadata is not known"))
+        .map_err(|error| format!("AX {attribute} read failed; metadata is not known; {error}"))
 }
 fn control_sensitive_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
@@ -1683,6 +1763,114 @@ impl controls::Native for PlacementNative {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ax_diagnostics_keep_symbol_number_and_presence_without_values() {
+        let names = [
+            "kAXErrorFailure",
+            "kAXErrorIllegalArgument",
+            "kAXErrorInvalidUIElement",
+            "kAXErrorInvalidUIElementObserver",
+            "kAXErrorCannotComplete",
+            "kAXErrorAttributeUnsupported",
+            "kAXErrorActionUnsupported",
+            "kAXErrorNotificationUnsupported",
+            "kAXErrorNotImplemented",
+            "kAXErrorNotificationAlreadyRegistered",
+            "kAXErrorNotificationNotRegistered",
+            "kAXErrorAPIDisabled",
+            "kAXErrorNoValue",
+            "kAXErrorParameterizedAttributeUnsupported",
+            "kAXErrorNotEnoughPrecision",
+        ];
+        for (offset, name) in names.iter().enumerate() {
+            let status = -25200 - offset as i32;
+            for present in [false, true] {
+                assert_eq!(
+                    ax_copy_diagnostic(status, present),
+                    format!("{name} ({status}); value_present={present}")
+                );
+            }
+        }
+        assert_eq!(
+            ax_copy_diagnostic(0, false),
+            "kAXErrorSuccess (0); value_present=false"
+        );
+        for unknown in [1, -1, -25215, i32::MIN, i32::MAX] {
+            for present in [false, true] {
+                let message = ax_copy_diagnostic(unknown, present);
+                assert_eq!(
+                    message,
+                    format!("unknown AXError ({unknown}); value_present={present}")
+                );
+                assert!(message.len() < 128);
+            }
+        }
+    }
+
+    #[test]
+    fn ax_diagnostics_preserve_required_and_optional_acceptance_matrix() {
+        let payload = CFString::new("synthetic-sensitive-must-not-appear").as_CFType();
+        for status in std::iter::once(0).chain((-25214..=-25200).chain([1, i32::MIN, i32::MAX])) {
+            for present in [false, true] {
+                let required = control_required_result(
+                    "AXFrontmost",
+                    status,
+                    present.then(|| payload.clone()),
+                );
+                let optional = control_optional_result(status, present.then(|| payload.clone()));
+                let accepted_required = status == kAXErrorSuccess && present;
+                let absent_optional = !present
+                    && (status == kAXErrorAttributeUnsupported || status == kAXErrorNoValue);
+                assert_eq!(required.is_ok(), accepted_required);
+                assert_eq!(optional.is_ok(), accepted_required || absent_optional);
+                if accepted_required {
+                    assert_eq!(required.as_ref().unwrap(), &payload);
+                    assert_eq!(optional.as_ref().unwrap().as_ref(), Some(&payload));
+                }
+                if absent_optional {
+                    assert!(optional.as_ref().unwrap().is_none());
+                }
+                for error in [required.err(), optional.err()].into_iter().flatten() {
+                    assert!(error.contains(&ax_copy_diagnostic(status, present)));
+                    assert!(!error.contains("synthetic-sensitive-must-not-appear"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ax_diagnostics_keep_strict_receiver_and_system_focus_fail_closed() {
+        let wrong_type = CFString::new("synthetic-sensitive-focus").as_CFType();
+        for status in [
+            kAXErrorSuccess,
+            kAXErrorAttributeUnsupported,
+            kAXErrorNoValue,
+            accessibility_sys::kAXErrorCannotComplete,
+            accessibility_sys::kAXErrorInvalidUIElement,
+            i32::MIN,
+        ] {
+            for present in [false, true] {
+                let strict = control_strict_element_result(
+                    "AXFocusedUIElement",
+                    status,
+                    present.then(|| wrong_type.clone()),
+                )
+                .err()
+                .expect("not an AX element");
+                assert!(strict.contains(&ax_copy_diagnostic(status, present)));
+                assert!(!strict.contains("synthetic-sensitive-focus"));
+                let system =
+                    placement_system_focus_result(status, present.then(|| wrong_type.clone()));
+                if status == accessibility_sys::kAXErrorCannotComplete && !present {
+                    assert!(system.unwrap().is_none()); // existing fallback only
+                } else {
+                    let error = system.err().expect("must refuse");
+                    assert!(error.contains(&ax_copy_diagnostic(status, present)));
+                    assert!(!error.contains("synthetic-sensitive-focus"));
+                }
+            }
+        }
+    }
     #[test]
     fn optional_control_metadata_distinguishes_absence_from_failure() {
         for status in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
