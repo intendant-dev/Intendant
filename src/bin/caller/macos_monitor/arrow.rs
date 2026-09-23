@@ -1,4 +1,4 @@
-//! Single-use, exact-receiver ArrowRight. No text/chords or implicit focus click.
+//! Single-use, direction-bound horizontal arrows. No text/chords or implicit focus click.
 use super::{
     controls,
     keyboard::{KeyboardTarget, ReceiverSnapshot},
@@ -12,6 +12,7 @@ pub(crate) const TTL_MS: u64 = 10_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Key {
     ArrowRight,
+    ArrowLeft,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +30,7 @@ impl Receiver {
         };
         if !r.valid() {
             return Err(
-                "ArrowRight requires an enabled nonprotected AXTextField or AXTextArea receiver"
+                "horizontal arrow requires an enabled nonprotected AXTextField or AXTextArea receiver"
                     .into(),
             );
         }
@@ -47,7 +48,7 @@ pub(crate) fn validate_token(t: &str) -> Result<(), String> {
             && v.bytes()
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     }) {
-        return Err("invalid opaque ArrowRight token".into());
+        return Err("invalid opaque horizontal arrow token".into());
     }
     Ok(())
 }
@@ -148,6 +149,18 @@ impl<E, F> Inventory<E, F> {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PrepareMacosWindowArrowleftParams {
+    pub binding: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PressMacosWindowArrowleftParams {
+    pub binding: String,
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PrepareMacosWindowArrowrightParams {
     pub binding: String,
 }
@@ -162,6 +175,21 @@ impl<N: controls::Native> placement::Windows<N> {
     pub(super) fn prepare_arrow(
         &mut self,
         id: u32,
+        geometry: impl FnMut(u32) -> Result<Bounds, String>,
+    ) -> Result<Prepared, String> {
+        self.prepare_arrow_direction(id, Key::ArrowRight, geometry)
+    }
+    pub(super) fn prepare_arrowleft(
+        &mut self,
+        id: u32,
+        geometry: impl FnMut(u32) -> Result<Bounds, String>,
+    ) -> Result<Prepared, String> {
+        self.prepare_arrow_direction(id, Key::ArrowLeft, geometry)
+    }
+    fn prepare_arrow_direction(
+        &mut self,
+        id: u32,
+        key: Key,
         mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<Prepared, String> {
         self.arrows.clear();
@@ -178,13 +206,13 @@ impl<N: controls::Native> placement::Windows<N> {
         placement::time_left(deadline)?;
         let prepared = Prepared {
             token: format!("macos_key:{}", uuid::Uuid::new_v4().simple()),
-            key: Key::ArrowRight,
+            key,
             receiver,
             window: snapshot.window,
             expires_in_ms: TTL_MS,
         };
         if !prepared.valid_reply() {
-            return Err("invalid ArrowRight preparation".into());
+            return Err("invalid horizontal arrow preparation".into());
         }
         self.arrows.0 = Some(Pending {
             binding: id,
@@ -198,6 +226,23 @@ impl<N: controls::Native> placement::Windows<N> {
         &mut self,
         id: u32,
         token: &str,
+        geometry: impl FnMut(u32) -> Result<Bounds, String>,
+    ) -> Result<ArrowResult, String> {
+        self.press_arrow_direction(id, token, Key::ArrowRight, geometry)
+    }
+    pub(super) fn press_arrowleft(
+        &mut self,
+        id: u32,
+        token: &str,
+        geometry: impl FnMut(u32) -> Result<Bounds, String>,
+    ) -> Result<ArrowResult, String> {
+        self.press_arrow_direction(id, token, Key::ArrowLeft, geometry)
+    }
+    fn press_arrow_direction(
+        &mut self,
+        id: u32,
+        token: &str,
+        key: Key,
         mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
     ) -> Result<ArrowResult, String> {
         // Consume before validation. Ingress refusals cannot mutate helper state.
@@ -205,31 +250,34 @@ impl<N: controls::Native> placement::Windows<N> {
         self.elements.clear();
         self.pointers.clear();
         validate_token(token)?;
-        let pending = pending.ok_or("stale or consumed ArrowRight preparation")?;
+        let pending = pending.ok_or("stale or consumed horizontal arrow preparation")?;
+        if pending.prepared.key != key {
+            return Err("keyboard preparation direction mismatch; token consumed".into());
+        }
         if pending.binding != id || pending.prepared.token != token {
-            return Err("ArrowRight token belongs to a different binding/preparation".into());
+            return Err("horizontal arrow token belongs to a different binding/preparation".into());
         }
         if pending.created.elapsed() >= Duration::from_millis(TTL_MS) {
-            return Err("ArrowRight preparation expired".into());
+            return Err("horizontal arrow preparation expired".into());
         }
         self.pointers.capacity()?;
         let deadline = Instant::now() + placement::BUDGET;
         self.keyboard_snapshot(id, &mut geometry, deadline, Some(&pending.snapshot))?;
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         self.native.arrow_ready(&b.window, deadline)?;
-        let mut pair = self.native.arrow_pair(&b.window, deadline)?;
+        let mut pair = self.native.arrow_pair(&b.window, key, deadline)?;
         // Construction does not post. Revalidate the exact receiver/path again.
         self.keyboard_snapshot(id, &mut geometry, deadline, Some(&pending.snapshot))?;
         let b = self.bindings.get(&id).ok_or("stale window binding")?;
         self.native.arrow_ready(&b.window, deadline)?;
         if pending.created.elapsed() >= Duration::from_millis(TTL_MS) {
-            return Err("ArrowRight preparation expired before dispatch".into());
+            return Err("horizontal arrow preparation expired before dispatch".into());
         }
         placement::time_left(deadline)?;
         let posting = pair.post();
         self.pointers.hold(pair); // hold partial/uncertain sources; no corrective input
         let mut result = ArrowResult {
-            key: Key::ArrowRight,
+            key,
             status: ClickStatus::Partial,
             posting_calls: posting.calls,
             action_attempted: posting.calls > 0,
@@ -249,7 +297,7 @@ impl<N: controls::Native> placement::Windows<N> {
             Ok(o) => {
                 result.after = Some(o);
                 if o.ax != result.before.ax || o.cg != result.before.cg {
-                    errors.push("window changed during ArrowRight".to_string());
+                    errors.push("window changed during horizontal arrow".to_string());
                 }
             }
             Err(e) => errors.push(e),
@@ -259,7 +307,7 @@ impl<N: controls::Native> placement::Windows<N> {
                 let changed = f != pending.snapshot.focus;
                 result.focus_interference = Some(changed);
                 if changed {
-                    errors.push("human focus changed during ArrowRight".into());
+                    errors.push("human focus changed during horizontal arrow".into());
                 }
             }
             Err(e) => errors.push(e),
@@ -281,7 +329,7 @@ impl<N: controls::Native> placement::Windows<N> {
             errors.push(e);
         }
         if posting.calls != 2 && result.detail.is_none() {
-            errors.push("ArrowRight pair was not fully posted; no retry attempted".into());
+            errors.push("horizontal arrow pair was not fully posted; no retry attempted".into());
         }
         if let Some(e) = result.detail.take() {
             errors.insert(0, e);

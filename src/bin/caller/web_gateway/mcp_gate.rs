@@ -1913,7 +1913,19 @@ mod tests {
                     "display.view",
                 ),
                 (
+                    "prepare_macos_window_arrowleft",
+                    serde_json::json!({"binding":"macos_window:fixture:1"}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
                     "press_macos_window_arrowright",
+                    serde_json::json!({"binding":"macos_window:fixture:1","token":"macos_key:00000000000000000000000000000001"}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
+                    "press_macos_window_arrowleft",
                     serde_json::json!({"binding":"macos_window:fixture:1","token":"macos_key:00000000000000000000000000000001"}),
                     DisplayInput,
                     "display.input",
@@ -1925,8 +1937,20 @@ mod tests {
                     "display.view",
                 ),
                 (
+                    "inspect",
+                    serde_json::json!({"argv":["display","prepare-arrowleft","macos_window:fixture:1"]}),
+                    DisplayView,
+                    "display.view",
+                ),
+                (
                     "act",
                     serde_json::json!({"argv":["display","arrowright","macos_window:fixture:1","macos_key:00000000000000000000000000000001"]}),
+                    DisplayInput,
+                    "display.input",
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["display","arrowleft","macos_window:fixture:1","macos_key:00000000000000000000000000000001"]}),
                     DisplayInput,
                     "display.input",
                 ),

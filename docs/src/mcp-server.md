@@ -901,3 +901,19 @@ chords, activation or global-input fallback is supplied. A dispatched pair
 does not verify application effects, and uncertain replies must not be replayed.
 The receiver-inspection tool remains read-only and does not grant key authority.
 See `docs/design/macos-bound-arrowright.md` for limits and acceptance.
+
+### Exact bound-receiver ArrowLeft
+
+`prepare_macos_window_arrowleft {binding}` and
+`press_macos_window_arrowleft {binding,token}` add a fixed unmodified ArrowLeft
+through the same retained-receiver engine. Preparation requires OwnerSurface
+plus DisplayView; dispatch requires OwnerSurface plus DisplayInput. The facade
+spellings are `inspect display prepare-arrowleft BINDING` and
+`act display arrowleft BINDING TOKEN`.
+
+Left/right preparations share one ten-second, single-use slot. The requested
+key is frozen: a cross-direction dispatch consumes/refuses rather than changing
+it. Existing ArrowRight calls remain supported. Exact receiver/window/monitor,
+protection and focus checks, source capacity and uncertainty semantics are
+unchanged. No hidden click, general key/text/chord or global-input fallback is
+added. See `docs/design/macos-bound-arrowleft.md` for limits and acceptance.

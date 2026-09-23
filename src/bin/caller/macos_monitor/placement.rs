@@ -207,14 +207,15 @@ pub(crate) trait Native {
         Err("native bound-window scrolling unavailable".into())
     }
     fn arrow_ready(&mut self, _window: &Self::Window, _deadline: Instant) -> Result<(), String> {
-        Err("native bound ArrowRight unavailable".into())
+        Err("native bound horizontal arrow unavailable".into())
     }
     fn arrow_pair(
         &mut self,
         _window: &Self::Window,
+        _key: crate::macos_monitor::arrow::Key,
         _deadline: Instant,
     ) -> Result<Box<dyn crate::macos_monitor::pointer::Pair>, String> {
-        Err("native bound ArrowRight unavailable".into())
+        Err("native bound horizontal arrow unavailable".into())
     }
     /// Readback-only settling never repeats a setter or changes focus.
     /// Fakes override this pacing hook; native work retains the operation budget.
