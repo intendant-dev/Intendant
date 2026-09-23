@@ -573,11 +573,18 @@ fn placement_permissions(deadline: Instant) -> Result<(), String> {
     }
     Ok(())
 }
+const BOUND_AX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn placement_timeout(element: &AXUIElement, deadline: Instant) -> Result<(), String> {
     placement::time_left(deadline)?;
     // SAFETY: live retained object, positive bounded per-IPC timeout. No default
     // system-wide timeout is changed, and no AX object crosses a thread.
-    let status = unsafe { AXUIElementSetMessagingTimeout(element.as_concrete_TypeRef(), 0.05) };
+    let status = unsafe {
+        AXUIElementSetMessagingTimeout(
+            element.as_concrete_TypeRef(),
+            BOUND_AX_TIMEOUT.as_secs_f32(),
+        )
+    };
     if status != kAXErrorSuccess {
         return Err("cannot bound AX messaging timeout".into());
     }
@@ -1116,14 +1123,57 @@ fn ax_copy_diagnostic(status: accessibility_sys::AXError, value_present: bool) -
     format!("{name} ({status}); value_present={value_present}")
 }
 
+/// Monotonic scalar observations only: no returned content or AX identities.
+/// This is diagnostic evidence, not proof that a timeout caused the failure.
+#[derive(Clone, Copy)]
+struct AxReadTiming {
+    elapsed: std::time::Duration,
+    budget_before: std::time::Duration,
+    budget_after: std::time::Duration,
+}
+impl AxReadTiming {
+    fn between(start: Instant, end: Instant, deadline: Instant) -> Self {
+        Self {
+            elapsed: end.saturating_duration_since(start),
+            budget_before: deadline.saturating_duration_since(start),
+            budget_after: deadline.saturating_duration_since(end),
+        }
+    }
+    fn annotate(self, error: String) -> String {
+        format!(
+            "{error}; ax_copy_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            self.elapsed.as_micros(),
+            BOUND_AX_TIMEOUT.as_micros(),
+            self.budget_before.as_micros(),
+            self.budget_after.as_micros(),
+        )
+    }
+    fn report<T>(self, result: Result<T, String>) -> Result<T, String> {
+        result.map_err(|error| self.annotate(error))
+    }
+    fn check_deadline(
+        self,
+        deadline: Instant,
+        status: accessibility_sys::AXError,
+        value_present: bool,
+    ) -> Result<(), String> {
+        self.report(
+            placement::time_left(deadline)
+                .map_err(|error| format!("{error}; {}", ax_copy_diagnostic(status, value_present))),
+        )
+    }
+}
+
 /// One native Copy, with ownership even for an anomalous error-plus-value reply.
 /// Callers retain their original permission, timeout and deadline checkpoints.
 fn control_copy_attribute(
     element: &AXUIElement,
     attribute: &str,
-) -> (accessibility_sys::AXError, Option<CFType>) {
+    deadline: Instant,
+) -> (accessibility_sys::AXError, Option<CFType>, AxReadTiming) {
     let key = CFString::new(attribute);
     let mut raw = std::ptr::null();
+    let started = Instant::now();
     // SAFETY: retained AX element/key and writable Copy-rule output. Every
     // non-null result is owned below and released even when status is an error.
     let status = unsafe {
@@ -1133,6 +1183,7 @@ fn control_copy_attribute(
             &mut raw,
         )
     };
+    let finished = Instant::now();
     let value = if raw.is_null() {
         None
     } else {
@@ -1140,7 +1191,11 @@ fn control_copy_attribute(
         // by the existing result/type decoders before any content is consumed.
         Some(unsafe { CFType::wrap_under_create_rule(raw) })
     };
-    (status, value)
+    (
+        status,
+        value,
+        AxReadTiming::between(started, finished, deadline),
+    )
 }
 
 fn control_required_result(
@@ -1160,8 +1215,8 @@ fn control_required_result(
 fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType, String> {
     placement_permissions(deadline)?;
     placement_timeout(e, deadline)?;
-    let (status, value) = control_copy_attribute(e, key);
-    control_required_result(key, status, value)
+    let (status, value, timing) = control_copy_attribute(e, key, deadline);
+    timing.report(control_required_result(key, status, value))
 }
 /// Strict AX Copy-rule element read used by the bound receiver path. Unlike
 /// optional metadata, every non-success status, missing value or wrong type is
@@ -1173,9 +1228,9 @@ fn control_strict_element_attr(
 ) -> Result<AXUIElement, String> {
     placement_permissions(deadline)?;
     placement_timeout(element, deadline)?;
-    let (status, value) = control_copy_attribute(element, attribute);
-    placement::time_left(deadline)?;
-    control_strict_element_result(attribute, status, value)
+    let (status, value, timing) = control_copy_attribute(element, attribute, deadline);
+    timing.check_deadline(deadline, status, value.is_some())?;
+    timing.report(control_strict_element_result(attribute, status, value))
 }
 fn control_strict_element_result(
     attribute: &str,
@@ -1240,10 +1295,12 @@ fn control_optional_attr(
 ) -> Result<Option<CFType>, String> {
     placement_permissions(deadline)?;
     placement_timeout(element, deadline)?;
-    let (status, value) = control_copy_attribute(element, attribute);
-    placement::time_left(deadline)?;
-    control_optional_result(status, value)
-        .map_err(|error| format!("AX {attribute} read failed; metadata is not known; {error}"))
+    let (status, value, timing) = control_copy_attribute(element, attribute, deadline);
+    timing.check_deadline(deadline, status, value.is_some())?;
+    timing.report(
+        control_optional_result(status, value)
+            .map_err(|error| format!("AX {attribute} read failed; metadata is not known; {error}")),
+    )
 }
 fn control_sensitive_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
@@ -1762,6 +1819,80 @@ impl controls::Native for PlacementNative {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_read_timing_reports_native_duration_and_saturating_budget() {
+        use std::time::Duration;
+        assert_eq!(BOUND_AX_TIMEOUT.as_secs_f32().to_bits(), 0.05_f32.to_bits());
+        let start = Instant::now();
+        let timing = AxReadTiming::between(
+            start,
+            start + Duration::from_micros(51_234),
+            start + Duration::from_secs(4),
+        );
+        assert_eq!(timing.annotate("fixture".into()),
+            "fixture; ax_copy_us=51234; ax_timeout_us=50000; budget_before_us=4000000; budget_after_us=3948766");
+        let exhausted = AxReadTiming::between(
+            start,
+            start + Duration::from_millis(51),
+            start + Duration::from_millis(20),
+        );
+        assert_eq!(exhausted.budget_after, Duration::ZERO);
+        let expired = AxReadTiming::between(
+            start,
+            start + Duration::from_millis(1),
+            start - Duration::from_millis(1),
+        );
+        assert_eq!(expired.budget_before, Duration::ZERO);
+        assert_eq!(expired.budget_after, Duration::ZERO);
+        let error = expired
+            .check_deadline(
+                start - Duration::from_millis(1),
+                accessibility_sys::kAXErrorCannotComplete,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.contains("kAXErrorCannotComplete (-25204); value_present=false"));
+        assert!(error.contains("budget_after_us=0"));
+        assert!(timing.annotate("fixture".into()).len() < 256);
+    }
+
+    #[test]
+    fn ax_read_timing_never_changes_acceptance_or_logs_successful_values() {
+        let start = Instant::now();
+        let timing = AxReadTiming::between(start, start, start);
+        let payload = CFString::new("synthetic-private-value").as_CFType();
+        for status in std::iter::once(0).chain((-25214..=-25200).chain([1, i32::MIN, i32::MAX])) {
+            for present in [false, true] {
+                let required = timing.report(control_required_result(
+                    "AXFrontmost",
+                    status,
+                    present.then(|| payload.clone()),
+                ));
+                let optional = timing.report(control_optional_result(
+                    status,
+                    present.then(|| payload.clone()),
+                ));
+                let accepted = status == kAXErrorSuccess && present;
+                let absent =
+                    !present && matches!(status, kAXErrorAttributeUnsupported | kAXErrorNoValue);
+                assert_eq!(required.is_ok(), accepted);
+                assert_eq!(optional.is_ok(), accepted || absent);
+                if accepted {
+                    assert_eq!(required.as_ref().unwrap(), &payload);
+                    assert_eq!(optional.as_ref().unwrap().as_ref(), Some(&payload));
+                }
+                if absent {
+                    assert!(optional.as_ref().unwrap().is_none());
+                }
+                for error in [required.err(), optional.err()].into_iter().flatten() {
+                    assert!(error.contains(&ax_copy_diagnostic(status, present)));
+                    assert!(error.contains("ax_copy_us=0; ax_timeout_us=50000"));
+                    assert!(!error.contains("synthetic-private-value"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn ax_diagnostics_keep_symbol_number_and_presence_without_values() {
