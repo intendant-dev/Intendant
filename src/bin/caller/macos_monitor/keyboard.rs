@@ -390,6 +390,9 @@ mod tests {
         second_receiver: Option<usize>,
         foreign: bool,
         human_focus: u64,
+        focus_reads: usize,
+        change_human_on_read: Option<usize>,
+        missing_human_on_read: Option<usize>,
         focused_reads: usize,
         semantic_metadata_reads: usize,
         value_reads: usize,
@@ -465,6 +468,9 @@ mod tests {
                 second_receiver: None,
                 foreign: false,
                 human_focus: 7,
+                focus_reads: 0,
+                change_human_on_read: None,
+                missing_human_on_read: None,
                 focused_reads: 0,
                 semantic_metadata_reads: 0,
                 value_reads: 0,
@@ -631,6 +637,13 @@ mod tests {
         fn focus(&mut self, deadline: Instant) -> Result<u64, String> {
             placement::time_left(deadline)?;
             let mut m = self.0.borrow_mut();
+            m.focus_reads += 1;
+            if m.missing_human_on_read == Some(m.focus_reads) {
+                return Err("synthetic human focus unavailable".into());
+            }
+            if m.change_human_on_read == Some(m.focus_reads) {
+                m.human_focus += 1;
+            }
             if matches!(m.change, Change::AfterHumanFocusGeometry) && m.focused_reads >= 2 {
                 m.nodes.get_mut(&1).unwrap().bounds.x += 1.0;
             }
@@ -1535,5 +1548,103 @@ mod tests {
             assert!(press_direction_fixture(&mut w, id, &current.token, other).is_err());
             assert_eq!(f.0.borrow().postings, 0);
         }
+    }
+
+    // Controlled model interleavings, not claims about native human/agent routing.
+    #[test]
+    fn concurrent_focus_changes_between_independent_reads_do_not_invalidate_receiver() {
+        let (mut w, f, id) = rig();
+        let before = inspect(&mut w, id, &f).unwrap();
+        f.0.borrow_mut().human_focus += 1;
+        let after = inspect(&mut w, id, &f).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(f.0.borrow().receiver, Some(1));
+        assert_eq!(f.0.borrow().postings, 0);
+        assert_eq!(f.0.borrow().writes, 0);
+        assert_eq!(f.0.borrow().value_reads, 0);
+    }
+
+    #[test]
+    fn concurrent_focus_change_during_read_refuses_even_with_stable_target() {
+        let (mut w, f, id) = rig();
+        {
+            let mut m = f.0.borrow_mut();
+            m.change_human_on_read = Some(m.focus_reads + 2);
+        }
+        let error = inspect(&mut w, id, &f).unwrap_err();
+        assert!(
+            error.contains("human global focused object changed"),
+            "{error}"
+        );
+        assert_eq!(f.0.borrow().receiver, Some(1));
+        assert_eq!(f.0.borrow().postings, 0);
+        assert_eq!(f.0.borrow().writes, 0);
+        // A later independent read is not an automatic retry and retains no authority.
+        let later = inspect(&mut w, id, &f).unwrap();
+        assert!(!later.keyboard_dispatch_supported);
+    }
+
+    #[test]
+    fn concurrent_focus_unavailable_is_not_unchanged_or_a_new_receiver() {
+        let (mut w, f, id) = rig();
+        {
+            let mut m = f.0.borrow_mut();
+            m.missing_human_on_read = Some(m.focus_reads + 2);
+        }
+        let error = inspect(&mut w, id, &f).unwrap_err();
+        assert!(
+            error.contains("synthetic human focus unavailable"),
+            "{error}"
+        );
+        assert_eq!(f.0.borrow().receiver, Some(1));
+        assert_eq!(f.0.borrow().postings, 0);
+        assert_eq!(f.0.borrow().writes, 0);
+    }
+
+    #[test]
+    fn concurrent_focus_changed_after_preparation_consumes_without_posting() {
+        for left in [false, true] {
+            let (mut w, f, id) = rig();
+            let prepared = if left {
+                w.prepare_arrowleft(id, |_| Ok(monitor()))
+            } else {
+                w.prepare_arrow(id, |_| Ok(monitor()))
+            }
+            .unwrap();
+            f.0.borrow_mut().human_focus += 1;
+            // Inspection cannot refresh the focus witness in a pending preparation.
+            inspect(&mut w, id, &f).unwrap();
+            let first = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            };
+            assert!(first.unwrap_err().contains("human focus changed"));
+            let replay = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            };
+            assert!(replay.unwrap_err().contains("consumed"));
+            assert_eq!(f.0.borrow().arrow_constructs, 0);
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_focus_change_after_posting_is_uncertain_not_no_effect() {
+        let (mut w, f, id) = rig();
+        let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
+        f.0.borrow_mut().arrow_post_change = Change::HumanFocus;
+        let result = w.press_arrow(id, &p.token, |_| Ok(monitor())).unwrap();
+        assert!(!result.successful());
+        assert!(result.valid_reply());
+        assert_eq!(result.posting_calls, 2);
+        assert_eq!(result.focus_interference, Some(true));
+        assert!(result.effects_unconfirmed);
+        assert!(!result.effect_verified);
+        assert_eq!(f.0.borrow().receiver, Some(1));
+        assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
+        assert_eq!(f.0.borrow().postings, 2);
     }
 }
