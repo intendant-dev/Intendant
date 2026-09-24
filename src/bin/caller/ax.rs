@@ -540,9 +540,7 @@ impl crate::macos_monitor::focus::Native for PlacementAppFocus {
             .ok_or_else(|| "application frontmost metadata unavailable or malformed".into())
     }
     fn focused(&mut self) -> Result<AXUIElement, String> {
-        control_attr(&self.app, kAXFocusedUIElementAttribute, self.deadline)?
-            .downcast_into::<AXUIElement>()
-            .ok_or_else(|| "application focused element unavailable or malformed".into())
+        control_focus_element_attr(&self.app, self.deadline)
     }
     fn element_pid(&mut self, element: &AXUIElement) -> Result<i32, String> {
         placement_pid(element, self.deadline)
@@ -1238,6 +1236,94 @@ fn control_strict_element_attr(
     timing.check_deadline(deadline, status, value.is_some())?;
     timing.report(control_strict_element_result(attribute, status, value))
 }
+/// A failed focused-element read is not an observation. Permit one new read
+/// only after an empty CannotComplete, on the same captured application object.
+/// This never retries a security attribute, action, setter or input dispatch.
+fn control_focus_element_attr(
+    application: &AXUIElement,
+    deadline: Instant,
+) -> Result<AXUIElement, String> {
+    control_focus_read_with(deadline, Instant::now, |reobservation| {
+        placement_permissions(deadline)?;
+        placement_timeout(application, deadline)?;
+        if reobservation && deadline.saturating_duration_since(Instant::now()) < BOUND_AX_TIMEOUT {
+            return Err("insufficient budget for focused-element re-observation".into());
+        }
+        Ok(control_copy_attribute(
+            application,
+            kAXFocusedUIElementAttribute,
+            deadline,
+        ))
+    })
+}
+
+/// Injection seam for hermetic status/deadline/ownership tests. The native
+/// closure above fixes the attribute and retained object for both attempts.
+fn control_focus_read_with(
+    deadline: Instant,
+    mut clock: impl FnMut() -> Instant,
+    mut copy: impl FnMut(
+        bool,
+    )
+        -> Result<(accessibility_sys::AXError, Option<CFType>, AxReadTiming), String>,
+) -> Result<AXUIElement, String> {
+    if clock() >= deadline {
+        return Err("focused-element observation budget expired before read".into());
+    }
+    let (status, value, timing) = copy(false)?;
+    let after_first = clock();
+    let first_diagnostic = || {
+        timing.annotate(format!(
+            "AX AXFocusedUIElement read unavailable; {}; focus_read_attempts=1",
+            ax_copy_diagnostic(status, value.is_some()),
+        ))
+    };
+    if after_first >= deadline {
+        return Err(format!(
+            "focused-element observation budget expired; {}",
+            first_diagnostic()
+        ));
+    }
+    if status != accessibility_sys::kAXErrorCannotComplete || value.is_some() {
+        return timing.report(control_strict_element_result(
+            kAXFocusedUIElementAttribute,
+            status,
+            value,
+        ));
+    }
+    let initial = first_diagnostic();
+    if deadline.saturating_duration_since(after_first) < BOUND_AX_TIMEOUT {
+        return Err(format!(
+            "insufficient budget for focused-element re-observation; {initial}"
+        ));
+    }
+    let (status, value, timing) = copy(true).map_err(|error| {
+        format!("focused-element re-observation preflight refused: {error}; initial=[{initial}]")
+    })?;
+    let final_diagnostic = timing.annotate(ax_copy_diagnostic(status, value.is_some()));
+    if clock() >= deadline {
+        return Err(format!(
+            "focused-element observation budget expired; focus_read_attempts=2; {final_diagnostic}; initial=[{initial}]"
+        ));
+    }
+    let result = timing.report(control_strict_element_result(
+        kAXFocusedUIElementAttribute,
+        status,
+        value,
+    ));
+    match result {
+        Ok(element) => {
+            // Helper diagnostics use stderr, never its stdout wire. Do not log
+            // the returned object, PID, labels, text or process identity.
+            eprintln!("bound AX focus re-observation succeeded; focus_read_attempts=2; {final_diagnostic}; initial=[{initial}]");
+            Ok(element)
+        }
+        Err(error) => Err(format!(
+            "{error}; focus_read_attempts=2; initial=[{initial}]"
+        )),
+    }
+}
+
 fn control_strict_element_result(
     attribute: &str,
     status: accessibility_sys::AXError,
@@ -1790,7 +1876,7 @@ impl controls::Native for PlacementNative {
         if placement_pid(&app, deadline)? != identity.pid {
             return Err("keyboard target application object identity changed".into());
         }
-        let focused = control_strict_element_attr(&app, kAXFocusedUIElementAttribute, deadline)?;
+        let focused = control_focus_element_attr(&app, deadline)?;
         if placement_pid(&focused, deadline)? != identity.pid {
             return Err("application-local focused receiver belongs to another process".into());
         }
@@ -1825,6 +1911,181 @@ impl controls::Native for PlacementNative {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn focus_reread_fixture() -> CFType {
+        // SAFETY: creates an owned reference to this process only; no attribute
+        // reads, window creation, focus changes or input. Null checked below.
+        let raw = unsafe { AXUIElementCreateApplication(std::process::id() as i32) };
+        assert!(!raw.is_null());
+        // SAFETY: non-null Create-rule result is released by the RAII wrapper.
+        unsafe { AXUIElement::wrap_under_create_rule(raw) }.as_CFType()
+    }
+
+    type FocusReply = Result<(accessibility_sys::AXError, Option<CFType>), String>;
+    fn focus_reread_run(
+        replies: Vec<FocusReply>,
+        ticks: Vec<Instant>,
+        deadline: Instant,
+    ) -> (Result<AXUIElement, String>, Vec<bool>, usize) {
+        let mut replies: std::collections::VecDeque<_> = replies.into();
+        let mut ticks = ticks.into_iter();
+        let mut calls = Vec::new();
+        let result = control_focus_read_with(
+            deadline,
+            || ticks.next().expect("unexpected clock read"),
+            |second| {
+                calls.push(second);
+                let (status, value) = replies.pop_front().expect("unexpected extra AX read")?;
+                let at = deadline - std::time::Duration::from_secs(1);
+                Ok((status, value, AxReadTiming::between(at, at, deadline)))
+            },
+        );
+        (result, calls, replies.len())
+    }
+
+    #[test]
+    fn focus_reread_only_empty_cannot_complete_is_eligible() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        let element = focus_reread_fixture();
+        for status in std::iter::once(0).chain((-25214..=-25200).chain([1, i32::MIN, i32::MAX])) {
+            for present in [false, true] {
+                if status == accessibility_sys::kAXErrorCannotComplete && !present {
+                    continue;
+                }
+                let (result, calls, remaining) = focus_reread_run(
+                    vec![Ok((status, present.then(|| element.clone())))],
+                    vec![now, now],
+                    deadline,
+                );
+                assert_eq!(result.is_ok(), status == kAXErrorSuccess && present);
+                assert_eq!(calls, [false]);
+                assert_eq!(remaining, 0);
+            }
+        }
+        let (result, calls, _) = focus_reread_run(
+            vec![Ok((
+                0,
+                Some(CFString::new("private-focus-must-not-leak").as_CFType()),
+            ))],
+            vec![now, now],
+            deadline,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, [false]);
+        assert!(!result
+            .err()
+            .unwrap()
+            .contains("private-focus-must-not-leak"));
+    }
+
+    #[test]
+    fn focus_reread_success_preserves_exact_returned_object() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        let element = focus_reread_fixture();
+        let (result, calls, remaining) = focus_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, None)),
+                Ok((0, Some(element.clone()))),
+            ],
+            vec![now, now, now],
+            deadline,
+        );
+        assert_eq!(result.unwrap().as_CFType(), element);
+        assert_eq!(calls, [false, true]);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn focus_reread_never_retries_a_second_failure_or_contradictory_value() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        let element = focus_reread_fixture();
+        for status in std::iter::once(0).chain((-25214..=-25200).chain([1, i32::MIN, i32::MAX])) {
+            for present in [false, true] {
+                if status == 0 && present {
+                    continue;
+                }
+                let (result, calls, remaining) = focus_reread_run(
+                    vec![
+                        Ok((accessibility_sys::kAXErrorCannotComplete, None)),
+                        Ok((status, present.then(|| element.clone()))),
+                        Ok((0, Some(element.clone()))),
+                    ],
+                    vec![now, now, now],
+                    deadline,
+                );
+                let error = result.err().expect("must refuse");
+                assert!(error.contains("focus_read_attempts=2"));
+                assert!(error.contains("initial=["));
+                assert!(error.contains(&ax_copy_diagnostic(status, present)));
+                assert_eq!(calls, [false, true]);
+                assert_eq!(remaining, 1);
+            }
+        }
+        let (result, calls, _) = focus_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, None)),
+                Ok((0, Some(CFString::new("secret-object").as_CFType()))),
+            ],
+            vec![now, now, now],
+            deadline,
+        );
+        let error = result.err().unwrap();
+        assert!(error.contains("not an AX element"));
+        assert!(!error.contains("secret-object"));
+        assert_eq!(calls, [false, true]);
+    }
+
+    #[test]
+    fn focus_reread_preflight_failure_preserves_initial_failure() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        let (result, calls, remaining) = focus_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, None)),
+                Err("permission revoked".into()),
+            ],
+            vec![now, now],
+            deadline,
+        );
+        let error = result.err().unwrap();
+        assert!(error.contains("permission revoked"));
+        assert!(error.contains("kAXErrorCannotComplete (-25204); value_present=false"));
+        assert!(error.contains("focus_read_attempts=1"));
+        assert_eq!(calls, [false, true]);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn focus_reread_honors_original_budget_before_after_and_between_calls() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(4);
+        let empty = || Ok((accessibility_sys::kAXErrorCannotComplete, None));
+        let (result, calls, _) = focus_reread_run(vec![], vec![deadline], deadline);
+        assert!(result.is_err());
+        assert!(calls.is_empty());
+        for after in [
+            deadline,
+            deadline + Duration::from_secs(1),
+            deadline - Duration::from_millis(49),
+        ] {
+            let (result, calls, _) = focus_reread_run(vec![empty()], vec![now, after], deadline);
+            assert!(result.is_err());
+            assert_eq!(calls, [false]);
+        }
+        let (result, calls, _) = focus_reread_run(
+            vec![empty(), Ok((0, Some(focus_reread_fixture())))],
+            vec![now, deadline - BOUND_AX_TIMEOUT, deadline],
+            deadline,
+        );
+        let error = result.err().unwrap();
+        assert!(error.contains("budget expired"));
+        assert!(error.contains("focus_read_attempts=2"));
+        assert_eq!(calls, [false, true]);
+    }
 
     #[test]
     fn ax_read_timing_reports_native_duration_and_saturating_budget() {
