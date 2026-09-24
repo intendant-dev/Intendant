@@ -12,6 +12,7 @@ page; the profile sends no native keys or system-wide focus operations. Its repo
 """
 import math
 import macos_arrow_acceptance as arrow_acceptance
+import macos_concurrent_keys as concurrent_keys
 import macos_receiver_study as receiver_study
 import macos_focus_witness as focus_study
 import argparse
@@ -296,7 +297,14 @@ def main():
     p.add_argument('--arrowleft',action='store_true',help='Explicit fixed ArrowLeft acceptance; requires separate setup click')
     p.add_argument("--receiver-study", action="store_true", help="Fixed twelve-read receiver study; no keys; requires explicit setup click")
     p.add_argument('--native-focus', action='store_true', help='Native focus bracketing; requires receiver-study')
+    p.add_argument("--concurrent-key-study", action="store_true", help="One arrow attempt with passive native focus/HID evidence")
     args = p.parse_args()
+    try:
+        concurrent_keys.validate_options(args.concurrent_key_study, args.keyboard_target,
+            args.keyboard_target_click_first, args.arrowleft, args.arrowright,
+            args.receiver_study or args.native_focus or args.placement_only)
+    except ValueError as error:
+        p.error(str(error))
     require(not args.native_focus or args.receiver_study, 'native focus requires receiver-study')
     try:
         receiver_study.validate_options(args.receiver_study, args.keyboard_target, args.keyboard_target_click_first, args.arrowleft or args.arrowright, args.placement_only)
@@ -320,7 +328,7 @@ def main():
         'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
               'browser_mode': 'background-window',
-              'profile': 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
+              'profile': 'concurrent_key' if args.concurrent_key_study else 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
@@ -361,7 +369,7 @@ def main():
         require(sum(m['display_target'] == args.monitor for m in owned) == 1, 'monitor not owned by isolated daemon')
         profile = root / 'profile'
         profile.mkdir(mode=0o700)
-        child = subprocess.Popen([str(supervisor), '--disposable-chromium-focus' if args.native_focus else '--disposable-chromium', str(bundle), str(profile), str(status_path), fixture_page.as_uri()],
+        child = subprocess.Popen([str(supervisor), '--disposable-chromium-concurrent-key' if args.concurrent_key_study else '--disposable-chromium-focus' if args.native_focus else '--disposable-chromium', str(bundle), str(profile), str(status_path), fixture_page.as_uri()],
                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         active = profile / 'DevToolsActivePort'
         deadline = time.monotonic() + 25
@@ -465,7 +473,29 @@ def main():
             if args.keyboard_target_click_first:
                 report['checks']['explicit_setup_click'] = {}
                 first_state = select_keyboard_fixture_with_click(call, evaluate, binding, first_state, expected, report['checks']['explicit_setup_click'])
-            if args.receiver_study:
+            if args.concurrent_key_study:
+                series = report['concurrent_key_study'] = {}
+                report['passed_semantics'] = 'collection/evidence validation; effect and activity are reported separately'
+                report['checks']['keyboard_input_requested'] = True
+                def checkpoint():
+                    pending = args.report.with_name(args.report.name + '.partial')
+                    pending.write_text(json.dumps(report, indent=2) + chr(10))
+                    pending.replace(args.report)
+                def witness(phase, sequence):
+                    child.stdin.write(b'f' if phase == 'before' else b'g'); child.stdin.flush()
+                    until = min(end, time.monotonic() + 3)
+                    while time.monotonic() < until:
+                        value = status().get('focus_witness', {})
+                        if value.get('sequence') == sequence and value.get('phase') == phase:
+                            return value
+                        require(value.get('phase') != 'refused', 'native witness refused')
+                        time.sleep(.01)
+                    raise RuntimeError('native witness acknowledgement deadline')
+                concurrent_keys.collect(call, evaluate, binding, witness,
+                    validate_keyboard_receiver, expected, series, checkpoint,
+                    min(end, time.monotonic() + 40), arrow_key)
+                require(series['completed'] and series['measurement_valid'], 'concurrent key study incomplete')
+            elif args.receiver_study:
                 series = report['receiver_study'] = {}
                 report['passed_semantics'] = 'measurement collection and validation only; not input availability'
                 report['checks']['keyboard_input_requested'] = False

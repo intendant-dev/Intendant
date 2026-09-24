@@ -1,0 +1,49 @@
+#pragma once
+// Fixture-only HID event counts: no event taps, key identities or input posting.
+#include "focus-witness.h"
+#import <CoreGraphics/CoreGraphics.h>
+
+enum { ActivityCounterCount = 5 };
+typedef struct { uint32_t values[ActivityCounterCount]; } ActivityCounters;
+static ActivityCounters activity_sample(void) {
+    const CGEventType types[ActivityCounterCount] = { kCGAnyInputEventType,
+        kCGEventKeyDown, kCGEventKeyUp, kCGEventMouseMoved, kCGEventScrollWheel };
+    ActivityCounters result = {{0}};
+    for (NSUInteger i=0;i<ActivityCounterCount;i++)
+        result.values[i] = CGEventSourceCounterForEventType(kCGEventSourceStateHIDSystemState, types[i]);
+    return result;
+}
+static NSDictionary *activity_delta(ActivityCounters before, ActivityCounters after) {
+    NSArray *names = @[@"any_input",@"key_down",@"key_up",@"mouse_move",@"scroll"];
+    BOOL regressed=NO, changed=NO;
+    for (NSUInteger i=0;i<ActivityCounterCount;i++) {
+        regressed |= after.values[i] < before.values[i];
+        changed |= after.values[i] != before.values[i];
+    }
+    NSMutableDictionary *deltas=[NSMutableDictionary dictionary];
+    for (NSUInteger i=0;i<ActivityCounterCount;i++)
+        deltas[names[i]] = regressed ? (id)NSNull.null : @((uint64_t)after.values[i]-before.values[i]);
+    return @{@"source":@"hid_system",@"counter_regression":regressed?@YES:@NO,
+        @"deltas":deltas,@"changed":regressed ? (id)NSNull.null : (changed?@YES:@NO),
+        @"attribution":@"not_authenticated"};
+}
+@interface ActivityWitness : FocusWitness
+@property ActivityCounters counts;
+@end
+@implementation ActivityWitness
+- (void)begin:(NSRunningApplication *)browser {
+    [super begin:browser];
+    if (!self.active || ![self.receipt[@"phase"] isEqual:@"before"]) return;
+    self.counts=activity_sample();
+    NSMutableDictionary *d=[self.receipt mutableCopy];
+    d[@"hid_activity"]=@{@"source":@"hid_system",@"sampled":@YES}; self.receipt=d;
+}
+- (void)finish:(NSRunningApplication *)browser {
+    BOOL hadStart=self.active;
+    [super finish:browser];
+    if (!hadStart || ![self.receipt[@"phase"] isEqual:@"after"]) return;
+    ActivityCounters after=activity_sample();
+    NSMutableDictionary *d=[self.receipt mutableCopy];
+    d[@"hid_activity"]=activity_delta(self.counts,after); self.receipt=d;
+}
+@end
