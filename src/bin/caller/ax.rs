@@ -742,9 +742,11 @@ fn placement_roots_result(
     Ok(())
 }
 
-fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, String> {
-    let app = placement_app(pid, deadline)?;
-    let key = CFString::new(kAXWindowsAttribute);
+fn placement_roots_copy(
+    app: &AXUIElement,
+    key: &CFString,
+    deadline: Instant,
+) -> (accessibility_sys::AXError, Option<CFArray>, AxReadTiming) {
     let mut raw = std::ptr::null();
     let started = Instant::now();
     // SAFETY: retained app/key and writable array output; request at most cap+1
@@ -759,15 +761,105 @@ fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, Stri
         )
     };
     let finished = Instant::now();
-    let timing = AxReadTiming::between(started, finished, deadline);
-    if raw.is_null() {
-        return placement_roots_result(status, false, None, timing).map(|()| Vec::new());
+    // Own every non-null Copy-rule result, including error-plus-array replies.
+    let array = if raw.is_null() {
+        None
+    } else {
+        // SAFETY: non-null Copy-rule CFArray output, released by the wrapper.
+        Some(unsafe { CFArray::wrap_under_create_rule(raw) })
+    };
+    (
+        status,
+        array,
+        AxReadTiming::between(started, finished, deadline),
+    )
+}
+
+/// Resolve one bounded AXWindows observation, with at most one new observation
+/// after an empty CannotComplete. The second native read must address the same
+/// retained application object as the first; the native closure below fixes it.
+fn placement_roots_read_with<T>(
+    deadline: Instant,
+    mut clock: impl FnMut() -> Instant,
+    mut read: impl FnMut(
+        bool,
+    ) -> Result<
+        (
+            accessibility_sys::AXError,
+            Option<T>,
+            Option<usize>,
+            AxReadTiming,
+        ),
+        String,
+    >,
+) -> Result<T, String> {
+    if clock() >= deadline {
+        return Err("AX window enumeration budget expired before read".into());
     }
-    // SAFETY: Copy-rule output is retained even if a malformed provider also
-    // returned an error. Wrapper releases it on all following paths.
-    let array: CFArray = unsafe { CFArray::wrap_under_create_rule(raw) };
+    let (status, value, count, timing) = read(false)?;
+    let after_first = clock();
+
+    if status != accessibility_sys::kAXErrorCannotComplete || value.is_some() {
+        placement_roots_result(status, value.is_some(), count, timing)?;
+        return value.ok_or_else(|| "AX window enumeration internal value mismatch".into());
+    }
+
+    let initial = placement_roots_result(status, false, None, timing)
+        .expect_err("empty CannotComplete is always a refusal");
+    if after_first >= deadline || deadline.saturating_duration_since(after_first) < BOUND_AX_TIMEOUT
+    {
+        return Err(format!(
+            "insufficient budget for AX window re-observation; windows_read_attempts=1; initial=[{initial}]"
+        ));
+    }
+
+    let (status, value, count, timing) = read(true).map_err(|error| {
+        format!(
+            "AX window re-observation preflight refused: {error}; windows_read_attempts=1; initial=[{initial}]"
+        )
+    })?;
+    if clock() >= deadline {
+        let second = placement_roots_result(status, value.is_some(), count, timing)
+            .err()
+            .unwrap_or_else(|| {
+                format!(
+                    "second_read_status={}; array_present={}",
+                    ax_error_name(status),
+                    value.is_some()
+                )
+            });
+        return Err(format!(
+            "AX window enumeration budget expired; windows_read_attempts=2; {second}; initial=[{initial}]"
+        ));
+    }
+
+    placement_roots_result(status, value.is_some(), count, timing)
+        .map_err(|error| format!("{error}; windows_read_attempts=2; initial=[{initial}]"))?;
+    value.ok_or_else(|| {
+        format!(
+            "AX window enumeration internal value mismatch; windows_read_attempts=2; initial=[{initial}]"
+        )
+    })
+}
+
+fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, String> {
+    let app = placement_app(pid, deadline)?;
+    let key = CFString::new(kAXWindowsAttribute);
+    let array = placement_roots_read_with(deadline, Instant::now, |reobservation| {
+        if reobservation {
+            // Re-observation is read-only but still gets fresh trust and timeout
+            // preflight. It must fit the original operation budget.
+            placement_permissions(deadline)?;
+            placement_timeout(&app, deadline)?;
+            if deadline.saturating_duration_since(Instant::now()) < BOUND_AX_TIMEOUT {
+                return Err("insufficient budget after AX window re-observation preflight".into());
+            }
+        }
+        let (status, array, timing) = placement_roots_copy(&app, &key, deadline);
+        let count = array.as_ref().map(|array| array.len() as usize);
+        Ok((status, array, count, timing))
+    })?;
     let count = array.len() as usize;
-    placement_roots_result(status, true, Some(count), timing)?;
     let mut windows = Vec::with_capacity(count);
     for item in array.iter() {
         placement::time_left(deadline)?;
@@ -2152,6 +2244,129 @@ mod tests {
         let error = result.err().unwrap();
         assert!(error.contains("budget expired"));
         assert!(error.contains("focus_read_attempts=2"));
+        assert_eq!(calls, [false, true]);
+    }
+
+    fn windows_reread_run(
+        replies: Vec<Result<(accessibility_sys::AXError, Option<u8>, Option<usize>), String>>,
+        times: Vec<Instant>,
+        deadline: Instant,
+    ) -> (Result<u8, String>, Vec<bool>) {
+        use std::{cell::RefCell, collections::VecDeque};
+        let replies = RefCell::new(VecDeque::from(replies));
+        let times = RefCell::new(VecDeque::from(times));
+        let calls = RefCell::new(Vec::new());
+        let result = placement_roots_read_with(
+            deadline,
+            || {
+                times
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected clock read")
+            },
+            |reread| {
+                calls.borrow_mut().push(reread);
+                let (status, value, count) = replies
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected AXWindows read")?;
+                let now = Instant::now();
+                Ok((
+                    status,
+                    value,
+                    count,
+                    AxReadTiming::between(now, now, deadline),
+                ))
+            },
+        );
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn window_enumeration_rereads_only_empty_cannot_complete_once() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(4);
+        let success = Ok((kAXErrorSuccess, Some(7), Some(1)));
+        let empty = Ok((accessibility_sys::kAXErrorCannotComplete, None, None));
+
+        let (result, calls) = windows_reread_run(vec![success.clone()], vec![now, now], deadline);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, [false]);
+
+        for first in [
+            Ok((accessibility_sys::kAXErrorFailure, None, None)),
+            Ok((accessibility_sys::kAXErrorCannotComplete, Some(9), Some(1))),
+            Ok((kAXErrorSuccess, None, None)),
+        ] {
+            let (result, calls) = windows_reread_run(vec![first], vec![now, now], deadline);
+            assert!(result.is_err());
+            assert_eq!(calls, [false]);
+        }
+
+        let (result, calls) =
+            windows_reread_run(vec![empty.clone(), success], vec![now, now, now], deadline);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, [false, true]);
+
+        for second in [
+            empty.clone(),
+            Ok((accessibility_sys::kAXErrorFailure, None, None)),
+            Ok((kAXErrorSuccess, None, None)),
+            Ok((accessibility_sys::kAXErrorCannotComplete, Some(9), Some(1))),
+        ] {
+            let (result, calls) =
+                windows_reread_run(vec![empty.clone(), second], vec![now, now, now], deadline);
+            let error = result.unwrap_err();
+            assert!(error.contains("windows_read_attempts=2"));
+            assert!(error.contains("initial=["));
+            assert_eq!(calls, [false, true]);
+        }
+    }
+
+    #[test]
+    fn window_enumeration_reread_honors_original_budget_and_preflight() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(4);
+        let empty = Ok((accessibility_sys::kAXErrorCannotComplete, None, None));
+
+        let (result, calls) = windows_reread_run(vec![], vec![deadline], deadline);
+        assert!(result.is_err());
+        assert!(calls.is_empty());
+
+        for after in [
+            deadline,
+            deadline + Duration::from_secs(1),
+            deadline - Duration::from_millis(49),
+        ] {
+            let (result, calls) =
+                windows_reread_run(vec![empty.clone()], vec![now, after], deadline);
+            let error = result.unwrap_err();
+            assert!(error.contains("insufficient budget"));
+            assert!(error.contains("windows_read_attempts=1"));
+            assert_eq!(calls, [false]);
+        }
+
+        let (result, calls) = windows_reread_run(
+            vec![empty.clone(), Err("fresh preflight failed".into())],
+            vec![now, now],
+            deadline,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("re-observation preflight refused"));
+        assert!(error.contains("fresh preflight failed"));
+        assert!(error.contains("initial=["));
+        assert_eq!(calls, [false, true]);
+
+        let (result, calls) = windows_reread_run(
+            vec![empty, Ok((kAXErrorSuccess, Some(7), Some(1)))],
+            vec![now, now, deadline],
+            deadline,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("budget expired"));
+        assert!(error.contains("windows_read_attempts=2"));
         assert_eq!(calls, [false, true]);
     }
 
