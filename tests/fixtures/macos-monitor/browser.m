@@ -10,6 +10,7 @@
 #include "browser-pointer.h"
 #include "browser-key.h"
 #include "focus-witness.h"
+#include "activity-witness.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -136,7 +137,8 @@ static NSDictionary *key_refused(NSRunningApplication *browser, BrowserKeyPlan p
 
 int main(int argc, const char **argv) {
     if (argc != 6) return 2;
-    BOOL focusMode = strcmp(argv[1], "--disposable-chromium-focus") == 0;
+    BOOL activityMode = strcmp(argv[1], "--disposable-chromium-concurrent-key") == 0;
+    BOOL focusMode = activityMode || strcmp(argv[1], "--disposable-chromium-focus") == 0;
     BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
     BOOL keyMode = strcmp(argv[1], "--disposable-chromium-key") == 0;
     BOOL clickKeyMode = browser_click_key_mode(argv[1]);
@@ -181,7 +183,7 @@ int main(int argc, const char **argv) {
         ClickReceiptState clickReceipt={0}; uint64_t clickChallenge=0; NSDictionary *clickReceiptResult=nil;
         NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
         NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO; BOOL keyShutdownRequested=NO;
-        FocusWitness *focus = focusMode ? [FocusWitness new] : nil;
+        FocusWitness *focus = activityMode ? [ActivityWitness new] : (focusMode ? [FocusWitness new] : nil);
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);

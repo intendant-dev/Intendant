@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse, base64, contextlib, ctypes, http.client, io, json, os, re, subprocess, tempfile, time
 from pathlib import Path
 from macos_scroll_evidence import parse_scroll_delta
+from macos_concurrent_keys import validate_options as validate_concurrent_key_options
 from macos_receiver_study import validate_options as validate_receiver_study_options
 
 
 @contextlib.contextmanager
-def preserve_study_evidence(report, path, enabled):
+def preserve_study_evidence(report, path, enabled, expected_profile="receiver_study"):
     """Preserve the last inner checkpoint without replacing an execution error."""
     try:
         yield
@@ -19,7 +20,7 @@ def preserve_study_evidence(report, path, enabled):
                     if path.stat().st_size > 512 * 1024:
                         raise ValueError('study evidence size limit')
                     value = json.loads(path.read_text())
-                    if not isinstance(value, dict) or value.get('profile') != 'receiver_study':
+                    if not isinstance(value, dict) or value.get('profile') != expected_profile:
                         raise ValueError('wrong study evidence profile')
                     report['chromium'] = value
             except (OSError, ValueError):
@@ -65,7 +66,17 @@ def parse_args(argv=None):
     parser.add_argument('--chromium-arrowleft',action='store_true',help='Explicit fixed ArrowLeft test; requires receiver and click-first opt-ins')
     parser.add_argument("--chromium-receiver-study", action="store_true", help="Fixed twelve-read study, not keyboard acceptance")
     parser.add_argument('--chromium-native-focus', action='store_true', help='Native focus witness; requires receiver study')
+    parser.add_argument("--chromium-concurrent-key-study", action="store_true", help="One fixed production arrow attempt with passive native focus/HID evidence")
     args = parser.parse_args(argv)
+    try:
+        validate_concurrent_key_options(args.chromium_concurrent_key_study,
+            args.chromium_keyboard_target, args.chromium_keyboard_target_click_first,
+            args.chromium_arrowleft, args.chromium_arrowright,
+            args.chromium_receiver_study or args.chromium_native_focus or args.chromium_placement_only
+            or args.chromium_bound_pointer or args.chromium_scroll_delta is not None
+            or bool(args.controls_fixture or args.placement_fixture))
+    except ValueError as error:
+        parser.error(str(error))
     if args.chromium_native_focus and not args.chromium_receiver_study:
         parser.error('native focus requires receiver-study')
     try:
@@ -201,11 +212,14 @@ def main():
                 assert controls.returncode == 0, report["controls"]
             if args.chromium_app:
                 chromium_report = root / 'chromium.json'
-                with preserve_study_evidence(report, chromium_report, args.chromium_receiver_study):
+                with preserve_study_evidence(report, chromium_report,
+                        args.chromium_receiver_study or args.chromium_concurrent_key_study,
+                        'concurrent_key' if args.chromium_concurrent_key_study else
+                        'native_focus' if args.chromium_native_focus else 'receiver_study'):
                     chromium = subprocess.run(['python3', str(Path(__file__).resolve().with_name('verify-macos-bound-pointer.py' if args.chromium_bound_pointer or scrolling else 'verify-macos-chromium-controls.py')),
                         '--bin', args.bin, '--browser-app', args.chromium_app, '--supervisor', args.chromium_supervisor,
                         '--port', str(port), '--monitor', first['display_target'], '--report', str(chromium_report),
-                        '--allow-disposable-chromium'] + (['--keyboard-target'] if args.chromium_keyboard_target else ['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []) + (['--keyboard-target-click-first'] if args.chromium_keyboard_target_click_first else []) + (['--arrowright'] if args.chromium_arrowright else ['--arrowleft'] if args.chromium_arrowleft else []) + (['--receiver-study'] if args.chromium_receiver_study else []) + (['--native-focus'] if args.chromium_native_focus else []), cwd=project, env=env, timeout=230)
+                        '--allow-disposable-chromium'] + (['--keyboard-target'] if args.chromium_keyboard_target else ['--placement-only'] if args.chromium_placement_only else ['--scroll-delta', str(args.chromium_scroll_delta)] if scrolling else []) + (['--keyboard-target-click-first'] if args.chromium_keyboard_target_click_first else []) + (['--arrowright'] if args.chromium_arrowright else ['--arrowleft'] if args.chromium_arrowleft else []) + (['--receiver-study'] if args.chromium_receiver_study else []) + (['--native-focus'] if args.chromium_native_focus else []) + (['--concurrent-key-study'] if args.chromium_concurrent_key_study else []), cwd=project, env=env, timeout=230)
                 report['chromium'] = json.loads(chromium_report.read_text()) if chromium_report.exists() else {'passed': False, 'error': 'Chromium fixture exited before producing a report; see stderr', 'exit_code': chromium.returncode}
                 assert chromium.returncode == 0, report['chromium']
                 if scrolling:
