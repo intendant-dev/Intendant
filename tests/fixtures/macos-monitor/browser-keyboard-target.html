@@ -66,4 +66,21 @@ window.keyboardTargetFixtureState = () => {
   };
 };
 window.receiverStudyState = () => ({...keyboardTargetFixtureState(), key_event_count: arrowEvents.length, key_overflow: arrowOverflow});
+// Finite fixture-only DOM focus movement, not native keyboard/mouse input.
+let witnessTimer = null, witnessChanges = 0;
+window.startFocusWitnessChurn = () => {
+  if (witnessTimer !== null) throw new Error('churn already active');
+  witnessChanges = 0;
+  witnessTimer = setInterval(() => {
+    selectKeyboardTarget(witnessChanges % 2 === 0 ? 'second' : 'first');
+    witnessChanges++;
+    if (witnessChanges === 8) { clearInterval(witnessTimer); witnessTimer = null; }
+  }, 75);
+  return {changes:witnessChanges, active:true};
+};
+window.stopFocusWitnessChurn = () => {
+  if (witnessTimer !== null) clearInterval(witnessTimer);
+  witnessTimer = null;
+  return {changes:witnessChanges, active:false};
+};
 </script>

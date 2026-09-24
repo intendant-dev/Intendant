@@ -13,6 +13,7 @@ page; the profile sends no native keys or system-wide focus operations. Its repo
 import math
 import macos_arrow_acceptance as arrow_acceptance
 import macos_receiver_study as receiver_study
+import macos_focus_witness as focus_study
 import argparse
 import base64
 import hashlib
@@ -294,7 +295,9 @@ def main():
     p.add_argument('--arrowright',action='store_true',help='Explicit one-pair production ArrowRight acceptance after verified setup selection')
     p.add_argument('--arrowleft',action='store_true',help='Explicit fixed ArrowLeft acceptance; requires separate setup click')
     p.add_argument("--receiver-study", action="store_true", help="Fixed twelve-read receiver study; no keys; requires explicit setup click")
+    p.add_argument('--native-focus', action='store_true', help='Native focus bracketing; requires receiver-study')
     args = p.parse_args()
+    require(not args.native_focus or args.receiver_study, 'native focus requires receiver-study')
     try:
         receiver_study.validate_options(args.receiver_study, args.keyboard_target, args.keyboard_target_click_first, args.arrowleft or args.arrowright, args.placement_only)
     except ValueError as error:
@@ -317,7 +320,7 @@ def main():
         'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
               'browser_mode': 'background-window',
-              'profile': 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
+              'profile': 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
@@ -358,7 +361,7 @@ def main():
         require(sum(m['display_target'] == args.monitor for m in owned) == 1, 'monitor not owned by isolated daemon')
         profile = root / 'profile'
         profile.mkdir(mode=0o700)
-        child = subprocess.Popen([str(supervisor), '--disposable-chromium', str(bundle), str(profile), str(status_path), fixture_page.as_uri()],
+        child = subprocess.Popen([str(supervisor), '--disposable-chromium-focus' if args.native_focus else '--disposable-chromium', str(bundle), str(profile), str(status_path), fixture_page.as_uri()],
                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         active = profile / 'DevToolsActivePort'
         deadline = time.monotonic() + 25
@@ -475,11 +478,30 @@ def main():
                     pending = args.report.with_name(args.report.name + '.partial')
                     pending.write_text(json.dumps(report, indent=2) + chr(10))
                     pending.replace(args.report)
-                receiver_study.collect(
-                    lambda: call('read_macos_window_keyboard_target', binding=binding),
-                    study_select, study_state, lambda: status()['observation'],
-                    validate_keyboard_receiver, expected, series, checkpoint,
-                    min(end, time.monotonic() + 75))
+                if args.native_focus:
+                    def witness(phase, sequence):
+                        child.stdin.write(b'f' if phase == 'before' else b'g'); child.stdin.flush()
+                        until = min(end, time.monotonic() + 3)
+                        while time.monotonic() < until:
+                            value = status().get('focus_witness', {})
+                            if value.get('sequence') == sequence and value.get('phase') == phase:
+                                return value
+                            require(value.get('phase') != 'refused', 'native witness refused')
+                            time.sleep(.01)
+                        raise RuntimeError('native witness acknowledgement deadline')
+                    focus_study.collect(
+                        lambda: call('read_macos_window_keyboard_target', binding=binding),
+                        study_select, study_state, witness,
+                        lambda: evaluate('startFocusWitnessChurn()'),
+                        lambda: evaluate('stopFocusWitnessChurn()'),
+                        validate_keyboard_receiver, expected, series, checkpoint,
+                        min(end, time.monotonic() + 75))
+                else:
+                    receiver_study.collect(
+                        lambda: call('read_macos_window_keyboard_target', binding=binding),
+                        study_select, study_state, lambda: status()['observation'],
+                        validate_keyboard_receiver, expected, series, checkpoint,
+                        min(end, time.monotonic() + 75))
                 require(series['completed'] and series['measurement_valid'], 'receiver study incomplete')
             else:
                 first_receiver = read_receiver(first_state)
