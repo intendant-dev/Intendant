@@ -23,3 +23,32 @@ implementing a reread is not evidence that it cures every intermittent failure.
 
 Primary references: Apple AXUIElementCopyAttributeValue and
 AXUIElementSetMessagingTimeout documentation and installed AXUIElement.h.
+
+## Exact recovery boundary
+
+The limit is one extra native copy per focused-element read invocation. A
+transaction contains several separate focus observations; each remains bounded
+by the original shared operation deadline. The second copy is attempted only
+with at least one unchanged 50 ms call allowance remaining, after a fresh
+permission/timeout check. Both copies have post-read deadline checks. No sleep,
+global timeout setting, missing-element substitution, or optional-attribute
+absence rule is added. All foreground/process checks and duplicate focused
+object comparisons still execute in the existing caller.
+
+Failed second reads report their status, presence and timing plus the initial
+failure. A successful second read emits scalar diagnostic evidence on helper
+stderr, never an object, field value, label, PID or wire capability. Success
+means a usable observation, not a focus lock or verified input effect.
+
+Hermetic tests inject native statuses and monotonic checkpoints: one-read
+success, documented absence, all known/unknown errors, error-plus-value,
+wrong-type success, exact object preservation, persistent failure, permission
+loss before reread, insufficient remaining budget, and deadline expiry after
+either copy. They create only AX reference objects and never read attributes
+from a running application or post input. Existing focus and receiver tests
+remain the end-to-end policy checks; live evidence is recorded separately.
+
+The ordinary broker currently discards helper stderr. The success diagnostic
+is therefore visible only when a caller explicitly captures that stream; it
+is not public proof that a particular successful HTTP operation used recovery.
+Native acceptance and injected-status unit tests are reported separately.
