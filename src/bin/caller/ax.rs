@@ -603,6 +603,66 @@ fn placement_app(pid: i32, deadline: Instant) -> Result<AXUIElement, String> {
     placement_timeout(&app, deadline)?;
     Ok(app)
 }
+fn ax_error_name(status: accessibility_sys::AXError) -> &'static str {
+    use accessibility_sys::*;
+    [
+        (kAXErrorSuccess, "kAXErrorSuccess"),
+        (kAXErrorFailure, "kAXErrorFailure"),
+        (kAXErrorIllegalArgument, "kAXErrorIllegalArgument"),
+        (kAXErrorInvalidUIElement, "kAXErrorInvalidUIElement"),
+        (
+            kAXErrorInvalidUIElementObserver,
+            "kAXErrorInvalidUIElementObserver",
+        ),
+        (kAXErrorCannotComplete, "kAXErrorCannotComplete"),
+        (kAXErrorAttributeUnsupported, "kAXErrorAttributeUnsupported"),
+        (kAXErrorActionUnsupported, "kAXErrorActionUnsupported"),
+        (
+            kAXErrorNotificationUnsupported,
+            "kAXErrorNotificationUnsupported",
+        ),
+        (kAXErrorNotImplemented, "kAXErrorNotImplemented"),
+        (
+            kAXErrorNotificationAlreadyRegistered,
+            "kAXErrorNotificationAlreadyRegistered",
+        ),
+        (
+            kAXErrorNotificationNotRegistered,
+            "kAXErrorNotificationNotRegistered",
+        ),
+        (kAXErrorAPIDisabled, "kAXErrorAPIDisabled"),
+        (kAXErrorNoValue, "kAXErrorNoValue"),
+        (
+            kAXErrorParameterizedAttributeUnsupported,
+            "kAXErrorParameterizedAttributeUnsupported",
+        ),
+        (kAXErrorNotEnoughPrecision, "kAXErrorNotEnoughPrecision"),
+    ]
+    .into_iter()
+    .find_map(|(code, name)| (code == status).then_some(name))
+    .unwrap_or("unknown AXError")
+}
+
+fn placement_window_id_result(
+    status: accessibility_sys::AXError,
+    id: u32,
+    timing: AxReadTiming,
+) -> Result<u32, String> {
+    if status != kAXErrorSuccess || id == 0 {
+        return Err(format!(
+            "cannot map AX window exactly; {} ({}); window_id_present={}; ax_window_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            ax_error_name(status),
+            status,
+            id != 0,
+            timing.elapsed.as_micros(),
+            BOUND_AX_TIMEOUT.as_micros(),
+            timing.budget_before.as_micros(),
+            timing.budget_after.as_micros(),
+        ));
+    }
+    Ok(id)
+}
+
 fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, String> {
     placement_timeout(element, deadline)?;
     type GetWindow = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> i32;
@@ -615,12 +675,15 @@ fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, 
     // SAFETY: known SPI ABI AXError(AXUIElementRef, CGWindowID*).
     let get: GetWindow = unsafe { std::mem::transmute(symbol) };
     let mut id = 0;
+    let started = Instant::now();
     // SAFETY: retained live element and writable u32 output.
     let status = unsafe { get(element.as_concrete_TypeRef(), &mut id) };
-    if status != kAXErrorSuccess || id == 0 {
-        return Err("cannot map AX window exactly".into());
-    }
-    Ok(id)
+    let finished = Instant::now();
+    placement_window_id_result(
+        status,
+        id,
+        AxReadTiming::between(started, finished, deadline),
+    )
 }
 fn placement_pid(element: &AXUIElement, deadline: Instant) -> Result<i32, String> {
     placement_timeout(element, deadline)?;
@@ -1087,44 +1150,10 @@ pub(crate) type RetainedElement = ancestry::Node<AXUIElement>;
 /// Names come from AXError.h. Unknown statuses retain their exact numeric value.
 /// Diagnostics inspect only status/presence, never the returned object's content.
 fn ax_copy_diagnostic(status: accessibility_sys::AXError, value_present: bool) -> String {
-    use accessibility_sys::*;
-    let name = [
-        (kAXErrorSuccess, "kAXErrorSuccess"),
-        (kAXErrorFailure, "kAXErrorFailure"),
-        (kAXErrorIllegalArgument, "kAXErrorIllegalArgument"),
-        (kAXErrorInvalidUIElement, "kAXErrorInvalidUIElement"),
-        (
-            kAXErrorInvalidUIElementObserver,
-            "kAXErrorInvalidUIElementObserver",
-        ),
-        (kAXErrorCannotComplete, "kAXErrorCannotComplete"),
-        (kAXErrorAttributeUnsupported, "kAXErrorAttributeUnsupported"),
-        (kAXErrorActionUnsupported, "kAXErrorActionUnsupported"),
-        (
-            kAXErrorNotificationUnsupported,
-            "kAXErrorNotificationUnsupported",
-        ),
-        (kAXErrorNotImplemented, "kAXErrorNotImplemented"),
-        (
-            kAXErrorNotificationAlreadyRegistered,
-            "kAXErrorNotificationAlreadyRegistered",
-        ),
-        (
-            kAXErrorNotificationNotRegistered,
-            "kAXErrorNotificationNotRegistered",
-        ),
-        (kAXErrorAPIDisabled, "kAXErrorAPIDisabled"),
-        (kAXErrorNoValue, "kAXErrorNoValue"),
-        (
-            kAXErrorParameterizedAttributeUnsupported,
-            "kAXErrorParameterizedAttributeUnsupported",
-        ),
-        (kAXErrorNotEnoughPrecision, "kAXErrorNotEnoughPrecision"),
-    ]
-    .into_iter()
-    .find_map(|(code, name)| (code == status).then_some(name))
-    .unwrap_or("unknown AXError");
-    format!("{name} ({status}); value_present={value_present}")
+    format!(
+        "{} ({status}); value_present={value_present}",
+        ax_error_name(status)
+    )
 }
 
 /// Monotonic scalar observations only: no returned content or AX identities.
@@ -2085,6 +2114,34 @@ mod tests {
         assert!(error.contains("budget expired"));
         assert!(error.contains("focus_read_attempts=2"));
         assert_eq!(calls, [false, true]);
+    }
+
+    #[test]
+    fn window_mapping_diagnostic_preserves_status_presence_and_timing() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let timing = AxReadTiming::between(
+            start,
+            start + Duration::from_micros(55_102),
+            start + Duration::from_secs(4),
+        );
+        let error =
+            placement_window_id_result(accessibility_sys::kAXErrorCannotComplete, 0, timing)
+                .unwrap_err();
+        assert!(error.contains("kAXErrorCannotComplete (-25204)"));
+        assert!(error.contains("window_id_present=false"));
+        assert!(error.contains("ax_window_us=55102"));
+        assert!(error.contains("ax_timeout_us=50000"));
+        assert!(error.contains("budget_before_us=4000000"));
+        assert!(error.contains("budget_after_us=3944898"));
+
+        let success = placement_window_id_result(kAXErrorSuccess, 41, timing).unwrap();
+        assert_eq!(success, 41);
+        let contradictory = placement_window_id_result(kAXErrorSuccess, 0, timing).unwrap_err();
+        assert!(contradictory.contains("kAXErrorSuccess (0)"));
+        assert!(contradictory.contains("window_id_present=false"));
+        let unknown = placement_window_id_result(i32::MAX, 0, timing).unwrap_err();
+        assert!(unknown.contains("unknown AXError (2147483647)"));
     }
 
     #[test]
