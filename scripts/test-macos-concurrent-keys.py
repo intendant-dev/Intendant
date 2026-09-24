@@ -255,4 +255,20 @@ class Tests(unittest.TestCase):
         self.assertIn('[changed]',wire)
         self.assertIn('[unexpected]',wire)
 
+    def test_actual_preparation_schema_uses_same_strict_geometry_without_read_only_field(self):
+        spec=importlib.util.spec_from_file_location('inner',Path(__file__).with_name('verify-macos-chromium-controls.py'))
+        inner=importlib.util.module_from_spec(spec);spec.loader.exec_module(inner)
+        fixture={'active':'first','rect':{'x':30,'y':40,'width':348,'height':27},
+                 'metrics':{'screen_x':-770,'screen_y':30,'outer_width':720,'outer_height':530,
+                            'inner_width':720,'inner_height':420,'scale':1,'zoom':1,'scroll_x':0,'scroll_y':0}}
+        rig=Rig()
+        self.assertEqual(keys.preparation_token(rig.preparation,'ArrowLeft',fixture,WINDOW,
+                         inner.validate_prepared_keyboard_receiver),TOKEN)
+        with self.assertRaises(RuntimeError):inner.validate_keyboard_receiver(RECEIVER,fixture,WINDOW)
+        self.assertEqual(inner.validate_keyboard_receiver(dict(RECEIVER,keyboard_dispatch_supported=False),fixture,WINDOW),BOUNDS)
+        with self.assertRaises(RuntimeError):inner.validate_prepared_keyboard_receiver(dict(RECEIVER,keyboard_dispatch_supported=False),fixture,WINDOW)
+        wrong=copy.deepcopy(RECEIVER);wrong['bounds']['y']+=3
+        with self.assertRaises(RuntimeError):inner.validate_prepared_keyboard_receiver(wrong,fixture,WINDOW)
+
+
 if __name__=='__main__': unittest.main(verbosity=2)

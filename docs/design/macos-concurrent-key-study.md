@@ -93,3 +93,5 @@ CGEventSourceStateID.hidSystemState documentation, and installed CGEventSource.h
 Exact revisions, outcomes, cleanup and evidence hashes are recorded on #954.
 
 Unexpected fixture text or key names are redacted in saved evidence. The known fixture text and the two fixed arrow names remain available for inspection; arbitrary typed contents are not copied into the report.
+
+The initial live run on 5df66502 caught a harness schema mismatch before key dispatch: prepared receivers have three fields, while read-only observations have a fourth capability field. Both schemas now have separate strict decoders sharing the unchanged numerical geometry checker. The failed run and confirmed cleanup remain recorded; its ArrowRight slot was not attempted.

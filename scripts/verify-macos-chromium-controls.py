@@ -183,12 +183,21 @@ def list_ready_fixture_window(call, status, initial, pause=time.sleep):
 
 
 def validate_keyboard_receiver(target, state, window):
+    require(isinstance(target, dict) and set(target) == {'role', 'bounds', 'enabled', 'keyboard_dispatch_supported'}, 'unexpected keyboard receiver fields')
+    require(target['role'] == 'AXTextField' and target['enabled'] is True and target['keyboard_dispatch_supported'] is False, 'receiver role or capability mismatch')
+    return validate_keyboard_receiver_bounds(target['bounds'], state, window)
+
+def validate_prepared_keyboard_receiver(receiver, state, window):
+    # A frozen preparation has three fields, unlike the read-only observation.
+    require(isinstance(receiver, dict) and set(receiver) == {'role', 'bounds', 'enabled'}, 'unexpected prepared receiver fields')
+    require(receiver['role'] == 'AXTextField' and receiver['enabled'] is True, 'prepared receiver role or enabled mismatch')
+    return validate_keyboard_receiver_bounds(receiver['bounds'], state, window)
+
+def validate_keyboard_receiver_bounds(bounds, state, window):
     def number(value):
         return type(value) in (int, float) and math.isfinite(value) and abs(value) <= 1000000
-    require(isinstance(target, dict) and set(target) == {"role", "bounds", "enabled", "keyboard_dispatch_supported"}, "unexpected keyboard receiver fields")
-    require(target["role"] == "AXTextField" and target["enabled"] is True and target["keyboard_dispatch_supported"] is False, "receiver role or capability mismatch")
     require(isinstance(state, dict) and state.get("active") in ("first", "second"), "ordinary synthetic receiver required")
-    rect, metrics, bounds = state.get("rect"), state.get("metrics"), target["bounds"]
+    rect, metrics = state.get("rect"), state.get("metrics")
     for geometry in (rect, bounds, window):
         require(isinstance(geometry, dict) and set(geometry) == {"x", "y", "width", "height"} and all(number(v) for v in geometry.values()) and geometry["width"] > 0 and geometry["height"] > 0, "invalid receiver geometry")
     keys = ("screen_x", "screen_y", "outer_width", "outer_height", "inner_width", "inner_height", "scale", "zoom", "scroll_x", "scroll_y")
@@ -492,7 +501,7 @@ def main():
                         time.sleep(.01)
                     raise RuntimeError('native witness acknowledgement deadline')
                 concurrent_keys.collect(call, evaluate, binding, witness,
-                    validate_keyboard_receiver, expected, series, checkpoint,
+                    validate_prepared_keyboard_receiver, expected, series, checkpoint,
                     min(end, time.monotonic() + 40), arrow_key)
                 require(series['completed'] and series['measurement_valid'], 'concurrent key study incomplete')
             elif args.receiver_study:
