@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
+import sys
 import unittest
 import macos_concurrent_keys as keys
 
@@ -31,6 +33,18 @@ def native_witness(phase, sequence, activity=0, human=False):
                                     'changed': bool(activity), 'attribution': 'not_authenticated',
                                     'deltas': {k: activity if k=='any_input' else 0 for k in keys.COUNTERS}})
     return json.loads(json.dumps(result))
+
+def current_activity(sequence=2, mouse=0, key_down=0, key_up=0, regression=False):
+    deltas={k:0 for k in keys.COUNTERS}
+    deltas.update(mouse_move=mouse,key_down=key_down,key_up=key_up)
+    activity={'source':'hid_system','counter_regression':regression,
+              'deltas':deltas,'changed':any(deltas.values()),
+              'attribution':'not_authenticated'}
+    if regression:
+        activity['deltas']={k:None for k in keys.COUNTERS}
+        activity['changed']=None
+    return {'sequence':sequence,'hid_activity':activity}
+
 
 def zero_refusal():
     return {'ok': False, 'action_attempted': False, 'effects_unconfirmed': False,
@@ -155,6 +169,36 @@ class Tests(unittest.TestCase):
         rig=Rig();rig.prep_activity=5;rig.run()
         self.assertFalse(rig.report['summary']['hid_activity_during_dispatch_bracket'])
 
+    def test_current_activity_and_mouse_overlap_are_strict(self):
+        before=current_activity(mouse=2)
+        samples=[current_activity(mouse=3),current_activity(mouse=5)]
+        result=keys.validate_mouse_overlap(before,samples)
+        self.assertEqual(result['before_dispatch'],2)
+        self.assertEqual(result['while_client_alive'],3)
+        self.assertTrue(result['client_process_overlap_verified'])
+        self.assertFalse(result['internal_posting_overlap_verified'])
+        for bad in (current_activity(mouse=2,regression=True),current_activity(mouse=2,key_down=1)):
+            with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(bad,samples)
+        with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(before,[current_activity(mouse=2)])
+        with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(before,[current_activity(mouse=4,key_up=1)])
+        value=current_activity();value['extra']=True
+        with self.assertRaises(RuntimeError):keys.validate_current_activity(value,2)
+
+    def test_observed_runner_samples_only_during_live_client(self):
+        spec=importlib.util.spec_from_file_location('inner_runner',Path(__file__).with_name('verify-macos-chromium-controls.py'))
+        inner=importlib.util.module_from_spec(spec);spec.loader.exec_module(inner)
+        emitted=[]
+        def observe():
+            value={'sample':len(emitted)}
+            emitted.append(value)
+            return value
+        output,observed=inner.run_bounded_observed(
+            [sys.executable,'-c','import time; time.sleep(.18); print("{}")'],
+            time.monotonic()+2,observe)
+        self.assertEqual(json.loads(output),{})
+        self.assertGreaterEqual(len(observed),1)
+        self.assertTrue(all(isinstance(v,dict) for v in observed))
+
     def test_counter_regression_is_unknown(self):
         value=native_witness('after',1)
         value['hid_activity'].update(counter_regression=True,changed=None,
@@ -222,11 +266,18 @@ class Tests(unittest.TestCase):
                 '--chromium-keyboard-target','--chromium-keyboard-target-click-first',
                 '--chromium-arrowleft','--chromium-concurrent-key-study']
         self.assertTrue(outer.parse_args(common).chromium_concurrent_key_study)
+        mouse=outer.parse_args(common+['--chromium-require-mouse-activity'])
+        self.assertTrue(mouse.chromium_require_mouse_activity)
+        bare=['--bin','unused','--fixture','unused','--report','unused','--chromium-require-mouse-activity']
+        with self.assertRaises(SystemExit),contextlib.redirect_stderr(io.StringIO()):
+            outer.parse_args(bare)
+        self.assertIn('--require-mouse-activity',
+                      Path(__file__).with_name('verify-macos-chromium-controls.py').read_text())
         for flag in ('--chromium-receiver-study','--chromium-native-focus','--chromium-arrowright','--chromium-bound-pointer'):
             with self.assertRaises(SystemExit),contextlib.redirect_stderr(io.StringIO()):outer.parse_args(common+[flag])
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'inner.json'
-            for profile in ('receiver_study','native_focus','concurrent_key'):
+            for profile in ('receiver_study','native_focus','concurrent_key','mouse_overlap'):
                 path.write_text(json.dumps({'profile':profile,'partial':True}))
                 report={}
                 with self.assertRaisesRegex(RuntimeError,'original timeout'):

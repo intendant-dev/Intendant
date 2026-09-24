@@ -71,6 +71,41 @@ def run_bounded(argv, deadline):
         process.stderr.close()
 
 
+def run_bounded_observed(argv, deadline, observe):
+    # One ctl process; collect read-only samples only while it remains alive.
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = bytearray()
+    total = 0
+    samples = []
+    try:
+        with selectors.DefaultSelector() as poll:
+            poll.register(process.stdout, selectors.EVENT_READ, True)
+            poll.register(process.stderr, selectors.EVENT_READ, False)
+            while poll.get_map():
+                require(time.monotonic() < deadline, 'ctl deadline; effects may be unconfirmed')
+                if process.poll() is None:
+                    value = observe()
+                    if process.poll() is None and value is not None:
+                        samples.append(value)
+                for key, _ in poll.select(timeout=.05):
+                    data = os.read(key.fileobj.fileno(), 4096)
+                    if not data:
+                        poll.unregister(key.fileobj)
+                        continue
+                    total += len(data)
+                    require(total <= 65536, 'ctl output limit')
+                    if key.data:
+                        output.extend(data)
+        require(process.wait(timeout=2) == 0, 'ctl failed; effects may be unconfirmed')
+        return bytes(output), samples
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        process.stdout.close()
+        process.stderr.close()
+
+
 class CDP:
     """Small bounded WebSocket client for our loopback-only test browser."""
     def __init__(self, port, path):
@@ -307,7 +342,10 @@ def main():
     p.add_argument("--receiver-study", action="store_true", help="Fixed twelve-read receiver study; no keys; requires explicit setup click")
     p.add_argument('--native-focus', action='store_true', help='Native focus bracketing; requires receiver-study')
     p.add_argument("--concurrent-key-study", action="store_true", help="One arrow attempt with passive native focus/HID evidence")
+    p.add_argument("--require-mouse-activity", action="store_true", help="Require mouse-motion counter progress before and while the one ctl dispatch process is alive")
     args = p.parse_args()
+    require(not args.require_mouse_activity or args.concurrent_key_study,
+            'mouse activity requires concurrent-key study')
     try:
         concurrent_keys.validate_options(args.concurrent_key_study, args.keyboard_target,
             args.keyboard_target_click_first, args.arrowleft, args.arrowright,
@@ -337,7 +375,7 @@ def main():
         'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
               'browser_mode': 'background-window',
-              'profile': 'concurrent_key' if args.concurrent_key_study else 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
+              'profile': 'mouse_overlap' if args.require_mouse_activity else 'concurrent_key' if args.concurrent_key_study else 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
@@ -347,10 +385,13 @@ def main():
     end = time.monotonic() + 150
     status_path = root / 'status.json'
 
+    def ctl_argv(tool, arguments):
+        return [str(binary), 'ctl', '--port', str(args.port), '--json',
+                'tools', 'call', tool, '--args', json.dumps(arguments)]
+
     def call(tool, **arguments):
         require(time.monotonic() < end, 'acceptance deadline; do not retry mutations')
-        return json.loads(run_bounded([str(binary), 'ctl', '--port', str(args.port), '--json',
-                                      'tools', 'call', tool, '--args', json.dumps(arguments)],
+        return json.loads(run_bounded(ctl_argv(tool, arguments),
                                      min(end, time.monotonic() + 25)))
 
     last_tick = -1
@@ -484,6 +525,7 @@ def main():
                 first_state = select_keyboard_fixture_with_click(call, evaluate, binding, first_state, expected, report['checks']['explicit_setup_click'])
             if args.concurrent_key_study:
                 series = report['concurrent_key_study'] = {}
+                series['mouse_activity_required'] = args.require_mouse_activity
                 report['passed_semantics'] = 'collection/evidence validation; effect and activity are reported separately'
                 report['checks']['keyboard_input_requested'] = True
                 def checkpoint():
@@ -500,10 +542,40 @@ def main():
                         require(value.get('phase') != 'refused', 'native witness refused')
                         time.sleep(.01)
                     raise RuntimeError('native witness acknowledgement deadline')
-                concurrent_keys.collect(call, evaluate, binding, witness,
+                def current_activity(sequence):
+                    value = status().get('activity_current')
+                    return concurrent_keys.validate_current_activity(value, sequence)
+                def wait_for_mouse(sequence):
+                    until = min(end, time.monotonic() + 8)
+                    while time.monotonic() < until:
+                        value = current_activity(sequence)
+                        activity = value['hid_activity']
+                        if not activity['counter_regression'] and activity['deltas']['mouse_move'] > 0:
+                            return value
+                    raise RuntimeError('required mouse activity not observed before dispatch')
+                def study_call(tool, **arguments):
+                    if not args.require_mouse_activity or not tool.startswith('press_macos_window_'):
+                        return call(tool, **arguments)
+                    before_activity = wait_for_mouse(2)
+                    payload, samples = run_bounded_observed(
+                        ctl_argv(tool, arguments), min(end, time.monotonic() + 25),
+                        lambda: current_activity(2))
+                    reply = json.loads(payload)
+                    series['mouse_overlap'] = concurrent_keys.validate_mouse_overlap(
+                        before_activity, samples)
+                    checkpoint()
+                    return reply
+                concurrent_keys.collect(study_call, evaluate, binding, witness,
                     validate_prepared_keyboard_receiver, expected, series, checkpoint,
                     min(end, time.monotonic() + 40), arrow_key)
                 require(series['completed'] and series['measurement_valid'], 'concurrent key study incomplete')
+                if args.require_mouse_activity:
+                    overlap = series.get('mouse_overlap', {})
+                    require(overlap.get('before_dispatch', 0) > 0
+                            and overlap.get('while_client_alive', 0) > 0
+                            and overlap.get('client_process_overlap_verified') is True
+                            and overlap.get('internal_posting_overlap_verified') is False,
+                            'required mouse overlap evidence missing')
             elif args.receiver_study:
                 series = report['receiver_study'] = {}
                 report['passed_semantics'] = 'measurement collection and validation only; not input availability'

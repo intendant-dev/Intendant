@@ -44,6 +44,58 @@ def validate_witness(value, sequence, phase):
     return value
 
 
+def validate_current_activity(value, sequence):
+    require(isinstance(value, dict) and set(value) == {'sequence', 'hid_activity'}
+            and type(value.get('sequence')) is int and value['sequence'] == sequence,
+            'current activity sequence/schema')
+    activity = value['hid_activity']
+    require(isinstance(activity, dict) and set(activity) == {
+        'source', 'counter_regression', 'deltas', 'changed', 'attribution'
+    } and activity.get('source') == 'hid_system'
+      and activity.get('attribution') == 'not_authenticated'
+      and type(activity.get('counter_regression')) is bool,
+      'current activity schema')
+    deltas = activity['deltas']
+    require(isinstance(deltas, dict) and set(deltas) == set(COUNTERS),
+            'current activity counters')
+    if activity['counter_regression']:
+        require(activity['changed'] is None and all(v is None for v in deltas.values()),
+                'regressed current counters must be unknown')
+    else:
+        require(all(type(v) is int and 0 <= v <= 2**32-1 for v in deltas.values()),
+                'current activity delta type/range')
+        require(type(activity['changed']) is bool and activity['changed'] == any(deltas.values()),
+                'current activity change disagrees with counters')
+    return value
+
+
+def validate_mouse_overlap(before, samples):
+    before = validate_current_activity(before, before.get('sequence') if isinstance(before, dict) else -1)
+    require(not before['hid_activity']['counter_regression'], 'mouse overlap baseline counter regression')
+    base = before['hid_activity']['deltas']
+    require(base['mouse_move'] > 0, 'required mouse activity was not observed before dispatch')
+    require(base['key_down'] == base['key_up'] == 0,
+            'keyboard HID activity observed before mouse-only dispatch')
+    require(isinstance(samples, list) and samples, 'no activity samples while client dispatch was alive')
+    sequence = before['sequence']
+    checked = [validate_current_activity(value, sequence) for value in samples]
+    require(all(not value['hid_activity']['counter_regression'] for value in checked),
+            'mouse overlap counter regression while client dispatch was alive')
+    require(all(value['hid_activity']['deltas']['key_down'] == 0
+                and value['hid_activity']['deltas']['key_up'] == 0 for value in checked),
+            'keyboard HID activity observed in mouse-only overlap profile')
+    peak = max(value['hid_activity']['deltas']['mouse_move'] for value in checked)
+    require(peak > base['mouse_move'],
+            'mouse activity did not progress while client dispatch process was alive')
+    return {
+        'before_dispatch': base['mouse_move'],
+        'while_client_alive': peak - base['mouse_move'],
+        'attribution': 'not_authenticated',
+        'client_process_overlap_verified': True,
+        'internal_posting_overlap_verified': False,
+    }
+
+
 def preparation_token(reply, key, fixture, window, validate_geometry):
     require(isinstance(reply, dict) and set(reply) == {'ok', 'action_attempted', 'prepared'}
             and reply['ok'] is True and reply['action_attempted'] is False, 'preparation not successful')
@@ -107,6 +159,7 @@ def public_fixture(state):
 
 def summarize(report):
     dispatch = report.get('dispatch', {})
+    overlap = report.get('mouse_overlap')
     native = dispatch.get('native_after', {}) if dispatch.get('witness_valid') is True else {}
     activity = native.get('hid_activity', {})
     deltas = activity.get('deltas', {})
@@ -119,6 +172,10 @@ def summarize(report):
             'hid_keyboard_activity_during_dispatch_bracket': keyboard,
             'human_focus_changed_during_dispatch_bracket': native.get('human_changed'),
             'human_activity_attribution': 'not_authenticated',
+            'mouse_activity_required': report.get('mouse_activity_required', False),
+            'mouse_activity_before_dispatch': overlap.get('before_dispatch') if isinstance(overlap, dict) else None,
+            'mouse_activity_while_client_alive': overlap.get('while_client_alive') if isinstance(overlap, dict) else None,
+            'client_process_overlap_verified': overlap.get('client_process_overlap_verified', False) if isinstance(overlap, dict) else False,
             'internal_posting_overlap_verified': False,
             'continuous_isolation_verified': False}
 

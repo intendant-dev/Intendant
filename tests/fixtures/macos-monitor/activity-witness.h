@@ -27,8 +27,12 @@ static NSDictionary *activity_delta(ActivityCounters before, ActivityCounters af
         @"deltas":deltas,@"changed":regressed ? (id)NSNull.null : (changed?@YES:@NO),
         @"attribution":@"not_authenticated"};
 }
+static NSDictionary *activity_current_evidence(NSUInteger sequence, ActivityCounters before, ActivityCounters after) {
+    return @{@"sequence":@(sequence), @"hid_activity":activity_delta(before,after)};
+}
 @interface ActivityWitness : FocusWitness
 @property ActivityCounters counts;
+- (NSDictionary *)currentEvidence;
 @end
 @implementation ActivityWitness
 - (void)begin:(NSRunningApplication *)browser {
@@ -37,6 +41,10 @@ static NSDictionary *activity_delta(ActivityCounters before, ActivityCounters af
     self.counts=activity_sample();
     NSMutableDictionary *d=[self.receipt mutableCopy];
     d[@"hid_activity"]=@{@"source":@"hid_system",@"sampled":@YES}; self.receipt=d;
+}
+- (NSDictionary *)currentEvidence {
+    if (!self.active) return nil;
+    return activity_current_evidence(self.sequence,self.counts,activity_sample());
 }
 - (void)finish:(NSRunningApplication *)browser {
     BOOL hadStart=self.active;

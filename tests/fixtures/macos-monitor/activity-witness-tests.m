@@ -20,6 +20,11 @@ int main(void) { @autoreleasepool {
     a=(ActivityCounters){{0}};b=(ActivityCounters){{UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX}};
     d=activity_delta(a,b);check([d[@"deltas"][@"key_down"] unsignedLongLongValue]==UINT32_MAX);++cases;
     check([NSJSONSerialization isValidJSONObject:d]);++cases;
+    a=(ActivityCounters){{10,20,30,40,50}};b=a;b.values[3]+=4;
+    NSDictionary *current=activity_current_evidence(7,a,b);
+    check([current[@"sequence"] unsignedIntegerValue]==7
+        && [current[@"hid_activity"][@"deltas"][@"mouse_move"] unsignedLongLongValue]==4);++cases;
+    check([NSJSONSerialization isValidJSONObject:current]);++cases;
     ActivityWitness *w=[ActivityWitness new];[w begin:nil];check(!w.active && !w.receipt[@"hid_activity"]);++cases;
     [w finish:nil];check(!w.active && !w.receipt[@"hid_activity"]);++cases;
     printf("{\"passed\":true,\"cases\":%lu,\"counter_samples\":0,\"native_input_calls\":0}\n",(unsigned long)cases);
