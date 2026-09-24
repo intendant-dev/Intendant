@@ -1333,3 +1333,13 @@ it. Existing ArrowRight calls remain supported. Exact receiver/window/monitor,
 protection and focus checks, source capacity and uncertainty semantics are
 unchanged. No hidden click, general key/text/chord or global-input fallback is
 added. See `docs/design/macos-bound-arrowleft.md` for limits and acceptance.
+
+### Bounded focused-element re-observation
+
+The bound-window foreground fallback and keyboard receiver path may reread
+`AXFocusedUIElement` once on the same retained application after an empty
+`kAXErrorCannotComplete` reply, within their existing operation deadline and
+50 ms per-copy timeout. This does not reread protection metadata, retry an
+input, accept missing focus, or relax retained-receiver/foreground checks.
+Other errors, malformed replies, persistent failure and expired budgets refuse.
+See `docs/design/macos-focus-reread.md` for the exact recovery boundary.
