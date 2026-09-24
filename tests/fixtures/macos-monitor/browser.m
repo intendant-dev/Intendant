@@ -9,6 +9,7 @@
 #include <string.h>
 #include "browser-pointer.h"
 #include "browser-key.h"
+#include "focus-witness.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -135,11 +136,12 @@ static NSDictionary *key_refused(NSRunningApplication *browser, BrowserKeyPlan p
 
 int main(int argc, const char **argv) {
     if (argc != 6) return 2;
+    BOOL focusMode = strcmp(argv[1], "--disposable-chromium-focus") == 0;
     BOOL pointerMode = strcmp(argv[1], "--disposable-chromium-pointer") == 0;
     BOOL keyMode = strcmp(argv[1], "--disposable-chromium-key") == 0;
     BOOL clickKeyMode = browser_click_key_mode(argv[1]);
     BOOL keyLifecycle = keyMode || clickKeyMode;
-    if (!clickKeyMode && !keyMode && !pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
+    if (!focusMode && !clickKeyMode && !keyMode && !pointerMode && strcmp(argv[1], "--disposable-chromium") != 0) return 2;
     @autoreleasepool {
         NSString *bundlePath = [NSString stringWithUTF8String:argv[2]];
         NSString *profile = [NSString stringWithUTF8String:argv[3]];
@@ -179,9 +181,14 @@ int main(int argc, const char **argv) {
         ClickReceiptState clickReceipt={0}; uint64_t clickChallenge=0; NSDictionary *clickReceiptResult=nil;
         NSDictionary *pointerResult = nil; BOOL pointerConsumed = NO; NSUInteger pointerReplays = 0;
         NSDictionary *diagnostic = nil; BOOL stopping = NO; NSTimeInterval stopAt = 0; NSUInteger tick = 0; BOOL browserEverFront = NO; BOOL keyShutdownRequested=NO;
+        FocusWitness *focus = focusMode ? [FocusWitness new] : nil;
         while (NSProcessInfo.processInfo.systemUptime - started < 200) {
             [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             char command = 0; ssize_t n = read(STDIN_FILENO, &command, 1);
+            if (focusMode && !stopping && !browserEverFront) {
+                if (command == 'f') [focus begin:browser];
+                if (command == 'g') [focus finish:browser];
+            }
             if (command == 'd' && browser && !browser.terminated) diagnostic = tree_probe(browser.processIdentifier);
             if (command == 'a') {
                 BrowserClickReceipt receipt={0}; BOOL readOK=click_receipt_read(&receipt);
@@ -257,6 +264,7 @@ int main(int argc, const char **argv) {
                 browserEverFront |= [current[@"front_pid"] intValue] == browser.processIdentifier;
             }
             status[@"tick"] = @(++tick);
+            if(focus.receipt) status[@"focus_witness"] = focus.receipt;
             if(keyResult) status[@"key_result"]=keyResult;
             status[@"key_replays_refused"]=@(keyReplays);
             if (clickKeyMode) {
@@ -301,6 +309,8 @@ int main(int argc, const char **argv) {
         NSMutableDictionary *final = [@{@"supervisor_pid": @(getpid()), @"browser_pid": @(browser ? browser.processIdentifier : 0),
             @"browser_terminated": (browser_exit_verified(browser!=nil,browser.terminated) ? @YES : @NO), @"launch_finished": @(launchFinished), @"tick": @(++tick), @"browser_ever_front": browserEverFront ? @YES : @NO,
             @"error": launchError ?: @"", @"before": before, @"observation": observation() ?: @{}} mutableCopy];
+        if(focus.receipt) final[@"focus_witness"] = focus.receipt;
+        [focus cancel];
         if(keyResult) final[@"key_result"]=keyResult;
         final[@"key_replays_refused"]=@(keyReplays);
         if (clickKeyMode) {
