@@ -12,6 +12,7 @@ page; the profile sends no native keys or system-wide focus operations. Its repo
 """
 import math
 import macos_arrow_acceptance as arrow_acceptance
+import macos_receiver_study as receiver_study
 import argparse
 import base64
 import hashlib
@@ -292,7 +293,12 @@ def main():
     p.add_argument('--keyboard-target-click-first', action='store_true', help='Explicit single bound-window setup click on the first disposable nonsecret field')
     p.add_argument('--arrowright',action='store_true',help='Explicit one-pair production ArrowRight acceptance after verified setup selection')
     p.add_argument('--arrowleft',action='store_true',help='Explicit fixed ArrowLeft acceptance; requires separate setup click')
+    p.add_argument("--receiver-study", action="store_true", help="Fixed twelve-read receiver study; no keys; requires explicit setup click")
     args = p.parse_args()
+    try:
+        receiver_study.validate_options(args.receiver_study, args.keyboard_target, args.keyboard_target_click_first, args.arrowleft or args.arrowright, args.placement_only)
+    except ValueError as error:
+        p.error(str(error))
     require(not (args.arrowleft and args.arrowright), 'choose exactly one arrow profile')
     arrow_key = 'ArrowLeft' if args.arrowleft else 'ArrowRight'
     arrow_profile = args.arrowleft or args.arrowright
@@ -311,7 +317,7 @@ def main():
         'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
               'browser_mode': 'background-window',
-              'profile': 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
+              'profile': 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
@@ -456,45 +462,65 @@ def main():
             if args.keyboard_target_click_first:
                 report['checks']['explicit_setup_click'] = {}
                 first_state = select_keyboard_fixture_with_click(call, evaluate, binding, first_state, expected, report['checks']['explicit_setup_click'])
-            first_receiver = read_receiver(first_state)
-            report['checks']['first_receiver'] = first_receiver
-            pending_arrow = None
-            if arrow_profile:
-                report[arrow_key.lower()] = {}
-                pending_arrow = arrow_acceptance.exercise(call,evaluate,binding,report[arrow_key.lower()],arrow_key)
-            second_state = evaluate("selectKeyboardTarget('second')")
-            require(second_state['active'] == 'second', 'fixture-only DOM focus setup failed for second field')
-            second = call('inspect', argv=['display', 'keyboard-target', binding])
-            require(second.get('ok') is True, second)
-            second_receiver = second.get('keyboard_target')
-            require(isinstance(second_receiver, dict) and set(second_receiver) == set(first_receiver), second)
-            require(second_receiver['role'] == 'AXTextField' and second_receiver['enabled'] is True
-                    and second_receiver['keyboard_dispatch_supported'] is False, second)
-            require(second_receiver['bounds'] != first_receiver['bounds'],
-                    'changed fixture receiver did not change reported geometry')
-            report['checks']['changed_receiver'] = second_receiver
-            validate_keyboard_receiver(second_receiver, second_state, expected)
-            protected_state = evaluate("selectKeyboardTarget('protected')")
-            require(protected_state['active'] == 'protected', 'fixture-only DOM focus setup failed for password field')
-            protected = call('read_macos_window_keyboard_target', binding=binding)
-            protected_wire = json.dumps(protected)
-            require(protected.get('ok') is False and 'synthetic-secret' not in protected_wire, protected)
-            report['checks']['protected_receiver_refused'] = True
-            require(any(word in str(protected.get("error", "")).lower() for word in ("protected", "absent")), "protected refusal reason was not established")
-            report["checks"]["protected_receiver_result"] = protected
-            stale_binding = binding
-            unbound = call('unbind_macos_window', binding=stale_binding)
-            require(unbound.get('ok') is True, unbound)
-            binding = None
-            stale = call('read_macos_window_keyboard_target', binding=stale_binding)
-            require(stale.get('ok') is False and 'stale' in json.dumps(stale).lower(), stale)
-            report['checks']['stale_binding_refused'] = True
-            if pending_arrow is not None:
-                refused=call('press_macos_window_'+arrow_key.lower(),binding=stale_binding,token=pending_arrow)
-                require(refused.get('ok') is False and refused.get('action_attempted') is False and refused.get('effects_unconfirmed') is False,refused)
-                report[arrow_key.lower()]['checks']['stale_binding_refused']=True
-            report['checks']['fixture_setup'] = ('one explicit verified native click, then fixture-only DOM receiver changes' if args.keyboard_target_click_first else 'DOM focus only; no native click')
-            report['checks']['keyboard_input_requested'] = arrow_profile
+            if args.receiver_study:
+                series = report['receiver_study'] = {}
+                report['passed_semantics'] = 'measurement collection and validation only; not input availability'
+                report['checks']['keyboard_input_requested'] = False
+                def study_state():
+                    return evaluate('receiverStudyState()')
+                def study_select(name):
+                    require(name in ('first', 'second', 'protected'), 'unknown study field')
+                    return evaluate("selectKeyboardTarget(" + json.dumps(name) + "); receiverStudyState()")
+                def checkpoint():
+                    pending = args.report.with_name(args.report.name + '.partial')
+                    pending.write_text(json.dumps(report, indent=2) + chr(10))
+                    pending.replace(args.report)
+                receiver_study.collect(
+                    lambda: call('read_macos_window_keyboard_target', binding=binding),
+                    study_select, study_state, lambda: status()['observation'],
+                    validate_keyboard_receiver, expected, series, checkpoint,
+                    min(end, time.monotonic() + 75))
+                require(series['completed'] and series['measurement_valid'], 'receiver study incomplete')
+            else:
+                first_receiver = read_receiver(first_state)
+                report['checks']['first_receiver'] = first_receiver
+                pending_arrow = None
+                if arrow_profile:
+                    report[arrow_key.lower()] = {}
+                    pending_arrow = arrow_acceptance.exercise(call,evaluate,binding,report[arrow_key.lower()],arrow_key)
+                second_state = evaluate("selectKeyboardTarget('second')")
+                require(second_state['active'] == 'second', 'fixture-only DOM focus setup failed for second field')
+                second = call('inspect', argv=['display', 'keyboard-target', binding])
+                require(second.get('ok') is True, second)
+                second_receiver = second.get('keyboard_target')
+                require(isinstance(second_receiver, dict) and set(second_receiver) == set(first_receiver), second)
+                require(second_receiver['role'] == 'AXTextField' and second_receiver['enabled'] is True
+                        and second_receiver['keyboard_dispatch_supported'] is False, second)
+                require(second_receiver['bounds'] != first_receiver['bounds'],
+                        'changed fixture receiver did not change reported geometry')
+                report['checks']['changed_receiver'] = second_receiver
+                validate_keyboard_receiver(second_receiver, second_state, expected)
+                protected_state = evaluate("selectKeyboardTarget('protected')")
+                require(protected_state['active'] == 'protected', 'fixture-only DOM focus setup failed for password field')
+                protected = call('read_macos_window_keyboard_target', binding=binding)
+                protected_wire = json.dumps(protected)
+                require(protected.get('ok') is False and 'synthetic-secret' not in protected_wire, protected)
+                report['checks']['protected_receiver_refused'] = True
+                require(any(word in str(protected.get("error", "")).lower() for word in ("protected", "absent")), "protected refusal reason was not established")
+                report["checks"]["protected_receiver_result"] = protected
+                stale_binding = binding
+                unbound = call('unbind_macos_window', binding=stale_binding)
+                require(unbound.get('ok') is True, unbound)
+                binding = None
+                stale = call('read_macos_window_keyboard_target', binding=stale_binding)
+                require(stale.get('ok') is False and 'stale' in json.dumps(stale).lower(), stale)
+                report['checks']['stale_binding_refused'] = True
+                if pending_arrow is not None:
+                    refused=call('press_macos_window_'+arrow_key.lower(),binding=stale_binding,token=pending_arrow)
+                    require(refused.get('ok') is False and refused.get('action_attempted') is False and refused.get('effects_unconfirmed') is False,refused)
+                    report[arrow_key.lower()]['checks']['stale_binding_refused']=True
+                report['checks']['fixture_setup'] = ('one explicit verified native click, then fixture-only DOM receiver changes' if args.keyboard_target_click_first else 'DOM focus only; no native click')
+                report['checks']['keyboard_input_requested'] = arrow_profile
         elif not args.placement_only:
             def read():
                 result = call('read_macos_window_elements', binding=binding)

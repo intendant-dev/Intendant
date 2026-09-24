@@ -65,4 +65,5 @@ window.keyboardTargetFixtureState = () => {
       scroll_x: scrollX, scroll_y: scrollY},
   };
 };
+window.receiverStudyState = () => ({...keyboardTargetFixtureState(), key_event_count: arrowEvents.length, key_overflow: arrowOverflow});
 </script>
