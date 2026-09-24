@@ -705,10 +705,48 @@ fn placement_generation(identity: WindowIdentity) -> Result<(), String> {
     }
     Ok(())
 }
+fn placement_roots_result(
+    status: accessibility_sys::AXError,
+    array_present: bool,
+    count: Option<usize>,
+    timing: AxReadTiming,
+) -> Result<(), String> {
+    let timing_suffix = || {
+        format!(
+            "ax_windows_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            timing.elapsed.as_micros(),
+            BOUND_AX_TIMEOUT.as_micros(),
+            timing.budget_before.as_micros(),
+            timing.budget_after.as_micros(),
+        )
+    };
+    if !array_present {
+        return Err(format!(
+            "application does not expose bounded AX windows; {} ({}); array_present=false; count=unknown; {}",
+            ax_error_name(status),
+            status,
+            timing_suffix(),
+        ));
+    }
+    let count = count
+        .ok_or_else(|| "AX window enumeration internal presence/count mismatch".to_string())?;
+    if status != kAXErrorSuccess || count > placement::MAX_CANDIDATES {
+        return Err(format!(
+            "AX window enumeration unavailable or exceeds capacity; {} ({}); array_present=true; count={count}; cap={}; {}",
+            ax_error_name(status),
+            status,
+            placement::MAX_CANDIDATES,
+            timing_suffix(),
+        ));
+    }
+    Ok(())
+}
+
 fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, String> {
     let app = placement_app(pid, deadline)?;
     let key = CFString::new(kAXWindowsAttribute);
     let mut raw = std::ptr::null();
+    let started = Instant::now();
     // SAFETY: retained app/key and writable array output; request at most cap+1
     // objects, so an app with too many windows fails without an unbounded copy.
     let status = unsafe {
@@ -720,16 +758,17 @@ fn placement_roots(pid: i32, deadline: Instant) -> Result<Vec<AXUIElement>, Stri
             &mut raw,
         )
     };
+    let finished = Instant::now();
+    let timing = AxReadTiming::between(started, finished, deadline);
     if raw.is_null() {
-        return Err("application does not expose bounded AX windows".into());
+        return placement_roots_result(status, false, None, timing).map(|()| Vec::new());
     }
     // SAFETY: Copy-rule output is retained even if a malformed provider also
     // returned an error. Wrapper releases it on all following paths.
     let array: CFArray = unsafe { CFArray::wrap_under_create_rule(raw) };
-    if status != kAXErrorSuccess || array.len() as usize > placement::MAX_CANDIDATES {
-        return Err("AX window enumeration unavailable or exceeds capacity".into());
-    }
-    let mut windows = Vec::with_capacity(array.len() as usize);
+    let count = array.len() as usize;
+    placement_roots_result(status, true, Some(count), timing)?;
+    let mut windows = Vec::with_capacity(count);
     for item in array.iter() {
         placement::time_left(deadline)?;
         let ptr = *item;
@@ -2114,6 +2153,64 @@ mod tests {
         assert!(error.contains("budget expired"));
         assert!(error.contains("focus_read_attempts=2"));
         assert_eq!(calls, [false, true]);
+    }
+
+    #[test]
+    fn window_enumeration_diagnostic_preserves_status_presence_count_and_timing() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let timing = AxReadTiming::between(
+            start,
+            start + Duration::from_micros(50_777),
+            start + Duration::from_secs(4),
+        );
+
+        let unavailable = placement_roots_result(
+            accessibility_sys::kAXErrorCannotComplete,
+            false,
+            None,
+            timing,
+        )
+        .unwrap_err();
+        assert!(unavailable.contains("application does not expose bounded AX windows"));
+        assert!(unavailable.contains("kAXErrorCannotComplete (-25204)"));
+        assert!(unavailable.contains("array_present=false"));
+        assert!(unavailable.contains("count=unknown"));
+        assert!(unavailable.contains("ax_windows_us=50777"));
+        assert!(unavailable.contains("ax_timeout_us=50000"));
+        assert!(unavailable.contains("budget_before_us=4000000"));
+        assert!(unavailable.contains("budget_after_us=3949223"));
+
+        let contradictory =
+            placement_roots_result(kAXErrorSuccess, false, None, timing).unwrap_err();
+        assert!(contradictory.contains("kAXErrorSuccess (0)"));
+        assert!(contradictory.contains("array_present=false"));
+
+        placement_roots_result(kAXErrorSuccess, true, Some(1), timing).unwrap();
+
+        let failed_with_array = placement_roots_result(
+            accessibility_sys::kAXErrorCannotComplete,
+            true,
+            Some(1),
+            timing,
+        )
+        .unwrap_err();
+        assert!(failed_with_array.contains("array_present=true"));
+        assert!(failed_with_array.contains("count=1"));
+
+        let over_capacity = placement_roots_result(
+            kAXErrorSuccess,
+            true,
+            Some(placement::MAX_CANDIDATES + 1),
+            timing,
+        )
+        .unwrap_err();
+        assert!(over_capacity.contains("exceeds capacity"));
+        assert!(over_capacity.contains(&format!("cap={}", placement::MAX_CANDIDATES)));
+
+        assert!(placement_roots_result(kAXErrorSuccess, true, None, timing)
+            .unwrap_err()
+            .contains("internal presence/count mismatch"));
     }
 
     #[test]
