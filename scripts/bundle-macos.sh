@@ -261,7 +261,8 @@ mkdir -p "$MACOS" "$RESOURCES"
 # files, swiftc only allows top-level code in a file named main.swift)
 echo "Compiling macOS app wrapper..."
 swiftc -O -o "$MACOS/Intendant" macos-app/main.swift macos-app/BackendSupervisor.swift \
-    macos-app/UpdateChecker.swift \
+    macos-app/UpdateChecker.swift macos-app/AgentViewModel.swift \
+    macos-app/AgentViewTransport.swift macos-app/AgentView.swift \
     -framework Cocoa -framework WebKit
 
 # Copy Rust binaries

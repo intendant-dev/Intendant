@@ -178,19 +178,23 @@ impl IntendantServer {
         &self,
         selector: String,
         compact: bool,
+        ephemeral: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
         let authority = self.macos_monitor_authority(caller).await;
-        let state = self.state.read().await;
-        let directory = state
-            .screenshot_dir
-            .clone()
-            .unwrap_or_else(|| state.log_dir.join("screenshots"));
-        drop(state);
-        let path = directory.join(format!(
-            "macos-monitor-{}.png",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let path = if ephemeral {
+            None
+        } else {
+            let state = self.state.read().await;
+            let directory = state
+                .screenshot_dir
+                .clone()
+                .unwrap_or_else(|| state.log_dir.join("screenshots"));
+            Some(directory.join(format!(
+                "macos-monitor-{}.png",
+                uuid::Uuid::new_v4().simple()
+            )))
+        };
         let receipt = match self
             .bus
             .macos_monitors
@@ -299,6 +303,10 @@ fn screenshot_response(
         .as_object_mut()
         .unwrap()
         .extend(fields.as_object().unwrap().clone());
+    if screenshot.path.is_none() {
+        metadata.as_object_mut().unwrap().remove("screenshot_path");
+        metadata["artifact_retained"] = false.into();
+    }
     if compact {
         compact_image_tool_result(metadata, "image/png")
     } else {
@@ -768,7 +776,7 @@ mod tests {
     fn macos_monitor_screenshot_preserves_image_and_compact_contracts() {
         let directory = tempfile::tempdir().unwrap();
         let screenshot = crate::macos_monitor::Screenshot {
-            path: directory.path().join("owned.png"),
+            path: Some(directory.path().join("owned.png")),
             png: b"fixture-png".to_vec(),
             width: 640,
             height: 480,
@@ -796,10 +804,95 @@ mod tests {
             serde_json::from_str(compact["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(
             metadata["screenshot_path"],
-            screenshot.path.to_string_lossy().as_ref()
+            screenshot.path.as_ref().unwrap().to_string_lossy().as_ref()
         );
         assert_eq!(metadata["width"], 640);
         assert_eq!(metadata["input_supported"], false);
+    }
+
+    #[test]
+    fn ephemeral_monitor_reply_is_inline_without_an_artifact_path() {
+        let image = crate::macos_monitor::Screenshot {
+            path: None,
+            png: b"memory-only".to_vec(),
+            width: 800,
+            height: 600,
+        };
+        let reply = serde_json::to_value(screenshot_response(
+            &image,
+            "macos_virtual:fixture:1",
+            false,
+        ))
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(metadata.get("screenshot_path").is_none());
+        assert_eq!(metadata["artifact_retained"], false);
+        assert_eq!(metadata["ephemeral_capture_supported"], true);
+        assert_eq!(reply["content"][1]["mimeType"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_monitor_requires_explicit_exact_target_and_inline_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = IntendantServer::new(
+            super::super::tests::test_state_with_log_dir(directory.path().to_path_buf()),
+            EventBus::new(),
+        );
+        let exact = "macos_virtual:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:536870912";
+        for (target, compact) in [
+            (None, false),
+            (Some("user_session"), false),
+            (Some("0"), false),
+            (Some("macos_virtual:bad"), false),
+            (Some(exact), true),
+        ] {
+            let reply = server
+                .take_screenshot_with_output(
+                    Parameters(TakeScreenshotParams {
+                        display_target: target.map(str::to_owned),
+                        ephemeral: true,
+                    }),
+                    compact,
+                    ToolCallerTrust::OwnerSurface,
+                )
+                .await
+                .unwrap();
+            assert!(serde_json::to_string(&reply)
+                .unwrap()
+                .contains("ephemeral screenshots require"));
+            assert!(server.bus.macos_monitors.not_started());
+        }
+        let defaults: TakeScreenshotParams = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.ephemeral);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_monitor_keeps_the_existing_scoped_display_grant_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = IntendantServer::new(
+            super::super::tests::test_state_with_log_dir(directory.path().to_path_buf()),
+            EventBus::new(),
+        );
+        let reply = server
+            .take_screenshot_with_output(
+                Parameters(TakeScreenshotParams {
+                    display_target: Some(
+                        "macos_virtual:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:536870912".into(),
+                    ),
+                    ephemeral: true,
+                }),
+                false,
+                ToolCallerTrust::Scoped,
+            )
+            .await
+            .unwrap();
+        assert!(serde_json::to_string(&reply)
+            .unwrap()
+            .contains("existing explicit user-display grant"));
+        assert!(server.bus.macos_monitors.not_started());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -888,7 +981,12 @@ mod tests {
             .await;
         assert!(destroy.contains("existing explicit user-display grant"));
         let result = server
-            .screenshot_macos_monitor("macos_virtual:bad".into(), false, ToolCallerTrust::Scoped)
+            .screenshot_macos_monitor(
+                "macos_virtual:bad".into(),
+                false,
+                false,
+                ToolCallerTrust::Scoped,
+            )
             .await
             .unwrap();
         assert!(serde_json::to_string(&result)

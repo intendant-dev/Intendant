@@ -821,6 +821,10 @@ pub(crate) fn default_timeout() -> u64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
+    /// Memory-only PNG for an exact owned macos_virtual generation. No artifact
+    /// is written. Requires an explicit target and inline output; defaults false.
+    #[serde(default)]
+    pub ephemeral: bool,
     /// On macOS, also accepts the exact opaque macos_virtual selector from
     /// create_virtual_display for a read-only, cursor-free owned-monitor frame.
     /// Display target: "user_session", "display_99", etc. Auto-detects if

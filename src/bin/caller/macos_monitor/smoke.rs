@@ -61,7 +61,7 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
         tx,
         Action::Capture {
             selector: monitor.selector.clone(),
-            path: directory.join("owned.png"),
+            path: Some(directory.join("owned.png")),
         },
     )
     .await?;
@@ -91,7 +91,7 @@ async fn exercise(tx: &mpsc::Sender<Request>, directory: &std::path::Path) -> Re
         tx,
         Action::Capture {
             selector: monitor.selector,
-            path: directory.join("stale.png"),
+            path: Some(directory.join("stale.png")),
         },
     )
     .await
