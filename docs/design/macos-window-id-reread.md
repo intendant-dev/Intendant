@@ -1,0 +1,3 @@
+# Bounded exact AX window-ID re-observation (2026-09-25)
+
+Permit at most one second _AXUIElementGetWindow read of the same retained AX window only when the first bounded read returns kAXErrorCannotComplete with window ID 0. The second read must fit the original operation budget and rerun the existing permission and per-element messaging-timeout preflight. Any other first result, error-plus-ID contradiction, insufficient budget, second failure, zero second ID, changed process/window identity, or later focus/protection check still refuses. No input retry, action retry, timeout increase, budget extension, activation, focus mutation, or metadata weakening.
