@@ -37,8 +37,9 @@ pub struct TerminalListParams {}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TerminalOpenParams {
-    /// Terminal id to open or attach (creates the shell when absent).
-    /// Omit to mint a fresh id.
+    /// Name for a new shell, or the exact opaque terminal_id returned by
+    /// open/list to attach to that incarnation without ever respawning it.
+    /// Omit for a fresh shell. Always retain the returned terminal_id.
     #[serde(default)]
     pub terminal_id: Option<String>,
     /// Initial columns (default 120).
@@ -55,7 +56,8 @@ pub struct TerminalOpenParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TerminalReadParams {
-    /// The terminal id.
+    /// The exact opaque terminal_id returned by terminal_open/terminal_list;
+    /// keep it across updates. Do not substitute the display name.
     pub terminal_id: String,
     /// Cursor from a previous read's `next_cursor` (0 = from the oldest
     /// retained output).
@@ -69,7 +71,8 @@ pub struct TerminalReadParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TerminalWriteParams {
-    /// The terminal id.
+    /// The exact opaque terminal_id returned by terminal_open/terminal_list;
+    /// keep it across updates. Do not substitute the display name.
     pub terminal_id: String,
     /// Bytes to write to the shell's stdin, verbatim.
     pub input: String,
@@ -82,7 +85,8 @@ pub struct TerminalWriteParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TerminalResizeParams {
-    /// The terminal id.
+    /// The exact opaque terminal_id returned by terminal_open/terminal_list;
+    /// keep it across updates. Do not substitute the display name.
     pub terminal_id: String,
     pub cols: u16,
     pub rows: u16,
@@ -90,7 +94,8 @@ pub struct TerminalResizeParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TerminalCloseParams {
-    /// The terminal id.
+    /// The exact opaque terminal_id returned by terminal_open/terminal_list;
+    /// keep it across updates. Do not substitute the display name.
     pub terminal_id: String,
 }
 
@@ -219,7 +224,8 @@ impl IntendantServer {
             .into_iter()
             .map(|s| {
                 serde_json::json!({
-                    "terminal_id": s.key.terminal_id,
+                    "terminal_id": registry.reference_for(&s.key, &s.instance_id),
+                    "terminal_name": s.key.terminal_id,
                     "host_id": s.key.host_id,
                     "alive": s.alive,
                     "shared": s.shared,
@@ -248,7 +254,16 @@ impl IntendantServer {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| format!("mcp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
-        let key = TerminalKey::local(&terminal_id);
+        let reference = match crate::terminal::TerminalReference::parse(&terminal_id) {
+            Ok(reference) => reference,
+            Err(error) => return error,
+        };
+        let key = TerminalKey::local(
+            reference
+                .as_ref()
+                .map(|r| r.name.as_str())
+                .unwrap_or(&terminal_id),
+        );
         let acting = terminal_actor(trust, actor);
         let policy = ShellSpawnPolicy {
             // The gate already charged this call as shell.spawn — that is
@@ -269,8 +284,8 @@ impl IntendantServer {
             scope: fs_scope.clone(),
         };
         match registry
-            .open_or_attach(
-                key,
+            .open_mcp(
+                &terminal_id,
                 params.cols.unwrap_or(120),
                 params.rows.unwrap_or(32),
                 &acting,
@@ -299,7 +314,8 @@ impl IntendantServer {
                 let (_, cursor, _) = session.read_since(u64::MAX, 0);
                 serde_json::json!({
                     "ok": true,
-                    "terminal_id": terminal_id,
+                    "terminal_id": registry.reference_for(&key, &session.instance_id),
+                    "terminal_name": key.terminal_id,
                     "created": created,
                     "alive": session.is_alive(),
                     "shared": session.shared(),
@@ -309,7 +325,7 @@ impl IntendantServer {
                 })
                 .to_string()
             }
-            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+            Err(error) => error,
         }
     }
 
@@ -323,10 +339,11 @@ impl IntendantServer {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
-        let key = TerminalKey::local(&params.terminal_id);
         let acting = terminal_actor(trust, actor);
-        let Some(session) = registry.get_visible(&key, &acting).await else {
-            return no_visible(&params.terminal_id);
+        let session = match registry.get_mcp_visible(&params.terminal_id, &acting).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return no_visible(&params.terminal_id),
+            Err(error) => return error,
         };
         if scope_is_stale(
             trust,
@@ -374,10 +391,11 @@ impl IntendantServer {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
-        let key = TerminalKey::local(&params.terminal_id);
         let acting = terminal_actor(trust, actor);
-        let Some(session) = registry.get_visible(&key, &acting).await else {
-            return no_visible(&params.terminal_id);
+        let session = match registry.get_mcp_visible(&params.terminal_id, &acting).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return no_visible(&params.terminal_id),
+            Err(error) => return error,
         };
         if scope_is_stale(
             trust,
@@ -422,10 +440,11 @@ impl IntendantServer {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
-        let key = TerminalKey::local(&params.terminal_id);
         let acting = terminal_actor(trust, actor);
-        let Some(session) = registry.get_visible(&key, &acting).await else {
-            return no_visible(&params.terminal_id);
+        let session = match registry.get_mcp_visible(&params.terminal_id, &acting).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return no_visible(&params.terminal_id),
+            Err(error) => return error,
         };
         if scope_is_stale(
             trust,
@@ -448,11 +467,13 @@ impl IntendantServer {
         let Some(registry) = self.terminal_registry().await else {
             return no_registry();
         };
-        let key = TerminalKey::local(&params.terminal_id);
-        let closed = registry
-            .close_visible(&key, &terminal_actor(trust, actor))
-            .await;
-        serde_json::json!({ "ok": closed, "closed": closed }).to_string()
+        match registry
+            .close_mcp_visible(&params.terminal_id, &terminal_actor(trust, actor))
+            .await
+        {
+            Ok(closed) => serde_json::json!({ "ok": closed, "closed": closed }).to_string(),
+            Err(error) => error,
+        }
     }
 }
 

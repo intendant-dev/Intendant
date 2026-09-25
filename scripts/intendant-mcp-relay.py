@@ -10,6 +10,11 @@ printing or returning it.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
+import hmac
+import re
 import http.client
 import ipaddress
 import json
@@ -132,6 +137,175 @@ def connect_to_active_daemon(
     raise RuntimeError("Intendant daemon changed during relay connection")
 
 
+
+# Terminal handles are routing identifiers, never credentials. They are also
+# checked by the owning daemon, including its normal per-call IAM/scope gate.
+TERMINAL_REFERENCE_PREFIX = "iterm1."
+TERMINAL_TOOLS = {
+    "terminal_open", "terminal_read", "terminal_write",
+    "terminal_resize", "terminal_close",
+}
+
+
+class TerminalRouteError(RuntimeError):
+    def __init__(self, code: str, request_id: object, delivery_unknown: bool = False):
+        super().__init__(code)
+        self.code = code
+        self.request_id = request_id
+        self.delivery_unknown = delivery_unknown
+
+
+@dataclass(frozen=True)
+class TerminalRoute:
+    boot_id: str
+    request_id: object
+
+
+def terminal_route(body: bytes) -> TerminalRoute | None:
+    """Inspect only a terminal tool's ID slot, never arbitrary input text."""
+    try:
+        request = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None  # Legacy opaque requests retain their existing behavior.
+    if not isinstance(request, dict) or request.get("method") != "tools/call":
+        return None
+    params = request.get("params")
+    if not isinstance(params, dict):
+        return None
+    tool, args = params.get("name"), params.get("arguments")
+    if not isinstance(tool, str) or not isinstance(args, dict):
+        return None
+    terminal_id = None
+    if tool in TERMINAL_TOOLS:
+        terminal_id = args.get("terminal_id")
+    elif tool in {"inspect", "act", "authorize"}:
+        argv = args.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+            return None
+        if len(argv) < 3 or argv[0] != "terminal" or "terminal_" + argv[1] not in TERMINAL_TOOLS:
+            return None
+        # The facade accepts flags before positional args. Skip only the
+        # flags belonging to this operation, not a generic command grammar.
+        valued = {"open": {"--cols", "--rows"}, "read": {"--cursor", "--max-bytes"}}
+        booleans = {"open": {"--shared"}, "write": {"--no-enter"}}
+        index = 2
+        while index < len(argv):
+            word = argv[index]
+            if word == "--":
+                index += 1
+                break
+            flag = word.split("=", 1)[0]
+            if flag in valued.get(argv[1], set()):
+                index += 1 if "=" in word else 2
+            elif flag in booleans.get(argv[1], set()):
+                index += 1
+            elif word.startswith("--"):
+                return None  # Let the daemon reject an unknown flag.
+            else:
+                break
+        if index < len(argv):
+            terminal_id = argv[index]
+    if not isinstance(terminal_id, str) or not terminal_id.startswith(TERMINAL_REFERENCE_PREFIX):
+        return None
+    request_id = request.get("id")
+    fields = terminal_id[len(TERMINAL_REFERENCE_PREFIX):].split(".")
+    if (len(terminal_id) > 1607 or len(fields) != 3
+            or re.fullmatch(r"(?:[a-z0-9]{26}|[a-z0-9]{32})", fields[0]) is None
+            or re.fullmatch(r"[a-f0-9]{32}", fields[1]) is None
+            or re.fullmatch(r"[A-Za-z0-9_-]+", fields[2]) is None):
+        raise TerminalRouteError("terminal_invalid_handle", request_id)
+    try:
+        name = base64.b64decode(fields[2] + "=" * (-len(fields[2]) % 4), altchars=b"-_", validate=True)
+        name.decode("utf-8")
+        if not 1 <= len(name) <= 1024 or base64.urlsafe_b64encode(name).rstrip(b"=").decode() != fields[2]:
+            raise ValueError("noncanonical terminal name")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        raise TerminalRouteError("terminal_invalid_handle", request_id) from None
+    return TerminalRoute(fields[0], request_id)
+
+
+def connect_to_terminal_owner(config: RelayConfig, route: TerminalRoute) -> tuple[http.client.HTTPConnection, int, str]:
+    """Use this boot's token, never a new occupant's token on a reused port."""
+    connection = None
+    try:
+        record = json.loads((config.state_root / "daemons" / f"{route.boot_id}.json").read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or record.get("boot_id") != route.boot_id or record.get("state") not in {"running", "draining"}:
+            raise ValueError("owner absent")
+        port, expected = record.get("port"), record.get("terminal_token_sha256")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("owner port invalid")
+        if not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None:
+            raise ValueError("owner does not support terminal continuity")
+        token = (config.token_dir / f"{port}.token").read_text(encoding="utf-8").strip()
+        if not token or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected):
+            raise ValueError("owner token changed")
+        connection = http.client.HTTPConnection(config.upstream_host, port, timeout=config.timeout_seconds)
+        connection.connect()
+        # The connected request retains this exact token. If the port is
+        # reused after this point the new process rejects it; never refresh
+        # the token or retry after a terminal mutation may have been sent.
+        return connection, port, token
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException):
+        if connection is not None:
+            connection.close()
+        raise TerminalRouteError("terminal_owner_unavailable", route.request_id) from None
+
+
+
+MCP_SESSION_PREFIX = "imcps1."
+
+
+def session_route(header: str | None, body: bytes) -> tuple[TerminalRoute | None, str | None]:
+    """Keep negotiated Tasks session affinity without a volatile relay map."""
+    if header is None or not header.startswith(MCP_SESSION_PREFIX):
+        return None, header
+    try:
+        request = json.loads(body)
+        request_id = request.get("id") if isinstance(request, dict) else None
+    except (ValueError, UnicodeDecodeError):
+        request_id = None
+    fields = header[len(MCP_SESSION_PREFIX):].split(".")
+    try:
+        if len(fields) != 2 or re.fullmatch(r"(?:[a-z0-9]{26}|[a-z0-9]{32})", fields[0]) is None or len(fields[1]) > 1400:
+            raise ValueError("invalid session wrapper")
+        raw = base64.b64decode(fields[1] + "=" * (-len(fields[1]) % 4), altchars=b"-_", validate=True)
+        if not raw or any(byte < 33 or byte > 126 for byte in raw):
+            raise ValueError("invalid session header")
+        if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != fields[1]:
+            raise ValueError("noncanonical session header")
+    except (ValueError, binascii.Error):
+        raise TerminalRouteError("mcp_session_invalid", request_id) from None
+    return TerminalRoute(fields[0], request_id), raw.decode("ascii")
+
+
+def boot_for_target(config: RelayConfig, port: int, token: str) -> str | None:
+    """Discover only a locally recorded owner pinned by its token fingerprint."""
+    expected = hashlib.sha256(token.encode()).hexdigest()
+    matches = []
+    for path in (config.state_root / "daemons").glob("*.json"):
+        if re.fullmatch(r"(?:[a-z0-9]{26}|[a-z0-9]{32})", path.stem) is None:
+            continue
+        try:
+            with path.open("rb") as source:
+                record = json.loads(source.read(65537))
+            if (isinstance(record, dict) and record.get("port") == port
+                    and record.get("boot_id") == path.stem
+                    and record.get("state") in {"running", "draining"}
+                    and record.get("terminal_token_sha256") == expected):
+                matches.append(path.stem)
+        except (OSError, ValueError):
+            continue
+    return matches[0] if len(matches) == 1 else None
+
+
+def wrapped_session_id(boot_id: str | None, raw: str) -> str:
+    # Old servers without the pinned presence descriptor retain the legacy
+    # header contract. They cannot acquire continuity retroactively.
+    if boot_id is None:
+        return raw
+    return MCP_SESSION_PREFIX + boot_id + "." + base64.urlsafe_b64encode(raw.encode("ascii")).rstrip(b"=").decode()
+
+
 class RelayHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -183,7 +357,33 @@ class RelayHandler(BaseHTTPRequestHandler):
             pass
         self.close_connection = True
 
+    def _send_terminal_error(self, error: TerminalRouteError) -> None:
+        detail = {
+            "ok": False, "code": error.code, "retry_safe": False,
+            "delivery": "unknown" if error.delivery_unknown else "not_sent",
+            "error": "the original terminal could not be reached safely; no replacement was opened and no request was replayed",
+            "hint": "preserve the handle and verify the prior command outcome before deliberately opening a replacement; use the protocol session that created this terminal, or a stateless connection",
+        }
+        payload = {"jsonrpc": "2.0", "id": error.request_id, "result": {
+            "isError": True, "content": [{"type": "text", "text": json.dumps(detail)}],
+        }}
+        body = json.dumps(payload).encode()
+        try:
+            self.send_response(200 if error.request_id is not None else 202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body) if error.request_id is not None else 0))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if error.request_id is not None:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
     def _forward(self) -> None:
+        route = None
+        sent = False
+        response_started = False
         try:
             if not ipaddress.ip_address(self.client_address[0]).is_loopback:
                 self._send_error_without_details(403)
@@ -195,7 +395,26 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
 
             body = self._request_body()
-            upstream, upstream_port, token = connect_to_active_daemon(self.config)
+            route = terminal_route(body) if self.command == "POST" else None
+            protocol_route, raw_session = session_route(self.headers.get("Mcp-Session-Id"), body)
+            if route is not None and protocol_route is not None and route.boot_id != protocol_route.boot_id:
+                raise TerminalRouteError("terminal_session_mismatch", route.request_id)
+            route = route or protocol_route
+            if route is not None:
+                upstream, upstream_port, token = connect_to_terminal_owner(self.config, route)
+                if self.headers.get("Mcp-Session-Id") and protocol_route is None:
+                    # Protocol Tasks sessions are process-bound too. Never
+                    # drop this header or send B's session authority to A.
+                    try:
+                        current_port, _ = active_descriptor(self.config)
+                    except (OSError, ValueError, RuntimeError):
+                        upstream.close()
+                        raise TerminalRouteError("terminal_session_reinitialize", route.request_id) from None
+                    if current_port != upstream_port:
+                        upstream.close()
+                        raise TerminalRouteError("terminal_session_reinitialize", route.request_id)
+            else:
+                upstream, upstream_port, token = connect_to_active_daemon(self.config)
             try:
                 headers: dict[str, str] = {}
                 for name, value in self.headers.items():
@@ -206,11 +425,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                         continue
                     if lower_name in {"host", "content-length"}:
                         continue
-                    headers[name] = value
+                    headers[name] = raw_session if lower_name == "mcp-session-id" and raw_session is not None else value
                 headers["Host"] = f"{self.config.upstream_host}:{upstream_port}"
                 headers["Content-Length"] = str(len(body))
                 headers["X-Intendant-Loopback-Token"] = token
 
+                sent = True
                 upstream.request(self.command, self.path, body=body, headers=headers)
                 response = upstream.getresponse()
                 is_event_stream = (
@@ -219,6 +439,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                     .startswith("text/event-stream")
                 )
 
+                session_owner = None
+                if response.getheader("Mcp-Session-Id") is not None:
+                    session_owner = route.boot_id if route is not None else boot_for_target(self.config, upstream_port, token)
+                response_started = True
                 self.send_response(response.status, response.reason)
                 for name, value in response.getheaders():
                     lower_name = name.lower()
@@ -226,7 +450,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         continue
                     if lower_name in {"content-length", "x-intendant-loopback-token"}:
                         continue
-                    self.send_header(name, value)
+                    self.send_header(name, wrapped_session_id(session_owner, value) if lower_name == "mcp-session-id" else value)
                 if is_event_stream:
                     self.send_header("Connection", "close")
                     self.end_headers()
@@ -247,6 +471,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             finally:
                 upstream.close()
+        except TerminalRouteError as error:
+            self._send_terminal_error(error)
         except (
             OSError,
             ValueError,
@@ -254,7 +480,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             json.JSONDecodeError,
             http.client.HTTPException,
         ):
-            self._send_error_without_details(502)
+            if response_started:
+                # A partial response is an uncertain delivery, not a second
+                # HTTP response and never a reason to replay a shell write.
+                self.close_connection = True
+            elif route is not None:
+                self._send_terminal_error(TerminalRouteError("terminal_owner_unavailable", route.request_id, sent))
+            else:
+                self._send_error_without_details(502)
 
     do_GET = _forward
     do_POST = _forward

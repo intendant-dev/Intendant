@@ -441,7 +441,16 @@ cleanup, and uncertain liveness probes stay conservative. See
   successor's port, and the agenda immediacy verbs (`start_now`,
   `request_occurrence`) refuse the same way. The classification lives in
   one place (`ControlMsg::creates_session`) and every surface consults it.
-- When its last work-holding session finishes (sessions parked after
+- Standalone terminal PTYs also hold a drain, separately from supervised
+  sessions. New shell creation closes at the drain boundary; reservations
+  admitted before it may finish. Both live shells and exited shells retaining
+  final output keep the predecessor alive until explicit `terminal_close`.
+  `terminal_count` and `terminal_holdouts` name them in status/presence and
+  the handover banner. They are never treated as agent recovery candidates.
+  The private MCP relay routes generation-bound handles back to this owner;
+  see [ChatGPT terminal continuity](./chatgpt-plugin.md#terminals-across-graceful-daemon-updates).
+- When its last work-holding session finishes **and all terminals are closed**
+  (sessions parked after
   `done` do not hold; parked conversations resume on the successor), the
   drainer records an `exited` presence state and the process exits. **A
   limit-parked wrapper holds the drain for as long as its in-memory park
