@@ -181,7 +181,7 @@ def summarize(report):
 
 
 def collect(call, evaluate, binding, witness, validate_geometry, window, report,
-            checkpoint, deadline, key, clock=time.monotonic, pause=time.sleep):
+            checkpoint, deadline, key, clock=time.monotonic, pause=time.sleep, before_dispatch=None):
     require(key in ('ArrowLeft', 'ArrowRight') and math.isfinite(deadline), 'bounded fixed key required')
     report.update(completed=False, measurement_valid=False, key=key,
                   keyboard_input_requested=True, automatic_input_retry=False,
@@ -190,7 +190,7 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
     state = lambda: evaluate('arrowFixtureState()')
     fixture = lambda: evaluate('keyboardTargetFixtureState()')
 
-    def bracket(name, sequence, operation):
+    def bracket(name, sequence, operation, before_operation=None):
         row = report[name] = {'attempted': False}
         checkpoint()
         require(clock() < deadline, 'key study deadline before witness')
@@ -199,6 +199,10 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
         validate_witness(row['native_before'], sequence, 'before')
         checkpoint()
         try:
+            # Passive gating precedes the transport attempt, inside the witness bracket.
+            if before_operation is not None:
+                require(clock() < deadline, 'key study deadline before dispatch gate')
+                before_operation()
             require(clock() < deadline, 'key study deadline before operation')
             row['attempted'] = True
             checkpoint()
@@ -243,7 +247,8 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
         else:
             token = preparation_token(prepared, key, geometry, window, validate_geometry)
             native = bracket('dispatch', 2,
-                             lambda: call('press_macos_window_'+key.lower(), binding=binding, token=token))
+                             lambda: call('press_macos_window_'+key.lower(), binding=binding, token=token),
+                             before_operation=before_dispatch)
             # Poll only observations. Never repeat a posting, even after an exception.
             until = min(deadline, clock()+2)
             after = state()
@@ -272,7 +277,7 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
     except Exception as error:
         report['stop_reason'] = str(error)[:8192]
         # Preserve available fixture effects even if posting lost its reply or witness.
-        if report.get('dispatch', {}).get('attempted'):
+        if 'dispatch' in report:
             try:
                 report['after'] = public_fixture(state())
             except Exception:

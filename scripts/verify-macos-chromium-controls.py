@@ -553,10 +553,15 @@ def main():
                         if not activity['counter_regression'] and activity['deltas']['mouse_move'] > 0:
                             return value
                     raise RuntimeError('required mouse activity not observed before dispatch')
+                before_activity = None
+                def before_dispatch():
+                    nonlocal before_activity
+                    if args.require_mouse_activity:
+                        before_activity = wait_for_mouse(2)
                 def study_call(tool, **arguments):
                     if not args.require_mouse_activity or not tool.startswith('press_macos_window_'):
                         return call(tool, **arguments)
-                    before_activity = wait_for_mouse(2)
+                    require(before_activity is not None, 'missing pre-dispatch activity gate')
                     payload, samples = run_bounded_observed(
                         ctl_argv(tool, arguments), min(end, time.monotonic() + 25),
                         lambda: current_activity(2))
@@ -567,7 +572,8 @@ def main():
                     return reply
                 concurrent_keys.collect(study_call, evaluate, binding, witness,
                     validate_prepared_keyboard_receiver, expected, series, checkpoint,
-                    min(end, time.monotonic() + 40), arrow_key)
+                    min(end, time.monotonic() + 40), arrow_key,
+                    before_dispatch=before_dispatch)
                 require(series['completed'] and series['measurement_valid'], 'concurrent key study incomplete')
                 if args.require_mouse_activity:
                     overlap = series.get('mouse_overlap', {})

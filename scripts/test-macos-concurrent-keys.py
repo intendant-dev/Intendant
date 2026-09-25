@@ -100,12 +100,82 @@ class Rig:
     def verify_geometry(self, receiver, geometry, window):
         assert receiver['bounds']==BOUNDS and geometry==self.geometry and window==WINDOW
 
-    def run(self):
+    def run(self,before_dispatch=None,clock=lambda:1):
         return keys.collect(self.call,self.evaluate,'binding',self.witness,self.verify_geometry,
                             WINDOW,self.report,lambda:self.checkpoints.append(copy.deepcopy(self.report)),
-                            10,self.key,clock=lambda:1,pause=lambda _:None)
+                            10,self.key,clock=clock,pause=lambda _:None,before_dispatch=before_dispatch)
 
 class Tests(unittest.TestCase):
+    def test_native_harness_wires_gate_before_request_callback(self):
+        import ast
+        tree=ast.parse(Path(__file__).with_name("verify-macos-chromium-controls.py").read_text())
+        funcs={n.name:n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef)}
+        names=lambda node:{n.func.id for n in ast.walk(node) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
+        self.assertIn("wait_for_mouse",names(funcs["before_dispatch"]))
+        self.assertNotIn("wait_for_mouse",names(funcs["study_call"]))
+        collectors=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and isinstance(n.func.value,ast.Name) and n.func.value.id=="concurrent_keys" and n.func.attr=="collect"]
+        self.assertEqual(len(collectors),1)
+        self.assertTrue(any(k.arg=="before_dispatch" and isinstance(k.value,ast.Name) and k.value.id=="before_dispatch" for k in collectors[0].keywords))
+
+    def test_passive_gate_refusal_is_not_a_dispatch_attempt(self):
+        rig=Rig()
+        def gate():
+            self.assertFalse(rig.report["dispatch"]["attempted"])
+            self.assertEqual(rig.markers[-1],("before",2))
+            raise RuntimeError("required mouse activity not observed before dispatch")
+        with self.assertRaisesRegex(RuntimeError,"required mouse activity"):
+            rig.run(before_dispatch=gate)
+        self.assertEqual(rig.calls,["prepare_macos_window_arrowleft"])
+        self.assertEqual(rig.markers[-1],("after",2))
+        self.assertFalse(rig.report["summary"]["dispatch_request_attempted"])
+        self.assertNotIn("client_elapsed_us",rig.report["dispatch"])
+        self.assertEqual(rig.report["after"]["count"],0)
+        self.assertFalse(any(r.get("dispatch",{}).get("attempted") for r in rig.checkpoints))
+
+    def test_passive_gate_success_dispatches_once_in_both_directions(self):
+        for key in ("ArrowLeft","ArrowRight"):
+            rig=Rig(key); gates=[]
+            def gate():
+                self.assertFalse(rig.report["dispatch"]["attempted"])
+                gates.append(True)
+            rig.run(before_dispatch=gate)
+            self.assertEqual(gates,[True])
+            self.assertEqual(len(rig.calls),2)
+            self.assertTrue(rig.report["summary"]["dispatch_request_attempted"])
+            self.assertEqual(rig.report["after"]["count"],1)
+
+    def test_passive_gate_expiry_never_calls_dispatch(self):
+        rig=Rig(); now=[1]
+        def gate(): now[0]=10
+        with self.assertRaisesRegex(RuntimeError,"deadline before operation"):
+            rig.run(before_dispatch=gate,clock=lambda:now[0])
+        self.assertEqual(len(rig.calls),1)
+        self.assertFalse(rig.report["summary"]["dispatch_request_attempted"])
+        self.assertEqual(rig.markers[-1],("after",2))
+
+    def test_preparation_refusal_does_not_run_dispatch_gate(self):
+        rig=Rig(); rig.prepare_error=True
+        def gate(): self.fail("gate ran after failed preparation")
+        rig.run(before_dispatch=gate)
+        self.assertEqual(len(rig.calls),1)
+
+    def test_transport_loss_after_gate_stays_attempted_without_replay(self):
+        rig=Rig(); rig.post_error="transport"
+        with self.assertRaisesRegex(RuntimeError,"lost dispatch reply"):
+            rig.run(before_dispatch=lambda:None)
+        self.assertTrue(rig.report["summary"]["dispatch_request_attempted"])
+        self.assertEqual(rig.report["after"]["count"],1)
+        self.assertEqual(len(rig.calls),2)
+
+    def test_gate_failure_preserves_primary_error_when_witness_fails(self):
+        rig=Rig(); rig.bad_witness=True
+        def gate(): raise RuntimeError("mouse gate failed")
+        with self.assertRaisesRegex(RuntimeError,"mouse gate failed"):
+            rig.run(before_dispatch=gate)
+        self.assertIn("witness_finish_error",rig.report["dispatch"])
+        self.assertFalse(rig.report["summary"]["dispatch_request_attempted"])
+        self.assertEqual(len(rig.calls),1)
+
     def test_both_directions_one_pair_and_separate_brackets(self):
         for key in ('ArrowLeft','ArrowRight'):
             rig=Rig(key);rig.run()
