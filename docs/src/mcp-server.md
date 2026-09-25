@@ -523,6 +523,17 @@ is running commands).
 | `terminal_resize` | Resize the PTY. | `terminal_id`, `cols`, `rows` |
 | `terminal_close` | Close the session. | `terminal_id` |
 
+Terminal open/list results carry an opaque `terminal_id` bound to the daemon
+boot and PTY incarnation, plus `terminal_name` for display. Clients must keep
+and reuse the returned ID, not reconstruct it from the name. A qualified open
+is attach-only and never respawns a stale handle. The private ChatGPT relay
+routes these handles to their original daemon through graceful updates; that
+daemon retains live terminals and exited output until **explicit close**.
+Plain-name legacy calls stay local to the addressed daemon. See
+[terminal update continuity](./chatgpt-plugin.md#terminals-across-graceful-daemon-updates)
+for initial-upgrade, protocol-session and hard-kill boundaries.
+
+
 ### Remote compute & Codex Cloud workers
 
 `remote_command` offloads heavy platform-neutral compilation and testing to

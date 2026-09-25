@@ -894,9 +894,11 @@
     const sameBuild = Boolean(ownPair)
       && others.every((d) => pair(d && d.version) === ownPair);
     const where = sameBuild ? 'on the previous daemon' : 'on the previous version';
-    return total === null
+    const terminals = others.reduce((n, d) => n + (Number(d.terminal_count) || 0), 0);
+    const shellNote = terminals ? ` — keeping ${terminals} terminal${terminals === 1 ? '' : 's'}` : '';
+    return (total === null
       ? `Finishing up ${where}`
-      : `Finishing up (${handoverTaskCount(total)}) ${where}`;
+      : `Finishing up (${handoverTaskCount(total)}) ${where}`) + shellNote;
   }
 
   // The §5.1 live-holder resolution rule (update-abstraction intake) —
@@ -1430,6 +1432,30 @@
   // session actually waits on (a DIED park never reaches this list —
   // those sessions are releasable and leave the wait set). Unknown
   // phases pass through rather than lie.
+  // PTYs are not supervised conversations. Name them without session links
+  // or recovery semantics, including exited terminals retaining final output.
+  function handoverTerminalWaitSet(record) {
+    const rows = Array.isArray(record.terminal_holdouts) ? record.terminal_holdouts : [];
+    const count = Number(record.terminal_count);
+    if (!rows.length && !(Number.isFinite(count) && count > 0)) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'handover-banner-note';
+    const heading = document.createElement('strong');
+    heading.textContent = `${Number.isFinite(count) ? count : rows.length} terminal(s) kept on this daemon until explicitly closed.`;
+    wrap.appendChild(heading);
+    rows.forEach((terminal) => {
+      const row = document.createElement('div');
+      row.textContent = `${String(terminal.terminal_id || 'terminal')} — ${String(terminal.state || 'retained')}`;
+      wrap.appendChild(row);
+    });
+    if (Number.isFinite(count) && count > rows.length) {
+      const more = document.createElement('div');
+      more.textContent = `And ${count - rows.length} more; open this daemon for the full terminal list.`;
+      wrap.appendChild(more);
+    }
+    return wrap;
+  }
+
   function handoverHoldoutState(holdout) {
     const park = holdout && holdout.limit_park;
     if (park) {
@@ -1588,11 +1614,14 @@
       el.textContent = '';
       const key = bannerStateKey('draining', body.boot_id);
       const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
+      const terminalWait = handoverTerminalWaitSet(body);
       // A pending consent (a draft holds the move) outranks the stored
       // collapse: the one decision the user must see never hides in a
       // pill.
       if (followWatch.phase !== 'consent' && bannerCollapsedNow(el, key)) {
-        bannerFillPill(el, key, rows.length
+        bannerFillPill(el, key, Number(body.terminal_count) > 0
+          ? `Updating Intendant — keeping ${Number(body.terminal_count)} terminal(s)`
+          : rows.length
           ? `Updating Intendant — finishing up (${handoverTaskCount(rows.length)})`
           : 'Updating Intendant — your work continues');
         handoverBannerReserve();
@@ -1620,6 +1649,7 @@
         : ' Wrapping up here, then the updated daemon takes over.';
       head.appendChild(tail);
       el.appendChild(head);
+      if (terminalWait) el.appendChild(terminalWait);
       if (holder) {
         el.appendChild(handoverDaemonLink(holder.port, 'Open the updated dashboard →'));
       } else {
@@ -1711,6 +1741,8 @@
           mech.appendChild(handoverDaemonLink(port, `Open :${port} →`));
         }
         section.appendChild(mech);
+        const terminals = handoverTerminalWaitSet(d);
+        if (terminals) section.appendChild(terminals);
         const rows = Array.isArray(d.holdouts) ? d.holdouts : [];
         if (rows.length) {
           section.appendChild(

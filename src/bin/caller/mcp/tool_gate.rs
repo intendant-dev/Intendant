@@ -619,7 +619,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "terminal_open",
         manual_http_tool_definition!(
             "terminal_open",
-            "Open (attach) or create a shell PTY session on this daemon. Creation is why this tool is gated as shell.spawn; attach-only workflows use terminal_list/terminal_read. Returns the id, whether it was created, geometry, and the read cursor to start polling from.",
+            "Open (attach) or create a shell PTY session on this daemon. Creation is why this tool is gated as shell.spawn; attach-only workflows use terminal_list/terminal_read. Returns an opaque terminal_id, display terminal_name, whether it was created, geometry, and the read cursor. Use the returned terminal_id verbatim on all later operations; it stays on the original shell across graceful updates. Close explicitly when done to release the old daemon.",
             crate::mcp::tools_terminal::TerminalOpenParams
         ),
     );

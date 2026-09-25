@@ -137,11 +137,58 @@ The tunnel does not weaken Intendant's call-time MCP authorization. The relay
 authenticates as the local-process principal; configure Intendant IAM for that
 principal to the least role the private plugin needs.
 
+### Terminals across graceful daemon updates
+
+The relay keeps an existing terminal on the daemon that owns its PTY while
+new stateless work follows the active daemon. There is no shell restart or
+state copying: cwd, exported variables, the running foreground command and
+the output cursor remain in the **original process**. Chained handovers and
+restarting the relay do not change that terminal's owner.
+
+After `terminal_open` (or `terminal_list`), retain the returned **opaque
+`terminal_id` verbatim**. `terminal_name` is only the human-readable name.
+The handle binds the owning daemon boot and one PTY incarnation. Passing it
+back to `terminal_open` is attach-only, including an exited shell whose final
+output is retained; it never creates a replacement. Plain names remain a
+legacy local-daemon create/attach interface and do **not** promise continuity.
+The raw `terminal_*` tools and canonical facade `terminal` commands use the
+same routing. Direct clients that do not use this relay must keep targeting
+the owning daemon themselves.
+
+During drain, existing terminals and already-admitted opening reservations
+hold the predecessor alive. New shell creation on that daemon is refused.
+Call **`terminal_close` when finished**, including after reading a shell's
+exit status: retained final output also holds the drain. The dashboard's
+handover views name these terminal holdouts separately from agent sessions.
+An update can therefore leave an old daemon running until its consumers close
+their terminals; it is not a timed forced restart.
+
+Routing uses only a recorded loopback boot under the configured state root.
+The relay verifies that boot's admission-token fingerprint before forwarding,
+and the daemon independently checks the PTY generation plus normal visibility,
+IAM and filesystem-scope rules. A handle is not an authorization credential.
+A reused name or port cannot redirect the old handle to a new shell.
+
+A hard kill/crash is not recoverable PTY migration. Missing owners and stale
+handles return explicit `terminal_owner_unavailable` / `terminal_lost` errors.
+After uncertain delivery the relay reports `delivery: "unknown"` and never
+replays the write; verify the previous command's effects before deliberately
+opening a replacement. The current 256 KiB scrollback bound and gap reporting
+still apply.
+
+**Rollout boundary:** install both the updated daemon and this relay, then
+open terminals on that daemon. A daemon already running pre-fix code cannot
+retroactively acquire drain protection, and its old plain-name handles cannot
+identify a PTY incarnation. Finish those terminals before the initial upgrade.
+The continuity guarantee applies to subsequent graceful updates with this
+implementation on the predecessor.
+
 ### Long-running MCP Tasks
 
 When ChatGPT/Codex negotiates `io.modelcontextprotocol/tasks`, the daemon's HTTP
-`/mcp` endpoint returns an opaque `Mcp-Session-Id`. The relay forwards that
-header in both directions, so `remote_command start` can return a Task and the
+`/mcp` endpoint returns an opaque `Mcp-Session-Id`. The relay wraps that
+opaque header with its locally verified owner boot and unwraps it only when
+forwarding to the same daemon, so `remote_command start` can return a Task and the
 plugin can poll `tasks/get` or request `tasks/cancel` through the same private
 tunnel. The session ID is not a bearer credential: Intendant re-authenticates
 every request, binds the Tasks session to that authenticated identity, and
@@ -151,7 +198,14 @@ Tasks remain sessionless and keep the original synchronous job-handle workflow.
 An MCP client may explicitly `DELETE /mcp` with its session ID when it is done;
 the relay forwards the DELETE and Intendant cancels/awaits any real remote work
 owned by that Tasks session. The protocol session and task handles are in-memory
-and do not survive a daemon restart.
+and do not survive a daemon restart. During graceful overlap, a negotiated
+session continues on its original daemon, including across relay restarts.
+A terminal handle and protocol session from different boots are refused,
+never combined and never made to work by stripping the session header.
+Initialize a fresh session on the successor (or use stateless terminal calls)
+for new shells; the old session remains for the old shell. Unwrapped session
+headers issued before this relay update require reinitialization rather than
+an unsafe cross-daemon guess. This is affinity, not persistent Tasks migration.
 
 ### Developer-only dogfooding (opt-in)
 

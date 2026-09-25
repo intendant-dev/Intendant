@@ -19,6 +19,9 @@
 //!   for now but is threaded through everywhere so multi-host phase 1 can
 //!   add sibling daemons without a refactor.
 
+mod continuity;
+pub(crate) use continuity::{TerminalHoldout, TerminalReference};
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,6 +151,8 @@ pub enum TerminalOpenError {
     /// The session would have to be created and the caller lacks
     /// shell.spawn.
     SpawnNotAllowed,
+    /// New shells are not admitted once graceful handover begins.
+    Draining,
     /// PTY/shell spawn failure.
     Spawn(String),
 }
@@ -160,6 +165,7 @@ impl std::fmt::Display for TerminalOpenError {
                 "not allowed: opening this terminal requires shell.spawn \
                  (or a shared session you can view)"
             ),
+            Self::Draining => write!(f, "daemon_draining: existing terminals continue here; open new shells on the successor daemon"),
             Self::Spawn(e) => write!(f, "{e}"),
         }
     }
@@ -893,6 +899,8 @@ impl OutputHub {
 /// neither can pin a killed ConPTY whose output pipe remains open until the
 /// master drops.
 pub struct PtySession {
+    /// Identity of this exact PTY incarnation, never reused on replacement.
+    pub(crate) instance_id: String,
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
     child_killer: StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
@@ -1083,6 +1091,7 @@ impl PtySession {
         })?;
 
         let session = Arc::new(Self {
+            instance_id: uuid::Uuid::new_v4().simple().to_string(),
             master: StdMutex::new(pair.master),
             writer: StdMutex::new(writer),
             child_killer: StdMutex::new(child_killer),
@@ -1540,6 +1549,7 @@ fn slot_is_current(entry: Option<&SessionSlot>, slot: &Arc<OpeningSlot>) -> bool
 #[derive(Debug, Clone)]
 pub struct TerminalSummary {
     pub key: TerminalKey,
+    pub(crate) instance_id: String,
     pub alive: bool,
     pub shared: bool,
     pub can_manage: bool,
@@ -1551,6 +1561,9 @@ pub struct TerminalSummary {
 /// `(host_id, terminal_id)`. Held by the web gateway inside an `Arc` so
 /// every WS connection can reach the same pool.
 pub struct TerminalRegistry {
+    fallback_boot_id: String,
+    handover: std::sync::OnceLock<Weak<crate::handover::HandoverRuntime>>,
+    spawn_closed: AtomicBool,
     sessions: RwLock<HashMap<TerminalKey, SessionSlot>>,
     project_root: std::path::PathBuf,
 }
@@ -1559,6 +1572,9 @@ impl TerminalRegistry {
     pub fn new(project_root: std::path::PathBuf) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            fallback_boot_id: uuid::Uuid::new_v4().simple().to_string(),
+            handover: std::sync::OnceLock::new(),
+            spawn_closed: AtomicBool::new(false),
             project_root,
         }
     }
@@ -1679,6 +1695,9 @@ impl TerminalRegistry {
                         // session in place, exactly as before.
                         if !may_spawn {
                             return Err(TerminalOpenError::SpawnNotAllowed);
+                        }
+                        if self.spawn_is_closed() {
+                            return Err(TerminalOpenError::Draining);
                         }
                         let prev = match other {
                             Some(SessionSlot::Live(dead)) => Some(dead.clone()),
@@ -1806,6 +1825,7 @@ impl TerminalRegistry {
             .filter_map(|(key, slot)| match slot {
                 SessionSlot::Live(session) if session.visible_to(actor) => Some(TerminalSummary {
                     key: key.clone(),
+                    instance_id: session.instance_id.clone(),
                     alive: session.is_alive(),
                     shared: session.shared(),
                     can_manage: session.managed_by(actor),

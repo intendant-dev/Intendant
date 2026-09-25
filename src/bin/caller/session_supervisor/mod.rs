@@ -952,6 +952,9 @@ impl SessionSupervisor {
         if !runtime.is_draining() {
             return false;
         }
+        // Freeze terminal admission under its reservation lock before checking
+        // emptiness. A shell accepted before the drain is real in-flight work.
+        let terminals_ready = runtime.terminals_drain_ready().await;
         let holding: Vec<(String, String, Option<String>, String, PathBuf)> = {
             let state = self.state.lock().await;
             state
@@ -1002,7 +1005,8 @@ impl SessionSupervisor {
         if rebuild {
             runtime.set_drain_wait_set(drain_holdout_rows(&holding));
         }
-        if !holding.is_empty() || self.exec.latest_pending_heavy_key().is_some() {
+        if !terminals_ready || !holding.is_empty() || self.exec.latest_pending_heavy_key().is_some()
+        {
             return false;
         }
         // Intake §3.3's exit parenthetical (the HS3 ruling's N5): a

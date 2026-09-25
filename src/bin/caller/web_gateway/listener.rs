@@ -1078,6 +1078,13 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         })),
     );
+    if let Some(runtime) = mcp_server
+        .as_ref()
+        .and_then(|server| server.handover_runtime_now())
+    {
+        terminal_registry.bind_handover(&runtime);
+        runtime.set_terminal_registry(&terminal_registry);
+    }
     // The MCP terminal tool family shares the same pool: a shell opened
     // over MCP is attachable from the dashboard and vice versa.
     if let Some(server) = mcp_server.as_ref() {
