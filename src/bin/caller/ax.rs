@@ -663,6 +663,57 @@ fn placement_window_id_result(
     Ok(id)
 }
 
+/// Resolve the exact CGWindowID with at most one read-only re-observation after
+/// an empty CannotComplete. The native closure fixes both reads to the same
+/// retained AXUIElement; no replacement element is selected by metadata.
+fn placement_window_id_read_with(
+    deadline: Instant,
+    mut clock: impl FnMut() -> Instant,
+    mut read: impl FnMut(bool) -> Result<(accessibility_sys::AXError, u32, AxReadTiming), String>,
+) -> Result<u32, String> {
+    if clock() >= deadline {
+        return Err("AX window mapping budget expired before read".into());
+    }
+    let (status, id, timing) = read(false)?;
+    let after_first = clock();
+
+    if status != accessibility_sys::kAXErrorCannotComplete || id != 0 {
+        return placement_window_id_result(status, id, timing);
+    }
+
+    let initial = placement_window_id_result(status, id, timing)
+        .expect_err("empty CannotComplete is always a refusal");
+    if after_first >= deadline || deadline.saturating_duration_since(after_first) < BOUND_AX_TIMEOUT
+    {
+        return Err(format!(
+            "insufficient budget for exact AX window re-observation; window_id_read_attempts=1; initial=[{initial}]"
+        ));
+    }
+
+    let (status, id, timing) = read(true).map_err(|error| {
+        format!(
+            "exact AX window re-observation preflight refused: {error}; window_id_read_attempts=1; initial=[{initial}]"
+        )
+    })?;
+    if clock() >= deadline {
+        let second = placement_window_id_result(status, id, timing)
+            .err()
+            .unwrap_or_else(|| {
+                format!(
+                    "second_read_status={}; window_id_present={}",
+                    ax_error_name(status),
+                    id != 0
+                )
+            });
+        return Err(format!(
+            "AX window mapping budget expired; window_id_read_attempts=2; {second}; initial=[{initial}]"
+        ));
+    }
+
+    placement_window_id_result(status, id, timing)
+        .map_err(|error| format!("{error}; window_id_read_attempts=2; initial=[{initial}]"))
+}
+
 fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, String> {
     placement_timeout(element, deadline)?;
     type GetWindow = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> i32;
@@ -674,17 +725,32 @@ fn placement_window_id(element: &AXUIElement, deadline: Instant) -> Result<u32, 
     }
     // SAFETY: known SPI ABI AXError(AXUIElementRef, CGWindowID*).
     let get: GetWindow = unsafe { std::mem::transmute(symbol) };
-    let mut id = 0;
-    let started = Instant::now();
-    // SAFETY: retained live element and writable u32 output.
-    let status = unsafe { get(element.as_concrete_TypeRef(), &mut id) };
-    let finished = Instant::now();
-    placement_window_id_result(
-        status,
-        id,
-        AxReadTiming::between(started, finished, deadline),
-    )
+    placement_window_id_read_with(deadline, Instant::now, |reobservation| {
+        if reobservation {
+            // Same retained element, fresh trust/timeout preflight, original
+            // operation budget. This is observation retry, never input replay.
+            placement_permissions(deadline)?;
+            placement_timeout(element, deadline)?;
+            if deadline.saturating_duration_since(Instant::now()) < BOUND_AX_TIMEOUT {
+                return Err(
+                    "insufficient budget after exact AX window re-observation preflight".into(),
+                );
+            }
+        }
+        let mut id = 0;
+        let started = Instant::now();
+        // SAFETY: the exact same retained live element is used on both bounded
+        // observations, with a fresh writable u32 output each time.
+        let status = unsafe { get(element.as_concrete_TypeRef(), &mut id) };
+        let finished = Instant::now();
+        Ok((
+            status,
+            id,
+            AxReadTiming::between(started, finished, deadline),
+        ))
+    })
 }
+
 fn placement_pid(element: &AXUIElement, deadline: Instant) -> Result<i32, String> {
     placement_timeout(element, deadline)?;
     let mut pid = 0;
@@ -2426,6 +2492,139 @@ mod tests {
         assert!(placement_roots_result(kAXErrorSuccess, true, None, timing)
             .unwrap_err()
             .contains("internal presence/count mismatch"));
+    }
+
+    type WindowMapReply = Result<(accessibility_sys::AXError, u32), String>;
+
+    fn window_map_reread_run(
+        replies: Vec<WindowMapReply>,
+        ticks: Vec<Instant>,
+        deadline: Instant,
+    ) -> (Result<u32, String>, Vec<bool>, usize) {
+        let mut replies: std::collections::VecDeque<_> = replies.into();
+        let mut ticks = ticks.into_iter();
+        let mut calls = Vec::new();
+        let result = placement_window_id_read_with(
+            deadline,
+            || ticks.next().expect("unexpected clock read"),
+            |second| {
+                calls.push(second);
+                let (status, id) = replies
+                    .pop_front()
+                    .expect("unexpected extra AX window read")?;
+                let at = deadline - std::time::Duration::from_secs(1);
+                Ok((status, id, AxReadTiming::between(at, at, deadline)))
+            },
+        );
+        (result, calls, replies.len())
+    }
+
+    #[test]
+    fn window_mapping_rereads_only_empty_cannot_complete_once() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        for status in std::iter::once(0).chain((-25214..=-25200).chain([1, i32::MIN, i32::MAX])) {
+            for id in [0, 41] {
+                if status == accessibility_sys::kAXErrorCannotComplete && id == 0 {
+                    continue;
+                }
+                let (result, calls, remaining) =
+                    window_map_reread_run(vec![Ok((status, id))], vec![now, now], deadline);
+                assert_eq!(result.is_ok(), status == kAXErrorSuccess && id != 0);
+                assert_eq!(calls, [false]);
+                assert_eq!(remaining, 0);
+            }
+        }
+
+        let (result, calls, remaining) = window_map_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, 0)),
+                Ok((kAXErrorSuccess, 41)),
+            ],
+            vec![now, now, now],
+            deadline,
+        );
+        assert_eq!(result.unwrap(), 41);
+        assert_eq!(calls, [false, true]);
+        assert_eq!(remaining, 0);
+
+        for second in [
+            (accessibility_sys::kAXErrorCannotComplete, 0),
+            (accessibility_sys::kAXErrorCannotComplete, 41),
+            (kAXErrorSuccess, 0),
+            (accessibility_sys::kAXErrorFailure, 0),
+            (accessibility_sys::kAXErrorFailure, 41),
+        ] {
+            let (result, calls, remaining) = window_map_reread_run(
+                vec![
+                    Ok((accessibility_sys::kAXErrorCannotComplete, 0)),
+                    Ok(second),
+                ],
+                vec![now, now, now],
+                deadline,
+            );
+            let error = result.unwrap_err();
+            assert!(error.contains("window_id_read_attempts=2"));
+            assert!(error.contains("initial=[cannot map AX window exactly"));
+            assert_eq!(calls, [false, true]);
+            assert_eq!(remaining, 0);
+        }
+    }
+
+    #[test]
+    fn window_mapping_reread_honors_original_budget_and_preflight() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(4);
+        let near = deadline - BOUND_AX_TIMEOUT + std::time::Duration::from_micros(1);
+
+        let (result, calls, remaining) = window_map_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, 0)),
+                Ok((kAXErrorSuccess, 41)),
+            ],
+            vec![now, near],
+            deadline,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("insufficient budget"));
+        assert!(error.contains("window_id_read_attempts=1"));
+        assert_eq!(calls, [false]);
+        assert_eq!(remaining, 1);
+
+        let (result, calls, remaining) = window_map_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, 0)),
+                Err("fresh trust preflight failed".into()),
+            ],
+            vec![now, now],
+            deadline,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("re-observation preflight refused"));
+        assert!(error.contains("fresh trust preflight failed"));
+        assert!(error.contains("window_id_read_attempts=1"));
+        assert_eq!(calls, [false, true]);
+        assert_eq!(remaining, 0);
+
+        let (result, calls, remaining) = window_map_reread_run(
+            vec![
+                Ok((accessibility_sys::kAXErrorCannotComplete, 0)),
+                Ok((kAXErrorSuccess, 41)),
+            ],
+            vec![now, now, deadline],
+            deadline,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("AX window mapping budget expired"));
+        assert!(error.contains("window_id_read_attempts=2"));
+        assert_eq!(calls, [false, true]);
+        assert_eq!(remaining, 0);
+
+        let (result, calls, remaining) =
+            window_map_reread_run(vec![Ok((kAXErrorSuccess, 41))], vec![deadline], deadline);
+        assert!(result.unwrap_err().contains("budget expired before read"));
+        assert!(calls.is_empty());
+        assert_eq!(remaining, 1);
     }
 
     #[test]
