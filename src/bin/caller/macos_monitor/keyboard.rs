@@ -1632,6 +1632,87 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_focus_change_before_fresh_preparation_establishes_new_witness() {
+        for left in [false, true] {
+            let (mut w, f, id) = rig();
+            f.0.borrow_mut().human_focus += 1;
+            let prepared = if left {
+                w.prepare_arrowleft(id, |_| Ok(monitor()))
+            } else {
+                w.prepare_arrow(id, |_| Ok(monitor()))
+            }
+            .unwrap();
+            let result = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            }
+            .unwrap();
+            assert!(result.successful() && result.valid_reply());
+            assert_eq!(result.focus_interference, Some(false));
+            assert_eq!(f.0.borrow().postings, 2);
+        }
+    }
+
+    #[test]
+    fn concurrent_focus_switch_away_and_back_is_endpoint_equality_only() {
+        for left in [false, true] {
+            let (mut w, f, id) = rig();
+            let prepared = if left {
+                w.prepare_arrowleft(id, |_| Ok(monitor()))
+            } else {
+                w.prepare_arrow(id, |_| Ok(monitor()))
+            }
+            .unwrap();
+            let original = f.0.borrow().human_focus;
+            f.0.borrow_mut().human_focus = original + 1;
+            f.0.borrow_mut().human_focus = original;
+            let result = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            }
+            .unwrap();
+            assert!(result.successful() && result.valid_reply());
+            assert_eq!(result.focus_interference, Some(false));
+            assert_eq!(f.0.borrow().postings, 2);
+        }
+    }
+
+    #[test]
+    fn concurrent_focus_unavailable_at_dispatch_consumes_without_posting() {
+        for left in [false, true] {
+            let (mut w, f, id) = rig();
+            let prepared = if left {
+                w.prepare_arrowleft(id, |_| Ok(monitor()))
+            } else {
+                w.prepare_arrow(id, |_| Ok(monitor()))
+            }
+            .unwrap();
+            {
+                let mut m = f.0.borrow_mut();
+                m.missing_human_on_read = Some(m.focus_reads + 1);
+            }
+            let first = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            };
+            assert!(first
+                .unwrap_err()
+                .contains("synthetic human focus unavailable"));
+            let replay = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            };
+            assert!(replay.unwrap_err().contains("consumed"));
+            assert_eq!(f.0.borrow().arrow_constructs, 0);
+            assert_eq!(f.0.borrow().postings, 0);
+        }
+    }
+
+    #[test]
     fn concurrent_focus_change_after_posting_is_uncertain_not_no_effect() {
         let (mut w, f, id) = rig();
         let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
