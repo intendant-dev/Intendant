@@ -9,3 +9,16 @@ No retry-until-success: failure to observe the required activity, any production
 ## Request accounting correction (2026-09-25)
 
 The passive mouse gate now runs inside the dispatch witness interval but before the request-attempt checkpoint. A gate refusal or expiry records `dispatch_request_attempted: false` and no client-request duration; both end-witness and available fixture-state observations remain preserved. A transport exception after launch still records an attempted request and never triggers input replay. The original eight-second activity wait and all input/focus/protection checks are unchanged. Older reports are retained verbatim: their `attempted` flag marked entry into the wrapper, which could still be waiting for mouse activity, not necessarily a launched request.
+
+## Witness bracket versus live request (2026-09-25)
+
+New reports separate activity over the whole dispatch witness bracket from activity
+observed while the dispatch client process is actually alive. A passive-gate
+refusal can therefore report witness-bracket activity while
+dispatch_request_attempted is false and both live-client activity fields remain
+unknown. When a client is launched, dispatch_client_activity is checkpointed
+before mouse-only overlap validation, so a later evidence refusal does not erase
+whether activity progressed while that client was alive. These counters remain
+unauthenticated source context and do not prove overlap with the narrower native
+posting instant or continuous isolation. Historical reports are retained as
+written and are not reinterpreted under the new field names.

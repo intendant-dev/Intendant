@@ -566,6 +566,9 @@ def main():
                         ctl_argv(tool, arguments), min(end, time.monotonic() + 25),
                         lambda: current_activity(2))
                     reply = json.loads(payload)
+                    series['dispatch_client_activity'] = concurrent_keys.summarize_client_activity(
+                        before_activity, samples)
+                    checkpoint()
                     series['mouse_overlap'] = concurrent_keys.validate_mouse_overlap(
                         before_activity, samples)
                     checkpoint()
@@ -576,6 +579,10 @@ def main():
                     before_dispatch=before_dispatch)
                 require(series['completed'] and series['measurement_valid'], 'concurrent key study incomplete')
                 if args.require_mouse_activity:
+                    failure = (series.get('preparation', {}).get('reply', {}).get('error')
+                               or series.get('stop_reason') or series.get('outcome'))
+                    require(series.get('outcome') == 'effect_verified',
+                            'mouse overlap study did not verify key effect: ' + str(failure))
                     overlap = series.get('mouse_overlap', {})
                     require(overlap.get('before_dispatch', 0) > 0
                             and overlap.get('while_client_alive', 0) > 0

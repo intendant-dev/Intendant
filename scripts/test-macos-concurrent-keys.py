@@ -113,12 +113,16 @@ class Tests(unittest.TestCase):
         names=lambda node:{n.func.id for n in ast.walk(node) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
         self.assertIn("wait_for_mouse",names(funcs["before_dispatch"]))
         self.assertNotIn("wait_for_mouse",names(funcs["study_call"]))
+        source=Path(__file__).with_name("verify-macos-chromium-controls.py").read_text()
+        self.assertLess(source.index("series['dispatch_client_activity']"),
+                        source.index("series['mouse_overlap']"))
+        self.assertIn("mouse overlap study did not verify key effect", source)
         collectors=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and isinstance(n.func.value,ast.Name) and n.func.value.id=="concurrent_keys" and n.func.attr=="collect"]
         self.assertEqual(len(collectors),1)
         self.assertTrue(any(k.arg=="before_dispatch" and isinstance(k.value,ast.Name) and k.value.id=="before_dispatch" for k in collectors[0].keywords))
 
     def test_passive_gate_refusal_is_not_a_dispatch_attempt(self):
-        rig=Rig()
+        rig=Rig();rig.activity=5
         def gate():
             self.assertFalse(rig.report["dispatch"]["attempted"])
             self.assertEqual(rig.markers[-1],("before",2))
@@ -128,6 +132,9 @@ class Tests(unittest.TestCase):
         self.assertEqual(rig.calls,["prepare_macos_window_arrowleft"])
         self.assertEqual(rig.markers[-1],("after",2))
         self.assertFalse(rig.report["summary"]["dispatch_request_attempted"])
+        self.assertTrue(rig.report["summary"]["hid_activity_during_dispatch_witness_bracket"])
+        self.assertIsNone(rig.report["summary"]["hid_activity_while_dispatch_client_alive"])
+        self.assertIsNone(rig.report["summary"]["hid_keyboard_activity_while_dispatch_client_alive"])
         self.assertNotIn("client_elapsed_us",rig.report["dispatch"])
         self.assertEqual(rig.report["after"]["count"],0)
         self.assertFalse(any(r.get("dispatch",{}).get("attempted") for r in rig.checkpoints))
@@ -190,7 +197,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(rig.calls),1)
         self.assertEqual(rig.report['outcome'],'preparation_refused')
         self.assertFalse(rig.report['summary']['dispatch_request_attempted'])
-        self.assertIsNone(rig.report['summary']['hid_activity_during_dispatch_bracket'])
+        self.assertIsNone(rig.report['summary']['hid_activity_during_dispatch_witness_bracket'])
 
     def test_zero_effect_refusal_records_no_delivery(self):
         rig=Rig();rig.post_error='zero';rig.run()
@@ -229,19 +236,25 @@ class Tests(unittest.TestCase):
         rig=Rig();rig.activity=3;rig.human=True;rig.run()
         result=rig.report['summary']
         self.assertTrue(result['effect_verified'])
-        self.assertTrue(result['hid_activity_during_dispatch_bracket'])
-        self.assertFalse(result['hid_keyboard_activity_during_dispatch_bracket'])
-        self.assertTrue(result['human_focus_changed_during_dispatch_bracket'])
+        self.assertTrue(result['hid_activity_during_dispatch_witness_bracket'])
+        self.assertFalse(result['hid_keyboard_activity_during_dispatch_witness_bracket'])
+        self.assertTrue(result['human_focus_changed_during_dispatch_witness_bracket'])
+        self.assertIsNone(result['hid_activity_while_dispatch_client_alive'])
+        self.assertIsNone(result['hid_keyboard_activity_while_dispatch_client_alive'])
         self.assertFalse(result['internal_posting_overlap_verified'])
         self.assertFalse(result['continuous_isolation_verified'])
 
     def test_preparation_activity_does_not_become_dispatch_activity(self):
         rig=Rig();rig.prep_activity=5;rig.run()
-        self.assertFalse(rig.report['summary']['hid_activity_during_dispatch_bracket'])
+        self.assertFalse(rig.report['summary']['hid_activity_during_dispatch_witness_bracket'])
 
     def test_current_activity_and_mouse_overlap_are_strict(self):
         before=current_activity(mouse=2)
         samples=[current_activity(mouse=3),current_activity(mouse=5)]
+        client=keys.summarize_client_activity(before,samples)
+        self.assertTrue(client['changed'])
+        self.assertFalse(client['keyboard_activity'])
+        self.assertEqual(client['deltas_while_client_alive']['mouse_move'],3)
         result=keys.validate_mouse_overlap(before,samples)
         self.assertEqual(result['before_dispatch'],2)
         self.assertEqual(result['while_client_alive'],3)
@@ -250,7 +263,11 @@ class Tests(unittest.TestCase):
         for bad in (current_activity(mouse=2,regression=True),current_activity(mouse=2,key_down=1)):
             with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(bad,samples)
         with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(before,[current_activity(mouse=2)])
-        with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(before,[current_activity(mouse=4,key_up=1)])
+        keyboard_client=keys.summarize_client_activity(
+            before,[current_activity(mouse=4,key_down=1)])
+        self.assertTrue(keyboard_client['keyboard_activity'])
+        with self.assertRaises(RuntimeError):keys.validate_mouse_overlap(
+            before,[current_activity(mouse=4,key_up=1)])
         value=current_activity();value['extra']=True
         with self.assertRaises(RuntimeError):keys.validate_current_activity(value,2)
 
