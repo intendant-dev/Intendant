@@ -1714,18 +1714,35 @@ mod tests {
 
     #[test]
     fn concurrent_focus_change_after_posting_is_uncertain_not_no_effect() {
-        let (mut w, f, id) = rig();
-        let p = w.prepare_arrow(id, |_| Ok(monitor())).unwrap();
-        f.0.borrow_mut().arrow_post_change = Change::HumanFocus;
-        let result = w.press_arrow(id, &p.token, |_| Ok(monitor())).unwrap();
-        assert!(!result.successful());
-        assert!(result.valid_reply());
-        assert_eq!(result.posting_calls, 2);
-        assert_eq!(result.focus_interference, Some(true));
-        assert!(result.effects_unconfirmed);
-        assert!(!result.effect_verified);
-        assert_eq!(f.0.borrow().receiver, Some(1));
-        assert!(w.press_arrow(id, &p.token, |_| Ok(monitor())).is_err());
-        assert_eq!(f.0.borrow().postings, 2);
+        for left in [false, true] {
+            let (mut w, f, id) = rig();
+            let prepared = if left {
+                w.prepare_arrowleft(id, |_| Ok(monitor()))
+            } else {
+                w.prepare_arrow(id, |_| Ok(monitor()))
+            }
+            .unwrap();
+            f.0.borrow_mut().arrow_post_change = Change::HumanFocus;
+            let result = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            }
+            .unwrap();
+            assert!(!result.successful());
+            assert!(result.valid_reply());
+            assert_eq!(result.posting_calls, 2);
+            assert_eq!(result.focus_interference, Some(true));
+            assert!(result.effects_unconfirmed);
+            assert!(!result.effect_verified);
+            assert_eq!(f.0.borrow().receiver, Some(1));
+            let replay = if left {
+                w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
+            } else {
+                w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
+            };
+            assert!(replay.is_err());
+            assert_eq!(f.0.borrow().postings, 2);
+        }
     }
 }
