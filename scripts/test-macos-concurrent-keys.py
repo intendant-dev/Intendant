@@ -271,6 +271,57 @@ class Tests(unittest.TestCase):
         value=current_activity();value['extra']=True
         with self.assertRaises(RuntimeError):keys.validate_current_activity(value,2)
 
+    def test_keyboard_overlap_requires_complete_pairs_and_keeps_refusal_distinct(self):
+        before=current_activity(key_down=2,key_up=2)
+        incomplete=keys.summarize_keyboard_overlap(
+            before,[current_activity(key_down=3,key_up=2)])
+        self.assertFalse(incomplete['progress_exceeds_single_tested_pair'])
+        one_pair=keys.summarize_keyboard_overlap(
+            before,[current_activity(key_down=3,key_up=3)])
+        self.assertFalse(one_pair['progress_exceeds_single_tested_pair'])
+        complete=keys.summarize_keyboard_overlap(
+            before,[current_activity(key_down=4,key_up=4)])
+        self.assertTrue(complete['progress_exceeds_single_tested_pair'])
+        self.assertEqual(complete['while_client_alive'],{'key_down':2,'key_up':2})
+        refused=keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),incomplete)
+        self.assertEqual(refused['containment_outcome'],'dispatch_refused_zero_post')
+        delivered=keys.finalize_keyboard_overlap('effect_verified',None,complete)
+        self.assertEqual(delivered['containment_outcome'],'effect_verified_with_keyboard_overlap')
+        with self.assertRaisesRegex(RuntimeError,'did not exceed'):
+            keys.finalize_keyboard_overlap('effect_verified',None,one_pair)
+        with self.assertRaisesRegex(RuntimeError,'zero-post'):
+            keys.finalize_keyboard_overlap('dispatch_refused',{'ok':False,'error':'ambiguous'},incomplete)
+        with self.assertRaisesRegex(RuntimeError,'unsupported outcome'):
+            keys.finalize_keyboard_overlap('preparation_refused',None,complete)
+        for bad in (
+            current_activity(key_down=1,key_up=0),
+            current_activity(key_down=0,key_up=1),
+            current_activity(key_down=1,key_up=1,regression=True),
+        ):
+            with self.assertRaises(RuntimeError):
+                keys.summarize_keyboard_overlap(bad,[current_activity(key_down=2,key_up=2)])
+
+    def test_keyboard_overlap_summary_never_claims_identity_or_posting_instant(self):
+        report={'keyboard_activity_required':True,'keyboard_overlap':{
+            'before_dispatch':{'key_down':2,'key_up':2},
+            'while_client_alive':{'key_down':2,'key_up':2},
+            'progress_exceeds_single_tested_pair':True,
+            'containment_outcome':'effect_verified_with_keyboard_overlap',
+            'attribution':'not_authenticated',
+            'client_process_overlap_verified':True,
+            'internal_posting_overlap_verified':False,
+        }}
+        summary=keys.summarize(report)
+        self.assertTrue(summary['keyboard_activity_required'])
+        self.assertEqual(summary['keyboard_activity_before_dispatch'],{'key_down':2,'key_up':2})
+        self.assertEqual(summary['keyboard_activity_while_client_alive'],{'key_down':2,'key_up':2})
+        self.assertTrue(summary['keyboard_progress_exceeds_tested_pair'])
+        self.assertEqual(summary['keyboard_containment_outcome'],'effect_verified_with_keyboard_overlap')
+        self.assertEqual(summary['human_activity_attribution'],'not_authenticated')
+        self.assertTrue(summary['client_process_overlap_verified'])
+        self.assertFalse(summary['internal_posting_overlap_verified'])
+        self.assertFalse(summary['continuous_isolation_verified'])
+
     def test_observed_runner_samples_only_during_live_client(self):
         spec=importlib.util.spec_from_file_location('inner_runner',Path(__file__).with_name('verify-macos-chromium-controls.py'))
         inner=importlib.util.module_from_spec(spec);spec.loader.exec_module(inner)
@@ -355,16 +406,25 @@ class Tests(unittest.TestCase):
         self.assertTrue(outer.parse_args(common).chromium_concurrent_key_study)
         mouse=outer.parse_args(common+['--chromium-require-mouse-activity'])
         self.assertTrue(mouse.chromium_require_mouse_activity)
-        bare=['--bin','unused','--fixture','unused','--report','unused','--chromium-require-mouse-activity']
+        keyboard=outer.parse_args(common+['--chromium-require-keyboard-activity'])
+        self.assertTrue(keyboard.chromium_require_keyboard_activity)
+        for required in ('--chromium-require-mouse-activity','--chromium-require-keyboard-activity'):
+            bare=['--bin','unused','--fixture','unused','--report','unused',required]
+            with self.assertRaises(SystemExit),contextlib.redirect_stderr(io.StringIO()):
+                outer.parse_args(bare)
         with self.assertRaises(SystemExit),contextlib.redirect_stderr(io.StringIO()):
-            outer.parse_args(bare)
-        self.assertIn('--require-mouse-activity',
-                      Path(__file__).with_name('verify-macos-chromium-controls.py').read_text())
+            outer.parse_args(common+['--chromium-require-mouse-activity',
+                                     '--chromium-require-keyboard-activity'])
+        inner_source=Path(__file__).with_name('verify-macos-chromium-controls.py').read_text()
+        self.assertIn('--require-mouse-activity',inner_source)
+        self.assertIn('--require-keyboard-activity',inner_source)
+        self.assertIn('wait_for_keyboard_pair',inner_source)
+        self.assertIn('finalize_keyboard_overlap',inner_source)
         for flag in ('--chromium-receiver-study','--chromium-native-focus','--chromium-arrowright','--chromium-bound-pointer'):
             with self.assertRaises(SystemExit),contextlib.redirect_stderr(io.StringIO()):outer.parse_args(common+[flag])
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'inner.json'
-            for profile in ('receiver_study','native_focus','concurrent_key','mouse_overlap'):
+            for profile in ('receiver_study','native_focus','concurrent_key','mouse_overlap','keyboard_overlap'):
                 path.write_text(json.dumps({'profile':profile,'partial':True}))
                 report={}
                 with self.assertRaisesRegex(RuntimeError,'original timeout'):
