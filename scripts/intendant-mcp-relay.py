@@ -205,6 +205,8 @@ def terminal_route(body: bytes) -> TerminalRoute | None:
                 break
         if index < len(argv):
             terminal_id = argv[index]
+    if isinstance(terminal_id, str) and (tool == "terminal_open" or (tool in {"inspect", "act", "authorize"} and args.get("argv", [None, None])[1] == "open")):
+        terminal_id = terminal_id.strip()  # Match the daemon's open normalization.
     if not isinstance(terminal_id, str) or not terminal_id.startswith(TERMINAL_REFERENCE_PREFIX):
         return None
     request_id = request.get("id")
@@ -380,7 +382,32 @@ class RelayHandler(BaseHTTPRequestHandler):
             pass
         self.close_connection = True
 
+    def _send_protocol_session_error(self, error: TerminalRouteError) -> None:
+        # tasks/get, initialize and session DELETE are not tools/call: never
+        # return a tool-result envelope where the protocol expects an error.
+        # A proven missing session uses the normal HTTP 404 reinitialize path;
+        # uncertain delivery remains 502 and must not invite mutation replay.
+        status = 502 if error.delivery_unknown else (400 if error.code == "mcp_session_invalid" else 404)
+        body = json.dumps({"jsonrpc": "2.0", "id": error.request_id, "error": {
+            "code": -32001,
+            "message": "MCP session owner unavailable" if error.code != "mcp_session_invalid" else "Invalid MCP session identifier",
+            "data": {"code": error.code, "retry_safe": False,
+                     "delivery": "unknown" if error.delivery_unknown else "not_sent"},
+        }}).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
     def _forward(self) -> None:
+        protocol_only = False
         route = None
         sent = False
         response_started = False
@@ -399,6 +426,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             protocol_route, raw_session = session_route(self.headers.get("Mcp-Session-Id"), body)
             if route is not None and protocol_route is not None and route.boot_id != protocol_route.boot_id:
                 raise TerminalRouteError("terminal_session_mismatch", route.request_id)
+            protocol_only = route is None and protocol_route is not None
             route = route or protocol_route
             if route is not None:
                 upstream, upstream_port, token = connect_to_terminal_owner(self.config, route)
@@ -472,7 +500,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             finally:
                 upstream.close()
         except TerminalRouteError as error:
-            self._send_terminal_error(error)
+            if protocol_only or error.code == "mcp_session_invalid":
+                self._send_protocol_session_error(error)
+            else:
+                self._send_terminal_error(error)
         except (
             OSError,
             ValueError,
@@ -485,7 +516,11 @@ class RelayHandler(BaseHTTPRequestHandler):
                 # HTTP response and never a reason to replay a shell write.
                 self.close_connection = True
             elif route is not None:
-                self._send_terminal_error(TerminalRouteError("terminal_owner_unavailable", route.request_id, sent))
+                error = TerminalRouteError("terminal_owner_unavailable", route.request_id, sent)
+                if protocol_only:
+                    self._send_protocol_session_error(error)
+                else:
+                    self._send_terminal_error(error)
             else:
                 self._send_error_without_details(502)
 

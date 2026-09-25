@@ -11,6 +11,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -156,6 +157,18 @@ def run(binary):
             assert tool("terminal_read", {"terminal_id": fresh["terminal_id"]})["alive"]
             assert tool("terminal_close", {"terminal_id": fresh["terminal_id"]})["ok"]
             print("PASS: real foreground command, cwd, environment, cursor and exit status survived takeover; close released predecessor; stale handle did not reach same-named successor shell")
+        except BaseException:
+            # These are this rig's disposable daemons, not owner logs. Keep
+            # failure evidence before TemporaryDirectory removes the rig,
+            # redacting even its generated test admission tokens.
+            for log in root.glob("*.log"):
+                try:
+                    tail = log.read_bytes()[-12000:].decode("utf-8", errors="replace")
+                    tail = re.sub(r"[a-fA-F0-9]{64}", "[redacted-test-token]", tail)
+                    print(f"--- {log.name} (test daemon) ---\n{tail}", file=sys.stderr)
+                except OSError:
+                    pass
+            raise
         finally:
             if front is not None:
                 front.shutdown()

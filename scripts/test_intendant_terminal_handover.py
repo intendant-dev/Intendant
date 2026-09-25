@@ -210,6 +210,28 @@ class TerminalHandoverTests(unittest.TestCase):
         self.assertEqual(self.code(mismatch)["code"], "terminal_session_mismatch")
         self.assertEqual(self.b.accepted, [])
 
+    def test_expired_protocol_owner_returns_session_error_not_tool_result(self):
+        init = self.exchange({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.record(self.a, state="exited")
+        self.point(self.b)
+        response = self.exchange({"jsonrpc": "2.0", "id": 9, "method": "tasks/get", "params": {"taskId": "fixture-task"}}, {"Mcp-Session-Id": init[1]["Mcp-Session-Id"]})
+        self.assertEqual(response[0], 404)
+        self.assertIn("error", response[2])
+        self.assertNotIn("result", response[2])
+        self.assertEqual(response[2]["id"], 9)
+        self.assertEqual(self.b.accepted, [])
+
+    def test_invalid_wrapped_session_is_protocol_error_before_delivery(self):
+        response = self.exchange({"jsonrpc": "2.0", "id": 9, "method": "tasks/get", "params": {}}, {"Mcp-Session-Id": "imcps1.../secret"})
+        self.assertEqual(response[0], 400)
+        self.assertEqual(response[2]["error"]["data"]["code"], "mcp_session_invalid")
+        self.assertEqual(self.a.accepted, [])
+
+    def test_open_whitespace_normalization_preserves_original_owner(self):
+        self.point(self.b)
+        for request in [call("terminal_open", {"terminal_id": "  " + handle(self.a.boot) + "  "}), call("authorize", {"argv": ["terminal", "open", "  " + handle(self.a.boot) + "  "]})]:
+            self.assertEqual(self.exchange(request)[2]["owner"], self.a.boot)
+
     def test_legacy_unpinned_protocol_session_is_not_silently_stripped(self):
         self.point(self.b)
         response = self.exchange(call("terminal_read", {"terminal_id": handle(self.a.boot)}), {"Mcp-Session-Id": "legacy-session"})
