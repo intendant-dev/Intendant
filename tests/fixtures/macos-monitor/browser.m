@@ -267,6 +267,10 @@ int main(int argc, const char **argv) {
             }
             status[@"tick"] = @(++tick);
             if(focus.receipt) status[@"focus_witness"] = focus.receipt;
+            if (activityMode && focus.active) {
+                NSDictionary *snapshot=[(ActivityWitness *)focus currentEvidence];
+                if(snapshot) status[@"activity_current"]=snapshot;
+            }
             if(keyResult) status[@"key_result"]=keyResult;
             status[@"key_replays_refused"]=@(keyReplays);
             if (clickKeyMode) {

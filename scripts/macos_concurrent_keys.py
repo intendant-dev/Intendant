@@ -44,6 +44,82 @@ def validate_witness(value, sequence, phase):
     return value
 
 
+def validate_current_activity(value, sequence):
+    require(isinstance(value, dict) and set(value) == {'sequence', 'hid_activity'}
+            and type(value.get('sequence')) is int and value['sequence'] == sequence,
+            'current activity sequence/schema')
+    activity = value['hid_activity']
+    require(isinstance(activity, dict) and set(activity) == {
+        'source', 'counter_regression', 'deltas', 'changed', 'attribution'
+    } and activity.get('source') == 'hid_system'
+      and activity.get('attribution') == 'not_authenticated'
+      and type(activity.get('counter_regression')) is bool,
+      'current activity schema')
+    deltas = activity['deltas']
+    require(isinstance(deltas, dict) and set(deltas) == set(COUNTERS),
+            'current activity counters')
+    if activity['counter_regression']:
+        require(activity['changed'] is None and all(v is None for v in deltas.values()),
+                'regressed current counters must be unknown')
+    else:
+        require(all(type(v) is int and 0 <= v <= 2**32-1 for v in deltas.values()),
+                'current activity delta type/range')
+        require(type(activity['changed']) is bool and activity['changed'] == any(deltas.values()),
+                'current activity change disagrees with counters')
+    return value
+
+
+def summarize_client_activity(before, samples):
+    before = validate_current_activity(
+        before, before.get('sequence') if isinstance(before, dict) else -1)
+    require(not before['hid_activity']['counter_regression'],
+            'client activity baseline counter regression')
+    require(isinstance(samples, list) and samples,
+            'no activity samples while client dispatch was alive')
+    sequence = before['sequence']
+    checked = [validate_current_activity(value, sequence) for value in samples]
+    require(all(not value['hid_activity']['counter_regression'] for value in checked),
+            'activity counter regression while client dispatch was alive')
+    base = before['hid_activity']['deltas']
+    progress = {}
+    for counter in COUNTERS:
+        peak = max(value['hid_activity']['deltas'][counter] for value in checked)
+        require(peak >= base[counter],
+                'activity counter moved backwards while client dispatch was alive')
+        progress[counter] = peak - base[counter]
+    return {
+        'sample_count': len(checked),
+        'deltas_while_client_alive': progress,
+        'changed': any(progress.values()),
+        'keyboard_activity': bool(progress['key_down'] or progress['key_up']),
+        'attribution': 'not_authenticated',
+    }
+
+
+def validate_mouse_overlap(before, samples):
+    before = validate_current_activity(
+        before, before.get('sequence') if isinstance(before, dict) else -1)
+    require(not before['hid_activity']['counter_regression'],
+            'mouse overlap baseline counter regression')
+    base = before['hid_activity']['deltas']
+    require(base['mouse_move'] > 0, 'required mouse activity was not observed before dispatch')
+    require(base['key_down'] == base['key_up'] == 0,
+            'keyboard HID activity observed before mouse-only dispatch')
+    client = summarize_client_activity(before, samples)
+    require(not client['keyboard_activity'],
+            'keyboard HID activity observed in mouse-only overlap profile')
+    mouse_progress = client['deltas_while_client_alive']['mouse_move']
+    require(mouse_progress > 0,
+            'mouse activity did not progress while client dispatch process was alive')
+    return {
+        'before_dispatch': base['mouse_move'],
+        'while_client_alive': mouse_progress,
+        'attribution': 'not_authenticated',
+        'client_process_overlap_verified': True,
+        'internal_posting_overlap_verified': False,
+    }
+
+
 def preparation_token(reply, key, fixture, window, validate_geometry):
     require(isinstance(reply, dict) and set(reply) == {'ok', 'action_attempted', 'prepared'}
             and reply['ok'] is True and reply['action_attempted'] is False, 'preparation not successful')
@@ -107,24 +183,35 @@ def public_fixture(state):
 
 def summarize(report):
     dispatch = report.get('dispatch', {})
+    overlap = report.get('mouse_overlap')
+    client = report.get('dispatch_client_activity')
     native = dispatch.get('native_after', {}) if dispatch.get('witness_valid') is True else {}
     activity = native.get('hid_activity', {})
     deltas = activity.get('deltas', {})
-    keyboard = None if not deltas or activity.get('counter_regression') else bool(deltas['key_down'] or deltas['key_up'])
+    keyboard = None if not deltas or activity.get('counter_regression') else bool(
+        deltas['key_down'] or deltas['key_up'])
     return {'outcome': report.get('outcome', 'incomplete'),
             'preparation_attempted': report.get('preparation', {}).get('attempted', False),
             'dispatch_request_attempted': dispatch.get('attempted', False),
             'effect_verified': report.get('assessment', {}).get('effect_verified', False),
-            'hid_activity_during_dispatch_bracket': activity.get('changed'),
-            'hid_keyboard_activity_during_dispatch_bracket': keyboard,
-            'human_focus_changed_during_dispatch_bracket': native.get('human_changed'),
+            'hid_activity_during_dispatch_witness_bracket': activity.get('changed'),
+            'hid_keyboard_activity_during_dispatch_witness_bracket': keyboard,
+            'human_focus_changed_during_dispatch_witness_bracket': native.get('human_changed'),
+            'hid_activity_while_dispatch_client_alive':
+                client.get('changed') if isinstance(client, dict) else None,
+            'hid_keyboard_activity_while_dispatch_client_alive':
+                client.get('keyboard_activity') if isinstance(client, dict) else None,
             'human_activity_attribution': 'not_authenticated',
+            'mouse_activity_required': report.get('mouse_activity_required', False),
+            'mouse_activity_before_dispatch': overlap.get('before_dispatch') if isinstance(overlap, dict) else None,
+            'mouse_activity_while_client_alive': overlap.get('while_client_alive') if isinstance(overlap, dict) else None,
+            'client_process_overlap_verified': overlap.get('client_process_overlap_verified', False) if isinstance(overlap, dict) else False,
             'internal_posting_overlap_verified': False,
             'continuous_isolation_verified': False}
 
 
 def collect(call, evaluate, binding, witness, validate_geometry, window, report,
-            checkpoint, deadline, key, clock=time.monotonic, pause=time.sleep):
+            checkpoint, deadline, key, clock=time.monotonic, pause=time.sleep, before_dispatch=None):
     require(key in ('ArrowLeft', 'ArrowRight') and math.isfinite(deadline), 'bounded fixed key required')
     report.update(completed=False, measurement_valid=False, key=key,
                   keyboard_input_requested=True, automatic_input_retry=False,
@@ -133,7 +220,7 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
     state = lambda: evaluate('arrowFixtureState()')
     fixture = lambda: evaluate('keyboardTargetFixtureState()')
 
-    def bracket(name, sequence, operation):
+    def bracket(name, sequence, operation, before_operation=None):
         row = report[name] = {'attempted': False}
         checkpoint()
         require(clock() < deadline, 'key study deadline before witness')
@@ -142,6 +229,10 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
         validate_witness(row['native_before'], sequence, 'before')
         checkpoint()
         try:
+            # Passive gating precedes the transport attempt, inside the witness bracket.
+            if before_operation is not None:
+                require(clock() < deadline, 'key study deadline before dispatch gate')
+                before_operation()
             require(clock() < deadline, 'key study deadline before operation')
             row['attempted'] = True
             checkpoint()
@@ -186,7 +277,8 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
         else:
             token = preparation_token(prepared, key, geometry, window, validate_geometry)
             native = bracket('dispatch', 2,
-                             lambda: call('press_macos_window_'+key.lower(), binding=binding, token=token))
+                             lambda: call('press_macos_window_'+key.lower(), binding=binding, token=token),
+                             before_operation=before_dispatch)
             # Poll only observations. Never repeat a posting, even after an exception.
             until = min(deadline, clock()+2)
             after = state()
@@ -215,7 +307,7 @@ def collect(call, evaluate, binding, witness, validate_geometry, window, report,
     except Exception as error:
         report['stop_reason'] = str(error)[:8192]
         # Preserve available fixture effects even if posting lost its reply or witness.
-        if report.get('dispatch', {}).get('attempted'):
+        if 'dispatch' in report:
             try:
                 report['after'] = public_fixture(state())
             except Exception:
