@@ -1,0 +1,3 @@
+# Bounded AXWindows re-observation (2026-09-24)
+
+Permit at most one second read of the same application-local AXWindows attribute only when the first bounded read returns kAXErrorCannotComplete with no array. The second read must fit the original operation budget and rerun permission/messaging-timeout preflight on the same retained application AX object. Any other first result, error-plus-array contradiction, insufficient budget, second failure, malformed array, over-capacity list, changed process/window identity, or later focus/protection check still refuses. No input retry, action retry, timeout increase, budget extension, activation, focus mutation, or security-metadata retry.
