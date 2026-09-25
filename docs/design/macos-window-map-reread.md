@@ -1,0 +1,3 @@
+# macOS exact-window mapping re-observation (2026-09-25)
+
+After exact evidence captured empty kAXErrorCannotComplete from _AXUIElementGetWindow with no window ID, allow at most one read-only re-observation of the same retained AX window element. Eligibility is only empty CannotComplete. The second observation gets fresh permission and messaging-timeout preflight and must fit the original operation deadline. No retry applies to success-with-zero, error-with-ID, any other status, a second failure, input posting, protected metadata, focus mutation, or activation. The 50 ms AX timeout, four-second operation budget, exact PID/window/generation checks, geometry checks, and fail-closed behavior otherwise remain unchanged.
