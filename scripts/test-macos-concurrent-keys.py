@@ -274,25 +274,25 @@ class Tests(unittest.TestCase):
     def test_keyboard_overlap_requires_complete_pairs_and_keeps_refusal_distinct(self):
         before=current_activity(key_down=2,key_up=2)
         incomplete=keys.summarize_keyboard_overlap(
-            before,[current_activity(key_down=3,key_up=2)])
+            before,[before,current_activity(key_down=3,key_up=2)])
         self.assertFalse(incomplete['progress_exceeds_single_tested_pair'])
         one_pair=keys.summarize_keyboard_overlap(
-            before,[current_activity(key_down=3,key_up=3)])
+            before,[before,current_activity(key_down=3,key_up=3)])
         self.assertFalse(one_pair['progress_exceeds_single_tested_pair'])
         complete=keys.summarize_keyboard_overlap(
-            before,[current_activity(key_down=4,key_up=4)])
+            before,[before,current_activity(key_down=4,key_up=4)])
         self.assertTrue(complete['progress_exceeds_single_tested_pair'])
         self.assertEqual(complete['while_client_alive'],{'key_down':2,'key_up':2})
-        refused=keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),incomplete)
+        refused=keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),incomplete,native_witness('after',2))
         self.assertEqual(refused['containment_outcome'],'dispatch_refused_zero_post')
-        delivered=keys.finalize_keyboard_overlap('effect_verified',None,complete)
+        delivered=keys.finalize_keyboard_overlap('effect_verified',None,complete,native_witness('after',2))
         self.assertEqual(delivered['containment_outcome'],'effect_verified_with_keyboard_overlap')
         with self.assertRaisesRegex(RuntimeError,'did not exceed'):
-            keys.finalize_keyboard_overlap('effect_verified',None,one_pair)
+            keys.finalize_keyboard_overlap('effect_verified',None,one_pair,native_witness('after',2))
         with self.assertRaisesRegex(RuntimeError,'zero-post'):
-            keys.finalize_keyboard_overlap('dispatch_refused',{'ok':False,'error':'ambiguous'},incomplete)
+            keys.finalize_keyboard_overlap('dispatch_refused',{'ok':False,'error':'ambiguous'},incomplete,native_witness('after',2))
         with self.assertRaisesRegex(RuntimeError,'unsupported outcome'):
-            keys.finalize_keyboard_overlap('preparation_refused',None,complete)
+            keys.finalize_keyboard_overlap('preparation_refused',None,complete,native_witness('after',2))
         for bad in (
             current_activity(key_down=1,key_up=0),
             current_activity(key_down=0,key_up=1),
@@ -300,6 +300,48 @@ class Tests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 keys.summarize_keyboard_overlap(bad,[current_activity(key_down=2,key_up=2)])
+
+    def test_keyboard_prior_activity_does_not_prove_overlap_on_zero_post_refusal(self):
+        baseline=current_activity(key_down=2,key_up=2)
+        evidence=keys.summarize_keyboard_overlap(baseline,[baseline,baseline])
+        result=keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),evidence,native_witness('after',2))
+        self.assertEqual(result['containment_outcome'],'dispatch_refused_zero_post')
+        self.assertFalse(result['client_process_overlap_verified'])
+        self.assertFalse(keys.summarize({'keyboard_overlap':result})['client_process_overlap_verified'])
+
+    def test_keyboard_one_inflight_sample_cannot_establish_inflight_progress(self):
+        baseline=current_activity(key_down=2,key_up=2)
+        evidence=keys.summarize_keyboard_overlap(baseline,[current_activity(key_down=9,key_up=9)])
+        self.assertEqual(evidence['while_client_alive'],{'key_down':0,'key_up':0})
+        with self.assertRaisesRegex(RuntimeError,'did not exceed'):
+            keys.finalize_keyboard_overlap('effect_verified',None,evidence,native_witness('after',2))
+        with self.assertRaisesRegex(RuntimeError,'backwards'):
+            keys.summarize_keyboard_overlap(baseline,[current_activity(key_down=5,key_up=5),baseline])
+
+    def test_keyboard_verified_effect_requires_unchanged_independent_focus(self):
+        baseline=current_activity(key_down=2,key_up=2)
+        evidence=keys.summarize_keyboard_overlap(baseline,[baseline,current_activity(key_down=4,key_up=4)])
+        for field in ('human_changed','receiver_changed','foreground_changed'):
+            witness=native_witness('after',2);witness[field]=True
+            with self.assertRaises(RuntimeError):
+                keys.finalize_keyboard_overlap('effect_verified',None,evidence,witness)
+        witness=native_witness('after',2);witness['human_before']['valid']=False;witness['human_changed']=None
+        with self.assertRaises(RuntimeError):
+            keys.finalize_keyboard_overlap('effect_verified',None,evidence,witness)
+        # A documented zero-post refusal need not pretend human focus was stable.
+        refusal=keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),evidence,native_witness('after',2,human=True))
+        self.assertEqual(refusal['containment_outcome'],'dispatch_refused_zero_post')
+
+    def test_keyboard_finalizer_rejects_forged_counter_claims(self):
+        baseline=current_activity(key_down=2,key_up=2)
+        evidence=keys.summarize_keyboard_overlap(baseline,[baseline,current_activity(key_down=4,key_up=4)])
+        for bad in (True,-1,2**32,1.5,None):
+            item=copy.deepcopy(evidence);item['while_client_alive']['key_down']=bad
+            with self.assertRaises(RuntimeError):
+                keys.finalize_keyboard_overlap('dispatch_refused',zero_refusal(),item,native_witness('after',2))
+        item=dict(evidence,progress_exceeds_single_tested_pair=False)
+        with self.assertRaises(RuntimeError):
+            keys.finalize_keyboard_overlap('effect_verified',None,item,native_witness('after',2))
 
     def test_keyboard_overlap_summary_never_claims_identity_or_posting_instant(self):
         report={'keyboard_activity_required':True,'keyboard_overlap':{

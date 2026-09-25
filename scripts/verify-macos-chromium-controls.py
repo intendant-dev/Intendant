@@ -619,7 +619,8 @@ def main():
                             'keyboard overlap study reached unsupported outcome: ' + str(failure))
                     series['keyboard_overlap'] = concurrent_keys.finalize_keyboard_overlap(
                         series['outcome'], series.get('dispatch', {}).get('reply'),
-                        series.get('keyboard_overlap', {}))
+                        series.get('keyboard_overlap', {}),
+                        series.get('dispatch', {}).get('native_after'))
                     series['summary'] = concurrent_keys.summarize(series)
                     checkpoint()
             elif args.receiver_study:

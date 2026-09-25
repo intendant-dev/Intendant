@@ -7,3 +7,18 @@ A fixed fresh run uses one disposable Chromium profile and owned virtual monitor
 The existing production held-key/button/shortcut checks, exact retained receiver/window/monitor identity, protected-content checks, one-use token, 50 ms AX timeout and four-second operation budget are unchanged. The harness does not keep trying until input happens: missing required keyboard activity, counter regression, malformed evidence, uncertain/partial dispatch, changed receiver/geometry, target activation or cleanup failure ends that predetermined run. ArrowLeft and ArrowRight are separate fixed cases, not retries.
 
 HID-system counters are activity context, not authenticated human identity. They do not prove which device/person generated activity, what keys were pressed, or overlap with the narrower native posting instant. Endpoint equality does not prove continuous focus stability. No production guard is weakened from this study, and no general routing/isolation claim follows from it.
+
+## Acceptance precision (2026-09-25 follow-up)
+
+Prior keyboard-counter activity and activity during the request are different facts.
+In-flight deltas are calculated between the first and later samples both collected
+while the client process remains alive, not against a prelaunch sample. One in-flight
+sample alone cannot prove progression. A zero-post refusal is retained as such even
+without subsequent counter changes, but its overlap flag stays false. No synthetic
+human input is used to obtain a positive sample.
+
+A delivered-effect containment result additionally requires known unchanged native
+human, receiver and foreground endpoints. Unknown or changed observations do not
+become a containment pass. Counter schemas, monotonicity and derived claims are
+validated. The existing production focus/input guards and source-attribution caveats
+are unchanged; optional review availability is not a landing requirement.

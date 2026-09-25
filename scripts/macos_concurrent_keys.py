@@ -129,6 +129,12 @@ def summarize_keyboard_overlap(before, samples):
     require(base['key_down'] > 0 and base['key_up'] > 0,
             'required completed keyboard activity not observed before dispatch')
     client = summarize_client_activity(before, samples)
+    # Only differences between two samples both taken while the client lives
+    # establish in-flight progress; the prelaunch gate is not that baseline.
+    client = summarize_client_activity(samples[0], samples)
+    for previous, current in zip([before] + samples, samples):
+        require(all(current['hid_activity']['deltas'][k] >= previous['hid_activity']['deltas'][k]
+                    for k in COUNTERS), 'keyboard counter sample moved backwards')
     progress = client['deltas_while_client_alive']
     return {
         'before_dispatch': {
@@ -142,7 +148,8 @@ def summarize_keyboard_overlap(before, samples):
         'progress_exceeds_single_tested_pair':
             progress['key_down'] >= 2 and progress['key_up'] >= 2,
         'attribution': 'not_authenticated',
-        'client_process_overlap_verified': True,
+        'client_samples_collected': True,
+        'client_process_overlap_verified': False,
         'internal_posting_overlap_verified': False,
     }
 
@@ -179,24 +186,41 @@ def definite_no_post(reply):
     return 'action' not in reply
 
 
-def finalize_keyboard_overlap(outcome, dispatch_reply, overlap):
-    require(isinstance(overlap, dict)
-            and isinstance(overlap.get('before_dispatch'), dict)
-            and overlap['before_dispatch'].get('key_down', 0) > 0
-            and overlap['before_dispatch'].get('key_up', 0) > 0
-            and overlap.get('client_process_overlap_verified') is True
-            and overlap.get('internal_posting_overlap_verified') is False,
-            'required keyboard overlap baseline evidence missing')
+def finalize_keyboard_overlap(outcome, dispatch_reply, overlap, native_after):
+    """Keep prior activity, in-flight progress, refusal, and delivery distinct."""
+    require(isinstance(overlap, dict) and set(overlap) == {
+        'before_dispatch', 'while_client_alive', 'progress_exceeds_single_tested_pair',
+        'client_samples_collected', 'attribution', 'client_process_overlap_verified',
+        'internal_posting_overlap_verified'}, 'required keyboard overlap evidence missing')
+    for phase in ('before_dispatch', 'while_client_alive'):
+        counts = overlap[phase]
+        require(isinstance(counts, dict) and set(counts) == {'key_down', 'key_up'}
+                and all(type(v) is int and 0 <= v <= 2**32 - 1 for v in counts.values()),
+                'invalid keyboard overlap counters')
+    before, during = overlap['before_dispatch'], overlap['while_client_alive']
+    extra_pair = during['key_down'] >= 2 and during['key_up'] >= 2
+    require(all(v > 0 for v in before.values())
+            and overlap['client_samples_collected'] is True
+            and overlap['attribution'] == 'not_authenticated'
+            and overlap['client_process_overlap_verified'] is False
+            and overlap['internal_posting_overlap_verified'] is False
+            and overlap['progress_exceeds_single_tested_pair'] is extra_pair,
+            'inconsistent keyboard overlap evidence')
+    validate_witness(native_after, 2, 'after')
     result = dict(overlap)
     if outcome == 'dispatch_refused':
         require(definite_no_post(dispatch_reply),
                 'keyboard overlap refusal lacks explicit zero-post evidence')
         result['containment_outcome'] = 'dispatch_refused_zero_post'
+        result['client_process_overlap_verified'] = all(v > 0 for v in during.values())
         return result
     if outcome == 'effect_verified':
-        require(result.get('progress_exceeds_single_tested_pair') is True,
-                'keyboard HID counter progress did not exceed the single tested arrow pair')
+        require(extra_pair, 'keyboard HID counter progress did not exceed the single tested arrow pair')
+        require(all(native_after.get(k) is False for k in
+                    ('human_changed', 'receiver_changed', 'foreground_changed', 'target_foreground_observed')),
+                'keyboard containment requires known unchanged focus endpoints')
         result['containment_outcome'] = 'effect_verified_with_keyboard_overlap'
+        result['client_process_overlap_verified'] = True
         return result
     raise RuntimeError('keyboard overlap study reached unsupported outcome: ' + str(outcome))
 
