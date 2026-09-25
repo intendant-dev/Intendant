@@ -61,6 +61,7 @@ pub(crate) struct Capabilities {
     capture_status: &'static str,
     input_supported: bool,
     streaming_supported: bool,
+    ephemeral_capture_supported: bool,
     cursor_overlay: bool,
     isolation: &'static str,
     ready: bool,
@@ -79,6 +80,7 @@ impl Capabilities {
             },
             input_supported: false,
             streaming_supported: false,
+            ephemeral_capture_supported: true,
             cursor_overlay: false,
             isolation: "shared_windowserver",
             ready: false, // No input backend, even after a verified screenshot.

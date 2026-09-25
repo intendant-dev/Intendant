@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 #[cfg(target_os = "macos")]
 pub(super) async fn capture(
     monitor: &Monitor,
-    path: &Path,
+    path: Option<&Path>,
     reply: &mut oneshot::Sender<Result<Receipt, String>>,
 ) -> Result<Screenshot, Failure> {
     let backend = crate::display::macos::MacOSBackend::read_only_display(monitor.native_id)
@@ -64,7 +64,7 @@ async fn capture_frame<C: Capture>(
 #[cfg(not(target_os = "macos"))]
 pub(super) async fn capture(
     _: &Monitor,
-    _: &Path,
+    _: Option<&Path>,
     _: &mut oneshot::Sender<Result<Receipt, String>>,
 ) -> Result<Screenshot, Failure> {
     Err(Failure::Request(
@@ -104,7 +104,7 @@ async fn first_frame<T>(
 fn encode_and_store(
     frame: crate::display::Frame,
     monitor: &Monitor,
-    path: &Path,
+    path: Option<&Path>,
 ) -> Result<Screenshot, Failure> {
     super::validate_dimensions(frame.width, frame.height).map_err(Failure::Request)?;
     if (frame.width, frame.height) != (monitor.width, monitor.height) {
@@ -119,20 +119,22 @@ fn encode_and_store(
         .write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| Failure::Request(e.to_string()))?;
     let png = png.into_inner();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Failure::Request(e.to_string()))?;
+    if let Some(path) = path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Failure::Request(e.to_string()))?;
+        }
+        // tempfile creates owner-private files (0600 on Unix), independently of
+        // umask. Publish only complete PNGs, without overwriting existing paths.
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| Failure::Request(e.to_string()))?;
+        file.write_all(&png)
+            .map_err(|e| Failure::Request(e.to_string()))?;
+        file.persist_noclobber(path)
+            .map_err(|e| Failure::Request(e.to_string()))?;
     }
-    // tempfile creates owner-private files (0600 on Unix), independently of
-    // umask. Publish only complete PNGs, without overwriting existing paths.
-    use std::io::Write;
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))
-        .map_err(|e| Failure::Request(e.to_string()))?;
-    file.write_all(&png)
-        .map_err(|e| Failure::Request(e.to_string()))?;
-    file.persist_noclobber(path)
-        .map_err(|e| Failure::Request(e.to_string()))?;
     Ok(Screenshot {
-        path: path.to_path_buf(),
+        path: path.map(Path::to_path_buf),
         png,
         width: frame.width,
         height: frame.height,
@@ -164,9 +166,13 @@ mod tests {
             timestamp: std::time::Instant::now(),
             dirty_rects: None,
         };
-        assert!(encode_and_store(frame(66, 64), &monitor, &path).is_err());
+        assert!(encode_and_store(frame(66, 64), &monitor, Some(&path)).is_err());
         assert!(!path.exists());
-        let screenshot = encode_and_store(frame(64, 64), &monitor, &path).unwrap();
+        let preview = encode_and_store(frame(64, 64), &monitor, None).unwrap();
+        assert!(preview.path.is_none());
+        assert!(!preview.png.is_empty());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let screenshot = encode_and_store(frame(64, 64), &monitor, Some(&path)).unwrap();
         let png = image::load_from_memory(&screenshot.png).unwrap();
         assert_eq!((png.width(), png.height()), (64, 64));
         assert_eq!(std::fs::read(&path).unwrap(), screenshot.png);
@@ -178,7 +184,7 @@ mod tests {
                 0o600
             );
         }
-        assert!(encode_and_store(frame(64, 64), &monitor, &path).is_err());
+        assert!(encode_and_store(frame(64, 64), &monitor, Some(&path)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), screenshot.png);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }

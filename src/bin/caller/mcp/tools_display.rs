@@ -1091,7 +1091,10 @@ impl IntendantServer {
         )
         .await;
         self.take_screenshot_with_output(
-            Parameters(TakeScreenshotParams { display_target }),
+            Parameters(TakeScreenshotParams {
+                display_target,
+                ephemeral: false,
+            }),
             compact_output,
             caller,
         )
@@ -1131,13 +1134,27 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
+        if params.ephemeral
+            && (compact_output
+                || !params
+                    .display_target
+                    .as_deref()
+                    .is_some_and(crate::macos_monitor::exact_selector))
+        {
+            return Ok(text_tool_error("ephemeral screenshots require an exact owned macos_virtual target and inline output"));
+        }
         if params
             .display_target
             .as_deref()
             .is_some_and(crate::macos_monitor::reserved)
         {
             return self
-                .screenshot_macos_monitor(params.display_target.unwrap(), compact_output, caller)
+                .screenshot_macos_monitor(
+                    params.display_target.unwrap(),
+                    compact_output,
+                    params.ephemeral,
+                    caller,
+                )
                 .await;
         }
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};

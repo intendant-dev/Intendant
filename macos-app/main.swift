@@ -304,6 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     let consoleBridge = ConsoleBridge()
     let messageBridge = AppMessageBridge()
     var window: NSWindow!
+    var agentView: AgentViewController?
     var webView: WKWebView!
     /// Retained so an update swap can re-point the `intendant://` proxy
     /// at the promoted successor's port.
@@ -475,6 +476,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             action: #selector(NSWindow.performMiniaturize(_:)),
             keyEquivalent: "m"
         )
+        windowMenu.addItem(NSMenuItem.separator())
+        let showAgent = windowMenu.addItem(withTitle: "Show Agent View", action: #selector(showAgentView(_:)), keyEquivalent: "")
+        showAgent.target = self
+        let hideAgent = windowMenu.addItem(withTitle: "Hide Agent View (agent continues)", action: #selector(hideAgentView(_:)), keyEquivalent: "")
+        hideAgent.target = self
         NSApp.mainMenu = mainMenu
     }
 
@@ -692,6 +698,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        disconnectAgentView()
         // Quitting kills the backend on purpose; the supervisor suppresses
         // its exit handling and takes the child down with a bounded wait.
         backendSupervisor?.shutdown()
@@ -1074,6 +1081,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// exits on its own.
     func backendSupervisor(_ supervisor: BackendSupervisor, didSwapToPort newPort: Int) {
         NSLog("Update swap: dashboard re-pointing to port \(newPort)")
+        disconnectAgentView()
         port = newPort
         schemeHandler?.port = newPort
         if let controller = webView?.configuration.userContentController {
@@ -1089,6 +1097,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         } else {
             showPlaceholder(paused: false)
         }
+    }
+
+    @objc func showAgentView(_ sender: Any?) {
+        if agentView == nil {
+            let source = AgentViewTransport(scheme: launchPlan.scheme, port: port,
+                token: { [weak self] in self.flatMap { loopbackAdmissionToken(port: $0.port) } },
+                authenticate: { [weak self] session, challenge, completion in
+                    if let trust = self?.backendTrustDelegate {
+                        trust.urlSession(session, didReceive: challenge, completionHandler: completion)
+                    } else { completion(.performDefaultHandling, nil) }
+                })
+            agentView = AgentViewController(source: source)
+        }
+        agentView?.show()
+    }
+
+    @objc func hideAgentView(_ sender: Any?) { agentView?.hide() }
+
+    func disconnectAgentView() {
+        agentView?.shutdown()
+        agentView = nil
     }
 
     // MARK: - Window
@@ -1217,6 +1246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// closed; the poll keeps running regardless, only painting is
     /// skipped.
     func showBackendStarting(detail: String) {
+        disconnectAgentView()
         webView?.loadHTMLString("""
             <html>
             <body style="background:#0B0C10;color:#EAECF2;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -1242,6 +1272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         title: String = "Backend process exited",
         detail: String = "Check ~/.intendant/app-backend.log for details"
     ) {
+        disconnectAgentView()
         NSLog("Backend crash screen: \(title) — \(detail)")
         // A dead daemon is worth a window even if the user had closed it —
         // remotely this machine just went dark.

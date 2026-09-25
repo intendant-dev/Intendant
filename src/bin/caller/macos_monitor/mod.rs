@@ -140,7 +140,7 @@ pub(crate) struct Monitor {
 }
 
 pub(crate) struct Screenshot {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -267,9 +267,18 @@ async fn await_pointer_reply(
 }
 
 pub(crate) enum Action {
-    Create { width: u32, height: u32 },
-    Destroy { display_id: u32, selector: String },
-    Capture { selector: String, path: PathBuf },
+    Create {
+        width: u32,
+        height: u32,
+    },
+    Destroy {
+        display_id: u32,
+        selector: String,
+    },
+    Capture {
+        selector: String,
+        path: Option<PathBuf>,
+    },
     Inspect(Inspection),
     Window(WindowAction),
 }
@@ -470,7 +479,7 @@ trait Driver: Send {
     async fn capture(
         &mut self,
         monitor: &Monitor,
-        path: &std::path::Path,
+        path: Option<&std::path::Path>,
         reply: &mut oneshot::Sender<Result<Receipt, String>>,
     ) -> Result<Screenshot, Failure>;
     async fn close(&mut self) -> Result<(), String>;
@@ -487,7 +496,7 @@ impl Driver for process::Process {
     async fn capture(
         &mut self,
         monitor: &Monitor,
-        path: &std::path::Path,
+        path: Option<&std::path::Path>,
         reply: &mut oneshot::Sender<Result<Receipt, String>>,
     ) -> Result<Screenshot, Failure> {
         capture::capture(monitor, path, reply).await
@@ -618,7 +627,7 @@ where
                     _ => None,
                 };
                 let artifact = match &value {
-                    Value::Captured(s) => Some(s.path.clone()),
+                    Value::Captured(s) => s.path.clone(),
                     _ => None,
                 };
                 let (commit, committed) = oneshot::channel();
@@ -845,11 +854,15 @@ async fn execute(
             if request.reply.is_closed() {
                 return Err(Failure::Request("capture cancelled".into()));
             }
-            let image = child.capture(&monitor, path, &mut request.reply).await?;
+            let image = child
+                .capture(&monitor, path.as_deref(), &mut request.reply)
+                .await?;
             // Even a successful frame cannot escape a dead/replaced helper or
             // generation. Destroy remains serialized until receipt release.
             if let Err(error) = verify(child, &monitor).await {
-                let _ = std::fs::remove_file(&image.path);
+                if let Some(path) = &image.path {
+                    let _ = std::fs::remove_file(path);
+                }
                 return Err(Failure::Retire(error));
             }
             Ok(Value::Captured(image))
@@ -1299,15 +1312,17 @@ mod tests {
         async fn capture(
             &mut self,
             _: &Monitor,
-            path: &std::path::Path,
+            path: Option<&std::path::Path>,
             reply: &mut oneshot::Sender<Result<Receipt, String>>,
         ) -> Result<Screenshot, Failure> {
             if self.successful_capture || self.die_after_capture || self.mismatch_after_capture {
                 self.captured = true;
                 self.dead = self.die_after_capture;
-                std::fs::write(path, b"fixture image").unwrap();
+                if let Some(path) = path {
+                    std::fs::write(path, b"fixture image").unwrap();
+                }
                 return Ok(Screenshot {
-                    path: path.to_path_buf(),
+                    path: path.map(std::path::Path::to_path_buf),
                     png: b"fixture image".to_vec(),
                     width: 640,
                     height: 480,
@@ -1516,6 +1531,7 @@ mod tests {
             "capture_status",
             "input_supported",
             "streaming_supported",
+            "ephemeral_capture_supported",
             "cursor_overlay",
             "isolation",
             "ready",
@@ -1853,7 +1869,7 @@ mod tests {
             &tx,
             Action::Capture {
                 selector: monitor.selector.clone(),
-                path: path.clone(),
+                path: Some(path.clone()),
             },
             authority(true),
         )
@@ -1978,7 +1994,7 @@ mod tests {
             &tx,
             Action::Capture {
                 selector: monitor.selector.clone(),
-                path: temp.path().join("unused.png"),
+                path: Some(temp.path().join("unused.png")),
             },
             authority(true),
         );
@@ -2085,7 +2101,7 @@ mod tests {
                 &tx,
                 Action::Capture {
                     selector: monitor.selector,
-                    path: path.clone(),
+                    path: Some(path.clone()),
                 },
                 authority(true),
             )

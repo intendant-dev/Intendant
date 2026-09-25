@@ -58,6 +58,17 @@ Two kinds of displays go through the same lifecycle:
 - **User-session displays** — the user's real desktop (`:0` on Linux, the native
   display on macOS/Windows), opt-in via the `DisplayControl` autonomy category.
 
+### Native macOS Agent View
+
+The macOS app offers Window > Show Agent View: a nonactivating, read-only
+floating snapshot preview of an explicitly selected owned monitor. It uses
+`take_screenshot` with `ephemeral:true`, not the streaming pipeline. This
+memory-only option requires the exact owned selector, inline output and existing
+DisplayView authority. Closing the preview stops its refresh, not the agent or
+monitor. Older daemons without the advertised memory-only capability are refused.
+Frame freshness is receipt age; streaming, input handoff and agent-status linkage
+are not supplied by this snapshot slice. See the Agent View design record.
+
 ### Backpressure rules
 
 Every stage is bounded and lossy by design — slow consumers drop frames rather
