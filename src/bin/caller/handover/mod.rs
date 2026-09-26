@@ -81,6 +81,8 @@ pub(crate) struct HandoverRuntime {
     /// successors. `None` until the first report; only reported while
     /// draining.
     drain_holdouts: std::sync::Mutex<Option<Vec<DrainHoldout>>>,
+    terminal_registry: std::sync::OnceLock<std::sync::Weak<crate::terminal::TerminalRegistry>>,
+    terminal_holdouts: std::sync::Mutex<Vec<crate::terminal::TerminalHoldout>>,
     /// Wakes the scheduler the instant a drain is requested, so
     /// drain-entry (which the scheduler performs BETWEEN passes — the
     /// structural "stop firing before the flock frees") does not wait
@@ -337,6 +339,8 @@ impl HandoverRuntime {
             draining: std::sync::atomic::AtomicBool::new(false),
             drain: std::sync::Mutex::new(DrainState::default()),
             drain_holdouts: std::sync::Mutex::new(None),
+            terminal_registry: std::sync::OnceLock::new(),
+            terminal_holdouts: std::sync::Mutex::new(Vec::new()),
             drain_notify: tokio::sync::Notify::new(),
             scheduler_attached: std::sync::atomic::AtomicBool::new(false),
             drain_hooks: std::sync::Mutex::new(Vec::new()),
@@ -516,6 +520,41 @@ impl HandoverRuntime {
             now_ms().saturating_sub(self.booted_at_ms),
             lease_poll_interval(),
         )
+    }
+
+    pub(crate) fn set_terminal_registry(
+        &self,
+        registry: &std::sync::Arc<crate::terminal::TerminalRegistry>,
+    ) {
+        let _ = self
+            .terminal_registry
+            .set(std::sync::Arc::downgrade(registry));
+    }
+
+    /// Freeze shell creation and report PTY holdouts independently of agent
+    /// sessions. Both live and exited terminals retain their state until close.
+    pub(crate) async fn terminals_drain_ready(&self) -> bool {
+        let rows = match self
+            .terminal_registry
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(registry) => registry.freeze_for_drain().await,
+            None => Vec::new(),
+        };
+        let ready = rows.is_empty();
+        if let Ok(mut presence) = self.presence.lock() {
+            if let Some(presence) = presence.as_mut() {
+                if let Err(error) = presence.update_terminal_wait_set(&rows) {
+                    eprintln!("[handover] terminal wait-set update failed: {error}");
+                }
+            }
+        }
+        *self
+            .terminal_holdouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = rows;
+        ready
     }
 
     pub(crate) fn boot_id(&self) -> &str {
@@ -988,6 +1027,10 @@ impl HandoverRuntime {
                     obj.insert("holdouts".into(), value);
                 }
             }
+        }
+        if let Ok(rows) = self.terminal_holdouts.lock() {
+            obj.insert("terminal_count".into(), serde_json::json!(rows.len()));
+            obj.insert("terminal_holdouts".into(), serde_json::json!(*rows));
         }
         if let Some(generation) = generation {
             obj.insert("generation".into(), generation.into());

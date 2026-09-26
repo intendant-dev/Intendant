@@ -105,6 +105,16 @@ pub(crate) struct PresenceRecord {
     /// before 2026-08 lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) holdouts: Option<Vec<DrainHoldout>>,
+    /// PTYs are separate resources, never supervised-session recovery rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_count: Option<u64>,
+    /// Hash of this boot's high-entropy admission token. The relay checks
+    /// it before forwarding to a recorded port, preventing port-reuse drift.
+    /// This is not a credential and cannot be presented for admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_token_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_holdouts: Option<Vec<crate::terminal::TerminalHoldout>>,
     /// The REGISTRATION instant — the era watershed
     /// (`grid_envelope::resolve_current_boot` reads it as boot-start to
     /// split current-boot sessions from outage residue, the #638 class).
@@ -181,6 +191,18 @@ impl DaemonPresence {
             state: "running".to_string(),
             session_count: None,
             holdouts: None,
+            terminal_count: None,
+            terminal_token_sha256: Some(
+                ring::digest::digest(
+                    &ring::digest::SHA256,
+                    crate::loopback_token::loopback_admission_token().as_bytes(),
+                )
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            ),
+            terminal_holdouts: None,
             updated_ms: super::now_ms(),
         };
         let presence = DaemonPresence {
@@ -230,6 +252,22 @@ impl DaemonPresence {
         }
         self.record.session_count = Some(count);
         self.record.holdouts = Some(capped.to_vec());
+        self.write_record()
+    }
+
+    pub(crate) fn update_terminal_wait_set(
+        &mut self,
+        rows: &[crate::terminal::TerminalHoldout],
+    ) -> std::io::Result<()> {
+        let count = rows.len() as u64;
+        let capped = &rows[..rows.len().min(PRESENCE_HOLDOUT_ROWS_CAP)];
+        if self.record.terminal_count == Some(count)
+            && self.record.terminal_holdouts.as_deref() == Some(capped)
+        {
+            return Ok(());
+        }
+        self.record.terminal_count = Some(count);
+        self.record.terminal_holdouts = Some(capped.to_vec());
         self.write_record()
     }
 

@@ -11,6 +11,7 @@
 #include "browser-key.h"
 #include "focus-witness.h"
 #include "activity-witness.h"
+#include "activity-calibration.h"
 
 static NSDictionary *observation(void) {
     CGEventRef event = CGEventCreate(NULL);
@@ -136,6 +137,8 @@ static NSDictionary *key_refused(NSRunningApplication *browser, BrowserKeyPlan p
 }
 
 int main(int argc, const char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--calibrate-input-observer") == 0)
+        return observer_calibration_main(argc, argv);
     if (argc != 6) return 2;
     BOOL activityMode = strcmp(argv[1], "--disposable-chromium-concurrent-key") == 0;
     BOOL focusMode = activityMode || strcmp(argv[1], "--disposable-chromium-focus") == 0;

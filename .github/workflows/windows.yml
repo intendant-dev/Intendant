@@ -530,6 +530,12 @@ jobs:
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
 
+      - name: MCP terminal continuity regressions
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: |
+          python3 -m unittest scripts/test_intendant_mcp_relay.py scripts/test_intendant_terminal_handover.py
+          python3 scripts/smoke_intendant_terminal_handover.py "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
+
       - name: session-vitals smoke
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
         run: node tests/skills/session-vitals-smoke/driver.cjs "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
