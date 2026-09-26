@@ -343,9 +343,14 @@ def main():
     p.add_argument('--native-focus', action='store_true', help='Native focus bracketing; requires receiver-study')
     p.add_argument("--concurrent-key-study", action="store_true", help="One arrow attempt with passive native focus/HID evidence")
     p.add_argument("--require-mouse-activity", action="store_true", help="Require mouse-motion counter progress before and while the one ctl dispatch process is alive")
+    p.add_argument("--require-keyboard-activity", action="store_true", help="Require aggregate HID key-down/key-up activity around the one ctl dispatch; records no key identity or text")
     args = p.parse_args()
     require(not args.require_mouse_activity or args.concurrent_key_study,
             'mouse activity requires concurrent-key study')
+    require(not args.require_keyboard_activity or args.concurrent_key_study,
+            'keyboard activity requires concurrent-key study')
+    require(not (args.require_mouse_activity and args.require_keyboard_activity),
+            'choose at most one required activity profile')
     try:
         concurrent_keys.validate_options(args.concurrent_key_study, args.keyboard_target,
             args.keyboard_target_click_first, args.arrowleft, args.arrowright,
@@ -375,7 +380,7 @@ def main():
         'browser-keyboard-target.html' if args.keyboard_target else 'browser.html')
     report = {'passed': False, 'browser_version': info['CFBundleShortVersionString'],
               'browser_mode': 'background-window',
-              'profile': 'mouse_overlap' if args.require_mouse_activity else 'concurrent_key' if args.concurrent_key_study else 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
+              'profile': 'mouse_overlap' if args.require_mouse_activity else 'keyboard_overlap' if args.require_keyboard_activity else 'concurrent_key' if args.concurrent_key_study else 'native_focus' if args.native_focus else 'receiver_study' if args.receiver_study else 'keyboard_target' if args.keyboard_target else ('placement_only' if args.placement_only else 'semantic_controls'),
               'checks': {}, 'cleanup': {}}
     root = Path(tempfile.mkdtemp(prefix='intendant-chromium-'))
     binding = None
@@ -526,6 +531,7 @@ def main():
             if args.concurrent_key_study:
                 series = report['concurrent_key_study'] = {}
                 series['mouse_activity_required'] = args.require_mouse_activity
+                series['keyboard_activity_required'] = args.require_keyboard_activity
                 report['passed_semantics'] = 'collection/evidence validation; effect and activity are reported separately'
                 report['checks']['keyboard_input_requested'] = True
                 def checkpoint():
@@ -553,13 +559,26 @@ def main():
                         if not activity['counter_regression'] and activity['deltas']['mouse_move'] > 0:
                             return value
                     raise RuntimeError('required mouse activity not observed before dispatch')
+                def wait_for_keyboard_pair(sequence):
+                    until = min(end, time.monotonic() + 8)
+                    while time.monotonic() < until:
+                        value = current_activity(sequence)
+                        activity = value['hid_activity']
+                        if (not activity['counter_regression']
+                                and activity['deltas']['key_down'] > 0
+                                and activity['deltas']['key_up'] > 0):
+                            return value
+                    raise RuntimeError('required completed keyboard activity not observed before dispatch')
                 before_activity = None
                 def before_dispatch():
                     nonlocal before_activity
                     if args.require_mouse_activity:
                         before_activity = wait_for_mouse(2)
+                    elif args.require_keyboard_activity:
+                        before_activity = wait_for_keyboard_pair(2)
                 def study_call(tool, **arguments):
-                    if not args.require_mouse_activity or not tool.startswith('press_macos_window_'):
+                    required_activity = args.require_mouse_activity or args.require_keyboard_activity
+                    if not required_activity or not tool.startswith('press_macos_window_'):
                         return call(tool, **arguments)
                     require(before_activity is not None, 'missing pre-dispatch activity gate')
                     payload, samples = run_bounded_observed(
@@ -569,8 +588,12 @@ def main():
                     series['dispatch_client_activity'] = concurrent_keys.summarize_client_activity(
                         before_activity, samples)
                     checkpoint()
-                    series['mouse_overlap'] = concurrent_keys.validate_mouse_overlap(
-                        before_activity, samples)
+                    if args.require_mouse_activity:
+                        series['mouse_overlap'] = concurrent_keys.validate_mouse_overlap(
+                            before_activity, samples)
+                    else:
+                        series['keyboard_overlap'] = concurrent_keys.summarize_keyboard_overlap(
+                            before_activity, samples)
                     checkpoint()
                     return reply
                 concurrent_keys.collect(study_call, evaluate, binding, witness,
@@ -589,6 +612,17 @@ def main():
                             and overlap.get('client_process_overlap_verified') is True
                             and overlap.get('internal_posting_overlap_verified') is False,
                             'required mouse overlap evidence missing')
+                elif args.require_keyboard_activity:
+                    failure = (series.get('preparation', {}).get('reply', {}).get('error')
+                               or series.get('stop_reason') or series.get('outcome'))
+                    require(series.get('outcome') in ('dispatch_refused', 'effect_verified'),
+                            'keyboard overlap study reached unsupported outcome: ' + str(failure))
+                    series['keyboard_overlap'] = concurrent_keys.finalize_keyboard_overlap(
+                        series['outcome'], series.get('dispatch', {}).get('reply'),
+                        series.get('keyboard_overlap', {}),
+                        series.get('dispatch', {}).get('native_after'))
+                    series['summary'] = concurrent_keys.summarize(series)
+                    checkpoint()
             elif args.receiver_study:
                 series = report['receiver_study'] = {}
                 report['passed_semantics'] = 'measurement collection and validation only; not input availability'
