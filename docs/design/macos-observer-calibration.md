@@ -24,11 +24,19 @@ Initial native compilation of the supervisor, pure calibration tests and existin
 
 That smoke exposed a NEW calibration serialization defect: Carbon Boolean and C comparison expressions boxed with `@()` became JSON numbers. The calibration now uses an explicit true/false boxing helper, with a pure native regression for BOOL, Carbon Boolean and comparison inputs. This is not a diagnosis of the earlier #963 zero-counter discrepancy.
 
-The corrected native compile-and-smoke command was blocked twice before execution by the OpenAI tool layer. No alternate execution route was attempted. The corrected native binary and added native assertions have NOT been run. The expanded 20 Python tests pass in the conversation Linux container; source hashes match the Mac checkout. The full Rust battery has not been repeated for this draft checkpoint. Production Rust, application input code and permissions are unchanged.
+The corrected native build and short smoke have now passed on `008fcda0`: 72 calibration assertions, 28 existing activity cases, 20 calibration Python tests, and 206 Python tests across all 13 macOS suites. The full local Rust battery passed (6,691 binary tests, 1,022 library tests, 57 E2E tests, Clippy/fmt/whitespace). Existing ignores remain unchanged. The one-second native run collected 11 samples with four key-downs and five key-ups observed in each table, without counter regression or changing access context. No user typing was requested or confirmed, so this is an operational-protocol result, not a diagnosis of the historical discrepancy. The observer was reaped.
 
-## Resume gates
+## Verified execution snapshot
 
-First build the corrected supervisor and native tests with the existing warnings-denied flags, verify their exact source/binary provenance, and run a fresh short read-only smoke. Only then coordinate a longer interval of confirmed typing; do not silently count an idle smoke as calibration of human input. Positive background-key acceptance remains in #963. Optional review quota is not a gate; this PR remains draft for unfinished native validation.
+An available review found that hashing the original build pathname before launching it allowed a concurrent rebuild to substitute different bytes. The runner now reads a bounded regular executable, hashes those bytes, creates a private verified executable copy, and launches that copy. The private directory remains owned by the runner until collection and observer cleanup finish; report metadata explicitly records `supervisor_execution: private_verified_copy`. No pathname from a mutable build cache is reopened for execution after verification.
+
+This is protection against accidental build replacement, not a sandbox against a same-user or root attacker. The executable copy is a new path; the observer always records its own access checks rather than assuming the source path's permissions carry over. Calibration still uses the actual supervisor code and unchanged HID sampling function.
+
+Seven new hermetic tests cover path replacement, in-place rebuild, private modes and cleanup, wrong hashes/non-executables, bounded size, actual main-to-collector wiring and provenance, and preservation of an existing report. The calibration Python suite now has 27 tests. A development smoke of the corrected launcher completed with 11 samples and unchanged access context; both tables recorded zero progress. That is not evidence of user inactivity. Its private executable and observer were cleaned up.
+
+## Remaining experiment
+
+Coordinate a longer interval of confirmed typing only after the exact published runner is validated. Collection success does not by itself prove observation of a particular person's input. Positive background-key acceptance remains in #963. Optional review availability is not a gate. Production Rust, application input code, permissions, and the installed daemon remain unchanged by this calibration slice.
 
 ## API sources
 

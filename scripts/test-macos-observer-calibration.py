@@ -135,6 +135,114 @@ class Tests(unittest.TestCase):
         rows = series(); rows[-1]['reason'] = 'cancelled'
         with self.assertRaises(ValueError): model.summarize(rows)
 
+    def test_verified_copy_survives_source_replacement_and_cleans_up(self):
+        import hashlib, os, stat, subprocess, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            image = b'#!/bin/sh\nprintf verified-original'
+            source.write_bytes(image); source.chmod(0o700)
+            digest = hashlib.sha256(image).hexdigest()
+            with runner.verified_supervisor(source, digest) as executable:
+                self.assertNotEqual(executable, source)
+                self.assertEqual(stat.S_IMODE(executable.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(executable.stat().st_mode), 0o500)
+                replacement = Path(directory) / 'replacement'
+                replacement.write_bytes(b'#!/bin/sh\nprintf unverified-replacement')
+                replacement.chmod(0o700); os.replace(replacement, source)
+                self.assertEqual(executable.read_bytes(), image)
+                if os.name == 'posix':
+                    result = subprocess.run([str(executable)], check=True, capture_output=True, timeout=3)
+                    self.assertEqual(result.stdout, b'verified-original')
+            self.assertFalse(executable.exists())
+            self.assertFalse(executable.parent.exists())
+            self.assertIn(b'unverified-replacement', source.read_bytes())
+
+    def test_verified_copy_survives_in_place_source_rebuild(self):
+        import hashlib, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            image = b'original bytes'; source.write_bytes(image); source.chmod(0o700)
+            with runner.verified_supervisor(source, hashlib.sha256(image).hexdigest()) as executable:
+                source.write_bytes(b'different rebuilt bytes')
+                self.assertEqual(executable.read_bytes(), image)
+
+    def test_verified_copy_is_removed_on_collection_exception(self):
+        import hashlib, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            image = b'original bytes'; source.write_bytes(image); source.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, 'collection failed'):
+                with runner.verified_supervisor(source, hashlib.sha256(image).hexdigest()) as executable:
+                    raise RuntimeError('collection failed')
+            self.assertFalse(executable.parent.exists())
+            self.assertTrue(source.exists())
+
+    def test_bad_hash_and_non_executable_never_yield(self):
+        import hashlib, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'; source.write_bytes(b'bytes'); source.chmod(0o700)
+            for digest in ('0' * 64, 'A' * 64, 'not-a-digest'):
+                with self.assertRaises(ValueError):
+                    with runner.verified_supervisor(source, digest):
+                        self.fail('invalid provenance admitted')
+            source.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'regular executable'):
+                with runner.verified_supervisor(source, hashlib.sha256(b'bytes').hexdigest()):
+                    self.fail('non-executable admitted')
+            with self.assertRaisesRegex(ValueError, 'regular executable'):
+                with runner.verified_supervisor(Path(directory), '0' * 64):
+                    self.fail('directory admitted')
+
+    def test_supervisor_size_is_bounded_before_copy(self):
+        import hashlib, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'; source.write_bytes(b'ninebytes'); source.chmod(0o700)
+            with mock.patch.object(runner, 'MAX_SUPERVISOR_BYTES', 8):
+                with self.assertRaisesRegex(ValueError, 'size limit'):
+                    with runner.verified_supervisor(source, hashlib.sha256(b'ninebytes').hexdigest()):
+                        self.fail('oversized executable admitted')
+
+    def test_main_passes_private_copy_and_records_execution_provenance(self):
+        import contextlib, hashlib, io, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'; image = b'verified bytes'
+            source.write_bytes(image); source.chmod(0o700)
+            report = Path(directory) / 'report.json'; launched = []
+            def collect(command, seconds, checkpoint):
+                executable = Path(command[0]); launched.append(executable)
+                self.assertNotEqual(executable, source)
+                source.write_bytes(b'rebuilt')
+                self.assertEqual(executable.read_bytes(), image)
+                self.assertEqual(command[1:], ['--calibrate-input-observer', '1'])
+                self.assertEqual(seconds, 1)
+                value = {'measurement_valid': True, 'completed': True, 'observer_reaped': True}
+                checkpoint(value)
+                return value
+            argv = ['verify', '--supervisor', str(source), '--sha256', hashlib.sha256(image).hexdigest(),
+                    '--seconds', '1', '--report', str(report), '--allow-readonly-input-observation']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(sys, 'platform', 'darwin'), \
+                 mock.patch.object(runner, 'collect', side_effect=collect), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(), 0)
+            self.assertEqual(json.loads(report.read_text())['supervisor_execution'], 'private_verified_copy')
+            self.assertEqual(json.loads(report.read_text())['supervisor_sha256'], hashlib.sha256(image).hexdigest())
+            self.assertFalse(launched[0].exists())
+
+    def test_existing_report_is_not_replaced_by_verified_copy_run(self):
+        import hashlib, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'; source.write_bytes(b'verified'); source.chmod(0o700)
+            report = Path(directory) / 'report.json'; report.write_text('previous evidence')
+            argv = ['verify', '--supervisor', str(source), '--sha256', hashlib.sha256(b'verified').hexdigest(),
+                    '--report', str(report), '--allow-readonly-input-observation']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(sys, 'platform', 'darwin'), \
+                 mock.patch.object(runner, 'collect') as collect:
+                with self.assertRaises(FileExistsError): runner.main()
+                collect.assert_not_called()
+            self.assertEqual(report.read_text(), 'previous evidence')
+
     def test_child_ready_handshake_and_completion(self):
         checkpoints = []
         script = ('import os,sys,json\nr='+repr(series())+'\nr[0]["pid"]=os.getpid()\n'
