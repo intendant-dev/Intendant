@@ -1,0 +1,17 @@
+{
+  "case_kind": "canonical-reject",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "malformed"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "20"
+  },
+  "name": "negative-int-rejected",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "case_kind": "commitment-derive",
+  "expected": {
+    "bytes": "2ece4ece80ec98c749b9c7c8755166a5daa75b7fdfb2607929427a9b2576ce8b"
+  },
+  "family": 8,
+  "inputs": {
+    "recovery_pk": "0f0c372d406204cb70ac5443400519ddba66a2619dfe66a7f0d7db173eba0720"
+  },
+  "name": "commitment-from-recovery-pk",
+  "source": "2.4",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

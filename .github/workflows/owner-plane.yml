@@ -1,0 +1,134 @@
+name: Owner-plane reference artifacts
+
+# ADVISORY (non-required): executes the D0-A reference artifacts — the
+# Rust core (vector mint + drift/coverage gates) and the independent
+# reducer (the differential harness) — on PRs touching the program.
+#
+# Job naming stays honest per lane (review R8.7 caught this header
+# lagging the deliveries): the reference-artifacts job = the TWO
+# RUST SURFACES agreeing on the committed corpus; the browser and
+# 3-OS storage jobs below EXECUTE their §13.2 lanes for real (run
+# sets pinned to coverage/lane-manifests.json). native-crypto stays
+# an annotation (the Rust suites execute those primitives natively);
+# Gate-B concerns stay out per execution-lanes-plan.md.
+#
+# Advisory like audit.yml: a red run must not block unrelated
+# landings while the program is pre-Gate-A; the strict harness step
+# exits nonzero on ANY structural failure, semantic FAIL, or
+# Unimplemented, so a red here is a real differential finding.
+
+on:
+  pull_request:
+    paths:
+      - "rfcs/owner-plane/**"
+      - ".github/workflows/owner-plane.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reference-artifacts:
+    name: owner-plane reference artifacts (Rust core + reducer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # rustup ships preinstalled on the GitHub-hosted runners; the
+      # components ride the default toolchain but are pinned here
+      # against image drift.
+      - name: toolchain components
+        run: rustup component add rustfmt clippy
+      - name: fmt
+        run: |
+          cargo fmt --check --manifest-path rfcs/owner-plane/core/Cargo.toml
+          cargo fmt --check --manifest-path rfcs/owner-plane/reducer/Cargo.toml
+      - name: core suite (drift gates, §13.2 surfaces, coverage inventory)
+        run: cargo test --manifest-path rfcs/owner-plane/core/Cargo.toml
+      # Release profile: the metamorphic convergence sweep (review R1)
+      # runs inside the corpus tests and the strict gate — in debug on
+      # the 2-core hosted runner the suite alone took 19 minutes and
+      # the job hit its timeout (observed 2026-07-15); release absorbs
+      # the sweep and the gate step reuses the same build.
+      - name: reducer suite (differential lanes, envelope sweep, journal machine)
+        run: cargo test --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml
+      - name: clippy
+        run: |
+          cargo clippy --manifest-path rfcs/owner-plane/core/Cargo.toml -- -D warnings
+          cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml -- -D warnings
+      - name: strict harness gate (every vector; nonzero exit on any red)
+        run: cargo run --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin harness
+      # The browser lane's build shapes (execution-lanes-plan lane 1):
+      # the schema-less reducer config the wasm wrapper consumes, and
+      # the wrapper's wasm32 compile. COMPILE CHECKS ONLY — browser
+      # EXECUTION arrives with the CDP driver and gets its own
+      # accurately-named job; nothing here runs a vector in Chromium.
+      - name: reducer schema-less config (the browser lane's build shape)
+        run: |
+          cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features --all-targets -- -D warnings
+          cargo test --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features
+      - name: browser-lane wasm build shape (clippy; execution is the browser job)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --manifest-path rfcs/owner-plane/browser-lane/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - name: mint idempotence (vectors + coverage map reproduce byte-exactly)
+        run: |
+          cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null
+          git diff --exit-code -- rfcs/owner-plane/vectors rfcs/owner-plane/coverage
+
+  # The D-203-funded browser execution lane (execution-lanes-plan.md,
+  # lane 1, all three work items): driver.cjs builds the wasm package
+  # (the schema-less reducer + the WebCrypto backend), serves the
+  # corpus to a fixture page, and runs EVERY browser-annotated vector
+  # in headless Chromium over raw CDP — semantics through
+  # crypto.subtle, and the family-13 §13.2 substrate (the IndexedDB
+  # Txn subset + Web Locks: per-transaction record round-trips,
+  # frame-mapped stream storage, fixture-layer crash cuts, the lock
+  # matrix with worker actors) executed per vector. Gated on the
+  # harness's all_green shape plus green substrate rows (any
+  # FAIL/Unimplemented row exits nonzero; tampered-corpus negative
+  # controls — a flipped verify expectation and a flipped lock-denial
+  # step — were exercised at birth). Gate-B concerns (IndexedDB
+  # failure injection/eviction, Firefox/Safari, quota pressure) stay
+  # out by design.
+  browser-execution:
+    name: browser execution (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: wasm toolchain (wasm32 target + pinned wasm-pack)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          want="$(cat .wasm-pack-version)"
+          have="$(wasm-pack --version 2>/dev/null | cut -d' ' -f2 || true)"
+          if [ "$have" != "$want" ]; then
+            cargo install wasm-pack --version "$want" --locked
+          fi
+      - name: browser lane (every browser-annotated vector in headless Chromium)
+        run: node rfcs/owner-plane/browser-lane/driver.cjs
+
+  # The D-203-funded per-OS portable-storage execution lane
+  # (execution-lanes-plan.md, lane 2): every storage-annotated vector
+  # byte-round-trips through real files, crash cuts run as real
+  # truncations, and the lock matrix runs across two REAL processes
+  # holding OS advisory locks — on all three OSes. Portable subset
+  # only: the Gate-B production concerns (fsync ordering, keystores,
+  # IndexedDB failure/eviction, engine matrices) stay out by design.
+  storage-lane:
+    name: portable storage execution (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: storage lane (real files, truncations, cross-process locks)
+        run: cargo run --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin storage_lane

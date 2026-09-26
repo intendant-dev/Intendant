@@ -1,0 +1,57 @@
+//! Mint the tranche + corpus vector files into `../vectors/`
+//! (relative to the crate — i.e. `rfcs/owner-plane/vectors/`). Every emitted vector is
+//! checked against the container rules and the companion vocabulary
+//! before it is written; the `tranche::tests` drift gate then pins
+//! the committed bytes to the builders.
+
+use owner_plane_core::{
+    corpus, corpus_audit, corpus_budget, corpus_ctrl, corpus_edge, corpus_erase, corpus_fold,
+    corpus_migration, corpus_recovery, corpus_status, corpus_time, tranche, vector,
+};
+
+fn main() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let dir = root.join("vectors");
+    std::fs::create_dir_all(&dir).expect("create vectors dir");
+    let companion: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("d0a-vector-cases.v1.json"))
+            .expect("companion readable"),
+    )
+    .expect("companion parses");
+
+    let mut all = tranche::tranche();
+    all.extend(corpus::corpus());
+    all.extend(corpus_fold::corpus_fold());
+    all.extend(corpus_recovery::corpus_recovery());
+    all.extend(corpus_edge::corpus_edge());
+    all.extend(corpus_migration::corpus_migration());
+    all.extend(corpus_status::corpus_status());
+    all.extend(corpus_erase::corpus_erase());
+    all.extend(corpus_time::corpus_time());
+    all.extend(corpus_ctrl::corpus_ctrl());
+    all.extend(corpus_budget::corpus_budget());
+    all.extend(corpus_audit::corpus_audit());
+    for v in all {
+        vector::check(&v.to_json(), &companion)
+            .unwrap_or_else(|e| panic!("{} fails mint-time check: {e}", v.name));
+        let path = dir.join(format!("f{:02}-{}.json", v.family, v.name));
+        std::fs::write(&path, v.to_file_string()).expect("write vector");
+        println!("minted {}", path.display());
+    }
+
+    // The §10.4 coverage map rides the same mint (drift-gated by
+    // `coverage::tests::committed_outcomes_map_matches_generator`).
+    let cov_dir = root.join("coverage");
+    std::fs::create_dir_all(&cov_dir).expect("create coverage dir");
+    let map_path = cov_dir.join("outcomes-map.json");
+    std::fs::write(&map_path, owner_plane_core::coverage::outcomes_map_file())
+        .expect("write outcomes map");
+    let manifests_path = map_path.with_file_name("lane-manifests.json");
+    std::fs::write(
+        &manifests_path,
+        owner_plane_core::coverage::lane_manifests_file(),
+    )
+    .expect("write lane manifests");
+    println!("minted {}", manifests_path.display());
+    println!("minted {}", map_path.display());
+}
