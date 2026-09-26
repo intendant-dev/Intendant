@@ -5,13 +5,16 @@
 
 enum { ActivityCounterCount = 5 };
 typedef struct { uint32_t values[ActivityCounterCount]; } ActivityCounters;
-static ActivityCounters activity_sample(void) {
+static ActivityCounters activity_sample_for_state(CGEventSourceStateID state) {
     const CGEventType types[ActivityCounterCount] = { kCGAnyInputEventType,
         kCGEventKeyDown, kCGEventKeyUp, kCGEventMouseMoved, kCGEventScrollWheel };
     ActivityCounters result = {{0}};
     for (NSUInteger i=0;i<ActivityCounterCount;i++)
-        result.values[i] = CGEventSourceCounterForEventType(kCGEventSourceStateHIDSystemState, types[i]);
+        result.values[i] = CGEventSourceCounterForEventType(state, types[i]);
     return result;
+}
+static ActivityCounters activity_sample(void) {
+    return activity_sample_for_state(kCGEventSourceStateHIDSystemState);
 }
 static NSDictionary *activity_delta(ActivityCounters before, ActivityCounters after) {
     NSArray *names = @[@"any_input",@"key_down",@"key_up",@"mouse_move",@"scroll"];
