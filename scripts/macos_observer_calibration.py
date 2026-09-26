@@ -21,7 +21,13 @@ def integer(value, lower=0, upper=2**32-1):
 
 
 def finite(value):
-    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        # Bounded JSON lines can still hold integers too large for a float.
+        return False
 
 
 def validate_record(record):

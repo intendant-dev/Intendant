@@ -243,6 +243,32 @@ class Tests(unittest.TestCase):
                 collect.assert_not_called()
             self.assertEqual(report.read_text(), 'previous evidence')
 
+    def test_oversized_uptime_integers_are_normal_validation_errors(self):
+        for index, field in ((1, 'started_uptime'), (2, 'started_uptime'),
+                             (2, 'finished_uptime'), (-1, 'finished_uptime')):
+            for value in (10**400, -(10**400)):
+                rows = series(); rows[index][field] = value
+                with self.assertRaises(ValueError): model.summarize(rows)
+        self.assertFalse(model.finite(10**400))
+        self.assertFalse(model.finite(-(10**400)))
+        self.assertTrue(model.finite(123))
+
+    def test_oversized_child_timestamp_preserves_report_and_reaps(self):
+        ready = series()[0]
+        started = series()[1]; started['started_uptime'] = 10**400
+        script = ('import os,sys,json\nr='+repr(ready)+'\nr["pid"]=os.getpid()\n'
+                  'print(json.dumps(r),flush=True)\nassert sys.stdin.read(1)=="s"\n'
+                  'print(json.dumps('+repr(started)+'),flush=True)\n')
+        checkpoints = []
+        result = runner.collect([sys.executable, '-u', '-c', script], 1,
+                                lambda r: checkpoints.append(copy.deepcopy(r)), timeout=3)
+        self.assertFalse(result['measurement_valid'])
+        self.assertFalse(result['completed'])
+        self.assertTrue(result['observer_reaped'])
+        self.assertEqual(result['error'], 'start schema')
+        self.assertEqual(len(result['records']), 1)
+        self.assertEqual(checkpoints[-1], result)
+
     def test_child_ready_handshake_and_completion(self):
         checkpoints = []
         script = ('import os,sys,json\nr='+repr(series())+'\nr[0]["pid"]=os.getpid()\n'

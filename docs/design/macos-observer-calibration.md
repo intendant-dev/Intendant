@@ -41,3 +41,7 @@ Coordinate a longer interval of confirmed typing only after the exact published 
 ## API sources
 
 Apple documents the hardware and combined-session state tables separately: https://developer.apple.com/documentation/coregraphics/cgeventsourcestateid . The installed SDK declares `CGEventSourceCounterForEventType` and the nonprompting preflight calls. Neither table by itself establishes authenticated human origin.
+
+## Oversized timestamp rejection
+
+The follow-up review identified that JSON integers can overflow conversion inside `math.isfinite` despite the line-size cap. The validator now rejects those values normally. Two new regressions cover every uptime field and the actual child-pipe path, preserving the ready checkpoint, a structured validation error, and owned-child cleanup. The calibration Python suite has 29 tests; no native sampling or production input code changed.
