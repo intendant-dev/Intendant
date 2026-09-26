@@ -821,6 +821,7 @@ mod tests {
             cdp_http_url: Some("http://127.0.0.1:9222".to_string()),
             cdp_ws_url: Some("ws://127.0.0.1:9222/devtools/page/1".to_string()),
             active_target_id: Some("page-1".to_string()),
+            macos_window_binding: None,
             lease: Some(crate::browser_workspace::BrowserWorkspaceLease {
                 holder_id: "attempt-1".to_string(),
                 holder_kind: BOUNDED_CU_LEASE_KIND.to_string(),

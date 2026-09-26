@@ -1,0 +1,70 @@
+{
+  "base_commit": "7befae99dffaf60f5adc269f713165ab071e2dd7",
+  "date": "2026-09-26",
+  "native_acceptance": "FAIL; no complete form-effect acceptance",
+  "installed_daemon_updated": false,
+  "runs": [
+    {
+      "report": "live-01.json",
+      "report_sha256": "7eca0b731cb4a2f982779cd8083ad3db9f699d834aa17b471500f55e88ccacf0",
+      "binary_sha256": "ed80fa87dd943a918eb4f406407df5a6862182896d37c6cdf37055d41ebb2152",
+      "overall_pass": false,
+      "stage": "placement unverified; original diagnostic discarded",
+      "workspace_ready": false,
+      "form_text_action_attempted": false,
+      "form_button_action_attempted": false,
+      "cleanup_ok": true,
+      "bound_workspaces_closed": 0,
+      "daemon_reaped": true,
+      "inventory_restored": true
+    },
+    {
+      "report": "live-02.json",
+      "report_sha256": "a22c5f0937d2c55741efda3e381d9df89a1594d5e57f13833c0c587cbf9f55ef",
+      "binary_sha256": "41f51a4017d2a3a6ac6d680e23c11d75c7fc3861da4ddd3ecbb793649c8acecb",
+      "overall_pass": false,
+      "stage": "top-edge clamp to y=30 observed; requested y=0",
+      "workspace_ready": false,
+      "form_text_action_attempted": false,
+      "form_button_action_attempted": false,
+      "cleanup_ok": true,
+      "bound_workspaces_closed": 0,
+      "daemon_reaped": true,
+      "inventory_restored": true
+    },
+    {
+      "report": "live-03.json",
+      "report_sha256": "aea6f55b0d309b1ba64f5eadbfe7e198e7a403471e59c8c151311882b5e63027",
+      "binary_sha256": "8bffa7be737d5859bb558e111bcced49363ee49a1ee2f4b52dae0b7b7ee58a0e",
+      "overall_pass": false,
+      "stage": "workspace ready; controls inspection refused on AX metadata timeout",
+      "workspace_ready": true,
+      "form_text_action_attempted": false,
+      "form_button_action_attempted": false,
+      "cleanup_ok": true,
+      "bound_workspaces_closed": 1,
+      "daemon_reaped": true,
+      "inventory_restored": true
+    },
+    {
+      "report": "live-04.json",
+      "report_sha256": "52cfc95432e9669b84df2caf9b828532ce30e81b23a1a63d932ea2bc8d7c9cd7",
+      "binary_sha256": "8bffa7be737d5859bb558e111bcced49363ee49a1ee2f4b52dae0b7b7ee58a0e",
+      "overall_pass": false,
+      "stage": "placement validation refused on AX window-list timeout",
+      "workspace_ready": false,
+      "form_text_action_attempted": false,
+      "form_button_action_attempted": false,
+      "cleanup_ok": true,
+      "bound_workspaces_closed": 0,
+      "daemon_reaped": true,
+      "inventory_restored": true
+    }
+  ],
+  "keyless_validation": {
+    "focused_rust_tests": 57,
+    "native_lifecycle_assertions": 19,
+    "python_readiness_tests": 4,
+    "full_cross_platform_battery": "pending PR CI"
+  }
+}

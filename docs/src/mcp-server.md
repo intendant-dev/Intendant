@@ -928,3 +928,16 @@ it. Existing ArrowRight calls remain supported. Exact receiver/window/monitor,
 protection and focus checks, source capacity and uncertainty semantics are
 unchanged. No hidden click, general key/text/chord or global-input fallback is
 added. See `docs/design/macos-bound-arrowleft.md` for limits and acceptance.
+
+### Managed browser on an owned macOS monitor
+
+The experimental owner-only `create_browser_workspace` path accepts an exact
+`macos_virtual` selector and returns `macos_window_binding`. It launches a fresh
+managed Chrome-for-Testing instance, without activation, then uses the existing
+bounded window-placement and control tools. It does not enable generic display
+input, streaming or a separate login-session seat. Fresh profiles are daemon-owned;
+caller profiles, extensions, system-browser providers and external URL handlers
+are refused in this slice. HTTP/ctl/facade calls preserve caller trust and require
+runtime control plus both display permissions. Legacy control-bus messages without
+caller provenance do not acquire owner authority. See the [contract and native
+acceptance procedure](../design/macos-browser-workspace.md).

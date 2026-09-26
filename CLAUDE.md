@@ -268,6 +268,16 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   refcount/ownership, buffer bounds, thread/apartment affinity). Do not
   introduce `unsafe` on the cross-platform or Unix paths beyond these
   documented exceptions.
+- **Narrow macOS managed-browser lifecycle exception (2026-09-26):**
+  `crates/intendant-platform/src/macos_browser.rs` and `macos_browser.m` may
+  invoke the typed, main-thread NSWorkspace lifecycle shim for one explicit
+  managed Chrome-for-Testing bundle. It starts a fresh nonactivating instance
+  with a private profile, carries no provider/admission credentials, and retains
+  exact-app cleanup through cancellation and late launch completion. This is
+  lifecycle only: no input posting, activation, focus restoration, user-profile
+  adoption or authority inference. The caller-aware controller and monitor broker
+  retain all IAM, owner-surface, exact-generation and bound-window checks. FFI
+  remains small and SAFETY-commented; no native app object crosses Rust threads.
 - **Narrow macOS bound-pointer exception (2026-09-20):**
   `crates/intendant-platform/src/bound_pointer.rs` and its ARC/exception shim
   `bound_pointer.m` are the dedicated native-input island for the retained-window

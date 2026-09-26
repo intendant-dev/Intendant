@@ -1,4 +1,6 @@
 mod extension_policy;
+#[cfg(target_os = "macos")]
+mod macos;
 mod viewport;
 
 pub(crate) mod launch_policy;
@@ -194,6 +196,10 @@ pub struct BrowserWorkspace {
     pub cdp_ws_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_target_id: Option<String>,
+    /// Exact owner-only macOS window binding when this workspace was launched
+    /// onto an owned macOS monitor. This token grants no authority by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_window_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<BrowserWorkspaceLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,6 +340,10 @@ pub enum BrowserWorkspaceError {
     Unsupported(String),
     Io(String),
     Launch(String),
+    CleanupPending {
+        workspace_id: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for BrowserWorkspaceError {
@@ -348,6 +358,13 @@ impl fmt::Display for BrowserWorkspaceError {
                 "browser workspace '{workspace_id}' is already leased by '{holder_id}'"
             ),
             Self::Unsupported(msg) | Self::Io(msg) | Self::Launch(msg) => f.write_str(msg),
+            Self::CleanupPending {
+                workspace_id,
+                message,
+            } => write!(
+                f,
+                "workspace {workspace_id}: cleanup pending; {message}; inspect before retry"
+            ),
         }
     }
 }
@@ -370,6 +387,54 @@ struct StartingReservationGuard {
     workspace_id: String,
     bus: EventBus,
     armed: bool,
+}
+
+struct MacosBindingGuard {
+    binding: Option<String>,
+    bus: EventBus,
+    authority: crate::macos_monitor::Authority,
+}
+
+impl MacosBindingGuard {
+    #[cfg(target_os = "macos")]
+    fn new(binding: String, bus: EventBus, authority: crate::macos_monitor::Authority) -> Self {
+        Self {
+            binding: Some(binding),
+            bus,
+            authority,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.binding = None;
+    }
+}
+
+impl Drop for MacosBindingGuard {
+    fn drop(&mut self) {
+        let Some(binding) = self.binding.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let bus = self.bus.clone();
+        let authority = self.authority.clone();
+        runtime.spawn(async move {
+            if let Ok(receipt) = bus
+                .macos_monitors
+                .request(
+                    crate::macos_monitor::Action::Window(
+                        crate::macos_monitor::WindowAction::Unbind { binding },
+                    ),
+                    authority,
+                )
+                .await
+            {
+                let _ = receipt.commit();
+            }
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -481,8 +546,9 @@ impl BrowserWorkspaceRegistry {
             .filter_map(|workspace| {
                 let target = workspace.display_target.as_deref()?;
                 let binding = parse_browser_display_binding(target).ok()?;
-                (!display_is_live(binding.display_id))
-                    .then(|| (workspace.id.clone(), binding.canonical))
+                let display_id = binding.linux_display_id()?;
+                (!display_is_live(display_id))
+                    .then(|| (workspace.id.clone(), binding.canonical().to_string()))
             })
             .collect();
 
@@ -508,8 +574,8 @@ impl BrowserWorkspaceRegistry {
             .filter_map(|workspace| {
                 let binding =
                     parse_browser_display_binding(workspace.display_target.as_deref()?).ok()?;
-                (binding.display_id == display_id)
-                    .then(|| (workspace.id.clone(), binding.canonical))
+                (binding.linux_display_id() == Some(display_id))
+                    .then(|| (workspace.id.clone(), binding.canonical().to_string()))
             })
             .collect();
 
@@ -797,12 +863,179 @@ fn create_private_browser_profile(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+fn create_fresh_macos_profile(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("profile has no parent"))?;
+    create_private_browser_profile(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+async fn require_macos_monitor_live(
+    bus: &EventBus,
+    selector: &str,
+    authority: &crate::macos_monitor::Authority,
+) -> Result<(), BrowserWorkspaceError> {
+    let snapshot = bus
+        .macos_monitors
+        .inspect(
+            crate::macos_monitor::Inspection::Status {
+                selector: selector.to_string(),
+            },
+            authority.clone(),
+        )
+        .await
+        .map_err(BrowserWorkspaceError::Unsupported)?;
+    let status = snapshot.status();
+    if status["broker_state"] == "live"
+        && status["lifecycle_ready"] == true
+        && status["monitor"]["display_target"] == selector
+    {
+        if status["monitor"]["width"].as_u64().unwrap_or(0) < 800
+            || status["monitor"]["height"].as_u64().unwrap_or(0) < 600
+        {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macOS browser workspace requires a monitor of at least 800x600 (including the system-bar inset)".into(),
+            ));
+        }
+        Ok(())
+    } else {
+        Err(BrowserWorkspaceError::Unsupported(
+            "macos_virtual browser workspace target is not the exact live owned monitor generation"
+                .into(),
+        ))
+    }
+}
+
 pub async fn create_workspace(
     request: CreateBrowserWorkspaceRequest,
     bus: &EventBus,
+    authority: Option<crate::macos_monitor::Authority>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
-    crate::macos_monitor::reject_unsupported(request.display_target.as_deref(), None)
-        .map_err(BrowserWorkspaceError::Unsupported)?;
+    if !request
+        .display_target
+        .as_deref()
+        .is_some_and(crate::macos_monitor::exact_selector)
+    {
+        return create_workspace_inner(request, bus, authority).await;
+    }
+    if !authority.as_ref().is_some_and(|a| a.owner_surface) {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "macos_virtual browser workspaces require an owner-surface caller".into(),
+        ));
+    }
+    let bus = bus.clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    // Request cancellation must not abandon an NSWorkspace launch or release
+    // the display-destruction lane before exact-child cleanup is requested.
+    tokio::spawn(async move {
+        let _lane = bus.macos_monitors.workspace_lane.clone().lock_owned().await;
+        if send.is_closed() {
+            return;
+        }
+        let result = create_workspace_inner(request, &bus, authority.clone()).await;
+        let watched = result.as_ref().ok().map(|workspace| {
+            (
+                workspace.id.clone(),
+                workspace.display_target.clone().expect("native target"),
+            )
+        });
+        match send.send(result) {
+            Err(Ok(workspace)) => {
+                if let Ok(closed) = close_workspace_inner(
+                    &workspace.id,
+                    Some("creation response was cancelled".into()),
+                    &bus,
+                    authority,
+                )
+                .await
+                {
+                    publish_workspace_event(&bus, "closed", &closed);
+                }
+            }
+            Ok(()) => {
+                if let (Some((id, selector)), Some(authority)) = (watched, authority) {
+                    watch_macos_workspace(id, selector, bus.clone(), authority);
+                }
+            }
+            Err(Err(_)) => {}
+        }
+    });
+    receive.await.map_err(|_| {
+        BrowserWorkspaceError::Launch(
+            "macOS browser creation worker ended without a result; inspect workspaces before retry"
+                .into(),
+        )
+    })?
+}
+
+/// Monitor-loss cleanup is not continuous desktop isolation. Every bounded
+/// observation uses the original exact generation, never creates/rebinds a
+/// monitor, and closes only the workspace's retained native application owner.
+fn watch_macos_workspace(
+    id: String,
+    selector: String,
+    bus: EventBus,
+    authority: crate::macos_monitor::Authority,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _lane = bus.macos_monitors.workspace_lane.clone().lock_owned().await;
+            let child_live = {
+                let registry = global_registry();
+                let mut registry = registry.write().await;
+                let Some(workspace) = registry.workspaces.get(&id) else {
+                    return;
+                };
+                if workspace.status != BrowserWorkspaceStatus::Ready {
+                    return;
+                }
+                registry
+                    .children
+                    .get_mut(&id)
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+            };
+            if child_live
+                && require_macos_monitor_live(&bus, &selector, &authority)
+                    .await
+                    .is_ok()
+            {
+                continue;
+            }
+            match close_workspace_inner(
+                &id,
+                Some("exact monitor or browser supervisor became unavailable".into()),
+                &bus,
+                Some(authority.clone()),
+            )
+            .await
+            {
+                Ok(closed) => publish_workspace_event(&bus, "closed", &closed),
+                Err(error) => bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".into(),
+                    workspace: None,
+                    workspace_id: Some(id.clone()),
+                    message: Some(format!("monitor-loss cleanup: {error}")),
+                }),
+            }
+            return;
+        }
+    });
+}
+
+async fn create_workspace_inner(
+    request: CreateBrowserWorkspaceRequest,
+    bus: &EventBus,
+    macos_authority: Option<crate::macos_monitor::Authority>,
+) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     // Validate navigation before display leases, registry reservations or filesystem effects.
     let launch_url = launch_policy::navigation(request.url.as_deref())
         .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?
@@ -866,10 +1099,57 @@ pub async fn create_workspace(
         .as_deref()
         .map(parse_browser_display_binding)
         .transpose()?;
-    let bound_display_id = display_binding.as_ref().map(|binding| binding.display_id);
+    if let Some(selector) = display_binding
+        .as_ref()
+        .and_then(BrowserDisplayBinding::macos_selector)
+    {
+        if !cfg!(target_os = "macos") {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces require macOS".into(),
+            ));
+        }
+        if provider != BrowserWorkspaceProvider::Cdp {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces require the managed cdp provider".into(),
+            ));
+        }
+        if extension_spec.is_some() {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces do not admit extension archives in this slice"
+                    .into(),
+            ));
+        }
+        let authority = macos_authority.as_ref().ok_or_else(|| {
+            BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces require an owner-surface caller".into(),
+            )
+        })?;
+        if !authority.owner_surface {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces require an owner-surface caller".into(),
+            ));
+        }
+        if request.profile_dir.is_some() {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual workspaces require a fresh daemon-managed profile; profile_dir is not accepted".into()));
+        }
+        let navigation = launch_url.as_deref().unwrap_or("about:blank");
+        if navigation != "about:blank"
+            && !url::Url::parse(navigation).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+            })
+        {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual workspace URL must be http, https or about:blank; external handlers are refused".into()));
+        }
+        require_macos_monitor_live(bus, selector, authority).await?;
+    }
+    let bound_display_id = display_binding
+        .as_ref()
+        .and_then(BrowserDisplayBinding::linux_display_id);
     let bound_display_target = display_binding
         .as_ref()
-        .map(|binding| binding.canonical.clone());
+        .map(|binding| binding.canonical().to_string());
     let _display_access = match bound_display_id {
         Some(display_id) => {
             Some(crate::computer_use::acquire_virtual_display_shared(display_id).await)
@@ -916,7 +1196,9 @@ pub async fn create_workspace(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        display_target: display_binding.map(|binding| binding.canonical),
+        display_target: display_binding
+            .as_ref()
+            .map(|binding| binding.canonical().to_string()),
         profile_dir: Some(profile_dir.display().to_string()),
         extension: None,
         browser_executable: None,
@@ -927,6 +1209,7 @@ pub async fn create_workspace(
         cdp_http_url: None,
         cdp_ws_url: None,
         active_target_id: None,
+        macos_window_binding: None,
         lease: None,
         message: Some("starting local CDP browser".to_string()),
         created_at: created_at.clone(),
@@ -965,7 +1248,16 @@ pub async fn create_workspace(
             }
         }
         None => {
-            if let Err(error) = create_private_browser_profile(&profile_dir) {
+            let profile_result = if display_binding
+                .as_ref()
+                .and_then(BrowserDisplayBinding::macos_selector)
+                .is_some()
+            {
+                create_fresh_macos_profile(&profile_dir)
+            } else {
+                create_private_browser_profile(&profile_dir)
+            };
+            if let Err(error) = profile_result {
                 let message = format!(
                     "failed to create browser workspace profile {}: {error}",
                     profile_dir.display()
@@ -989,10 +1281,22 @@ pub async fn create_workspace(
         }
     }
 
-    let (child, cdp) = match launch_cdp_browser(&workspace, &profile_dir, viewport).await {
+    let (child, mut cdp) = match launch_cdp_browser(
+        &workspace,
+        &profile_dir,
+        viewport,
+        bus,
+        macos_authority.as_ref(),
+    )
+    .await
+    {
         Ok(launched) => launched,
         Err(error) => {
-            reservation.cleanup(&error.to_string()).await;
+            if matches!(error, BrowserWorkspaceError::CleanupPending { .. }) {
+                reservation.disarm();
+            } else {
+                reservation.cleanup(&error.to_string()).await;
+            }
             return Err(error);
         }
     };
@@ -1003,13 +1307,17 @@ pub async fn create_workspace(
         extension.runtime_id = Some(runtime_id);
     }
     workspace.browser_executable = Some(cdp.executable.path.display().to_string());
-    workspace.browser_executable_source = Some(cdp.executable.source);
-    workspace.launch_arguments = Some(cdp.launch_arguments);
+    workspace.browser_executable_source = Some(cdp.executable.source.clone());
+    workspace.launch_arguments = Some(cdp.launch_arguments.clone());
     workspace.process_id = cdp.process_id;
     workspace.debugging_port = Some(cdp.port);
     workspace.cdp_http_url = Some(format!("http://127.0.0.1:{}", cdp.port));
-    workspace.cdp_ws_url = cdp.web_socket_debugger_url;
-    workspace.active_target_id = cdp.target_id;
+    workspace.cdp_ws_url = cdp.web_socket_debugger_url.clone();
+    workspace.active_target_id = cdp.target_id.clone();
+    workspace.macos_window_binding = cdp
+        .macos_binding_guard
+        .as_ref()
+        .and_then(|guard| guard.binding.clone());
     workspace.status = BrowserWorkspaceStatus::Ready;
     workspace.message = Some("ready".to_string());
     workspace.updated_at = now_string();
@@ -1063,6 +1371,9 @@ pub async fn create_workspace(
     };
     match commit {
         Ok(committed) => {
+            if let Some(guard) = cdp.macos_binding_guard.as_mut() {
+                guard.disarm();
+            }
             if let Some(filesystem) = extension_filesystem.as_mut() {
                 filesystem.disarm();
             }
@@ -1070,8 +1381,20 @@ pub async fn create_workspace(
             Ok(committed)
         }
         Err(message) => {
-            terminate_workspace_process(cdp.process_id, child);
-            reservation.cleanup(&message).await;
+            if is_macos_workspace(&workspace) {
+                workspace.status = BrowserWorkspaceStatus::Error;
+                workspace.message = Some(message.clone());
+                if let Some(guard) = cdp.macos_binding_guard.as_mut() {
+                    guard.disarm();
+                }
+                let id = workspace.id.clone();
+                global_registry().write().await.insert(workspace, child);
+                reservation.disarm();
+                close_workspace_inner(&id, Some(message.clone()), bus, macos_authority).await?;
+            } else {
+                terminate_workspace_process(cdp.process_id, child);
+                reservation.cleanup(&message).await;
+            }
             Err(BrowserWorkspaceError::Launch(message))
         }
     }
@@ -1287,23 +1610,227 @@ async fn remove_failed_reservation(id: &str, message: &str, bus: &EventBus) {
     }
 }
 
+async fn unbind_macos_workspace(
+    workspace: &BrowserWorkspace,
+    bus: &EventBus,
+    authority: &crate::macos_monitor::Authority,
+) -> Result<(), BrowserWorkspaceError> {
+    let Some(binding) = workspace.macos_window_binding.as_ref() else {
+        return Ok(());
+    };
+    if !authority.owner_surface {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "macOS-bound browser workspace cleanup requires an owner surface".into(),
+        ));
+    }
+    let receipt = bus
+        .macos_monitors
+        .request(
+            crate::macos_monitor::Action::Window(crate::macos_monitor::WindowAction::Unbind {
+                binding: binding.clone(),
+            }),
+            authority.clone(),
+        )
+        .await
+        .map_err(BrowserWorkspaceError::Launch)?;
+    let unbound = matches!(
+        &receipt.value,
+        crate::macos_monitor::Value::Window(crate::macos_monitor::WindowValue::Unbound)
+    );
+    if !receipt.commit() {
+        return Err(BrowserWorkspaceError::Launch(
+            "macOS browser unbind receipt expired; cleanup may already have applied".into(),
+        ));
+    }
+    if !unbound {
+        return Err(BrowserWorkspaceError::Launch(
+            "unexpected macOS browser unbind result".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_macos_workspace(workspace: &BrowserWorkspace) -> bool {
+    workspace
+        .display_target
+        .as_deref()
+        .is_some_and(crate::macos_monitor::reserved)
+}
+
+/// Supplemental gate resolution only: caller trust is checked independently.
+pub(crate) async fn macos_workspace_request(tool: &str, args: &serde_json::Value) -> bool {
+    match tool {
+        "create_browser_workspace" => args
+            .get("display_target")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::macos_monitor::reserved),
+        "close_browser_workspace" | "acquire_browser_workspace" | "release_browser_workspace" => {
+            let Some(id) = args.get("workspace_id").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            global_registry()
+                .read()
+                .await
+                .workspaces
+                .get(id)
+                .is_some_and(is_macos_workspace)
+        }
+        _ => false,
+    }
+}
+
 pub async fn close_workspace(
     id: &str,
     reason: Option<String>,
+    bus: &EventBus,
+    authority: Option<crate::macos_monitor::Authority>,
+) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let native = global_registry()
+        .read()
+        .await
+        .workspaces
+        .get(id)
+        .is_some_and(is_macos_workspace);
+    if !native {
+        return close_workspace_inner(id, reason, bus, authority).await;
+    }
+    if !authority.as_ref().is_some_and(|a| a.owner_surface) {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "closing a macOS-bound browser workspace requires an owner surface".into(),
+        ));
+    }
+    let bus = bus.clone();
+    let id = id.to_owned();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _lane = bus.macos_monitors.workspace_lane.clone().lock_owned().await;
+        if send.is_closed() {
+            return;
+        }
+        let result = close_workspace_inner(&id, reason, &bus, authority).await;
+        let _ = send.send(result);
+    });
+    receive.await.map_err(|_| {
+        BrowserWorkspaceError::Launch(
+            "macOS browser cleanup worker ended without a result; inspect before retry".into(),
+        )
+    })?
+}
+
+async fn close_workspace_inner(
+    id: &str,
+    reason: Option<String>,
+    bus: &EventBus,
+    macos_authority: Option<crate::macos_monitor::Authority>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
     let _display_access = acquire_workspace_display_access(id).await?;
-    let (mut workspace, child) = global_registry()
-        .write()
-        .await
-        .remove(id)
-        .ok_or_else(|| BrowserWorkspaceError::NotFound(id.to_string()))?;
+    let (mut workspace, mut child) = {
+        let registry = global_registry();
+        let mut registry = registry.write().await;
+        let needs_macos = registry.workspaces.get(id).is_some_and(is_macos_workspace);
+        if needs_macos
+            && !macos_authority
+                .as_ref()
+                .is_some_and(|authority| authority.owner_surface)
+        {
+            return Err(BrowserWorkspaceError::Unsupported(
+                "closing a macOS-bound browser workspace requires an owner surface".into(),
+            ));
+        }
+        registry
+            .remove(id)
+            .ok_or_else(|| BrowserWorkspaceError::NotFound(id.to_string()))?
+    };
+
+    let unbind = match macos_authority.as_ref() {
+        Some(authority) => unbind_macos_workspace(&workspace, bus, authority).await,
+        None if workspace.macos_window_binding.is_none() => Ok(()),
+        None => Err(BrowserWorkspaceError::Unsupported(
+            "macOS-bound browser workspace cleanup requires owner authority".into(),
+        )),
+    };
+    if unbind.is_ok() {
+        workspace.macos_window_binding = None;
+    }
     workspace.status = BrowserWorkspaceStatus::Closed;
     workspace.lease = None;
     workspace.message = reason.or_else(|| Some("closed".to_string()));
     workspace.updated_at = now_string();
-    terminate_workspace_process(workspace.process_id, child);
-    cleanup_extension_workspace(&workspace);
+    if is_macos_workspace(&workspace) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(owned) = child.as_mut() {
+                if let Err(error) = macos::stop(owned).await {
+                    workspace.status = BrowserWorkspaceStatus::Error;
+                    workspace.message = Some(format!("cleanup unconfirmed: {error}"));
+                    global_registry().write().await.insert(workspace, child);
+                    return Err(error);
+                }
+            }
+            if let Some(profile) = workspace.profile_dir.as_deref() {
+                if let Err(error) = fs::remove_dir_all(profile) {
+                    if Path::new(profile).exists() {
+                        return Err(BrowserWorkspaceError::Io(format!(
+                            "browser stopped; profile cleanup failed: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &mut child;
+        }
+    } else {
+        terminate_workspace_process(workspace.process_id, child);
+        cleanup_extension_workspace(&workspace);
+    }
+    if let Err(error) = unbind {
+        return Err(BrowserWorkspaceError::Launch(format!(
+            "browser workspace process was closed but its macOS window binding cleanup failed: {error}"
+        )));
+    }
     Ok(workspace)
+}
+
+/// Caller holds the broker workspace lane through validation, cleanup and
+/// monitor destruction. A scan before/after destruction is not a transaction.
+pub async fn close_macos_workspaces_for_display(
+    selector: &str,
+    reason: &str,
+    bus: &EventBus,
+    authority: &crate::macos_monitor::Authority,
+) -> Result<Vec<String>, BrowserWorkspaceError> {
+    if !crate::macos_monitor::exact_selector(selector) {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "exact macOS monitor required".into(),
+        ));
+    }
+    authority
+        .check()
+        .await
+        .map_err(BrowserWorkspaceError::Unsupported)?;
+    let ids = global_registry()
+        .read()
+        .await
+        .workspaces
+        .values()
+        .filter(|w| w.display_target.as_deref() == Some(selector))
+        .map(|w| w.id.clone())
+        .collect::<Vec<_>>();
+    if !ids.is_empty() && !authority.owner_surface {
+        return Err(BrowserWorkspaceError::Unsupported(
+            "monitor has an owner-bound browser workspace; owner cleanup required".into(),
+        ));
+    }
+    let mut closed = Vec::new();
+    for id in ids {
+        let workspace =
+            close_workspace_inner(&id, Some(reason.into()), bus, Some(authority.clone())).await?;
+        publish_workspace_event(bus, "display_retired", &workspace);
+        closed.push(id);
+    }
+    Ok(closed)
 }
 
 pub async fn acquire_workspace(
@@ -1359,8 +1886,11 @@ async fn acquire_workspace_display_access(
         return Ok(None);
     };
     let binding = parse_browser_display_binding(&display_target)?;
+    let Some(display_id) = binding.linux_display_id() else {
+        return Ok(None);
+    };
     Ok(Some(
-        crate::computer_use::acquire_virtual_display_shared(binding.display_id).await,
+        crate::computer_use::acquire_virtual_display_shared(display_id).await,
     ))
 }
 
@@ -1413,6 +1943,7 @@ struct CdpLaunch {
     web_socket_debugger_url: Option<String>,
     target_id: Option<String>,
     extension_runtime_id: Option<String>,
+    macos_binding_guard: Option<MacosBindingGuard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1985,7 +2516,40 @@ async fn launch_cdp_browser(
     workspace: &BrowserWorkspace,
     profile_dir: &Path,
     viewport: Option<viewport::Viewport>,
+    bus: &EventBus,
+    macos_authority: Option<&crate::macos_monitor::Authority>,
 ) -> Result<(Child, CdpLaunch), BrowserWorkspaceError> {
+    let display_binding = workspace
+        .display_target
+        .as_deref()
+        .map(parse_browser_display_binding)
+        .transpose()?;
+    if let Some(selector) = display_binding
+        .as_ref()
+        .and_then(BrowserDisplayBinding::macos_selector)
+    {
+        #[cfg(target_os = "macos")]
+        {
+            if viewport.is_some() {
+                return Err(BrowserWorkspaceError::Unsupported(
+                    "explicit viewport is unsupported for macos_virtual browser workspaces".into(),
+                ));
+            }
+            let authority = macos_authority.ok_or_else(|| {
+                BrowserWorkspaceError::Unsupported(
+                    "macos_virtual browser workspace lost owner-surface authority".into(),
+                )
+            })?;
+            return macos::launch(workspace, profile_dir, bus, authority, selector).await;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (selector, bus, macos_authority);
+            return Err(BrowserWorkspaceError::Unsupported(
+                "macos_virtual browser workspaces require macOS".into(),
+            ));
+        }
+    }
     let navigation = launch_policy::navigation(workspace.url.as_deref())
         .map_err(|error| BrowserWorkspaceError::Launch(error.into()))?;
     let extension_required = workspace.extension.is_some();
@@ -1993,17 +2557,14 @@ async fn launch_cdp_browser(
         matches!(workspace.provider, BrowserWorkspaceProvider::SystemCdp),
         extension_required,
     )?;
-    let display_binding = workspace
-        .display_target
-        .as_deref()
-        .map(parse_browser_display_binding)
-        .transpose()?;
     if let Some(binding) = display_binding.as_ref() {
-        if !crate::virtual_display::process_owns_browser_bindable_display(binding.display_id) {
-            return Err(BrowserWorkspaceError::Launch(format!(
-                "browser workspace display {} left the daemon-created lifecycle before browser launch",
-                binding.canonical
-            )));
+        if let Some(display_id) = binding.linux_display_id() {
+            if !crate::virtual_display::process_owns_browser_bindable_display(display_id) {
+                return Err(BrowserWorkspaceError::Launch(format!(
+                    "browser workspace display {} left the daemon-created lifecycle before browser launch",
+                    binding.canonical()
+                )));
+            }
         }
     }
     clear_stale_devtools_active_port(profile_dir)?;
@@ -2021,18 +2582,23 @@ async fn launch_cdp_browser(
     }
     #[cfg(target_os = "linux")]
     if let Some(binding) = display_binding.as_ref() {
-        let authorization = crate::vision::virtual_display_x11_authorization(binding.display_id)
+        let display_id = binding.linux_display_id().ok_or_else(|| {
+            BrowserWorkspaceError::Launch(
+                "macOS monitor binding reached Linux browser launch".into(),
+            )
+        })?;
+        let authorization = crate::vision::virtual_display_x11_authorization(display_id)
             .ok_or_else(|| {
                 BrowserWorkspaceError::Launch(format!(
                     "browser workspace display {} has no live private X11 authorization",
-                    binding.canonical
+                    binding.canonical()
                 ))
             })?;
         // A bound workspace must use only its leased X11 display. Ambient
         // Wayland/Xauthority state belongs to the daemon's login session and
         // must not redirect or authorize this isolated browser child.
         command
-            .env("DISPLAY", format!(":{}", binding.display_id))
+            .env("DISPLAY", format!(":{display_id}"))
             .env("XDG_SESSION_TYPE", "x11")
             .env_remove("WAYLAND_DISPLAY")
             .env("XAUTHORITY", authorization.xauthority_path())
@@ -2111,6 +2677,7 @@ async fn launch_cdp_browser(
                     web_socket_debugger_url: ws,
                     target_id,
                     extension_runtime_id,
+                    macos_binding_guard: None,
                 },
             ))
         }
@@ -3152,24 +3719,49 @@ fn default_profile_dir(id: &str) -> PathBuf {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserDisplayBinding {
-    canonical: String,
-    display_id: u32,
+enum BrowserDisplayBinding {
+    Linux { canonical: String, display_id: u32 },
+    Macos { canonical: String },
+}
+
+impl BrowserDisplayBinding {
+    fn canonical(&self) -> &str {
+        match self {
+            Self::Linux { canonical, .. } | Self::Macos { canonical } => canonical,
+        }
+    }
+    fn linux_display_id(&self) -> Option<u32> {
+        match self {
+            Self::Linux { display_id, .. } => Some(*display_id),
+            Self::Macos { .. } => None,
+        }
+    }
+    fn macos_selector(&self) -> Option<&str> {
+        match self {
+            Self::Macos { canonical } => Some(canonical),
+            Self::Linux { .. } => None,
+        }
+    }
 }
 
 fn parse_browser_display_binding(
     raw: &str,
 ) -> Result<BrowserDisplayBinding, BrowserWorkspaceError> {
+    if crate::macos_monitor::exact_selector(raw) {
+        return Ok(BrowserDisplayBinding::Macos {
+            canonical: raw.to_string(),
+        });
+    }
+    let value = raw.trim();
     crate::macos_monitor::reject_unsupported(Some(raw), None)
         .map_err(BrowserWorkspaceError::Unsupported)?;
-    let value = raw.trim();
     let digits = value
         .strip_prefix("display_")
         .or_else(|| value.strip_prefix(':'))
         .unwrap_or(value);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(BrowserWorkspaceError::Unsupported(format!(
-            "invalid browser workspace display target '{value}'; expected display_N, :N, or N"
+            "invalid browser workspace display target '{value}'; expected display_N, :N, N, or an exact macos_virtual generation"
         )));
     }
     let display_id = digits.parse::<u32>().map_err(|_| {
@@ -3187,7 +3779,7 @@ fn parse_browser_display_binding(
             "browser workspace display :{display_id} is outside Intendant's managed virtual-display range"
         )));
     }
-    Ok(BrowserDisplayBinding {
+    Ok(BrowserDisplayBinding::Linux {
         canonical: format!("display_{display_id}"),
         display_id,
     })
@@ -3199,6 +3791,200 @@ fn now_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn macos_browser_workspace_facade_has_same_extra_display_gate_as_raw_call() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(root.path().to_path_buf());
+        let bus = EventBus::new();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let target = format!("macos_virtual:{}:536870912", "d".repeat(32));
+        for (tool, args) in [
+            (
+                "create_browser_workspace",
+                serde_json::json!({"url":"about:blank","display_target":target}),
+            ),
+            (
+                "act",
+                serde_json::json!({"argv":["browser","create","about:blank","--display-target",target]}),
+            ),
+            (
+                "act",
+                serde_json::json!({"argv":["browser","open","about:blank","--display-target",target]}),
+            ),
+        ] {
+            assert!(
+                server.macos_browser_workspace_request(tool, &args).await,
+                "{tool} {args}"
+            );
+        }
+        assert!(
+            !server
+                .macos_browser_workspace_request(
+                    "create_browser_workspace",
+                    &serde_json::json!({"display_target":"display_99"})
+                )
+                .await
+        );
+        assert!(bus.macos_monitors.not_started());
+    }
+
+    #[tokio::test]
+    async fn macos_browser_workspace_stale_monitor_destroy_cannot_close_browser_first() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(root.path().to_path_buf());
+        state
+            .read()
+            .await
+            .autonomy
+            .write()
+            .await
+            .user_display_granted = true;
+        let bus = EventBus::new();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let id = format!("test-stale-macos-{}", uuid::Uuid::new_v4());
+        let target = format!("macos_virtual:{}:536870912", uuid::Uuid::new_v4().simple());
+        let mut workspace = sample_workspace(&id);
+        workspace.display_target = Some(target.clone());
+        global_registry().write().await.insert(workspace, None);
+        for principal in [
+            crate::access::iam::AccessPrincipal::root_dashboard_session("stale-test", "http"),
+            crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "stale-scoped",
+                "http",
+                true,
+            ),
+        ] {
+            let caller = crate::mcp::ToolCaller::from_gate(&principal, None);
+            let result = server
+                .call_tool_by_name_as_caller(
+                    "destroy_virtual_display",
+                    serde_json::json!({"display_id":536870912,"capture_generation":target}),
+                    None,
+                    None,
+                    caller,
+                )
+                .await
+                .unwrap();
+            assert!(serde_json::to_string(&result).unwrap().contains(
+                if cfg!(target_os = "macos") {
+                    "stale"
+                } else {
+                    "macos_virtual"
+                }
+            ));
+            assert!(global_registry().read().await.workspaces.contains_key(&id));
+        }
+        global_registry().write().await.remove(&id).unwrap();
+        assert!(bus.macos_monitors.not_started());
+    }
+
+    #[test]
+    fn macos_browser_workspace_selector_is_exact_and_separate_from_x11() {
+        let exact = format!("macos_virtual:{}:536870912", "a".repeat(32));
+        let parsed = parse_browser_display_binding(&exact).unwrap();
+        assert_eq!(parsed.macos_selector(), Some(exact.as_str()));
+        assert_eq!(parsed.linux_display_id(), None);
+        for raw in [
+            format!(" {exact}"),
+            format!("{exact} "),
+            exact.to_uppercase(),
+            exact.replace(":536870912", ":0536870912"),
+            "536870912".into(),
+            format!("{exact}:extra"),
+            "macos_virtual:bad:536870912".into(),
+        ] {
+            assert!(parse_browser_display_binding(&raw).is_err(), "{raw}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let linux = parse_browser_display_binding("display_99").unwrap();
+            assert_eq!(linux.macos_selector(), None);
+            assert_eq!(linux.linux_display_id(), Some(99));
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(parse_browser_display_binding("display_99").is_err());
+    }
+
+    #[test]
+    fn macos_browser_workspace_profile_is_fresh_and_never_reuses_existing_data() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("owned").join("profile");
+        create_fresh_macos_profile(&profile).unwrap();
+        let marker = profile.join("must-not-touch");
+        fs::write(&marker, b"existing").unwrap();
+        assert!(create_fresh_macos_profile(&profile).is_err());
+        assert_eq!(fs::read(marker).unwrap(), b"existing");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(profile).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn macos_browser_workspace_scoped_creation_has_no_helper_or_filesystem_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(root.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        autonomy.write().await.user_display_granted = true;
+        let bus = EventBus::new();
+        let mut request = sample_create_request();
+        request.display_target = Some(format!("macos_virtual:{}:536870912", "b".repeat(32)));
+        request.profile_dir = Some(root.path().join("forbidden").display().to_string());
+        for authority in [
+            None,
+            Some(crate::macos_monitor::Authority {
+                owner_surface: false,
+                autonomy: autonomy.clone(),
+            }),
+        ] {
+            let error = create_workspace(request.clone(), &bus, authority)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("owner-surface"), "{error}");
+            assert!(!root.path().join("forbidden").exists());
+            assert!(bus.macos_monitors.not_started());
+        }
+    }
+
+    #[tokio::test]
+    async fn macos_browser_workspace_starting_cleanup_still_requires_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(root.path().to_path_buf());
+        let autonomy = state.read().await.autonomy.clone();
+        autonomy.write().await.user_display_granted = true;
+        let authority = crate::macos_monitor::Authority {
+            owner_surface: false,
+            autonomy,
+        };
+        let bus = EventBus::new();
+        let id = format!("test-macos-{}", uuid::Uuid::new_v4());
+        let mut workspace = sample_workspace(&id);
+        workspace.status = BrowserWorkspaceStatus::Starting;
+        workspace.display_target = Some(format!("macos_virtual:{}:536870912", "c".repeat(32)));
+        assert!(workspace.macos_window_binding.is_none());
+        global_registry()
+            .write()
+            .await
+            .insert(workspace.clone(), None);
+        let result = close_workspace(&id, None, &bus, Some(authority.clone())).await;
+        assert!(result.unwrap_err().to_string().contains("owner surface"));
+        let result = close_macos_workspaces_for_display(
+            workspace.display_target.as_ref().unwrap(),
+            "unauthorized",
+            &bus,
+            &authority,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("owner cleanup"));
+        assert!(global_registry().read().await.workspaces.contains_key(&id));
+        global_registry().write().await.remove(&id).unwrap();
+        assert!(bus.macos_monitors.not_started());
+    }
+
     #[test]
     fn macos_monitor_browser_placement_is_always_refused() {
         for value in [
@@ -3277,6 +4063,7 @@ mod tests {
             cdp_http_url: None,
             cdp_ws_url: None,
             active_target_id: None,
+            macos_window_binding: None,
             lease: None,
             message: None,
             created_at: "2026-05-31T00:00:00.000Z".to_string(),
@@ -4172,7 +4959,7 @@ mod tests {
         for raw in ["display_99", ":99", "99", " display_099 "] {
             assert_eq!(
                 parse_browser_display_binding(raw).unwrap(),
-                BrowserDisplayBinding {
+                BrowserDisplayBinding::Linux {
                     canonical: "display_99".to_string(),
                     display_id: 99,
                 }

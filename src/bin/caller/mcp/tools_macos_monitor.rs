@@ -98,7 +98,7 @@ impl IntendantServer {
         )
     }
 
-    async fn macos_monitor_authority(&self, caller: ToolCallerTrust) -> Authority {
+    pub(super) async fn macos_monitor_authority(&self, caller: ToolCallerTrust) -> Authority {
         Authority {
             owner_surface: caller == ToolCallerTrust::OwnerSurface,
             autonomy: self.state.read().await.autonomy.clone(),
@@ -148,8 +148,73 @@ impl IntendantServer {
         params: DestroyVirtualDisplayParams,
         caller: ToolCallerTrust,
     ) -> String {
+        let server = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _lane = server
+                .bus
+                .macos_monitors
+                .workspace_lane
+                .clone()
+                .lock_owned()
+                .await;
+            if send.is_closed() {
+                return;
+            }
+            let result = server.destroy_macos_monitor_locked(params, caller).await;
+            let _ = send.send(result);
+        });
+        receive.await.unwrap_or_else(|_| {
+            serde_json::json!({"ok":false,
+            "error":"monitor cleanup worker ended without a result; inspect before retry"})
+            .to_string()
+        })
+    }
+
+    async fn destroy_macos_monitor_locked(
+        &self,
+        params: DestroyVirtualDisplayParams,
+        caller: ToolCallerTrust,
+    ) -> String {
         let authority = self.macos_monitor_authority(caller).await;
-        match self
+        // Verify authority AND the exact ID/generation pair before closing any
+        // browser. A stale or mismatched cleanup cannot affect a live workspace.
+        let checked = self
+            .bus
+            .macos_monitors
+            .inspect(
+                Inspection::Status {
+                    selector: params.capture_generation.clone(),
+                },
+                authority.clone(),
+            )
+            .await;
+        let status = match checked {
+            Ok(snapshot) => snapshot.status(),
+            Err(error) => return serde_json::json!({"ok":false,"error":error}).to_string(),
+        };
+        if status["lifecycle_ready"] != true
+            || status["monitor"]["display_id"] != params.display_id
+            || status["monitor"]["display_target"] != params.capture_generation
+        {
+            return serde_json::json!({"ok":false,"error":"stale, foreign or mismatched macOS monitor generation"}).to_string();
+        }
+        let closed = match crate::browser_workspace::close_macos_workspaces_for_display(
+            &params.capture_generation,
+            "owned macOS monitor is being destroyed",
+            &self.bus,
+            &authority,
+        )
+        .await
+        {
+            Ok(closed) => closed,
+            Err(error) => {
+                return serde_json::json!({"ok":false,"error":error.to_string(),
+                "monitor_destroyed":false})
+                .to_string()
+            }
+        };
+        let receipt = match self
             .bus
             .macos_monitors
             .request(
@@ -161,17 +226,20 @@ impl IntendantServer {
             )
             .await
         {
-            Ok(receipt) => {
-                let response = serde_json::json!({"ok": true, "display_id": params.display_id,
-                    "display_target": params.capture_generation, "capture_generation": params.capture_generation,
-                    "closed_browser_workspace_ids": []}).to_string();
-                if !receipt.commit() {
-                    return serde_json::json!({"ok":false,"error":"monitor destruction response expired; destruction may already have applied"}).to_string();
-                }
-                response
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return serde_json::json!({"ok":false,"error":error,
+                "closed_browser_workspace_ids":closed})
+                .to_string()
             }
-            Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+        };
+        if !receipt.commit() {
+            return serde_json::json!({"ok":false,"error":"monitor destruction response expired; destruction may already have applied",
+                "closed_browser_workspace_ids":closed}).to_string();
         }
+        serde_json::json!({"ok":true,"display_id":params.display_id,
+            "display_target":params.capture_generation,"capture_generation":params.capture_generation,
+            "closed_browser_workspace_ids":closed}).to_string()
     }
 
     pub(super) async fn screenshot_macos_monitor(

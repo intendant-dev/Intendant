@@ -3,12 +3,15 @@ fn main() {
     println!("cargo:rerun-if-changed=src/bound_pointer.m");
     println!("cargo:rerun-if-changed=src/bound_arrow.m");
     println!("cargo:rerun-if-changed=src/foreground.m");
+    println!("cargo:rerun-if-changed=src/macos_browser.m");
+    println!("cargo:rerun-if-changed=src/macos_browser_lifecycle.h");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("src/cgvirtual.m")
             .file("src/bound_pointer.m")
             .file("src/bound_arrow.m")
             .file("src/foreground.m")
+            .file("src/macos_browser.m")
             .flag("-fobjc-arc")
             .flag("-fobjc-arc-exceptions")
             .flag("-fobjc-exceptions")
