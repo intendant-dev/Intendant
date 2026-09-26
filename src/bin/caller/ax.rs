@@ -1136,7 +1136,7 @@ impl Native for PlacementNative {
         placement_permissions(deadline)?;
         placement_generation(window.identity)?;
         if !intendant_platform::bound_arrow::ready(window.identity.pid) {
-            return Err("horizontal arrow requires existing post-event permission, a background target, and no held human keys/buttons/modifiers".into());
+            return Err("horizontal arrow requires existing post-event permission, a background target, no held human mouse buttons, and no held shortcut modifiers".into());
         }
         placement::time_left(deadline)
     }

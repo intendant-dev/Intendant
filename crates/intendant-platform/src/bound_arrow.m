@@ -65,6 +65,15 @@ static BOOL key_shortcut_held(CGEventFlags flags) {
     return (flags & (kCGEventFlagMaskShift|kCGEventFlagMaskControl|
         kCGEventFlagMaskAlternate|kCGEventFlagMaskCommand|kCGEventFlagMaskSecondaryFn)) != 0;
 }
+static uint8_t held_mouse_buttons(void) {
+    uint8_t mask=0;
+    for (CGMouseButton b=0;b<5;b++)
+        if(CGEventSourceButtonState(kCGEventSourceStateHIDSystemState,b)) mask |= (uint8_t)(1u<<b);
+    return mask;
+}
+static BOOL arrow_input_conflict(CGEventFlags flags,uint8_t buttons) {
+    return key_shortcut_held(flags) || buttons != 0;
+}
 
 typedef struct { CGEventSourceRef source; CGEventRef down,up; pid_t pid; uint8_t used; } ArrowPair;
 uint8_t intendant_arrow_ready(int32_t pid) {
@@ -72,12 +81,13 @@ uint8_t intendant_arrow_ready(int32_t pid) {
         if (![NSThread isMainThread] || pid<=0 || !AXIsProcessTrusted() || !CGPreflightPostEventAccess()) return 0;
         NSRunningApplication *front=NSWorkspace.sharedWorkspace.frontmostApplication;
         if (!front || front.terminated || front.processIdentifier==pid) return 0;
-        if (key_shortcut_held(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState))) return 0;
-        for (CGMouseButton b=0;b<5;b++) if(CGEventSourceButtonState(kCGEventSourceStateHIDSystemState,b)) return 0;
-        for (CGKeyCode k=0;k<128;k++) {
-            // Caps Lock is a latched nontext state, not a held shortcut.
-            if(k!=57 && CGEventSourceKeyState(kCGEventSourceStateHIDSystemState,k)) return 0;
-        }
+        // The fixed private-source event carries flags=0 and is addressed to the
+        // exact retained background PID/window. Ordinary human key-down state is
+        // therefore not a readiness conflict: it stays on the foreground app.
+        // Shortcut modifiers remain conflicting, and held mouse buttons retain the
+        // conservative refusal in this keyboard-only concurrency slice.
+        if (arrow_input_conflict(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState),
+                                 held_mouse_buttons())) return 0;
         return 1;
     } @catch(NSException *e) { (void)e; return 0; } }
 }
