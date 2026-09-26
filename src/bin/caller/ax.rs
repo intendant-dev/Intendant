@@ -2113,6 +2113,18 @@ impl controls::Native for PlacementNative {
         placement::time_left(deadline)?;
         Ok(RetainedElement::plain(focused))
     }
+    fn keyboard_human_focus_same_context(
+        &self,
+        before: &PlacementFocus,
+        after: &PlacementFocus,
+    ) -> bool {
+        // The input event is addressed to a separately retained background PID
+        // and exact window. Human navigation within the same foreground process
+        // must not stall that independent target. A process restart or app switch
+        // remains a conflict; arrow_ready separately refuses if the target itself
+        // becomes foreground.
+        before.pid == after.pid && before.birth == after.birth
+    }
     fn keyboard_metadata(
         &mut self,
         e: &RetainedElement,

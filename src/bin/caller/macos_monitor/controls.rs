@@ -248,6 +248,13 @@ pub(crate) trait Native: placement::Native {
     fn keyboard_human_focus(&mut self, deadline: Instant) -> Result<Self::Focus, String> {
         placement::Native::focus(self, deadline)
     }
+    /// Compare the human context that must remain stable while inspecting or
+    /// dispatching to a separate exact background receiver. Default platforms
+    /// keep exact focus equality; macOS may deliberately define a narrower,
+    /// process-scoped context when its addressed input path remains isolated.
+    fn keyboard_human_focus_same_context(&self, before: &Self::Focus, after: &Self::Focus) -> bool {
+        before == after
+    }
 }
 struct Retained<E> {
     control: Control,

@@ -272,9 +272,13 @@ impl<N: Native> placement::Windows<N> {
                 deadline,
             )?,
         )?;
-        if self.native.keyboard_human_focus(deadline)? != human_before {
+        let human_after = self.native.keyboard_human_focus(deadline)?;
+        if !self
+            .native
+            .keyboard_human_focus_same_context(&human_before, &human_after)
+        {
             return Err(
-                "human global focused object changed during keyboard receiver observation".into(),
+                "human global focus context changed during keyboard receiver observation".into(),
             );
         }
         // The global-focus witness itself is a native read. Close the window
@@ -326,8 +330,14 @@ impl<N: Native> placement::Windows<N> {
         placement::time_left(deadline)?;
         if let Some(retained) = retained {
             controls::same_window(retained.window, before)?;
-            if result != retained.target || human_before != retained.focus {
-                return Err("prepared keyboard receiver metadata or human focus changed".into());
+            if result != retained.target
+                || !self
+                    .native
+                    .keyboard_human_focus_same_context(&human_before, &retained.focus)
+            {
+                return Err(
+                    "prepared keyboard receiver metadata or human focus context changed".into(),
+                );
             }
         }
         Ok(ReceiverSnapshot {
@@ -1619,7 +1629,7 @@ mod tests {
             } else {
                 w.press_arrow(id, &prepared.token, |_| Ok(monitor()))
             };
-            assert!(first.unwrap_err().contains("human focus changed"));
+            assert!(first.unwrap_err().contains("human focus context changed"));
             let replay = if left {
                 w.press_arrowleft(id, &prepared.token, |_| Ok(monitor()))
             } else {
