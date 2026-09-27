@@ -1075,7 +1075,7 @@ impl DashboardControlGrant {
             return false;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return false;
+            return line.contains("browser_workspace_changed");
         };
         match value.get("event").and_then(serde_json::Value::as_str) {
             Some(
@@ -1098,10 +1098,27 @@ impl DashboardControlGrant {
         // Provenance is durable and independent of optional cleanup resources.
         // Missing/malformed provenance fails closed; current public X11 rows
         // serialize an explicit false value.
-        workspace
-            .get("owner_only_native")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false)
+        let Some(object) = workspace.as_object() else {
+            return true;
+        };
+        let durable = match object.get("owner_only_native") {
+            Some(value) => match value.as_bool() {
+                Some(value) => Some(value),
+                None => return true,
+            },
+            None => None,
+        };
+        let target = match object.get("display_target") {
+            Some(serde_json::Value::String(target)) => Some(target.as_str()),
+            Some(serde_json::Value::Null) | None => None,
+            Some(_) => return true,
+        };
+        let binding = match object.get("macos_window_binding") {
+            Some(serde_json::Value::String(_)) => true,
+            Some(serde_json::Value::Null) | None => false,
+            Some(_) => return true,
+        };
+        crate::browser_workspace::workspace_metadata_requires_owner(durable, target, binding)
     }
 
     /// Remove owner-only display events from a browser bootstrap replay.
@@ -3159,6 +3176,18 @@ mod fs_scope_grant_tests {
         ));
         assert!(!observer.allows_dashboard_event_line(
             r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":"no"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":false,"macos_window_binding":"macos_window:retained"}}"#
+        ));
+        assert!(observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"display_target":"display_99"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"display_target":"macos_virtual:broken"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":true"#
         ));
 
         let replay = serde_json::json!({

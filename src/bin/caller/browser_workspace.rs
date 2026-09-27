@@ -176,8 +176,8 @@ pub struct BrowserWorkspace {
     pub display_target: Option<String>,
     /// Durable provenance bit for owner-only native workspace state. This is
     /// independent of cleanup resources such as the optional window binding.
-    #[serde(default)]
-    pub owner_only_native: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_only_native: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,7 +344,7 @@ pub enum BrowserWorkspaceError {
     Unsupported(String),
     Io(String),
     Launch(String),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     CleanupPending {
         workspace_id: String,
         message: String,
@@ -363,7 +363,7 @@ impl fmt::Display for BrowserWorkspaceError {
                 "browser workspace '{workspace_id}' is already leased by '{holder_id}'"
             ),
             Self::Unsupported(msg) | Self::Io(msg) | Self::Launch(msg) => f.write_str(msg),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", test))]
             Self::CleanupPending {
                 workspace_id,
                 message,
@@ -1205,10 +1205,12 @@ async fn create_workspace_inner(
         display_target: display_binding
             .as_ref()
             .map(|binding| binding.canonical().to_string()),
-        owner_only_native: display_binding
-            .as_ref()
-            .and_then(BrowserDisplayBinding::macos_selector)
-            .is_some(),
+        owner_only_native: Some(
+            display_binding
+                .as_ref()
+                .and_then(BrowserDisplayBinding::macos_selector)
+                .is_some(),
+        ),
         profile_dir: Some(profile_dir.display().to_string()),
         extension: None,
         browser_executable: None,
@@ -1643,14 +1645,19 @@ async fn unbind_macos_workspace(
         Ok(crate::macos_monitor::CleanupUnbindReceipt::ExactTokenAbsent) => return Ok(()),
         Err(error) => return Err(BrowserWorkspaceError::Launch(error)),
     };
+    consume_macos_unbind_receipt(receipt)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn consume_macos_unbind_receipt(
+    receipt: crate::macos_monitor::Receipt,
+) -> Result<(), BrowserWorkspaceError> {
     let unbound = matches!(
         &receipt.value,
         crate::macos_monitor::Value::Window(crate::macos_monitor::WindowValue::Unbound)
     );
-    if !receipt.commit() {
-        return validate_macos_unbind_receipt(unbound, false);
-    }
-    validate_macos_unbind_receipt(unbound, true)
+    let committed = receipt.commit();
+    validate_macos_unbind_receipt(unbound, committed)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1669,7 +1676,27 @@ fn validate_macos_unbind_receipt(
 }
 
 pub(crate) fn is_macos_workspace(workspace: &BrowserWorkspace) -> bool {
-    workspace.owner_only_native
+    workspace_metadata_requires_owner(
+        workspace.owner_only_native,
+        workspace.display_target.as_deref(),
+        workspace.macos_window_binding.is_some(),
+    )
+}
+
+pub(crate) fn workspace_metadata_requires_owner(
+    durable_native: Option<bool>,
+    display_target: Option<&str>,
+    has_macos_binding: bool,
+) -> bool {
+    if durable_native == Some(true) || has_macos_binding {
+        return true;
+    }
+    match display_target {
+        Some(target) if crate::macos_monitor::reserved(target) => true,
+        Some(target) if parse_browser_display_binding(target).is_ok() => false,
+        Some(_) => true,
+        None => durable_native != Some(false),
+    }
 }
 
 /// Supplemental gate resolution only: caller trust is checked independently.
@@ -1766,59 +1793,18 @@ async fn close_workspace_inner(
     if is_macos_workspace(&workspace) {
         #[cfg(target_os = "macos")]
         {
-            if let Some(owned) = child.as_mut() {
-                if let Err(error) = macos::stop(owned).await {
-                    retain_macos_cleanup(&mut workspace, child, bus, &error.to_string()).await;
-                    return Err(error);
-                }
-            } else if workspace_has_process_handles(&workspace) {
-                let message = "supervisor handle missing; exact browser termination is unconfirmed";
-                retain_macos_cleanup(&mut workspace, None, bus, message).await;
-                return Err(BrowserWorkspaceError::CleanupPending {
-                    workspace_id: workspace.id.clone(),
-                    message: message.into(),
-                });
-            }
-            // The supervisor's receipt verifies exact-app termination. Its
-            // child and every process/CDP handle are now stale authority and
-            // must not survive if a later unbind or profile removal fails.
-            child = None;
-            clear_stopped_workspace_handles(&mut workspace);
-
-            let unbind = match macos_authority.as_ref() {
-                Some(authority) => unbind_macos_workspace(&workspace, bus, authority).await,
-                None if workspace.macos_window_binding.is_none() => Ok(()),
-                None => Err(BrowserWorkspaceError::Unsupported(
-                    "macOS-bound browser workspace cleanup requires owner authority".into(),
-                )),
+            let mut driver = PlatformNativeCleanup {
+                bus,
+                authority: macos_authority.as_ref(),
             };
-            if let Err(error) = unbind {
-                let message = format!("browser stopped; window unbind unconfirmed: {error}");
-                retain_macos_cleanup(&mut workspace, None, bus, &message).await;
-                return Err(BrowserWorkspaceError::CleanupPending {
-                    workspace_id: workspace.id.clone(),
-                    message,
-                });
-            }
-            workspace.macos_window_binding = None;
-
-            if let Some(profile) = workspace.profile_dir.as_deref() {
-                if let Err(error) =
-                    remove_macos_profile_with(Path::new(profile), fs::remove_dir_all)
-                {
-                    let message = format!("browser stopped; profile cleanup failed: {error}");
-                    retain_macos_cleanup(&mut workspace, None, bus, &message).await;
-                    return Err(BrowserWorkspaceError::CleanupPending {
-                        workspace_id: workspace.id.clone(),
-                        message,
-                    });
-                }
-            }
-            workspace.profile_dir = None;
+            finish_native_cleanup(&mut workspace, &mut child, bus, &mut driver).await?;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = &mut child;
+            let message = "native browser cleanup is unavailable on this platform";
+            retain_native_cleanup(&mut workspace, child, bus, message).await;
+            return Err(BrowserWorkspaceError::Unsupported(message.into()));
         }
     } else {
         terminate_workspace_process(workspace.process_id, child);
@@ -1845,8 +1831,7 @@ fn workspace_has_process_handles(workspace: &BrowserWorkspace) -> bool {
         || workspace.active_target_id.is_some()
 }
 
-#[cfg(target_os = "macos")]
-async fn retain_macos_cleanup(
+async fn retain_native_cleanup(
     workspace: &mut BrowserWorkspace,
     child: Option<Child>,
     bus: &EventBus,
@@ -1861,6 +1846,99 @@ async fn retain_macos_cleanup(
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[async_trait::async_trait]
+trait NativeCleanupDriver {
+    async fn verify_stop(
+        &mut self,
+        child: &mut Option<Child>,
+        workspace: &BrowserWorkspace,
+    ) -> Result<(), BrowserWorkspaceError>;
+    async fn unbind(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserWorkspaceError>;
+    fn remove_profile(&mut self, profile: &Path) -> std::io::Result<()>;
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn finish_native_cleanup(
+    workspace: &mut BrowserWorkspace,
+    child: &mut Option<Child>,
+    bus: &EventBus,
+    driver: &mut dyn NativeCleanupDriver,
+) -> Result<(), BrowserWorkspaceError> {
+    if let Err(error) = driver.verify_stop(child, workspace).await {
+        let retained_child = child.take();
+        retain_native_cleanup(workspace, retained_child, bus, &error.to_string()).await;
+        return Err(error);
+    }
+    *child = None;
+    clear_stopped_workspace_handles(workspace);
+
+    if workspace.macos_window_binding.is_some() {
+        if let Err(error) = driver.unbind(workspace).await {
+            let message = format!("browser stopped; window unbind unconfirmed: {error}");
+            retain_native_cleanup(workspace, None, bus, &message).await;
+            return Err(BrowserWorkspaceError::CleanupPending {
+                workspace_id: workspace.id.clone(),
+                message,
+            });
+        }
+    }
+    workspace.macos_window_binding = None;
+    workspace.owner_only_native = Some(true);
+
+    if let Some(profile) = workspace.profile_dir.as_deref() {
+        if let Err(error) = driver.remove_profile(Path::new(profile)) {
+            let message = format!("browser stopped; profile cleanup failed: {error}");
+            retain_native_cleanup(workspace, None, bus, &message).await;
+            return Err(BrowserWorkspaceError::CleanupPending {
+                workspace_id: workspace.id.clone(),
+                message,
+            });
+        }
+    }
+    workspace.profile_dir = None;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct PlatformNativeCleanup<'a> {
+    bus: &'a EventBus,
+    authority: Option<&'a crate::macos_monitor::Authority>,
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait::async_trait]
+impl NativeCleanupDriver for PlatformNativeCleanup<'_> {
+    async fn verify_stop(
+        &mut self,
+        child: &mut Option<Child>,
+        workspace: &BrowserWorkspace,
+    ) -> Result<(), BrowserWorkspaceError> {
+        if let Some(owned) = child.as_mut() {
+            macos::stop(owned).await
+        } else if workspace_has_process_handles(workspace) {
+            Err(BrowserWorkspaceError::Launch(
+                "supervisor handle missing; exact browser termination is unconfirmed".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn unbind(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserWorkspaceError> {
+        match self.authority {
+            Some(authority) => unbind_macos_workspace(workspace, self.bus, authority).await,
+            None if workspace.macos_window_binding.is_none() => Ok(()),
+            None => Err(BrowserWorkspaceError::Unsupported(
+                "macOS-bound browser workspace cleanup requires owner authority".into(),
+            )),
+        }
+    }
+
+    fn remove_profile(&mut self, profile: &Path) -> std::io::Result<()> {
+        remove_macos_profile_with(profile, fs::remove_dir_all)
+    }
+}
+
 fn mark_macos_cleanup_pending(workspace: &mut BrowserWorkspace, message: &str) {
     workspace.status = BrowserWorkspaceStatus::Error;
     workspace.lease = None;
@@ -3878,6 +3956,85 @@ fn now_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    enum FakeUnbind {
+        Ok,
+        Error(&'static str),
+        Receipt(crate::macos_monitor::Receipt),
+    }
+
+    struct FakeNativeCleanup {
+        stop: Result<(), &'static str>,
+        unbind: VecDeque<FakeUnbind>,
+        remove: VecDeque<Result<(), std::io::ErrorKind>>,
+        stops: usize,
+        unbinds: usize,
+        removals: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl NativeCleanupDriver for FakeNativeCleanup {
+        async fn verify_stop(
+            &mut self,
+            _child: &mut Option<Child>,
+            _workspace: &BrowserWorkspace,
+        ) -> Result<(), BrowserWorkspaceError> {
+            self.stops += 1;
+            self.stop.map_err(|message| {
+                BrowserWorkspaceError::Launch(format!("stop unconfirmed: {message}"))
+            })
+        }
+
+        async fn unbind(
+            &mut self,
+            _workspace: &BrowserWorkspace,
+        ) -> Result<(), BrowserWorkspaceError> {
+            self.unbinds += 1;
+            match self.unbind.pop_front().unwrap_or(FakeUnbind::Ok) {
+                FakeUnbind::Ok => Ok(()),
+                FakeUnbind::Error(message) => Err(BrowserWorkspaceError::Launch(message.into())),
+                FakeUnbind::Receipt(receipt) => consume_macos_unbind_receipt(receipt),
+            }
+        }
+
+        fn remove_profile(&mut self, _profile: &Path) -> std::io::Result<()> {
+            self.removals += 1;
+            match self.remove.pop_front().unwrap_or(Ok(())) {
+                Ok(()) => Ok(()),
+                Err(kind) => Err(std::io::Error::from(kind)),
+            }
+        }
+    }
+
+    async fn close_with_fake_driver(
+        id: &str,
+        owner: bool,
+        bus: &EventBus,
+        driver: &mut FakeNativeCleanup,
+    ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+        let (mut workspace, mut child) = {
+            let shared = global_registry();
+            let mut registry = shared.write().await;
+            let workspace = registry
+                .workspaces
+                .get(id)
+                .ok_or_else(|| BrowserWorkspaceError::NotFound(id.into()))?;
+            if is_macos_workspace(workspace) && !owner {
+                return Err(BrowserWorkspaceError::Unsupported(
+                    "closing a macOS-bound browser workspace requires an owner surface".into(),
+                ));
+            }
+            registry
+                .remove(id)
+                .ok_or_else(|| BrowserWorkspaceError::NotFound(id.into()))?
+        };
+        workspace.status = BrowserWorkspaceStatus::Closed;
+        workspace.lease = None;
+        finish_native_cleanup(&mut workspace, &mut child, bus, driver).await?;
+        Ok(workspace)
+    }
+
     #[tokio::test]
     async fn macos_browser_workspace_facade_has_same_extra_display_gate_as_raw_call() {
         let root = tempfile::tempdir().unwrap();
@@ -3996,7 +4153,7 @@ mod tests {
     fn incomplete_native_workspace_is_owner_only_without_classifying_x11() {
         let mut native = sample_workspace("native-partial");
         native.display_target = None;
-        native.owner_only_native = true;
+        native.owner_only_native = Some(true);
         native.macos_window_binding = Some("macos_window:retained".into());
         assert!(is_macos_workspace(&native));
 
@@ -4004,12 +4161,33 @@ mod tests {
         x11.display_target = Some("display_99".into());
         x11.profile_dir = Some("/tmp/public-managed-profile".into());
         assert!(!is_macos_workspace(&x11));
+
+        let legacy_native: BrowserWorkspace = serde_json::from_value(serde_json::json!({
+            "id":"legacy-native", "label":"legacy", "provider":"cdp",
+            "requested_provider":"auto", "placement":{"kind":"local"},
+            "status":"error", "preview_mode":"semantic",
+            "display_target":format!("macos_virtual:{}:536870912", "d".repeat(32)),
+            "created_at":"now", "updated_at":"now"
+        }))
+        .unwrap();
+        assert_eq!(legacy_native.owner_only_native, None);
+        assert!(is_macos_workspace(&legacy_native));
+
+        let mut contradictory = sample_workspace("contradictory");
+        contradictory.owner_only_native = Some(false);
+        contradictory.macos_window_binding = Some("macos_window:retained".into());
+        assert!(is_macos_workspace(&contradictory));
+
+        let mut historical_x11 = sample_workspace("historical-x11");
+        historical_x11.owner_only_native = None;
+        historical_x11.display_target = Some("display_99".into());
+        assert!(!is_macos_workspace(&historical_x11));
     }
 
     #[test]
     fn cleanup_retention_clears_stopped_handles_but_preserves_pending_resources() {
         let mut workspace = sample_workspace("native-cleanup");
-        workspace.owner_only_native = true;
+        workspace.owner_only_native = Some(true);
         workspace.process_id = Some(42);
         workspace.debugging_port = Some(9222);
         workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
@@ -4066,7 +4244,7 @@ mod tests {
     #[test]
     fn missing_supervisor_with_live_handles_remains_unconfirmed() {
         let mut workspace = sample_workspace("missing-supervisor");
-        workspace.owner_only_native = true;
+        workspace.owner_only_native = Some(true);
         workspace.process_id = Some(42);
         workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
         assert!(workspace_has_process_handles(&workspace));
@@ -4095,6 +4273,185 @@ mod tests {
             .contains("unexpected"));
     }
 
+    fn native_cleanup_workspace(id: &str) -> BrowserWorkspace {
+        let mut workspace = sample_workspace(id);
+        workspace.owner_only_native = Some(true);
+        workspace.display_target = None;
+        workspace.process_id = Some(42);
+        workspace.debugging_port = Some(9222);
+        workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
+        workspace.cdp_ws_url = Some("ws://127.0.0.1:9222/devtools/page/one".into());
+        workspace.active_target_id = Some("one".into());
+        workspace.macos_window_binding = Some("macos_window:exact".into());
+        workspace.profile_dir = Some("/private/exact-profile".into());
+        workspace
+    }
+
+    fn fake_cleanup(
+        stop: Result<(), &'static str>,
+        unbind: impl IntoIterator<Item = FakeUnbind>,
+        remove: impl IntoIterator<Item = Result<(), std::io::ErrorKind>>,
+    ) -> FakeNativeCleanup {
+        FakeNativeCleanup {
+            stop,
+            unbind: unbind.into_iter().collect(),
+            remove: remove.into_iter().collect(),
+            stops: 0,
+            unbinds: 0,
+            removals: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_cleanup_path_retains_unbind_failure_and_owner_retry_completes() {
+        let id = format!("native-unbind-{}", uuid::Uuid::new_v4().simple());
+        global_registry()
+            .write()
+            .await
+            .insert(native_cleanup_workspace(&id), None);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let mut denied_driver = fake_cleanup(Ok(()), [], []);
+        assert!(matches!(
+            close_with_fake_driver(&id, false, &bus, &mut denied_driver).await,
+            Err(BrowserWorkspaceError::Unsupported(_))
+        ));
+        assert_eq!(denied_driver.stops, 0);
+
+        let mut failed = fake_cleanup(Ok(()), [FakeUnbind::Error("helper retired")], []);
+        assert!(matches!(
+            close_with_fake_driver(&id, true, &bus, &mut failed).await,
+            Err(BrowserWorkspaceError::CleanupPending { .. })
+        ));
+        assert_eq!((failed.stops, failed.unbinds, failed.removals), (1, 1, 0));
+        let retained = global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&id)
+            .cloned()
+            .unwrap();
+        assert_eq!(retained.status, BrowserWorkspaceStatus::Error);
+        assert_eq!(
+            retained.macos_window_binding.as_deref(),
+            Some("macos_window:exact")
+        );
+        assert_eq!(
+            retained.profile_dir.as_deref(),
+            Some("/private/exact-profile")
+        );
+        assert!(!workspace_has_process_handles(&retained));
+        match events.try_recv().unwrap() {
+            AppEvent::BrowserWorkspaceChanged {
+                kind,
+                workspace: Some(workspace),
+                ..
+            } => {
+                assert_eq!(kind, "cleanup_pending");
+                assert_ne!(workspace.status, BrowserWorkspaceStatus::Closed);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let mut retry = fake_cleanup(Ok(()), [FakeUnbind::Ok], [Ok(())]);
+        let closed = close_with_fake_driver(&id, true, &bus, &mut retry)
+            .await
+            .unwrap();
+        assert!(closed.macos_window_binding.is_none());
+        assert!(closed.profile_dir.is_none());
+        assert_eq!((retry.stops, retry.unbinds, retry.removals), (1, 1, 1));
+        assert!(!global_registry().read().await.workspaces.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn actual_cleanup_path_expired_receipt_and_profile_denial_are_retryable() {
+        let id = format!("native-expired-{}", uuid::Uuid::new_v4().simple());
+        global_registry()
+            .write()
+            .await
+            .insert(native_cleanup_workspace(&id), None);
+        let bus = EventBus::new();
+        let (receipt, committed) = crate::macos_monitor::Receipt::fixture(
+            crate::macos_monitor::Value::Window(crate::macos_monitor::WindowValue::Unbound),
+        );
+        drop(committed);
+        let mut expired = fake_cleanup(Ok(()), [FakeUnbind::Receipt(receipt)], []);
+        assert!(matches!(
+            close_with_fake_driver(&id, true, &bus, &mut expired).await,
+            Err(BrowserWorkspaceError::CleanupPending { .. })
+        ));
+        assert_eq!(expired.unbinds, 1);
+        assert_eq!(
+            global_registry()
+                .read()
+                .await
+                .workspaces
+                .get(&id)
+                .unwrap()
+                .macos_window_binding
+                .as_deref(),
+            Some("macos_window:exact")
+        );
+
+        let mut profile_denied = fake_cleanup(
+            Ok(()),
+            [FakeUnbind::Ok],
+            [Err(std::io::ErrorKind::PermissionDenied)],
+        );
+        assert!(matches!(
+            close_with_fake_driver(&id, true, &bus, &mut profile_denied).await,
+            Err(BrowserWorkspaceError::CleanupPending { .. })
+        ));
+        let retained = global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&id)
+            .cloned()
+            .unwrap();
+        assert!(retained.macos_window_binding.is_none());
+        assert_eq!(
+            retained.profile_dir.as_deref(),
+            Some("/private/exact-profile")
+        );
+        assert!(is_macos_workspace(&retained));
+
+        let mut retry = fake_cleanup(Ok(()), [], [Ok(())]);
+        assert!(close_with_fake_driver(&id, true, &bus, &mut retry)
+            .await
+            .is_ok());
+        assert_eq!((retry.unbinds, retry.removals), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn actual_cleanup_path_stop_uncertainty_preserves_all_handles() {
+        let id = format!("native-stop-{}", uuid::Uuid::new_v4().simple());
+        global_registry()
+            .write()
+            .await
+            .insert(native_cleanup_workspace(&id), None);
+        let bus = EventBus::new();
+        let mut driver = fake_cleanup(Err("missing supervisor"), [], []);
+        assert!(matches!(
+            close_with_fake_driver(&id, true, &bus, &mut driver).await,
+            Err(BrowserWorkspaceError::Launch(_))
+        ));
+        let retained = global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&id)
+            .cloned()
+            .unwrap();
+        assert_eq!(retained.process_id, Some(42));
+        assert_eq!(retained.debugging_port, Some(9222));
+        assert_eq!(
+            retained.macos_window_binding.as_deref(),
+            Some("macos_window:exact")
+        );
+        assert_eq!((driver.stops, driver.unbinds, driver.removals), (1, 0, 0));
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn native_close_retains_profile_failure_and_owner_retry_finishes_cleanup() {
@@ -4117,7 +4474,7 @@ mod tests {
         fs::create_dir(&success_profile).unwrap();
         let mut success = sample_workspace(&success_id);
         success.display_target = Some(selector.clone());
-        success.owner_only_native = true;
+        success.owner_only_native = Some(true);
         success.profile_dir = Some(success_profile.display().to_string());
         global_registry().write().await.insert(success, None);
         let closed = close_workspace(&success_id, None, &bus, Some(owner.clone()))
@@ -4132,7 +4489,7 @@ mod tests {
         fs::write(&retained_profile, b"not a directory").unwrap();
         let mut retry = sample_workspace(&retry_id);
         retry.display_target = Some(selector);
-        retry.owner_only_native = true;
+        retry.owner_only_native = Some(true);
         retry.profile_dir = Some(retained_profile.display().to_string());
         global_registry().write().await.insert(retry, None);
 
@@ -4243,7 +4600,7 @@ mod tests {
         let mut workspace = sample_workspace(&id);
         workspace.status = BrowserWorkspaceStatus::Starting;
         workspace.display_target = Some(format!("macos_virtual:{}:536870912", "c".repeat(32)));
-        workspace.owner_only_native = true;
+        workspace.owner_only_native = Some(true);
         assert!(workspace.macos_window_binding.is_none());
         global_registry()
             .write()
@@ -4332,7 +4689,7 @@ mod tests {
             preview_mode: BrowserWorkspacePreviewMode::Semantic,
             owner_session_id: Some("session-1".to_string()),
             display_target: None,
-            owner_only_native: false,
+            owner_only_native: Some(false),
             profile_dir: None,
             extension: None,
             browser_executable: None,
