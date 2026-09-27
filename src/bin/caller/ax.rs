@@ -571,18 +571,39 @@ fn placement_permissions(deadline: Instant) -> Result<(), String> {
     }
     Ok(())
 }
-const BOUND_AX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+// A read can need more than one 50 ms scheduling interval in a background
+// Chromium process. This is a latency allowance, never permission to accept an
+// unknown protection/identity value. The outer four-second budget still wins.
+const BOUND_AX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const BOUND_AX_GEOMETRY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn bounded_ax_timeout_seconds(
+    remaining: std::time::Duration,
+    cap: std::time::Duration,
+) -> Result<f32, String> {
+    let seconds = remaining.min(cap).as_secs_f32();
+    if seconds <= 0.0 {
+        return Err("AX messaging deadline exceeded before call".into());
+    }
+    Ok(seconds)
+}
 
 fn placement_timeout(element: &AXUIElement, deadline: Instant) -> Result<(), String> {
+    placement_timeout_with_cap(element, deadline, BOUND_AX_TIMEOUT)
+}
+
+fn placement_timeout_with_cap(
+    element: &AXUIElement,
+    deadline: Instant,
+    cap: std::time::Duration,
+) -> Result<(), String> {
     placement::time_left(deadline)?;
-    // SAFETY: live retained object, positive bounded per-IPC timeout. No default
-    // system-wide timeout is changed, and no AX object crosses a thread.
-    let status = unsafe {
-        AXUIElementSetMessagingTimeout(
-            element.as_concrete_TypeRef(),
-            BOUND_AX_TIMEOUT.as_secs_f32(),
-        )
-    };
+    let seconds =
+        bounded_ax_timeout_seconds(deadline.saturating_duration_since(Instant::now()), cap)?;
+    // SAFETY: live retained object and a positive budget-capped timeout. For a
+    // system-wide focus object Apple's API sets this helper's process-local
+    // default; bound reads/writes always explicitly apply their own cap.
+    let status = unsafe { AXUIElementSetMessagingTimeout(element.as_concrete_TypeRef(), seconds) };
     if status != kAXErrorSuccess {
         return Err("cannot bound AX messaging timeout".into());
     }
@@ -650,7 +671,7 @@ fn placement_window_id_result(
 ) -> Result<u32, String> {
     if status != kAXErrorSuccess || id == 0 {
         return Err(format!(
-            "cannot map AX window exactly; {} ({}); window_id_present={}; ax_window_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            "cannot map AX window exactly; {} ({}); window_id_present={}; ax_window_us={}; ax_timeout_cap_us={}; budget_before_us={}; budget_after_us={}",
             ax_error_name(status),
             status,
             id != 0,
@@ -775,7 +796,7 @@ fn placement_roots_result(
 ) -> Result<(), String> {
     let timing_suffix = || {
         format!(
-            "ax_windows_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            "ax_windows_us={}; ax_timeout_cap_us={}; budget_before_us={}; budget_after_us={}",
             timing.elapsed.as_micros(),
             BOUND_AX_TIMEOUT.as_micros(),
             timing.budget_before.as_micros(),
@@ -1099,6 +1120,7 @@ fn placement_set(
     {
         return Err("retained window identity changed immediately before write".into());
     }
+    placement_timeout_with_cap(window, deadline, BOUND_AX_GEOMETRY_WRITE_TIMEOUT)?;
     // SAFETY: retained exact AX window, key and correctly typed AXValue are live.
     // These are the only mutation verbs in the placement implementation.
     let status = unsafe {
@@ -1367,7 +1389,7 @@ impl AxReadTiming {
     }
     fn annotate(self, error: String) -> String {
         format!(
-            "{error}; ax_copy_us={}; ax_timeout_us={}; budget_before_us={}; budget_after_us={}",
+            "{error}; ax_copy_us={}; ax_timeout_cap_us={}; budget_before_us={}; budget_after_us={}",
             self.elapsed.as_micros(),
             BOUND_AX_TIMEOUT.as_micros(),
             self.budget_before.as_micros(),
@@ -1442,6 +1464,7 @@ fn control_attr(e: &AXUIElement, key: &str, deadline: Instant) -> Result<CFType,
     placement_permissions(deadline)?;
     placement_timeout(e, deadline)?;
     let (status, value, timing) = control_copy_attribute(e, key, deadline);
+    timing.check_deadline(deadline, status, value.is_some())?;
     timing.report(control_required_result(key, status, value))
 }
 /// Strict AX Copy-rule element read used by the bound receiver path. Unlike
@@ -2574,7 +2597,7 @@ mod tests {
         assert!(unavailable.contains("array_present=false"));
         assert!(unavailable.contains("count=unknown"));
         assert!(unavailable.contains("ax_windows_us=50777"));
-        assert!(unavailable.contains("ax_timeout_us=50000"));
+        assert!(unavailable.contains("ax_timeout_cap_us=200000"));
         assert!(unavailable.contains("budget_before_us=4000000"));
         assert!(unavailable.contains("budget_after_us=3949223"));
 
@@ -2625,7 +2648,7 @@ mod tests {
         assert!(error.contains("kAXErrorCannotComplete (-25204)"));
         assert!(error.contains("window_id_present=false"));
         assert!(error.contains("ax_window_us=55102"));
-        assert!(error.contains("ax_timeout_us=50000"));
+        assert!(error.contains("ax_timeout_cap_us=200000"));
         assert!(error.contains("budget_before_us=4000000"));
         assert!(error.contains("budget_after_us=3944898"));
 
@@ -2639,9 +2662,36 @@ mod tests {
     }
 
     #[test]
+    fn bound_read_latency_preserves_write_cap_and_overall_deadline() {
+        use std::time::Duration;
+        assert_eq!(
+            bounded_ax_timeout_seconds(Duration::from_secs(4), BOUND_AX_TIMEOUT).unwrap(),
+            0.2
+        );
+        assert_eq!(
+            bounded_ax_timeout_seconds(Duration::from_millis(17), BOUND_AX_TIMEOUT).unwrap(),
+            0.017
+        );
+        assert_eq!(
+            bounded_ax_timeout_seconds(Duration::from_secs(4), BOUND_AX_GEOMETRY_WRITE_TIMEOUT)
+                .unwrap(),
+            0.05
+        );
+        assert_eq!(
+            bounded_ax_timeout_seconds(Duration::from_millis(9), BOUND_AX_GEOMETRY_WRITE_TIMEOUT)
+                .unwrap(),
+            0.009
+        );
+        assert!(bounded_ax_timeout_seconds(Duration::ZERO, BOUND_AX_TIMEOUT).is_err());
+        assert!(
+            bounded_ax_timeout_seconds(Duration::ZERO, BOUND_AX_GEOMETRY_WRITE_TIMEOUT).is_err()
+        );
+    }
+
+    #[test]
     fn ax_read_timing_reports_native_duration_and_saturating_budget() {
         use std::time::Duration;
-        assert_eq!(BOUND_AX_TIMEOUT.as_secs_f32().to_bits(), 0.05_f32.to_bits());
+        assert_eq!(BOUND_AX_TIMEOUT.as_secs_f32().to_bits(), 0.2_f32.to_bits());
         let start = Instant::now();
         let timing = AxReadTiming::between(
             start,
@@ -2649,7 +2699,7 @@ mod tests {
             start + Duration::from_secs(4),
         );
         assert_eq!(timing.annotate("fixture".into()),
-            "fixture; ax_copy_us=51234; ax_timeout_us=50000; budget_before_us=4000000; budget_after_us=3948766");
+            "fixture; ax_copy_us=51234; ax_timeout_cap_us=200000; budget_before_us=4000000; budget_after_us=3948766");
         let exhausted = AxReadTiming::between(
             start,
             start + Duration::from_millis(51),
@@ -2705,7 +2755,7 @@ mod tests {
                 }
                 for error in [required.err(), optional.err()].into_iter().flatten() {
                     assert!(error.contains(&ax_copy_diagnostic(status, present)));
-                    assert!(error.contains("ax_copy_us=0; ax_timeout_us=50000"));
+                    assert!(error.contains("ax_copy_us=0; ax_timeout_cap_us=200000"));
                     assert!(!error.contains("synthetic-private-value"));
                 }
             }

@@ -10,6 +10,8 @@ pub mod bound_arrow;
 mod bound_pointer_ffi;
 pub mod cgvirtual;
 pub mod display_target;
+#[cfg(target_os = "macos")]
+pub mod macos_browser;
 pub mod memory;
 pub mod platform;
 pub mod vision;
