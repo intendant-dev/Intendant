@@ -2019,6 +2019,7 @@ mod tests {
 
         // The sibling dies (lock freed): the cached fetch is inert — the
         // entry serves exactly the capped floor again, marked not live.
+        sibling_lock.unlock().unwrap();
         drop(sibling_lock);
         let status = runtime.status_json();
         let entry = status["daemons"]
