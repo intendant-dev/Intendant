@@ -517,7 +517,7 @@ or timed-out inspection reports `unavailable`. Neither outcome permits respawn,
 ID adoption or bypassing cleanup.
 
 Reserved selectors, including malformed/case/whitespace variants, are refused
-by generic input, AX-tree, shared-view, browser-workspace and peer forwarding APIs.
+by generic input, AX-tree, shared-view and peer forwarding APIs.
 Explicit owner-only window placement is described below. Exact canonical
 selectors alone have a read-only `display_readiness` route: existing `DisplayView`
 and shared-session authority are required, and status uses only broker liveness
@@ -526,7 +526,18 @@ capture and unsupported input/streaming; overall CU readiness remains false.
 Unknown/stale/foreign generations are distinct from a retired broker. Malformed
 selectors and raw-ID aliases remain refused, without a physical-display fallback.
 There is no automatic/default selection of these monitors, global input,
-clipboard isolation, streaming or browser-placement claim.
+clipboard isolation or streaming.
+
+The separate owner-only `create_browser_workspace` route accepts an exact
+owned macOS monitor generation and launches a fresh managed Chrome-for-Testing
+window with a private profile and retained binding. It does not enable generic
+keyboard input or an independent input seat. Native workspace records remain
+owner-only in both inventory and live/replayed dashboard events, including
+partial and failed-cleanup records. Closing first verifies browser termination;
+failed unbind or profile removal retains an Error record and the exact pending
+resources for a later owner close. Confirmed termination clears stale process
+and CDP handles, not the still-pending binding/profile. See the
+[managed browser design](../design/macos-browser-workspace.md).
 
 #### Explicit owner-only app window placement
 

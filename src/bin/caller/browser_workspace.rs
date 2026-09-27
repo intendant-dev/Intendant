@@ -1641,7 +1641,7 @@ async fn unbind_macos_workspace(
         .cleanup_unbind(binding.clone(), authority.clone())
         .await
     {
-        Ok(crate::macos_monitor::CleanupUnbindReceipt::Receipt(receipt)) => receipt,
+        Ok(crate::macos_monitor::CleanupUnbindReceipt::Receipt(receipt)) => *receipt,
         Ok(crate::macos_monitor::CleanupUnbindReceipt::ExactTokenAbsent) => return Ok(()),
         Err(error) => return Err(BrowserWorkspaceError::Launch(error)),
     };
@@ -1693,10 +1693,19 @@ pub(crate) fn workspace_metadata_requires_owner(
     }
     match display_target {
         Some(target) if crate::macos_monitor::reserved(target) => true,
-        Some(target) if parse_browser_display_binding(target).is_ok() => false,
+        Some(target) if canonical_x11_workspace_target(target) => false,
         Some(_) => true,
         None => durable_native != Some(false),
     }
+}
+
+// Event provenance is a wire-format fact, not a probe of this host's ability
+// to create X11 displays. Runtime creation keeps its platform/range checks.
+fn canonical_x11_workspace_target(target: &str) -> bool {
+    target
+        .strip_prefix("display_")
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .is_some_and(|id| id != 0 && target == format!("display_{id}"))
 }
 
 /// Supplemental gate resolution only: caller trust is checked independently.
@@ -1847,7 +1856,7 @@ async fn retain_native_cleanup(
 
 #[cfg(any(target_os = "macos", test))]
 #[async_trait::async_trait]
-trait NativeCleanupDriver {
+trait NativeCleanupDriver: Send {
     async fn verify_stop(
         &mut self,
         child: &mut Option<Child>,
@@ -1935,7 +1944,7 @@ impl NativeCleanupDriver for PlatformNativeCleanup<'_> {
     }
 
     fn remove_profile(&mut self, profile: &Path) -> std::io::Result<()> {
-        remove_macos_profile_with(profile, fs::remove_dir_all)
+        remove_macos_profile_with(profile, |path| fs::remove_dir_all(path))
     }
 }
 
@@ -4147,6 +4156,40 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert!(parse_browser_display_binding("display_99").is_err());
+    }
+
+    #[test]
+    fn workspace_event_provenance_is_platform_independent_and_canonical() {
+        assert!(!workspace_metadata_requires_owner(
+            None,
+            Some("display_99"),
+            false
+        ));
+        for target in [
+            "display_0",
+            "display_099",
+            ":99",
+            "99",
+            "display_-1",
+            "display_4294967296",
+            "user_session",
+            "macos_virtual:bad",
+        ] {
+            assert!(
+                workspace_metadata_requires_owner(Some(false), Some(target), false),
+                "{target}"
+            );
+        }
+        assert!(workspace_metadata_requires_owner(
+            Some(true),
+            Some("display_99"),
+            false
+        ));
+        assert!(workspace_metadata_requires_owner(
+            Some(false),
+            Some("display_99"),
+            true
+        ));
     }
 
     #[test]

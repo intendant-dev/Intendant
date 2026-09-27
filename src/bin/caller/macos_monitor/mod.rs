@@ -166,7 +166,7 @@ pub(crate) struct Receipt {
 
 #[cfg(target_os = "macos")]
 pub(crate) enum CleanupUnbindReceipt {
-    Receipt(Receipt),
+    Receipt(Box<Receipt>),
     ExactTokenAbsent,
 }
 
@@ -346,7 +346,7 @@ impl Broker {
             .request(Action::Window(WindowAction::Unbind { binding }), authority)
             .await
         {
-            Ok(receipt) => Ok(CleanupUnbindReceipt::Receipt(receipt)),
+            Ok(receipt) => Ok(CleanupUnbindReceipt::Receipt(Box::new(receipt))),
             Err(error) if error == "stale or foreign window binding" => {
                 Ok(CleanupUnbindReceipt::ExactTokenAbsent)
             }
