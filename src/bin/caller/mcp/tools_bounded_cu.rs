@@ -811,6 +811,7 @@ mod tests {
             preview_mode: crate::browser_workspace::BrowserWorkspacePreviewMode::Semantic,
             owner_session_id: Some("attempt-1".to_string()),
             display_target: Some("display_99".to_string()),
+            owner_only_native: false,
             profile_dir: Some("/tmp/profile".to_string()),
             extension: None,
             browser_executable: Some("/usr/bin/chromium".to_string()),

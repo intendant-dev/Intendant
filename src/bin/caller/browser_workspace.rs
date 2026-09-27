@@ -174,6 +174,10 @@ pub struct BrowserWorkspace {
     /// `display_99`) when this workspace is explicitly display-bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_target: Option<String>,
+    /// Durable provenance bit for owner-only native workspace state. This is
+    /// independent of cleanup resources such as the optional window binding.
+    #[serde(default)]
+    pub owner_only_native: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1201,6 +1205,10 @@ async fn create_workspace_inner(
         display_target: display_binding
             .as_ref()
             .map(|binding| binding.canonical().to_string()),
+        owner_only_native: display_binding
+            .as_ref()
+            .and_then(BrowserDisplayBinding::macos_selector)
+            .is_some(),
         profile_dir: Some(profile_dir.display().to_string()),
         extension: None,
         browser_executable: None,
@@ -1628,20 +1636,11 @@ async fn unbind_macos_workspace(
     }
     let receipt = match bus
         .macos_monitors
-        .request(
-            crate::macos_monitor::Action::Window(crate::macos_monitor::WindowAction::Unbind {
-                binding: binding.clone(),
-            }),
-            authority.clone(),
-        )
+        .cleanup_unbind(binding.clone(), authority.clone())
         .await
     {
-        Ok(receipt) => receipt,
-        // An earlier unbind may have committed after its receipt expired. On
-        // a later owner close, absence of this exact opaque token from the
-        // broker is the required cleanup fact; do not replay native input or
-        // strand the retained workspace forever.
-        Err(error) if error == "stale or foreign window binding" => return Ok(()),
+        Ok(crate::macos_monitor::CleanupUnbindReceipt::Receipt(receipt)) => receipt,
+        Ok(crate::macos_monitor::CleanupUnbindReceipt::ExactTokenAbsent) => return Ok(()),
         Err(error) => return Err(BrowserWorkspaceError::Launch(error)),
     };
     let unbound = matches!(
@@ -1670,11 +1669,7 @@ fn validate_macos_unbind_receipt(
 }
 
 pub(crate) fn is_macos_workspace(workspace: &BrowserWorkspace) -> bool {
-    workspace.macos_window_binding.is_some()
-        || workspace
-            .display_target
-            .as_deref()
-            .is_some_and(crate::macos_monitor::reserved)
+    workspace.owner_only_native
 }
 
 /// Supplemental gate resolution only: caller trust is checked independently.
@@ -1776,6 +1771,13 @@ async fn close_workspace_inner(
                     retain_macos_cleanup(&mut workspace, child, bus, &error.to_string()).await;
                     return Err(error);
                 }
+            } else if workspace_has_process_handles(&workspace) {
+                let message = "supervisor handle missing; exact browser termination is unconfirmed";
+                retain_macos_cleanup(&mut workspace, None, bus, message).await;
+                return Err(BrowserWorkspaceError::CleanupPending {
+                    workspace_id: workspace.id.clone(),
+                    message: message.into(),
+                });
             }
             // The supervisor's receipt verifies exact-app termination. Its
             // child and every process/CDP handle are now stale authority and
@@ -1801,15 +1803,15 @@ async fn close_workspace_inner(
             workspace.macos_window_binding = None;
 
             if let Some(profile) = workspace.profile_dir.as_deref() {
-                if let Err(error) = fs::remove_dir_all(profile) {
-                    if Path::new(profile).exists() {
-                        let message = format!("browser stopped; profile cleanup failed: {error}");
-                        retain_macos_cleanup(&mut workspace, None, bus, &message).await;
-                        return Err(BrowserWorkspaceError::CleanupPending {
-                            workspace_id: workspace.id.clone(),
-                            message,
-                        });
-                    }
+                if let Err(error) =
+                    remove_macos_profile_with(Path::new(profile), fs::remove_dir_all)
+                {
+                    let message = format!("browser stopped; profile cleanup failed: {error}");
+                    retain_macos_cleanup(&mut workspace, None, bus, &message).await;
+                    return Err(BrowserWorkspaceError::CleanupPending {
+                        workspace_id: workspace.id.clone(),
+                        message,
+                    });
                 }
             }
             workspace.profile_dir = None;
@@ -1834,6 +1836,15 @@ fn clear_stopped_workspace_handles(workspace: &mut BrowserWorkspace) {
     workspace.active_target_id = None;
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn workspace_has_process_handles(workspace: &BrowserWorkspace) -> bool {
+    workspace.process_id.is_some()
+        || workspace.debugging_port.is_some()
+        || workspace.cdp_http_url.is_some()
+        || workspace.cdp_ws_url.is_some()
+        || workspace.active_target_id.is_some()
+}
+
 #[cfg(target_os = "macos")]
 async fn retain_macos_cleanup(
     workspace: &mut BrowserWorkspace,
@@ -1855,6 +1866,18 @@ fn mark_macos_cleanup_pending(workspace: &mut BrowserWorkspace, message: &str) {
     workspace.lease = None;
     workspace.message = Some(format!("cleanup pending: {message}"));
     workspace.updated_at = now_string();
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remove_macos_profile_with(
+    profile: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match remove(profile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Caller holds the broker workspace lane through validation, cleanup and
@@ -3973,6 +3996,7 @@ mod tests {
     fn incomplete_native_workspace_is_owner_only_without_classifying_x11() {
         let mut native = sample_workspace("native-partial");
         native.display_target = None;
+        native.owner_only_native = true;
         native.macos_window_binding = Some("macos_window:retained".into());
         assert!(is_macos_workspace(&native));
 
@@ -3985,6 +4009,7 @@ mod tests {
     #[test]
     fn cleanup_retention_clears_stopped_handles_but_preserves_pending_resources() {
         let mut workspace = sample_workspace("native-cleanup");
+        workspace.owner_only_native = true;
         workspace.process_id = Some(42);
         workspace.debugging_port = Some(9222);
         workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
@@ -4015,11 +4040,46 @@ mod tests {
         // clears only its token; a failed profile removal remains discoverable.
         workspace.macos_window_binding = None;
         mark_macos_cleanup_pending(&mut workspace, "profile removal failed");
+        assert!(is_macos_workspace(&workspace));
         assert!(workspace.macos_window_binding.is_none());
         assert_eq!(
             workspace.profile_dir.as_deref(),
             Some("/private/tmp/exact-profile")
         );
+    }
+
+    #[test]
+    fn profile_cleanup_accepts_only_removed_or_not_found() {
+        let profile = Path::new("/private/exact-profile");
+        assert!(remove_macos_profile_with(profile, |_| Ok(())).is_ok());
+        assert!(remove_macos_profile_with(profile, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .is_ok());
+        let denied = remove_macos_profile_with(profile, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn missing_supervisor_with_live_handles_remains_unconfirmed() {
+        let mut workspace = sample_workspace("missing-supervisor");
+        workspace.owner_only_native = true;
+        workspace.process_id = Some(42);
+        workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
+        assert!(workspace_has_process_handles(&workspace));
+        mark_macos_cleanup_pending(
+            &mut workspace,
+            "supervisor handle missing; termination unconfirmed",
+        );
+        assert_eq!(workspace.process_id, Some(42));
+        assert_eq!(
+            workspace.cdp_http_url.as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
+        assert!(is_macos_workspace(&workspace));
     }
 
     #[test]
@@ -4057,6 +4117,7 @@ mod tests {
         fs::create_dir(&success_profile).unwrap();
         let mut success = sample_workspace(&success_id);
         success.display_target = Some(selector.clone());
+        success.owner_only_native = true;
         success.profile_dir = Some(success_profile.display().to_string());
         global_registry().write().await.insert(success, None);
         let closed = close_workspace(&success_id, None, &bus, Some(owner.clone()))
@@ -4071,6 +4132,7 @@ mod tests {
         fs::write(&retained_profile, b"not a directory").unwrap();
         let mut retry = sample_workspace(&retry_id);
         retry.display_target = Some(selector);
+        retry.owner_only_native = true;
         retry.profile_dir = Some(retained_profile.display().to_string());
         global_registry().write().await.insert(retry, None);
 
@@ -4181,6 +4243,7 @@ mod tests {
         let mut workspace = sample_workspace(&id);
         workspace.status = BrowserWorkspaceStatus::Starting;
         workspace.display_target = Some(format!("macos_virtual:{}:536870912", "c".repeat(32)));
+        workspace.owner_only_native = true;
         assert!(workspace.macos_window_binding.is_none());
         global_registry()
             .write()
@@ -4269,6 +4332,7 @@ mod tests {
             preview_mode: BrowserWorkspacePreviewMode::Semantic,
             owner_session_id: Some("session-1".to_string()),
             display_target: None,
+            owner_only_native: false,
             profile_dir: None,
             extension: None,
             browser_executable: None,

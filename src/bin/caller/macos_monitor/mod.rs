@@ -164,6 +164,12 @@ pub(crate) struct Receipt {
     commit: oneshot::Sender<()>,
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) enum CleanupUnbindReceipt {
+    Receipt(Receipt),
+    ExactTokenAbsent,
+}
+
 impl Receipt {
     #[cfg(test)]
     pub(crate) fn fixture(value: Value) -> (Self, oneshot::Receiver<()>) {
@@ -323,6 +329,31 @@ pub(crate) struct Broker {
 }
 
 impl Broker {
+    /// Owner cleanup-specific idempotent unbind. `ExactTokenAbsent` is emitted
+    /// only after authority validation and only for the broker's pre-dispatch
+    /// lookup failure; helper retirement, transport loss, and unknown effects
+    /// remain errors and can never be promoted to confirmed cleanup.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn cleanup_unbind(
+        &self,
+        binding: String,
+        authority: Authority,
+    ) -> Result<CleanupUnbindReceipt, String> {
+        if !authority.owner_surface {
+            return Err("macOS browser cleanup requires an owner surface".into());
+        }
+        match self
+            .request(Action::Window(WindowAction::Unbind { binding }), authority)
+            .await
+        {
+            Ok(receipt) => Ok(CleanupUnbindReceipt::Receipt(receipt)),
+            Err(error) if error == "stale or foreign window binding" => {
+                Ok(CleanupUnbindReceipt::ExactTokenAbsent)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn request(
         &self,
         action: Action,

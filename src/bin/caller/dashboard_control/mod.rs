@@ -1089,24 +1089,19 @@ impl DashboardControlGrant {
             }
             Some("browser_workspace_changed") => value
                 .get("workspace")
-                .is_some_and(Self::browser_workspace_event_requires_owner),
+                .is_none_or(Self::browser_workspace_event_requires_owner),
             _ => false,
         }
     }
 
     fn browser_workspace_event_requires_owner(workspace: &serde_json::Value) -> bool {
-        // A macOS workspace is owner-only even if creation/cancellation left a
-        // partial record. Either native discriminator is sufficient; requiring
-        // both would fail open and expose the remaining binding/profile/CDP
-        // cleanup state. Linux display-bound workspaces deliberately remain in
-        // the scoped dashboard projection.
+        // Provenance is durable and independent of optional cleanup resources.
+        // Missing/malformed provenance fails closed; current public X11 rows
+        // serialize an explicit false value.
         workspace
-            .get("display_target")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(crate::macos_monitor::reserved)
-            || workspace
-                .get("macos_window_binding")
-                .is_some_and(|binding| !binding.is_null())
+            .get("owner_only_native")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
     }
 
     /// Remove owner-only display events from a browser bootstrap replay.
@@ -3145,11 +3140,11 @@ mod fs_scope_grant_tests {
         let request = r#"{"event":"display_request_raised","id":1}"#;
         let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
         let native_workspace = format!(
-            r#"{{"event":"browser_workspace_changed","kind":"ready","workspace":{{"id":"native","display_target":"macos_virtual:{}:536870912","profile_dir":"/private/owner-profile","cdp_http_url":"http://127.0.0.1:9222","macos_window_binding":"macos_window:secret"}}}}"#,
+            r#"{{"event":"browser_workspace_changed","kind":"ready","workspace":{{"id":"native","owner_only_native":true,"display_target":"macos_virtual:{}:536870912","profile_dir":"/private/owner-profile","cdp_http_url":"http://127.0.0.1:9222","macos_window_binding":"macos_window:secret"}}}}"#,
             "a".repeat(32)
         );
-        let incomplete_native = r#"{"event":"browser_workspace_changed","kind":"cleanup_pending","workspace":{"id":"native-partial","macos_window_binding":"macos_window:retained","profile_dir":"/private/owner-profile"}}"#;
-        let public_x11 = r#"{"event":"browser_workspace_changed","kind":"ready","workspace":{"id":"linux","display_target":"display_99","profile_dir":"/tmp/managed-profile","cdp_http_url":"http://127.0.0.1:9222"}}"#;
+        let incomplete_native = r#"{"event":"browser_workspace_changed","kind":"cleanup_pending","workspace":{"id":"native-partial","owner_only_native":true,"macos_window_binding":"macos_window:retained","profile_dir":"/private/owner-profile"}}"#;
+        let public_x11 = r#"{"event":"browser_workspace_changed","kind":"ready","workspace":{"id":"linux","owner_only_native":false,"display_target":"display_99","profile_dir":"/tmp/managed-profile","cdp_http_url":"http://127.0.0.1:9222"}}"#;
         assert!(root.allows_dashboard_event_line(private_ready));
         assert!(!observer.allows_dashboard_event_line(private_ready));
         assert!(observer.allows_dashboard_event_line(public_ready));
@@ -3159,6 +3154,12 @@ mod fs_scope_grant_tests {
         assert!(!observer.allows_dashboard_event_line(&native_workspace));
         assert!(!observer.allows_dashboard_event_line(incomplete_native));
         assert!(observer.allows_dashboard_event_line(public_x11));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","kind":"error"}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":"no"}}"#
+        ));
 
         let replay = serde_json::json!({
             "t": "log_replay",
