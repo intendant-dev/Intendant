@@ -340,6 +340,7 @@ pub enum BrowserWorkspaceError {
     Unsupported(String),
     Io(String),
     Launch(String),
+    #[cfg(target_os = "macos")]
     CleanupPending {
         workspace_id: String,
         message: String,
@@ -358,6 +359,7 @@ impl fmt::Display for BrowserWorkspaceError {
                 "browser workspace '{workspace_id}' is already leased by '{holder_id}'"
             ),
             Self::Unsupported(msg) | Self::Io(msg) | Self::Launch(msg) => f.write_str(msg),
+            #[cfg(target_os = "macos")]
             Self::CleanupPending {
                 workspace_id,
                 message,
@@ -1292,10 +1294,10 @@ async fn create_workspace_inner(
     {
         Ok(launched) => launched,
         Err(error) => {
-            if matches!(error, BrowserWorkspaceError::CleanupPending { .. }) {
-                reservation.disarm();
-            } else {
-                reservation.cleanup(&error.to_string()).await;
+            match &error {
+                #[cfg(target_os = "macos")]
+                BrowserWorkspaceError::CleanupPending { .. } => reservation.disarm(),
+                _ => reservation.cleanup(&error.to_string()).await,
             }
             return Err(error);
         }
