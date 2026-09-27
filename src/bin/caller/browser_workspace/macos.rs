@@ -686,10 +686,7 @@ pub(super) async fn stop(child: &mut Child) -> Result<(), BrowserWorkspaceError>
             "oversized cleanup receipt".into(),
         ));
     }
-    let last = bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .next_back();
+    let last = bytes.split(|b| *b == b'\n').rfind(|line| !line.is_empty());
     let verified = last
         .and_then(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .is_some_and(|reply| reply == serde_json::json!({"cleanup_verified":true}));

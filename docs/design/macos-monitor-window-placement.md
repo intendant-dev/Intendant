@@ -108,8 +108,9 @@ The **same** private main-thread helper owns monitors and windows; no second
 native worker or unsafe AX `Send`/`Sync` exists. Bind/place/unbind serialize with
 monitor destruction. There are at most 16 retained bindings plus one inventory
 of 16 retained candidates, 16 AX window roots per PID (request cap + 1 to detect overflow), two monitors, eight queued broker
-requests, and 16 KiB per private JSON line. AX messaging uses 50 ms per-object
-IPC limits and a four-second operation budget checked between native calls;
+requests, and 16 KiB per private JSON line. AX reads use a 200 ms per-object cap clipped to the remaining operation
+budget. Geometry writes retain their separate 50 ms cap. The four-second
+operation budget is checked between native calls;
 there is no unbounded retry. The existing pipe exchange deadline is six seconds,
 frontend receipt wait is twenty seconds, and receipt commit is limited to two
 seconds. Non-interruptible OS calls can still exceed cooperative budgets; the

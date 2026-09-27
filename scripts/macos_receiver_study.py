@@ -43,9 +43,12 @@ def classify_refusal(error):
         category = "other_refusal"
     timing = {}
     for key in TIMING_KEYS:
-        match = re.search(r"\b" + key + r"=(\d{1,20})(?!\d)", error)
-        if match:
-            timing[key] = int(match[1])
+        names = ("ax_timeout_cap_us", key) if key == "ax_timeout_us" else (key,)
+        for name in names:
+            match = re.search(r"\b" + name + r"=(\d{1,20})(?!\d)", error)
+            if match:
+                timing[name] = int(match[1])
+                break
     return {"category": category, "native_status": native,
             "native_timing": timing if len(timing) == len(TIMING_KEYS) else None}
 

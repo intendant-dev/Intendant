@@ -557,7 +557,8 @@ result, with outer `ok:false`. Movement may already have applied or still be in
 progress. There is no activation, raising,
 unminimizing, keyboard/mouse/clipboard action, retry or focus restoration.
 
-Sixteen bindings maximum; 50 ms AX IPC limits and a four-second operation budget;
+Sixteen bindings maximum; 200 ms AX read caps clipped to the remaining budget,
+50 ms geometry-write caps, and a four-second operation budget;
 receipt commit has a two-second limit. Expiry closes the receiver then drains a
 buffered commit, so successful send cannot race binding rollback. Dropped
 bind receipts roll back only the retained binding. Cancellation after placement
@@ -1339,7 +1340,7 @@ added. See `docs/design/macos-bound-arrowleft.md` for limits and acceptance.
 The bound-window foreground fallback and keyboard receiver path may reread
 `AXFocusedUIElement` once on the same retained application after an empty
 `kAXErrorCannotComplete` reply, within their existing operation deadline and
-50 ms per-copy timeout. This does not reread protection metadata, retry an
+200 ms per-copy cap clipped to the remaining budget. This does not reread protection metadata, retry an
 input, accept missing focus, or relax retained-receiver/foreground checks.
 Other errors, malformed replies, persistent failure and expired budgets refuse.
 See `docs/design/macos-focus-reread.md` for the exact recovery boundary.

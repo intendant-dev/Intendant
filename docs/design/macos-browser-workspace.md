@@ -115,3 +115,30 @@ Fresh validation: 57 focused Rust tests, 19 pure native lifecycle assertions,
 cross-platform validation is delegated to PR CI. The remaining native gate is
 reliable startup AX readiness followed by independently verified form effects,
 capture and cleanup, not concurrent typing or automatic Agent View reveal.
+
+## Native form acceptance after read-budget correction (2026-09-27)
+
+Three fresh isolated-daemon/browser/monitor invocations passed the complete form
+path with one binary. Each used one initial control snapshot, one text write,
+one refreshed snapshot and one button press. Independent fixture readback observed
+the requested text and button_count=1 with canvas_count=0. Exact memory-only frames
+were captured before and after, monitor destruction closed the attached browser,
+and all temporary daemons and original display inventories were restored. The
+production button receipt still says Dispatched/effects_unconfirmed; independent
+fixture readback, not posting alone, verifies its effect.
+
+The correction raises the AX READ cap from 50 to 200 ms and clips it to the
+remaining four-second operation deadline. Geometry writes explicitly reapply their
+50 ms cap immediately before mutation; semantic actions retain their separate cap.
+Unknown, error or contradictory protection metadata still refuses. Required
+attribute reads reject late results before consuming the value. No input or setter
+is automatically retried. Diagnostics name the configured ceiling ax_timeout_cap_us;
+the receiver-study reader preserves both this and historical ax_timeout_us records.
+
+This supersedes the native-blocked checkpoint above, not its retained failure
+reports. Evidence: evidence/macos-browser-workspace-ax-readiness-20260927.json.
+Full local reports: target/cu-completion/ax-readiness/. The executable was built
+before committing (its version says dirty); binary and AX source hashes pin the
+actual tested state. Three passes on one macOS/Chrome configuration do not prove
+general reliability or concurrent-human-keyboard isolation. #967 and automatic
+Agent View reveal remain separate. No installed-daemon change was made.
