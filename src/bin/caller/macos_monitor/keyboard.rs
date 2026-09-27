@@ -1583,7 +1583,7 @@ mod tests {
         }
         let error = inspect(&mut w, id, &f).unwrap_err();
         assert!(
-            error.contains("human global focused object changed"),
+            error.contains("human global focus context changed"),
             "{error}"
         );
         assert_eq!(f.0.borrow().receiver, Some(1));
