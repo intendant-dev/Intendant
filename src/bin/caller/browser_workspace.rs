@@ -1612,6 +1612,7 @@ async fn remove_failed_reservation(id: &str, message: &str, bus: &EventBus) {
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn unbind_macos_workspace(
     workspace: &BrowserWorkspace,
     bus: &EventBus,
@@ -1625,7 +1626,7 @@ async fn unbind_macos_workspace(
             "macOS-bound browser workspace cleanup requires an owner surface".into(),
         ));
     }
-    let receipt = bus
+    let receipt = match bus
         .macos_monitors
         .request(
             crate::macos_monitor::Action::Window(crate::macos_monitor::WindowAction::Unbind {
@@ -1634,29 +1635,46 @@ async fn unbind_macos_workspace(
             authority.clone(),
         )
         .await
-        .map_err(BrowserWorkspaceError::Launch)?;
+    {
+        Ok(receipt) => receipt,
+        // An earlier unbind may have committed after its receipt expired. On
+        // a later owner close, absence of this exact opaque token from the
+        // broker is the required cleanup fact; do not replay native input or
+        // strand the retained workspace forever.
+        Err(error) if error == "stale or foreign window binding" => return Ok(()),
+        Err(error) => return Err(BrowserWorkspaceError::Launch(error)),
+    };
     let unbound = matches!(
         &receipt.value,
         crate::macos_monitor::Value::Window(crate::macos_monitor::WindowValue::Unbound)
     );
     if !receipt.commit() {
+        return validate_macos_unbind_receipt(unbound, false);
+    }
+    validate_macos_unbind_receipt(unbound, true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_unbind_receipt(
+    unbound: bool,
+    committed: bool,
+) -> Result<(), BrowserWorkspaceError> {
+    if !committed {
         return Err(BrowserWorkspaceError::Launch(
             "macOS browser unbind receipt expired; cleanup may already have applied".into(),
         ));
     }
-    if !unbound {
-        return Err(BrowserWorkspaceError::Launch(
-            "unexpected macOS browser unbind result".into(),
-        ));
-    }
-    Ok(())
+    unbound.then_some(()).ok_or_else(|| {
+        BrowserWorkspaceError::Launch("unexpected macOS browser unbind result".into())
+    })
 }
 
 pub(crate) fn is_macos_workspace(workspace: &BrowserWorkspace) -> bool {
-    workspace
-        .display_target
-        .as_deref()
-        .is_some_and(crate::macos_monitor::reserved)
+    workspace.macos_window_binding.is_some()
+        || workspace
+            .display_target
+            .as_deref()
+            .is_some_and(crate::macos_monitor::reserved)
 }
 
 /// Supplemental gate resolution only: caller trust is checked independently.
@@ -1725,6 +1743,8 @@ async fn close_workspace_inner(
     bus: &EventBus,
     macos_authority: Option<crate::macos_monitor::Authority>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = bus;
     let _display_access = acquire_workspace_display_access(id).await?;
     let (mut workspace, mut child) = {
         let registry = global_registry();
@@ -1744,16 +1764,6 @@ async fn close_workspace_inner(
             .ok_or_else(|| BrowserWorkspaceError::NotFound(id.to_string()))?
     };
 
-    let unbind = match macos_authority.as_ref() {
-        Some(authority) => unbind_macos_workspace(&workspace, bus, authority).await,
-        None if workspace.macos_window_binding.is_none() => Ok(()),
-        None => Err(BrowserWorkspaceError::Unsupported(
-            "macOS-bound browser workspace cleanup requires owner authority".into(),
-        )),
-    };
-    if unbind.is_ok() {
-        workspace.macos_window_binding = None;
-    }
     workspace.status = BrowserWorkspaceStatus::Closed;
     workspace.lease = None;
     workspace.message = reason.or_else(|| Some("closed".to_string()));
@@ -1763,21 +1773,46 @@ async fn close_workspace_inner(
         {
             if let Some(owned) = child.as_mut() {
                 if let Err(error) = macos::stop(owned).await {
-                    workspace.status = BrowserWorkspaceStatus::Error;
-                    workspace.message = Some(format!("cleanup unconfirmed: {error}"));
-                    global_registry().write().await.insert(workspace, child);
+                    retain_macos_cleanup(&mut workspace, child, bus, &error.to_string()).await;
                     return Err(error);
                 }
             }
+            // The supervisor's receipt verifies exact-app termination. Its
+            // child and every process/CDP handle are now stale authority and
+            // must not survive if a later unbind or profile removal fails.
+            child = None;
+            clear_stopped_workspace_handles(&mut workspace);
+
+            let unbind = match macos_authority.as_ref() {
+                Some(authority) => unbind_macos_workspace(&workspace, bus, authority).await,
+                None if workspace.macos_window_binding.is_none() => Ok(()),
+                None => Err(BrowserWorkspaceError::Unsupported(
+                    "macOS-bound browser workspace cleanup requires owner authority".into(),
+                )),
+            };
+            if let Err(error) = unbind {
+                let message = format!("browser stopped; window unbind unconfirmed: {error}");
+                retain_macos_cleanup(&mut workspace, None, bus, &message).await;
+                return Err(BrowserWorkspaceError::CleanupPending {
+                    workspace_id: workspace.id.clone(),
+                    message,
+                });
+            }
+            workspace.macos_window_binding = None;
+
             if let Some(profile) = workspace.profile_dir.as_deref() {
                 if let Err(error) = fs::remove_dir_all(profile) {
                     if Path::new(profile).exists() {
-                        return Err(BrowserWorkspaceError::Io(format!(
-                            "browser stopped; profile cleanup failed: {error}"
-                        )));
+                        let message = format!("browser stopped; profile cleanup failed: {error}");
+                        retain_macos_cleanup(&mut workspace, None, bus, &message).await;
+                        return Err(BrowserWorkspaceError::CleanupPending {
+                            workspace_id: workspace.id.clone(),
+                            message,
+                        });
                     }
                 }
             }
+            workspace.profile_dir = None;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1787,12 +1822,39 @@ async fn close_workspace_inner(
         terminate_workspace_process(workspace.process_id, child);
         cleanup_extension_workspace(&workspace);
     }
-    if let Err(error) = unbind {
-        return Err(BrowserWorkspaceError::Launch(format!(
-            "browser workspace process was closed but its macOS window binding cleanup failed: {error}"
-        )));
-    }
     Ok(workspace)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn clear_stopped_workspace_handles(workspace: &mut BrowserWorkspace) {
+    workspace.process_id = None;
+    workspace.debugging_port = None;
+    workspace.cdp_http_url = None;
+    workspace.cdp_ws_url = None;
+    workspace.active_target_id = None;
+}
+
+#[cfg(target_os = "macos")]
+async fn retain_macos_cleanup(
+    workspace: &mut BrowserWorkspace,
+    child: Option<Child>,
+    bus: &EventBus,
+    message: &str,
+) {
+    mark_macos_cleanup_pending(workspace, message);
+    global_registry()
+        .write()
+        .await
+        .insert(workspace.clone(), child);
+    publish_workspace_event(bus, "cleanup_pending", workspace);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mark_macos_cleanup_pending(workspace: &mut BrowserWorkspace, message: &str) {
+    workspace.status = BrowserWorkspaceStatus::Error;
+    workspace.lease = None;
+    workspace.message = Some(format!("cleanup pending: {message}"));
+    workspace.updated_at = now_string();
 }
 
 /// Caller holds the broker workspace lane through validation, cleanup and
@@ -3905,6 +3967,158 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert!(parse_browser_display_binding("display_99").is_err());
+    }
+
+    #[test]
+    fn incomplete_native_workspace_is_owner_only_without_classifying_x11() {
+        let mut native = sample_workspace("native-partial");
+        native.display_target = None;
+        native.macos_window_binding = Some("macos_window:retained".into());
+        assert!(is_macos_workspace(&native));
+
+        let mut x11 = sample_workspace("public-x11");
+        x11.display_target = Some("display_99".into());
+        x11.profile_dir = Some("/tmp/public-managed-profile".into());
+        assert!(!is_macos_workspace(&x11));
+    }
+
+    #[test]
+    fn cleanup_retention_clears_stopped_handles_but_preserves_pending_resources() {
+        let mut workspace = sample_workspace("native-cleanup");
+        workspace.process_id = Some(42);
+        workspace.debugging_port = Some(9222);
+        workspace.cdp_http_url = Some("http://127.0.0.1:9222".into());
+        workspace.cdp_ws_url = Some("ws://127.0.0.1:9222/devtools/page/one".into());
+        workspace.active_target_id = Some("one".into());
+        workspace.macos_window_binding = Some("macos_window:exact".into());
+        workspace.profile_dir = Some("/private/tmp/exact-profile".into());
+
+        clear_stopped_workspace_handles(&mut workspace);
+        mark_macos_cleanup_pending(&mut workspace, "unbind receipt expired");
+
+        assert_eq!(workspace.status, BrowserWorkspaceStatus::Error);
+        assert!(workspace.process_id.is_none());
+        assert!(workspace.debugging_port.is_none());
+        assert!(workspace.cdp_http_url.is_none());
+        assert!(workspace.cdp_ws_url.is_none());
+        assert!(workspace.active_target_id.is_none());
+        assert_eq!(
+            workspace.macos_window_binding.as_deref(),
+            Some("macos_window:exact")
+        );
+        assert_eq!(
+            workspace.profile_dir.as_deref(),
+            Some("/private/tmp/exact-profile")
+        );
+
+        // A later owner close resumes from retained state. Successful unbind
+        // clears only its token; a failed profile removal remains discoverable.
+        workspace.macos_window_binding = None;
+        mark_macos_cleanup_pending(&mut workspace, "profile removal failed");
+        assert!(workspace.macos_window_binding.is_none());
+        assert_eq!(
+            workspace.profile_dir.as_deref(),
+            Some("/private/tmp/exact-profile")
+        );
+    }
+
+    #[test]
+    fn unbind_receipt_validation_is_single_decision_and_fail_closed() {
+        assert!(validate_macos_unbind_receipt(true, true).is_ok());
+        let expired = validate_macos_unbind_receipt(true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(expired.contains("may already have applied"));
+        assert!(validate_macos_unbind_receipt(false, true)
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_close_retains_profile_failure_and_owner_retry_finishes_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(root.path().join("state"));
+        let autonomy = state.read().await.autonomy.clone();
+        let owner = crate::macos_monitor::Authority {
+            owner_surface: true,
+            autonomy: autonomy.clone(),
+        };
+        let non_owner = crate::macos_monitor::Authority {
+            owner_surface: false,
+            autonomy,
+        };
+        let bus = EventBus::new();
+        let selector = format!("macos_virtual:{}:536870912", "c".repeat(32));
+
+        let success_id = format!("native-success-{}", uuid::Uuid::new_v4().simple());
+        let success_profile = root.path().join("success-profile");
+        fs::create_dir(&success_profile).unwrap();
+        let mut success = sample_workspace(&success_id);
+        success.display_target = Some(selector.clone());
+        success.profile_dir = Some(success_profile.display().to_string());
+        global_registry().write().await.insert(success, None);
+        let closed = close_workspace(&success_id, None, &bus, Some(owner.clone()))
+            .await
+            .unwrap();
+        assert_eq!(closed.status, BrowserWorkspaceStatus::Closed);
+        assert!(closed.profile_dir.is_none());
+        assert!(!success_profile.exists());
+
+        let retry_id = format!("native-retry-{}", uuid::Uuid::new_v4().simple());
+        let retained_profile = root.path().join("retained-profile");
+        fs::write(&retained_profile, b"not a directory").unwrap();
+        let mut retry = sample_workspace(&retry_id);
+        retry.display_target = Some(selector);
+        retry.profile_dir = Some(retained_profile.display().to_string());
+        global_registry().write().await.insert(retry, None);
+
+        let denied = close_workspace(&retry_id, None, &bus, Some(non_owner))
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("owner surface"));
+        assert!(global_registry()
+            .read()
+            .await
+            .workspaces
+            .contains_key(&retry_id));
+
+        let failed = close_workspace(&retry_id, None, &bus, Some(owner.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failed,
+            BrowserWorkspaceError::CleanupPending { .. }
+        ));
+        let retained = global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&retry_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(retained.status, BrowserWorkspaceStatus::Error);
+        assert_eq!(
+            retained.profile_dir.as_deref(),
+            Some(retained_profile.to_str().unwrap())
+        );
+        assert!(retained.process_id.is_none());
+        assert!(retained.cdp_http_url.is_none());
+
+        fs::remove_file(&retained_profile).unwrap();
+        fs::create_dir(&retained_profile).unwrap();
+        let closed = close_workspace(&retry_id, None, &bus, Some(owner))
+            .await
+            .unwrap();
+        assert_eq!(closed.status, BrowserWorkspaceStatus::Closed);
+        assert!(closed.profile_dir.is_none());
+        assert!(!retained_profile.exists());
+        assert!(!global_registry()
+            .read()
+            .await
+            .workspaces
+            .contains_key(&retry_id));
     }
 
     #[test]

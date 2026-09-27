@@ -1070,6 +1070,7 @@ impl DashboardControlGrant {
             && !line.contains("display_request_resolved")
             && !line.contains("display_approval_pending")
             && !line.contains("\"agent_visible\"")
+            && !line.contains("browser_workspace_changed")
         {
             return false;
         }
@@ -1086,8 +1087,26 @@ impl DashboardControlGrant {
                     .and_then(serde_json::Value::as_bool)
                     == Some(false)
             }
+            Some("browser_workspace_changed") => value
+                .get("workspace")
+                .is_some_and(Self::browser_workspace_event_requires_owner),
             _ => false,
         }
+    }
+
+    fn browser_workspace_event_requires_owner(workspace: &serde_json::Value) -> bool {
+        // A macOS workspace is owner-only even if creation/cancellation left a
+        // partial record. Either native discriminator is sufficient; requiring
+        // both would fail open and expose the remaining binding/profile/CDP
+        // cleanup state. Linux display-bound workspaces deliberately remain in
+        // the scoped dashboard projection.
+        workspace
+            .get("display_target")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::macos_monitor::reserved)
+            || workspace
+                .get("macos_window_binding")
+                .is_some_and(|binding| !binding.is_null())
     }
 
     /// Remove owner-only display events from a browser bootstrap replay.
@@ -3125,11 +3144,21 @@ mod fs_scope_grant_tests {
         let public_ready = r#"{"event":"display_ready","display_id":8,"agent_visible":true}"#;
         let request = r#"{"event":"display_request_raised","id":1}"#;
         let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
+        let native_workspace = format!(
+            r#"{{"event":"browser_workspace_changed","kind":"ready","workspace":{{"id":"native","display_target":"macos_virtual:{}:536870912","profile_dir":"/private/owner-profile","cdp_http_url":"http://127.0.0.1:9222","macos_window_binding":"macos_window:secret"}}}}"#,
+            "a".repeat(32)
+        );
+        let incomplete_native = r#"{"event":"browser_workspace_changed","kind":"cleanup_pending","workspace":{"id":"native-partial","macos_window_binding":"macos_window:retained","profile_dir":"/private/owner-profile"}}"#;
+        let public_x11 = r#"{"event":"browser_workspace_changed","kind":"ready","workspace":{"id":"linux","display_target":"display_99","profile_dir":"/tmp/managed-profile","cdp_http_url":"http://127.0.0.1:9222"}}"#;
         assert!(root.allows_dashboard_event_line(private_ready));
         assert!(!observer.allows_dashboard_event_line(private_ready));
         assert!(observer.allows_dashboard_event_line(public_ready));
         assert!(!observer.allows_dashboard_event_line(request));
         assert!(!observer.allows_dashboard_event_line(approval));
+        assert!(root.allows_dashboard_event_line(&native_workspace));
+        assert!(!observer.allows_dashboard_event_line(&native_workspace));
+        assert!(!observer.allows_dashboard_event_line(incomplete_native));
+        assert!(observer.allows_dashboard_event_line(public_x11));
 
         let replay = serde_json::json!({
             "t": "log_replay",
@@ -3138,6 +3167,9 @@ mod fs_scope_grant_tests {
                 serde_json::from_str::<serde_json::Value>(public_ready).unwrap(),
                 serde_json::from_str::<serde_json::Value>(request).unwrap(),
                 serde_json::from_str::<serde_json::Value>(approval).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&native_workspace).unwrap(),
+                serde_json::from_str::<serde_json::Value>(incomplete_native).unwrap(),
+                serde_json::from_str::<serde_json::Value>(public_x11).unwrap(),
                 {"event": "display_capture_lost", "display_id": 9, "reason": "closed"},
             ],
         });
@@ -3153,7 +3185,14 @@ mod fs_scope_grant_tests {
             .iter()
             .filter_map(|entry| entry.get("event").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(events, vec!["display_ready", "display_capture_lost"]);
+        assert_eq!(
+            events,
+            vec![
+                "display_ready",
+                "browser_workspace_changed",
+                "display_capture_lost"
+            ]
+        );
     }
 
     #[test]
