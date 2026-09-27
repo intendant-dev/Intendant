@@ -196,6 +196,11 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 | `bundle-macos.sh` | Build and codesign the macOS `.app` (WKWebView wrapper over the `intendant://` scheme) and install to `/Applications` |
 | `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers/orchestrators around the native `intendant access` cert enrollment flow |
 
+The macOS bundler uses one minimum OS version (currently 14.0) for both the
+Swift launcher's explicit compiler target and `LSMinimumSystemVersion`. It
+checks the launcher's Mach-O minimum before signing or installation: compiler
+defaults can otherwise require a newer macOS than the build host supports.
+
 `intendant setup browsers` can also be run directly to install or repair the
 managed browser cache used by CDP browser workspaces.
 
