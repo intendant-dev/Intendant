@@ -132,3 +132,13 @@ are never killed or recreated to manufacture inventory restoration.
 Keyboard effects, the final exact screenshot, and owned cleanup are recorded
 even when the separate activity requirement fails. Such a run remains failed
 for concurrent acceptance; a successful baseline is not renamed as overlap.
+
+The paced 2026-09-28 confirmation used the published 46fb228f implementation
+with unchanged Rust sources and a separately pinned coordination harness. All
+13 positive transitions, nine key pairs, six input events and the duplicate
+refusal passed. Exact captures and complete owned cleanup passed; the foreground
+process and clipboard change count stayed unchanged across 434 action-span
+samples. No HID keyboard activity occurred, so concurrent acceptance remains
+false. See `evidence/macos-managed-keyboard-coordinated-20260928.json`.
+The earlier overlapping-test inventory failures remain preserved separately;
+they are not evidence that the browser failed its own resource cleanup.
