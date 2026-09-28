@@ -321,7 +321,16 @@ def main():
             report['daemon_reaped'] = daemon.poll() is not None
         else:
             report['daemon_retained_for_cleanup'] = True
-        report['after'] = monitor_harness.inventory()
+        # CGVirtualDisplay teardown is asynchronous at the WindowServer edge.
+        # The production destroy receipt has already confirmed owner cleanup;
+        # wait only for the read-only OS inventory to converge, exactly as the
+        # canonical monitor harness does. Never retry destroy or any input.
+        inventory_deadline = time.monotonic() + 10
+        while True:
+            report['after'] = monitor_harness.inventory()
+            if report['after'] == report['before'] or time.monotonic() >= inventory_deadline:
+                break
+            time.sleep(.1)
         report['inventory_restored'] = report['after'] == report['before']
         report['ok'] = report.get('ok') is True and cleaned and report['inventory_restored']
         checkpoint()
