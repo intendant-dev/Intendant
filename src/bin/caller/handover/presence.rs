@@ -416,6 +416,35 @@ mod tests {
         assert!(!boot_id_is_live(dir.path(), "boot-b"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn explicit_unlock_releases_fixture_lock_with_duplicated_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemons = dir.path().join(DAEMONS_DIR);
+        std::fs::create_dir_all(&daemons).unwrap();
+        let owner = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(daemons.join("boot-a.lock"))
+            .unwrap();
+        owner.try_lock().unwrap();
+        let inherited = owner.try_clone().unwrap();
+
+        drop(owner);
+        assert!(
+            boot_id_is_live(dir.path(), "boot-a"),
+            "closing one duplicated descriptor must not model process death"
+        );
+
+        inherited.unlock().unwrap();
+        assert!(
+            !boot_id_is_live(dir.path(), "boot-a"),
+            "explicit unlock must establish fixture death before status is sampled"
+        );
+    }
+
     #[test]
     fn boot_liveness_is_lock_takeability() {
         let dir = tempfile::tempdir().unwrap();

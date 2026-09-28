@@ -3804,6 +3804,10 @@ fn main() -> Result<(), CallerError> {
     // Private helper interception precedes even runtime/crypto/panic-hook setup,
     // config, auth, lease cleanup, logging, sockets and normal argument parsing.
     #[cfg(target_os = "macos")]
+    if let Some(result) = browser_workspace::managed_keyboard::intercept_foreground_probe() {
+        return result.map_err(CallerError::Display);
+    }
+    #[cfg(target_os = "macos")]
     if let Some(result) = intendant_platform::macos_browser::intercept_supervisor() {
         return result.map_err(CallerError::Display);
     }

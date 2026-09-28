@@ -1032,6 +1032,16 @@ mod tests {
                 _ => arrow::Key::ArrowRight,
             };
             match op {
+                Operation::ValidatePageWindow { .. } => {
+                    self.log.lock().unwrap().push("validate_page_window");
+                    let bounds = placement::tests::monitor();
+                    Ok(Outcome::ValidatedPageWindow {
+                        observation: placement::Observation {
+                            ax: bounds,
+                            cg: bounds,
+                        },
+                    })
+                }
                 Operation::Create { width, height } => {
                     self.log.lock().unwrap().push("create");
                     if let Some(started) = self.created.take() {

@@ -21,6 +21,11 @@ pub(crate) enum WindowAction {
     ReadElements {
         binding: String,
     },
+    // Internal read-only geometry/protection check for separately addressed CDP input.
+    #[cfg(any(target_os = "macos", test))]
+    ValidatePageWindow {
+        binding: String,
+    },
     ReadKeyboardTarget {
         binding: String,
     },
@@ -115,6 +120,8 @@ impl WindowAction {
                 valid_binding(binding)?;
                 bounds.validate()
             }
+            #[cfg(any(target_os = "macos", test))]
+            Self::ValidatePageWindow { binding } => valid_binding(binding),
             Self::Unbind { binding }
             | Self::ReadElements { binding }
             | Self::ReadKeyboardTarget { binding }
@@ -156,6 +163,8 @@ pub(crate) enum WindowValue {
         error: String,
     },
     Elements(Vec<Control>),
+    #[cfg(any(target_os = "macos", test))]
+    ValidatedPageWindow(placement::Observation),
     KeyboardTarget(KeyboardTarget),
     PreparedArrow(arrow::Prepared),
     Arrowed(Box<arrow::ArrowResult>),
@@ -235,6 +244,16 @@ pub(super) async fn execute_window(
             Operation::PlaceWindow {
                 binding: bound.helper_binding,
                 bounds: *bounds,
+            }
+        }
+        #[cfg(any(target_os = "macos", test))]
+        WindowAction::ValidatePageWindow { binding } => {
+            let bound = state
+                .bindings
+                .get(binding)
+                .ok_or_else(|| Failure::Request("stale or foreign window binding".into()))?;
+            Operation::ValidatePageWindow {
+                binding: bound.helper_binding,
             }
         }
         WindowAction::ReadElements { binding }
@@ -381,6 +400,14 @@ pub(super) async fn execute_window(
         }
         (WindowAction::Place { .. }, Outcome::PlacedWindow { result }) if result.valid_reply() => {
             WindowValue::Placed(result)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        (WindowAction::ValidatePageWindow { .. }, Outcome::ValidatedPageWindow { observation })
+            if observation.ax.validate().is_ok()
+                && observation.cg.validate().is_ok()
+                && observation.ax.close(observation.cg) =>
+        {
+            WindowValue::ValidatedPageWindow(observation)
         }
         (WindowAction::ReadElements { .. }, Outcome::WindowElements { controls })
             if controls.len() <= controls::MAX_CONTROLS

@@ -1,0 +1,224 @@
+{
+  "keyboard_tool": "execute_browser_workspace_keyboard",
+  "steps": [
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "cdefb171-c978-436b-bef2-1eb52498b20a",
+        "action": {
+          "type": "select_all"
+        }
+      },
+      "expected": {
+        "first": "seed",
+        "firstSelection": [
+          0,
+          4
+        ]
+      },
+      "key": "a",
+      "receiver": "first"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "3ebe928f-6aaf-4d59-9547-6cd8d09d8791",
+        "action": {
+          "type": "insert_text",
+          "text": "agent typing"
+        }
+      },
+      "expected": {
+        "first": "agent typing",
+        "second": ""
+      },
+      "minimum_input_events": 1
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "7d1df397-c792-422f-a63f-59ca56c3d386",
+        "action": {
+          "type": "key",
+          "key": "ArrowLeft"
+        }
+      },
+      "expected": {
+        "firstSelection": [
+          11,
+          11
+        ]
+      },
+      "key": "ArrowLeft",
+      "receiver": "first"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "28d1b7e3-ab33-482c-bf83-df1c792c1f0c",
+        "action": {
+          "type": "key",
+          "key": "Backspace"
+        }
+      },
+      "expected": {
+        "first": "agent typig",
+        "firstSelection": [
+          10,
+          10
+        ]
+      },
+      "key": "Backspace",
+      "receiver": "first",
+      "minimum_input_events": 1
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "432728c3-c6a0-4535-8e7e-0c467fcd74c2",
+        "action": {
+          "type": "key",
+          "key": "Tab"
+        }
+      },
+      "expected": {
+        "active": "second",
+        "first": "agent typig"
+      },
+      "key": "Tab",
+      "receiver": "first",
+      "facade": true
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "dd3dc731-550d-4368-aa75-62d4d59a4343",
+        "action": {
+          "type": "insert_text",
+          "text": "Hello 東京 🙂"
+        }
+      },
+      "expected": {
+        "second": "Hello 東京 🙂",
+        "first": "agent typig"
+      },
+      "minimum_input_events": 1
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "ab007b78-b754-44d7-8e84-953611fe8059",
+        "action": {
+          "type": "key",
+          "key": "Enter"
+        }
+      },
+      "expected": {
+        "second": "Hello 東京 🙂\n"
+      },
+      "key": "Enter",
+      "receiver": "second",
+      "minimum_input_events": 1
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "16c3dbbf-2242-4e3b-a3a8-c5a447945774",
+        "action": {
+          "type": "insert_text",
+          "text": "Second line"
+        }
+      },
+      "expected": {
+        "second": "Hello 東京 🙂\nSecond line"
+      },
+      "minimum_input_events": 1,
+      "facade": true
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "c1251c3d-5120-4995-91a4-e03438066dcd",
+        "action": {
+          "type": "key",
+          "key": "Tab"
+        }
+      },
+      "expected": {
+        "active": "editor"
+      },
+      "key": "Tab",
+      "receiver": "second"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "dfe4e7ab-2f2e-4d26-80b9-61b836acb9df",
+        "action": {
+          "type": "select_all"
+        }
+      },
+      "expected": {
+        "editor": "rich seed"
+      },
+      "key": "a",
+      "receiver": "editor"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "0936f975-f171-444d-b884-ee2fc08e6272",
+        "action": {
+          "type": "insert_text",
+          "text": "Edited rich text"
+        }
+      },
+      "expected": {
+        "editor": "Edited rich text"
+      },
+      "minimum_input_events": 1
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "abff1ab0-4686-4671-adef-87a9323edf8b",
+        "action": {
+          "type": "key",
+          "key": "Tab"
+        }
+      },
+      "expected": {
+        "active": "activate"
+      },
+      "key": "Tab",
+      "receiver": "editor"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "e4af5ce2-09ef-43ff-bb6f-5f72f1cfb6d9",
+        "action": {
+          "type": "key",
+          "key": "Enter"
+        }
+      },
+      "expected": {
+        "activations": 1,
+        "active": "activate"
+      },
+      "key": "Enter",
+      "receiver": "activate"
+    },
+    {
+      "arguments": {
+        "workspace_id": "$workspace",
+        "request_id": "e4af5ce2-09ef-43ff-bb6f-5f72f1cfb6d9",
+        "action": {
+          "type": "key",
+          "key": "Enter"
+        }
+      },
+      "expect_refusal": "duplicate keyboard request"
+    }
+  ]
+}

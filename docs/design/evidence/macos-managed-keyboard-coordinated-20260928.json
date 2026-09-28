@@ -1,0 +1,118 @@
+{
+  "schema": "intendant-coordinated-browser-keyboard-v1",
+  "implementation_source_head": "46fb228f3e1b5b99ab465875f8cd2ca33237c48c",
+  "harness_source_head": "0d767abfcfe01aaa59756b49bf559ac3f01c10f7",
+  "binary_version": "intendant 0.2.0-alpha.7 (commit 46fb228f-dirty, built 2026-09-28T04:36:30Z, aarch64-apple-darwin)",
+  "binary_sha256": "eab625b5848cdcae5e4e9e1bbb30f3dfcda281265935dd851edc88b327c00f4a",
+  "harness_sha256": "505b1b3ad78e12d07b6b79ace318050b3375a4b45d2792f17f3aaf067a33e9af",
+  "observer_sha256": "7731fe81e4f736f69bd6ccab28c94009550b8d77aa506d7e2428f045f7d5f5b2",
+  "fixture_sha256": "e9d4ce7600d578ae2ee924686cbb90e8efe55ef5a559c163692011659cd81d42",
+  "plan_sha256": "260217db4f1219585e02aea7b9adcaaa11483042168946adb1b2b87662874a35",
+  "raw_report_sha256": "ac0a3ffa88f90647bcfae50ed179b518f032a65c4b35f5013dcc146dc451d4c8",
+  "start_delay_ms": 30000,
+  "step_delay_ms": 1500,
+  "native_acceptance_lock_held": true,
+  "checks": {
+    "launch_and_placement_verified": true,
+    "exact_monitor_capture_verified": true,
+    "keyboard_effects_verified": true,
+    "monitor_destruction_closes_browser": true
+  },
+  "overall_concurrent_acceptance": false,
+  "error": "no observed keyboard activity inside a keyboard request",
+  "verified_effect_steps": 13,
+  "page_key_pairs": 9,
+  "page_input_events": 6,
+  "duplicate_refusals_without_effect": 1,
+  "witness": {
+    "sampled_focus_unchanged": true,
+    "sampled_clipboard_unchanged": true,
+    "keyboard_activity_observed_in_action_span": false,
+    "samples_in_action_span": 434,
+    "human_provenance_verified": false,
+    "continuous_isolation_verified": false
+  },
+  "request_activity": {
+    "keyboard_activity_observed_during_request": false,
+    "requests": [
+      {
+        "index": 0,
+        "samples": 3,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 1,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 2,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 3,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 4,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 5,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 6,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 7,
+        "samples": 3,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 8,
+        "samples": 3,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 9,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 10,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 11,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      },
+      {
+        "index": 12,
+        "samples": 2,
+        "keyboard_activity_observed": false
+      }
+    ],
+    "human_provenance_verified": false,
+    "continuous_isolation_verified": false
+  },
+  "inventory_restored": true,
+  "daemon_reaped": true,
+  "installed_daemon_changed": false,
+  "limitations": [
+    "No HID keyboard activity was observed; simultaneous human typing is not established.",
+    "Sampled focus and clipboard equality are not continuous isolation or human provenance.",
+    "Text insertion is CDP input, not physical alphabetic key events.",
+    "Owner-authorized managed browser only; ordinary scoped agent delegation remains separate.",
+    "The binary retains a dirty version stamp; its implementation source and hash are explicit.",
+    "The exclusive lock coordinates updated harnesses only, not older test clients."
+  ]
+}

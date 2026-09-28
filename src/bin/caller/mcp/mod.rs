@@ -1010,6 +1010,18 @@ impl IntendantServer {
             "list_browser_workspaces" => Ok(text_tool_result(
                 self.list_browser_workspaces_as_caller(caller).await,
             )),
+            "execute_browser_workspace_keyboard" => {
+                let Parameters(params) =
+                    parse_params::<crate::browser_workspace::managed_keyboard::Request>(args)?;
+                let authority = self.macos_monitor_authority(caller).await;
+                let result = crate::browser_workspace::managed_keyboard::execute(
+                    params, &self.bus, authority,
+                )
+                .await;
+                Ok(text_tool_result(
+                    serde_json::to_string(&result).unwrap_or_default(),
+                ))
+            }
             "create_browser_workspace" => {
                 let Parameters(params) = parse_params::<CreateBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
@@ -1997,6 +2009,23 @@ fn shared_view_user_display_id(
 
 #[tool_router]
 impl IntendantServer {
+    #[tool(
+        description = "Send one browser-page text insertion, paired navigation key, or select-all edit to an exact managed macOS virtual-display workspace. Requires owner authority and display view/input permissions. No OS keyboard posting, activation, clipboard access, arbitrary CDP, held keys, or automatic replay. request_id is a single-use UUID; insertion is not physical typing and acknowledgements do not prove page effects."
+    )]
+    pub(crate) async fn execute_browser_workspace_keyboard(
+        &self,
+        Parameters(params): Parameters<crate::browser_workspace::managed_keyboard::Request>,
+    ) -> String {
+        let authority = self
+            .macos_monitor_authority(ToolCallerTrust::OwnerSurface)
+            .await;
+        serde_json::to_string(
+            &crate::browser_workspace::managed_keyboard::execute(params, &self.bus, authority)
+                .await,
+        )
+        .unwrap_or_default()
+    }
+
     #[tool(
         description = "List candidate tokens and macOS AX/CG window identities for one explicit PID, including process start generation. Owner-only DisplayView read; requires an existing monitor helper and existing Accessibility/Screen Recording permissions. One retained inventory of at most 16 windows; any helper listing refresh, including failure, invalidates unbound tokens across callers. No activation or input.",
         annotations(read_only_hint = true)

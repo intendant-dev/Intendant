@@ -1,6 +1,7 @@
 mod extension_policy;
 #[cfg(target_os = "macos")]
 mod macos;
+pub(crate) mod managed_keyboard;
 mod viewport;
 
 pub(crate) mod launch_policy;
@@ -1721,6 +1722,7 @@ fn canonical_x11_workspace_target(target: &str) -> bool {
 /// Supplemental gate resolution only: caller trust is checked independently.
 pub(crate) async fn macos_workspace_request(tool: &str, args: &serde_json::Value) -> bool {
     match tool {
+        "execute_browser_workspace_keyboard" => true,
         "create_browser_workspace" => args
             .get("display_target")
             .and_then(serde_json::Value::as_str)

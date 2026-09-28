@@ -120,6 +120,40 @@ def validate_mouse_overlap(before, samples):
     }
 
 
+def summarize_keyboard_overlap(before, samples):
+    before = validate_current_activity(
+        before, before.get('sequence') if isinstance(before, dict) else -1)
+    require(not before['hid_activity']['counter_regression'],
+            'keyboard overlap baseline counter regression')
+    base = before['hid_activity']['deltas']
+    require(base['key_down'] > 0 and base['key_up'] > 0,
+            'required completed keyboard activity not observed before dispatch')
+    client = summarize_client_activity(before, samples)
+    # Only differences between two samples both taken while the client lives
+    # establish in-flight progress; the prelaunch gate is not that baseline.
+    client = summarize_client_activity(samples[0], samples)
+    for previous, current in zip([before] + samples, samples):
+        require(all(current['hid_activity']['deltas'][k] >= previous['hid_activity']['deltas'][k]
+                    for k in COUNTERS), 'keyboard counter sample moved backwards')
+    progress = client['deltas_while_client_alive']
+    return {
+        'before_dispatch': {
+            'key_down': base['key_down'],
+            'key_up': base['key_up'],
+        },
+        'while_client_alive': {
+            'key_down': progress['key_down'],
+            'key_up': progress['key_up'],
+        },
+        'progress_exceeds_single_tested_pair':
+            progress['key_down'] >= 2 and progress['key_up'] >= 2,
+        'attribution': 'not_authenticated',
+        'client_samples_collected': True,
+        'client_process_overlap_verified': False,
+        'internal_posting_overlap_verified': False,
+    }
+
+
 def preparation_token(reply, key, fixture, window, validate_geometry):
     require(isinstance(reply, dict) and set(reply) == {'ok', 'action_attempted', 'prepared'}
             and reply['ok'] is True and reply['action_attempted'] is False, 'preparation not successful')
@@ -150,6 +184,45 @@ def definite_no_post(reply):
             and isinstance(reply.get('error'), str) and reply['error']):
         return False
     return 'action' not in reply
+
+
+def finalize_keyboard_overlap(outcome, dispatch_reply, overlap, native_after):
+    """Keep prior activity, in-flight progress, refusal, and delivery distinct."""
+    require(isinstance(overlap, dict) and set(overlap) == {
+        'before_dispatch', 'while_client_alive', 'progress_exceeds_single_tested_pair',
+        'client_samples_collected', 'attribution', 'client_process_overlap_verified',
+        'internal_posting_overlap_verified'}, 'required keyboard overlap evidence missing')
+    for phase in ('before_dispatch', 'while_client_alive'):
+        counts = overlap[phase]
+        require(isinstance(counts, dict) and set(counts) == {'key_down', 'key_up'}
+                and all(type(v) is int and 0 <= v <= 2**32 - 1 for v in counts.values()),
+                'invalid keyboard overlap counters')
+    before, during = overlap['before_dispatch'], overlap['while_client_alive']
+    extra_pair = during['key_down'] >= 2 and during['key_up'] >= 2
+    require(all(v > 0 for v in before.values())
+            and overlap['client_samples_collected'] is True
+            and overlap['attribution'] == 'not_authenticated'
+            and overlap['client_process_overlap_verified'] is False
+            and overlap['internal_posting_overlap_verified'] is False
+            and overlap['progress_exceeds_single_tested_pair'] is extra_pair,
+            'inconsistent keyboard overlap evidence')
+    validate_witness(native_after, 2, 'after')
+    result = dict(overlap)
+    if outcome == 'dispatch_refused':
+        require(definite_no_post(dispatch_reply),
+                'keyboard overlap refusal lacks explicit zero-post evidence')
+        result['containment_outcome'] = 'dispatch_refused_zero_post'
+        result['client_process_overlap_verified'] = all(v > 0 for v in during.values())
+        return result
+    if outcome == 'effect_verified':
+        require(extra_pair, 'keyboard HID counter progress did not exceed the single tested arrow pair')
+        require(all(native_after.get(k) is False for k in
+                    ('human_changed', 'receiver_changed', 'foreground_changed', 'target_foreground_observed')),
+                'keyboard containment requires known unchanged focus endpoints')
+        result['containment_outcome'] = 'effect_verified_with_keyboard_overlap'
+        result['client_process_overlap_verified'] = True
+        return result
+    raise RuntimeError('keyboard overlap study reached unsupported outcome: ' + str(outcome))
 
 
 def public_reply(reply):
@@ -184,6 +257,7 @@ def public_fixture(state):
 def summarize(report):
     dispatch = report.get('dispatch', {})
     overlap = report.get('mouse_overlap')
+    keyboard_overlap = report.get('keyboard_overlap')
     client = report.get('dispatch_client_activity')
     native = dispatch.get('native_after', {}) if dispatch.get('witness_valid') is True else {}
     activity = native.get('hid_activity', {})
@@ -203,9 +277,21 @@ def summarize(report):
                 client.get('keyboard_activity') if isinstance(client, dict) else None,
             'human_activity_attribution': 'not_authenticated',
             'mouse_activity_required': report.get('mouse_activity_required', False),
+            'keyboard_activity_required': report.get('keyboard_activity_required', False),
             'mouse_activity_before_dispatch': overlap.get('before_dispatch') if isinstance(overlap, dict) else None,
             'mouse_activity_while_client_alive': overlap.get('while_client_alive') if isinstance(overlap, dict) else None,
-            'client_process_overlap_verified': overlap.get('client_process_overlap_verified', False) if isinstance(overlap, dict) else False,
+            'keyboard_activity_before_dispatch':
+                keyboard_overlap.get('before_dispatch') if isinstance(keyboard_overlap, dict) else None,
+            'keyboard_activity_while_client_alive':
+                keyboard_overlap.get('while_client_alive') if isinstance(keyboard_overlap, dict) else None,
+            'keyboard_progress_exceeds_tested_pair':
+                keyboard_overlap.get('progress_exceeds_single_tested_pair') if isinstance(keyboard_overlap, dict) else None,
+            'keyboard_containment_outcome':
+                keyboard_overlap.get('containment_outcome') if isinstance(keyboard_overlap, dict) else None,
+            'client_process_overlap_verified':
+                (overlap.get('client_process_overlap_verified', False) if isinstance(overlap, dict)
+                 else keyboard_overlap.get('client_process_overlap_verified', False)
+                 if isinstance(keyboard_overlap, dict) else False),
             'internal_posting_overlap_verified': False,
             'continuous_isolation_verified': False}
 

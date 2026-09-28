@@ -69,14 +69,18 @@ class StudyTests(unittest.TestCase):
         self.assertFalse(report['summary']['continuous_isolation_verified'])
 
     def test_refusals_are_recorded_not_retried_until_success(self):
-        r = Rig()
-        r.mutate_reply = lambda v: (v.clear(), v.update(ok=False, error='human global focused object changed during keyboard receiver observation'))
-        report = r.run()
-        self.assertEqual(r.reads, 12)
-        self.assertTrue(report['completed'])
-        self.assertFalse(report['summary']['all_nonprotected_reads_succeeded'])
-        self.assertEqual(report['summary']['accepted_nonprotected'], 0)
-        self.assertEqual(report['summary']['categories'], {'human_focus_changed': 12})
+        for diagnostic in (
+                'human global focused object changed during keyboard receiver observation',
+                'human global focus context changed during keyboard receiver observation'):
+            with self.subTest(diagnostic=diagnostic):
+                r = Rig()
+                r.mutate_reply = lambda v: (v.clear(), v.update(ok=False, error=diagnostic))
+                report = r.run()
+                self.assertEqual(r.reads, 12)
+                self.assertTrue(report['completed'])
+                self.assertFalse(report['summary']['all_nonprotected_reads_succeeded'])
+                self.assertEqual(report['summary']['accepted_nonprotected'], 0)
+                self.assertEqual(report['summary']['categories'], {'human_focus_changed': 12})
 
     def test_transport_failure_preserves_attempt_and_aborts(self):
         r = Rig(); r.fail_read = True

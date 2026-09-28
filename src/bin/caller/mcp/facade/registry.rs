@@ -1108,6 +1108,19 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "List browser workspaces",
     },
     CommandSpec {
+        path: &["browser", "keyboard"],
+        lane: RiskLane::Act,
+        tool: "execute_browser_workspace_keyboard",
+        seed: "{}",
+        positionals: &[
+            p_str("WORKSPACE", "workspace_id", true, false),
+            p_str("REQUEST_ID", "request_id", true, false),
+            PositionalSpec { name: "ACTION", json_key: "action", kind: ValueKind::Json, required: true, greedy: false },
+        ],
+        flags: &[],
+        help: "One owner-authorized managed-browser text/key/edit action; request UUID is single-use",
+    },
+    CommandSpec {
         path: &["browser", "create"],
         lane: RiskLane::Act,
         tool: "create_browser_workspace",

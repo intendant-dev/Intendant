@@ -29,7 +29,10 @@ def classify_refusal(error):
         native = {"name": status[1], "code": int(status[2]), "value_present": status[3] == "true"}
     if native:
         category = "ax_cannot_complete" if native["code"] == -25204 else "ax_other"
-    elif "human global focused object changed" in error or "human focus changed" in error:
+    elif any(message in error for message in (
+            "human global focused object changed",
+            "human global focus context changed",
+            "human focus changed")):
         category = "human_focus_changed"
     elif "application-local focused receiver changed" in error:
         category = "receiver_changed"
