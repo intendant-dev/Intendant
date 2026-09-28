@@ -1065,16 +1065,30 @@ impl DashboardControlGrant {
         self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
     }
 
+    pub(crate) fn project_browser_workspaces(
+        &self,
+        workspaces: Vec<crate::browser_workspace::BrowserWorkspace>,
+    ) -> Vec<crate::browser_workspace::BrowserWorkspace> {
+        if self.has_owner_dashboard_authority() {
+            return workspaces;
+        }
+        workspaces
+            .into_iter()
+            .filter(|workspace| !crate::browser_workspace::is_macos_workspace(workspace))
+            .collect()
+    }
+
     pub(crate) fn dashboard_event_line_requires_owner(line: &str) -> bool {
         if !line.contains("display_request_raised")
             && !line.contains("display_request_resolved")
             && !line.contains("display_approval_pending")
             && !line.contains("\"agent_visible\"")
+            && !line.contains("browser_workspace_changed")
         {
             return false;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return false;
+            return line.contains("browser_workspace_changed");
         };
         match value.get("event").and_then(serde_json::Value::as_str) {
             Some(
@@ -1086,8 +1100,38 @@ impl DashboardControlGrant {
                     .and_then(serde_json::Value::as_bool)
                     == Some(false)
             }
+            Some("browser_workspace_changed") => value
+                .get("workspace")
+                .is_none_or(Self::browser_workspace_event_requires_owner),
             _ => false,
         }
+    }
+
+    fn browser_workspace_event_requires_owner(workspace: &serde_json::Value) -> bool {
+        // Provenance is durable and independent of optional cleanup resources.
+        // Missing/malformed provenance fails closed; current public X11 rows
+        // serialize an explicit false value.
+        let Some(object) = workspace.as_object() else {
+            return true;
+        };
+        let durable = match object.get("owner_only_native") {
+            Some(value) => match value.as_bool() {
+                Some(value) => Some(value),
+                None => return true,
+            },
+            None => None,
+        };
+        let target = match object.get("display_target") {
+            Some(serde_json::Value::String(target)) => Some(target.as_str()),
+            Some(serde_json::Value::Null) | None => None,
+            Some(_) => return true,
+        };
+        let binding = match object.get("macos_window_binding") {
+            Some(serde_json::Value::String(_)) => true,
+            Some(serde_json::Value::Null) | None => false,
+            Some(_) => return true,
+        };
+        crate::browser_workspace::workspace_metadata_requires_owner(durable, target, binding)
     }
 
     /// Remove owner-only display events from a browser bootstrap replay.
@@ -2954,7 +2998,10 @@ impl OutboundControlQueue {
 mod fs_scope_grant_tests {
     use super::*;
 
-    fn browser_grant_for_role(role_id: &str, fingerprint: &str) -> DashboardControlGrant {
+    pub(crate) fn browser_grant_for_role(
+        role_id: &str,
+        fingerprint: &str,
+    ) -> DashboardControlGrant {
         let mut state = crate::access::iam::LocalIamState::default();
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
             "test",
@@ -2977,6 +3024,28 @@ mod fs_scope_grant_tests {
         DashboardControlGrant::UserClient {
             principal,
             iam_state: std::sync::Arc::new(state),
+            iam_cert_dir: None,
+            authority_memo: Default::default(),
+        }
+    }
+
+    pub(crate) fn revoked_root_grant(fingerprint: &str) -> DashboardControlGrant {
+        let grant = browser_grant_for_role("role:root", fingerprint);
+        let DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+            ..
+        } = grant
+        else {
+            unreachable!()
+        };
+        let mut state = (*iam_state).clone();
+        for item in &mut state.grants {
+            item.status = "revoked".into();
+        }
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: Arc::new(state),
             iam_cert_dir: None,
             authority_memo: Default::default(),
         }
@@ -3125,11 +3194,39 @@ mod fs_scope_grant_tests {
         let public_ready = r#"{"event":"display_ready","display_id":8,"agent_visible":true}"#;
         let request = r#"{"event":"display_request_raised","id":1}"#;
         let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
+        let native_workspace = format!(
+            r#"{{"event":"browser_workspace_changed","kind":"ready","workspace":{{"id":"native","owner_only_native":true,"display_target":"macos_virtual:{}:536870912","profile_dir":"/private/owner-profile","cdp_http_url":"http://127.0.0.1:9222","macos_window_binding":"macos_window:secret"}}}}"#,
+            "a".repeat(32)
+        );
+        let incomplete_native = r#"{"event":"browser_workspace_changed","kind":"cleanup_pending","workspace":{"id":"native-partial","owner_only_native":true,"macos_window_binding":"macos_window:retained","profile_dir":"/private/owner-profile"}}"#;
+        let public_x11 = r#"{"event":"browser_workspace_changed","kind":"ready","workspace":{"id":"linux","owner_only_native":false,"display_target":"display_99","profile_dir":"/tmp/managed-profile","cdp_http_url":"http://127.0.0.1:9222"}}"#;
         assert!(root.allows_dashboard_event_line(private_ready));
         assert!(!observer.allows_dashboard_event_line(private_ready));
         assert!(observer.allows_dashboard_event_line(public_ready));
         assert!(!observer.allows_dashboard_event_line(request));
         assert!(!observer.allows_dashboard_event_line(approval));
+        assert!(root.allows_dashboard_event_line(&native_workspace));
+        assert!(!observer.allows_dashboard_event_line(&native_workspace));
+        assert!(!observer.allows_dashboard_event_line(incomplete_native));
+        assert!(observer.allows_dashboard_event_line(public_x11));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","kind":"error"}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":"no"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":false,"macos_window_binding":"macos_window:retained"}}"#
+        ));
+        assert!(observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"display_target":"display_99"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"display_target":"macos_virtual:broken"}}"#
+        ));
+        assert!(!observer.allows_dashboard_event_line(
+            r#"{"event":"browser_workspace_changed","workspace":{"owner_only_native":true"#
+        ));
 
         let replay = serde_json::json!({
             "t": "log_replay",
@@ -3138,6 +3235,9 @@ mod fs_scope_grant_tests {
                 serde_json::from_str::<serde_json::Value>(public_ready).unwrap(),
                 serde_json::from_str::<serde_json::Value>(request).unwrap(),
                 serde_json::from_str::<serde_json::Value>(approval).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&native_workspace).unwrap(),
+                serde_json::from_str::<serde_json::Value>(incomplete_native).unwrap(),
+                serde_json::from_str::<serde_json::Value>(public_x11).unwrap(),
                 {"event": "display_capture_lost", "display_id": 9, "reason": "closed"},
             ],
         });
@@ -3153,7 +3253,14 @@ mod fs_scope_grant_tests {
             .iter()
             .filter_map(|entry| entry.get("event").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(events, vec!["display_ready", "display_capture_lost"]);
+        assert_eq!(
+            events,
+            vec![
+                "display_ready",
+                "browser_workspace_changed",
+                "display_capture_lost"
+            ]
+        );
     }
 
     #[test]
