@@ -16,6 +16,29 @@ pub(crate) struct ReservedSessionLaunch {
     pub(crate) session_id: String,
 }
 
+/// Register the native task before deriving its runtime credential, just as
+/// external backend construction does. Same-task respawns remain stable;
+/// another task/log cannot reuse the original credential. No gateway means
+/// no credential and no new registration.
+fn registered_native_runtime_mcp_env(
+    port: Option<u16>,
+    session_id: &str,
+    session_log: &SharedSessionLog,
+) -> Option<crate::agent_runner::RuntimeMcpEnv> {
+    let port = port?;
+    crate::web_gateway::register_supervised_mcp_session(session_id, session_log);
+    Some(crate::agent_runner::RuntimeMcpEnv {
+        url: crate::external_agent::intendant_bootstrap_mcp_url_at(
+            "127.0.0.1",
+            port,
+            Some(session_id),
+            None,
+            Some(crate::web_gateway::loopback_mcp_auth_token()),
+        ),
+        session_id: session_id.to_owned(),
+    })
+}
+
 impl SessionSupervisor {
     /// Mint a fresh session log dir + id (see [`ReservedSessionLaunch`]).
     /// Synchronous and side-effect free.
@@ -1798,18 +1821,11 @@ impl SessionSupervisor {
                     // the runtime sandbox's gateway-port guard does not (and
                     // need not) cover, because it only ever mints the calling
                     // session's own authority.
-                    runtime_mcp_env: crate::web_gateway::session_mcp_port().map(|port| {
-                        crate::agent_runner::RuntimeMcpEnv {
-                            url: crate::external_agent::intendant_bootstrap_mcp_url_at(
-                                "127.0.0.1",
-                                port,
-                                Some(&session_id),
-                                None,
-                                Some(crate::web_gateway::loopback_mcp_auth_token()),
-                            ),
-                            session_id: session_id.clone(),
-                        }
-                    }),
+                    runtime_mcp_env: registered_native_runtime_mcp_env(
+                        crate::web_gateway::session_mcp_port(),
+                        &session_id,
+                        &session_log,
+                    ),
                 };
                 run_direct_mode(
                     provider,
@@ -2710,6 +2726,54 @@ mod tests {
     use crate::session_supervisor::tests::{
         managed_session, test_supervisor, test_supervisor_with_mock_provider,
     };
+
+    #[test]
+    fn native_runtime_credential_registers_before_bootstrap_and_rotates_for_new_log() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("native-bootstrap-{}", uuid::Uuid::new_v4());
+        let first = Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(root.path().join("first")).unwrap(),
+        ));
+        assert!(registered_native_runtime_mcp_env(None, &id, &first).is_none());
+        assert!(crate::web_gateway::supervised_mcp_registration_epoch(&id).is_none());
+        let original = registered_native_runtime_mcp_env(Some(12345), &id, &first).unwrap();
+        let old_epoch = crate::web_gateway::supervised_mcp_registration_epoch(&id).unwrap();
+        let again = registered_native_runtime_mcp_env(Some(12345), &id, &first).unwrap();
+        assert_eq!(original.url, again.url);
+        assert_eq!(original.session_id, id);
+        let request = |url: &str| {
+            let path = url.strip_prefix("http://127.0.0.1:12345").unwrap();
+            format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:12345\r\n\r\n")
+        };
+        let access = crate::web_gateway::session_only_mcp_access_context(
+            root.path(),
+            &request(&original.url),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::web_gateway::supervised_mcp_epoch_from_principal(&access.principal),
+            Some(old_epoch.clone())
+        );
+        let replacement = Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(root.path().join("replacement")).unwrap(),
+        ));
+        let next = registered_native_runtime_mcp_env(Some(12345), &id, &replacement).unwrap();
+        assert_ne!(next.url, original.url);
+        assert_ne!(
+            crate::web_gateway::supervised_mcp_registration_epoch(&id),
+            Some(old_epoch)
+        );
+        assert!(crate::web_gateway::session_only_mcp_access_context(
+            root.path(),
+            &request(&original.url)
+        )
+        .is_err());
+        assert!(crate::web_gateway::session_only_mcp_access_context(
+            root.path(),
+            &request(&next.url)
+        )
+        .is_ok());
+    }
 
     fn write_external_wrapper_identity(
         home: &Path,
