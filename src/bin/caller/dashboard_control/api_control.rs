@@ -72,8 +72,10 @@ pub(crate) async fn api_voice_session_response(
 pub(crate) async fn api_browser_workspace_snapshot_response(
     id: String,
     bus: &crate::event::EventBus,
+    grant: &DashboardControlGrant,
 ) -> serde_json::Value {
-    let workspaces = crate::browser_workspace::list_workspaces(bus).await;
+    let workspaces =
+        grant.project_browser_workspaces(crate::browser_workspace::list_workspaces(bus).await);
     serde_json::json!({
         "t": "response",
         "id": id,
@@ -211,7 +213,12 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     }
     if !runtime.grant.is_hosted_lease() {
         if let Some(frame) = response_result(
-            api_browser_workspace_snapshot_response("bootstrap-browser".into(), &runtime.bus).await,
+            api_browser_workspace_snapshot_response(
+                "bootstrap-browser".into(),
+                &runtime.bus,
+                &runtime.grant,
+            )
+            .await,
         ) {
             frames.push(frame);
         }
@@ -5293,5 +5300,115 @@ mod tests {
         assert_eq!(invalid_remove["result"]["ok"], false);
         assert_eq!(invalid_remove["result"]["_httpStatus"], 400);
         assert_eq!(invalid_remove["result"]["_httpOk"], false);
+    }
+
+    fn snapshot_workspace(
+        id: &str,
+        owner_only_native: Option<bool>,
+        display_target: Option<&str>,
+        binding: Option<&str>,
+    ) -> crate::browser_workspace::BrowserWorkspace {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "label": id,
+            "provider": "cdp",
+            "requested_provider": "auto",
+            "placement": {"kind":"local"},
+            "status": "error",
+            "preview_mode": "semantic",
+            "owner_only_native": owner_only_native,
+            "display_target": display_target,
+            "profile_dir": format!("/private/{id}"),
+            "macos_window_binding": binding,
+            "message": "cleanup pending",
+            "created_at": "2026-09-27T00:00:00Z",
+            "updated_at": "2026-09-27T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn snapshot_ids(response: &serde_json::Value) -> Vec<&str> {
+        response["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|workspace| workspace["id"].as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_snapshot_and_bootstrap_project_by_current_grant() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let public_id = format!("snapshot-public-{suffix}");
+        let native_id = format!("snapshot-native-{suffix}");
+        crate::browser_workspace::insert_test_workspace(snapshot_workspace(
+            &public_id,
+            None,
+            Some("display_99"),
+            None,
+        ))
+        .await;
+        crate::browser_workspace::insert_test_workspace(snapshot_workspace(
+            &native_id,
+            Some(false),
+            None,
+            Some("macos_window:retained"),
+        ))
+        .await;
+
+        let owner = DashboardControlGrant::TrustedLocal;
+        let observer = crate::dashboard_control::fs_scope_grant_tests::browser_grant_for_role(
+            "role:observer",
+            &format!("AA:OBSERVER:{suffix}"),
+        );
+        let scoped = crate::dashboard_control::fs_scope_grant_tests::browser_grant_for_role(
+            "role:scoped-human",
+            &format!("AA:SCOPED:{suffix}"),
+        );
+        let revoked = crate::dashboard_control::fs_scope_grant_tests::revoked_root_grant(&format!(
+            "AA:REVOKED:{suffix}"
+        ));
+
+        for (grant, sees_native) in [
+            (&owner, true),
+            (&observer, false),
+            (&scoped, false),
+            (&revoked, false),
+        ] {
+            let response = api_browser_workspace_snapshot_response(
+                format!("snapshot-{suffix}"),
+                &crate::event::EventBus::new(),
+                grant,
+            )
+            .await;
+            let ids = snapshot_ids(&response);
+            assert!(ids.contains(&public_id.as_str()));
+            assert_eq!(ids.contains(&native_id.as_str()), sees_native);
+
+            let mut rt = runtime();
+            rt.grant = grant.clone();
+            let bootstrap =
+                api_dashboard_bootstrap_response(format!("bootstrap-{suffix}"), &rt).await;
+            let browser = bootstrap["result"]["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|frame| frame["t"] == "browser_workspace_snapshot");
+            if grant.is_hosted_lease() {
+                assert!(browser.is_none());
+            } else {
+                let ids = browser.unwrap()["workspaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|workspace| workspace["id"].as_str())
+                    .collect::<Vec<_>>();
+                assert!(ids.contains(&public_id.as_str()));
+                assert_eq!(ids.contains(&native_id.as_str()), sees_native);
+            }
+        }
+
+        crate::browser_workspace::remove_test_workspace(&public_id).await;
+        crate::browser_workspace::remove_test_workspace(&native_id).await;
     }
 }
