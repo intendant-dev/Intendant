@@ -1002,6 +1002,7 @@ mod tests {
             ),
         ] {
             let caller = ToolCaller {
+                session_credential_epoch: None,
                 trust,
                 actor,
                 fs_scope: None,

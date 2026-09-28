@@ -739,6 +739,7 @@ mod tests {
                             None,
                             None,
                             ToolCaller {
+                                session_credential_epoch: None,
                                 trust,
                                 actor: crate::access::actor::ActorBinding::unattributed(),
                                 fs_scope: None,
@@ -1286,6 +1287,7 @@ mod tests {
                         None,
                         None,
                         ToolCaller {
+                            session_credential_epoch: None,
                             trust: ToolCallerTrust::Scoped,
                             actor: crate::access::actor::ActorBinding::unattributed(),
                             fs_scope: None,
@@ -1342,6 +1344,7 @@ mod tests {
                         None,
                         None,
                         ToolCaller {
+                            session_credential_epoch: None,
                             trust: ToolCallerTrust::Scoped,
                             actor: crate::access::actor::ActorBinding::unattributed(),
                             fs_scope: None,

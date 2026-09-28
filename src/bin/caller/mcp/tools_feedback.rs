@@ -369,6 +369,7 @@ mod tests {
         server.state.write().await.agenda = Some(agenda.clone());
         for trust in [ToolCallerTrust::OwnerSurface, ToolCallerTrust::Scoped] {
             let caller = ToolCaller {
+                session_credential_epoch: None,
                 trust,
                 actor: crate::access::actor::ActorBinding::local_process(Some(
                     "principal:test".into(),

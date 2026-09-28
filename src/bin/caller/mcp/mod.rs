@@ -621,8 +621,22 @@ impl IntendantServer {
         let ToolCaller {
             trust: caller,
             actor,
+            session_credential_epoch,
             fs_scope,
         } = caller;
+        if let Some(epoch) = session_credential_epoch.as_deref() {
+            let current = actor
+                .session_id
+                .as_deref()
+                .and_then(crate::web_gateway::supervised_mcp_registration_epoch);
+            if actor.kind != crate::access::actor::ActorKind::AgentSession
+                || current.as_deref() != Some(epoch)
+            {
+                return Ok(text_tool_error(
+                    "supervised session credential changed; no action dispatched",
+                ));
+            }
+        }
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -696,6 +710,7 @@ impl IntendantServer {
                             ToolCaller {
                                 trust: caller,
                                 actor,
+                                session_credential_epoch,
                                 fs_scope,
                             },
                         ))
@@ -3255,6 +3270,9 @@ impl ToolCallerTrust {
 pub struct ToolCaller {
     pub trust: ToolCallerTrust,
     pub actor: crate::access::actor::ActorBinding,
+    /// Epoch matched with the session bearer at ingress. Never filled by looking
+    /// up a newer live session, or accepted from a tool request. Not authority.
+    pub session_credential_epoch: Option<String>,
     /// The filesystem scope sandboxing any shell this caller spawns
     /// (`terminal_open`): `None` = unrestricted (owner surfaces and
     /// scope-less grants — dashboard-tunnel parity). Constructors default
@@ -3270,6 +3288,7 @@ impl ToolCaller {
         Self {
             trust: ToolCallerTrust::Scoped,
             actor: crate::access::actor::ActorBinding::unattributed(),
+            session_credential_epoch: None,
             fs_scope: Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
         }
     }
@@ -3284,6 +3303,9 @@ impl ToolCaller {
     ) -> Self {
         Self {
             trust: ToolCallerTrust::from_principal(principal),
+            session_credential_epoch: gate_session
+                .as_ref()
+                .and_then(|_| crate::web_gateway::supervised_mcp_epoch_from_principal(principal)),
             actor: crate::access::actor::ActorBinding::from_principal(principal, gate_session),
             // Fail-closed until the gate states the real scope — an
             // ungated ToolCaller sandboxes any shell it spawns to nothing.

@@ -105,3 +105,20 @@ without testing the actual token/grant invalidation path.
 The next major product milestone is arbitrary native-app background CU, not more
 browser-specific polish. See [the delivery milestones](macos-background-cu-delivery.md).
 A browser-only success is not completion of native keyboard/hover/drag/shortcuts.
+
+## Session credential incarnation binding (implementation checkpoint)
+
+Registered supervised backend tokens now bind to their session-log lifetime.
+Re-registering the same log for an in-task backend respawn preserves the token;
+replacing that log rotates its epoch even if an old thread retains the old log.
+No new user approval or credential-distribution mechanism is introduced.
+
+The matched credential and epoch are one ingress snapshot carried in ToolCaller
+through raw and facade dispatch. Stale stamped requests refuse before execution.
+Delegation must also pin and recheck this SAME epoch through its admitted action;
+looking up the latest epoch for an old request is insufficient. Unregistered
+legacy token routes carry no epoch and cannot gain a delegated browser permit
+merely by naming a session. Existing IAM gates and owner posture are unchanged.
+
+This is a production prerequisite, not the completed provision/capture/input
+workflow. Assignment, exact-resource permits and lifecycle cleanup still apply.

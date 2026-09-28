@@ -271,6 +271,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let server = test_server_with_home(home.path().to_path_buf());
         let caller = ToolCaller {
+            session_credential_epoch: None,
             trust: ToolCallerTrust::Scoped,
             actor: crate::access::actor::ActorBinding::local_process(Some(
                 "principal:local-process".into(),
