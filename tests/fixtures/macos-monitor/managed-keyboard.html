@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'">
+<title>Intendant disposable background keyboard acceptance</title>
+<style>body{font:16px system-ui;margin:24px}input,textarea,button,[contenteditable]{display:block;margin:8px 0;width:480px;font:18px system-ui}textarea{height:75px}[contenteditable]{min-height:45px;border:1px solid;padding:5px}output{display:block;white-space:pre-wrap}</style>
+<label for="first">First keyboard field</label><input id="first" aria-label="First keyboard field" value="seed">
+<label for="second">Multiline keyboard field</label><textarea id="second" aria-label="Multiline keyboard field"></textarea>
+<div id="editor" contenteditable="true" role="textbox" aria-label="Rich keyboard field">rich seed</div>
+<button id="activate" aria-label="Keyboard activation counter">Activate once</button>
+<input id="protected" type="password" aria-label="Protected fixture field" value="fixture-only-not-exported">
+<output id="counts" aria-live="off"></output>
+<script>
+'use strict';
+// This page observes only its own disposable content. Never export the protected
+// field's value or key identities; the test must not target that field.
+const events=[];let overflow=false,activations=0,protectedEvents=0;
+function draw(){document.querySelector('#counts').textContent=`Activations: ${activations}\nObserved events: ${events.length}`;}
+for(const type of ['keydown','keyup','beforeinput','input']){
+ document.addEventListener(type,event=>{
+  if(event.target.id==='protected'){protectedEvents++;return;}
+  if(events.length===512){overflow=true;return;}
+  events.push({type,id:event.target.id||'',key:event.key??null,code:event.code??null,
+   inputType:event.inputType??null,trusted:event.isTrusted,repeat:event.repeat??false,
+   ctrl:!!event.ctrlKey,meta:!!event.metaKey,alt:!!event.altKey,shift:!!event.shiftKey});
+  draw();
+ },true);
+}
+document.querySelector('#activate').addEventListener('click',()=>{activations++;draw();});
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}
+window.keyboardFixtureStatus=()=>({first:document.querySelector('#first').value,
+ second:document.querySelector('#second').value,editor:document.querySelector('#editor').textContent,
+ firstSelection:[document.querySelector('#first').selectionStart,document.querySelector('#first').selectionEnd],secondSelection:[document.querySelector('#second').selectionStart,document.querySelector('#second').selectionEnd],active:document.activeElement?.id||'',activations,protectedEvents,overflow,
+ events:events.slice(),firstRect:rect('first'),visibility:document.visibilityState,
+ pageFocused:document.hasFocus(),metrics:{x:screenX,y:screenY,width:outerWidth,height:outerHeight,innerWidth,innerHeight,scale:devicePixelRatio,zoom:visualViewport.scale,scrollX,scrollY}});
+draw();
+</script>
