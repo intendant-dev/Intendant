@@ -216,6 +216,10 @@ def backend():
           "model": "delegation-protocol-fixture", "tools": [], "permissionMode": "default",
           "cwd": str(Path.cwd())})
     for _ in range(64):
+        import select
+        remaining = (manifest["expires_unix_ms"] - time.time_ns() // 1_000_000) / 1000
+        require(remaining > 0 and select.select([sys.stdin.buffer], [], [], min(remaining, 300))[0],
+                "proof input interval expired")
         line = sys.stdin.buffer.readline(65_537)
         if not line:
             return
@@ -232,6 +236,144 @@ def backend():
                       "effects_unconfirmed": True, "effects_verified": False}
         emit({"type": "result", "subtype": "success", "is_error": result.get("probe_failed", False),
               "result": json.dumps(result), "session_id": backend_id})
+        if manifest.get("single_probe") is True:
+            destination = Path.cwd() / ".intendant-delegation-result.json"
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as output:
+                json.dump(result, output)
+            return
+
+
+def check_injected_session():
+    """No-GUI smoke through an actual temporary daemon and external supervisor."""
+    import argparse
+    import re
+    import secrets
+    import shlex
+    import shutil
+    import socket
+    import struct
+    import subprocess
+    import tempfile
+    parser = argparse.ArgumentParser(description=check_injected_session.__doc__)
+    parser.add_argument("--check-injected-session", action="store_true")
+    parser.add_argument("--bin", required=True, type=Path)
+    parser.add_argument("--report", required=True, type=Path)
+    args = parser.parse_args()
+    require(not args.report.exists(), "report must be fresh")
+    binary = args.bin.resolve(strict=True)
+    root = Path(tempfile.mkdtemp(prefix="intendant-session-identity-proof-"))
+    os.chmod(root, 0o700)
+    home, project = root / "home", root / "project"
+    home.mkdir(); project.mkdir()
+    (project / "intendant.toml").write_text("")
+    mock = root / "mock.json"; mock.write_text('{"profiles":[]}')
+    report = {"ok": False, "schema": "intendant-session-identity-proof-v1",
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "probe_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "native_input_calls": 0, "browser_created": False,
+              "installed_daemon_changed": False, "delegation_verified": False}
+    daemon = None
+    connection = None
+    try:
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME")}
+        env.update(HOME=str(home), USERPROFILE=str(home), PROVIDER="mock",
+                   INTENDANT_MOCK_SCRIPT=str(mock), INTENDANT_MOCK_DISPLAY="synthetic",
+                   INTENDANT_MOCK_MEMORY="nominal")
+        with (root / "daemon.log").open("wb") as log:
+            daemon = subprocess.Popen([str(binary), "--web", "0", "--bind", "127.0.0.1",
+                "--no-tui", "--no-tls", "--autonomy", "full"], cwd=project, env=env,
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        deadline = time.monotonic() + 35
+        port = token = None
+        while time.monotonic() < deadline:
+            text = (root / "daemon.log").read_text(errors="replace")
+            found = re.search(r"Dashboard:.*?https?://127\.0\.0\.1:(\d+)", text)
+            if found:
+                port = int(found[1])
+                path = home / ".intendant/loopback-tokens" / f"{port}.token"
+                if path.is_file():
+                    token = path.read_text().strip(); break
+            require(daemon.poll() is None, "temporary daemon stopped before readiness")
+            time.sleep(.1)
+        require(port and token, "temporary daemon did not become ready")
+        launcher = project / "delegation-test-backend"
+        launcher.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " +
+                            shlex.quote(str(Path(__file__).resolve())) + ' "$@"\n')
+        launcher.chmod(0o700)
+        manifest = {"schema": SCHEMA, "origin": f"http://127.0.0.1:{port}",
+                    "expires_unix_ms": time.time_ns() // 1_000_000 + 120_000, "single_probe": True}
+        fd = os.open(project / ".intendant-delegation-proof.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as output: json.dump(manifest, output)
+        # Owner token starts only this disposable fixture; the child uses only
+        # the daemon's ordinary derived session token, never this owner's token.
+        connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        path = "/ws?" + urllib.parse.urlencode({"token": token})
+        connection.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buffer = b""
+        while b"\r\n\r\n" not in buffer:
+            require(len(buffer) <= 8192, "dashboard handshake budget")
+            part = connection.recv(4096); require(part, "dashboard handshake closed"); buffer += part
+        header = buffer.split(b"\r\n\r\n", 1)[0]
+        require(header.split(b"\r\n", 1)[0].split()[1] == b"101", "dashboard handshake refused")
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        headers = dict((k.lower(), v.strip()) for k, v in
+                       (line.decode().split(":", 1) for line in header.split(b"\r\n")[1:]))
+        require(headers.get("sec-websocket-accept") == expected, "dashboard handshake mismatch")
+        probe = {"id": str(uuid.uuid4()), "tool": "whoami", "arguments": {}}
+        message = {"action": "create_session", "task": json.dumps({"probe": probe}),
+                   "agent": "claude-code", "agent_command": str(launcher), "project_root": str(project)}
+        payload = json.dumps(message).encode(); require(len(payload) <= 65535, "request budget")
+        mask = secrets.token_bytes(4)
+        length = bytes([0x80 | len(payload)]) if len(payload) < 126 else b"\xfe" + struct.pack("!H", len(payload))
+        # One create only. No retry-spawn loop or fixture duplication.
+        time.sleep(.3)
+        connection.sendall(b"\x81" + length + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(payload)))
+        deadline = time.monotonic() + 45
+        result_path = project / ".intendant-delegation-result.json"
+        while not result_path.is_file() and time.monotonic() < deadline:
+            require(daemon.poll() is None, "temporary daemon stopped during probe")
+            time.sleep(.1)
+        require(result_path.is_file(), "supervised probe did not return a receipt")
+        value = loads(result_path.read_text())
+        require(value.get("probe_id") == probe["id"] and value.get("probe_failed") is not True,
+                "session probe failed")
+        require(value.get("owner_fallback_used") is False, "unexpected owner fallback")
+        texts = value.get("texts"); require(isinstance(texts, list) and len(texts) == 1, "missing whoami result")
+        identity = texts[0]
+        require(identity.get("supervised") is True and identity.get("actor_kind") == "agent_session",
+                "server did not bind a supervised agent actor")
+        require(identity.get("daemon_session_id") == value.get("token_bound_session"),
+                "server identity differs from child's injected session")
+        require(isinstance(identity.get("principal_id"), str), "missing server principal")
+        report.update(ok=True, gate_resolved_actor=identity["actor_kind"],
+                      principal_id=identity["principal_id"], daemon_session_id=identity["daemon_session_id"],
+                      session_bearer_identity_verified=True, owner_fallback_used=False,
+                      supervisor_launch_requests=1)
+    except Exception as error:
+        report["error_type"] = type(error).__name__
+        report["error"] = str(error) if isinstance(error, ValueError) else "local protocol smoke failed"
+    finally:
+        if connection is not None: connection.close()
+        if daemon is not None:
+            if daemon.poll() is None:
+                daemon.terminate()
+                try: daemon.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    daemon.kill(); daemon.wait(timeout=5)
+            report["temporary_daemon_reaped"] = daemon.poll() is not None
+        if not report["ok"]:
+            report["private_rig_retained_for_diagnosis"] = str(root)
+        require(not args.report.exists(), "refusing to overwrite concurrent report")
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(args.report, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as output: json.dump(report, output, indent=2)
+        if report["ok"]: shutil.rmtree(root)
+    print(json.dumps(report, indent=2))
+    return 0 if report["ok"] and report.get("temporary_daemon_reaped") else 1
 
 
 def self_test():
@@ -338,6 +480,8 @@ def self_test():
 
 
 if __name__ == "__main__":
+    if "--check-injected-session" in sys.argv[1:]:
+        raise SystemExit(check_injected_session())
     if "--self-test" in sys.argv[1:]:
         raise SystemExit(self_test())
     if "--help" in sys.argv[1:]:
