@@ -1065,6 +1065,19 @@ impl DashboardControlGrant {
         self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
     }
 
+    pub(crate) fn project_browser_workspaces(
+        &self,
+        workspaces: Vec<crate::browser_workspace::BrowserWorkspace>,
+    ) -> Vec<crate::browser_workspace::BrowserWorkspace> {
+        if self.has_owner_dashboard_authority() {
+            return workspaces;
+        }
+        workspaces
+            .into_iter()
+            .filter(|workspace| !crate::browser_workspace::is_macos_workspace(workspace))
+            .collect()
+    }
+
     pub(crate) fn dashboard_event_line_requires_owner(line: &str) -> bool {
         if !line.contains("display_request_raised")
             && !line.contains("display_request_resolved")
@@ -2985,7 +2998,10 @@ impl OutboundControlQueue {
 mod fs_scope_grant_tests {
     use super::*;
 
-    fn browser_grant_for_role(role_id: &str, fingerprint: &str) -> DashboardControlGrant {
+    pub(crate) fn browser_grant_for_role(
+        role_id: &str,
+        fingerprint: &str,
+    ) -> DashboardControlGrant {
         let mut state = crate::access::iam::LocalIamState::default();
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
             "test",
@@ -3008,6 +3024,28 @@ mod fs_scope_grant_tests {
         DashboardControlGrant::UserClient {
             principal,
             iam_state: std::sync::Arc::new(state),
+            iam_cert_dir: None,
+            authority_memo: Default::default(),
+        }
+    }
+
+    pub(crate) fn revoked_root_grant(fingerprint: &str) -> DashboardControlGrant {
+        let grant = browser_grant_for_role("role:root", fingerprint);
+        let DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+            ..
+        } = grant
+        else {
+            unreachable!()
+        };
+        let mut state = (*iam_state).clone();
+        for item in &mut state.grants {
+            item.status = "revoked".into();
+        }
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: Arc::new(state),
             iam_cert_dir: None,
             authority_memo: Default::default(),
         }

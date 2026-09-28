@@ -1350,6 +1350,7 @@ mod tests {
         let workspace_snapshot = api_browser_workspace_snapshot_response(
             "bw1".to_string(),
             &crate::event::EventBus::new(),
+            &crate::dashboard_control::DashboardControlGrant::TrustedLocal,
         )
         .await;
         assert_eq!(workspace_snapshot["t"], "response");

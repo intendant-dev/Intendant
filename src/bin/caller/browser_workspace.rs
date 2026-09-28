@@ -61,6 +61,16 @@ pub fn global_registry() -> SharedBrowserWorkspaceRegistry {
         .clone()
 }
 
+#[cfg(test)]
+pub(crate) async fn insert_test_workspace(workspace: BrowserWorkspace) {
+    global_registry().write().await.insert(workspace, None);
+}
+
+#[cfg(test)]
+pub(crate) async fn remove_test_workspace(id: &str) {
+    global_registry().write().await.remove(id);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserWorkspaceProvider {

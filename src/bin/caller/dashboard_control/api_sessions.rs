@@ -435,7 +435,7 @@ pub(crate) async fn control_request_frame(
         "api_recordings" => api_recordings_response(id, &runtime).await,
         "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
         "api_browser_workspace_snapshot" => {
-            api_browser_workspace_snapshot_response(id, &runtime.bus).await
+            api_browser_workspace_snapshot_response(id, &runtime.bus, &runtime.grant).await
         }
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_display_bootstrap" => api_display_bootstrap_response(id, &runtime).await,

@@ -2862,7 +2862,10 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         }
                     }
 
-                    let browser_workspaces = crate::browser_workspace::list_workspaces(&bus).await;
+                    let browser_workspaces = dashboard_control_grant_for_ws
+                        .project_browser_workspaces(
+                            crate::browser_workspace::list_workspaces(&bus).await,
+                        );
                     let browser_snapshot = serde_json::json!({
                         "t": "browser_workspace_snapshot",
                         "workspaces": browser_workspaces,
