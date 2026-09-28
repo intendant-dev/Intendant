@@ -19,7 +19,8 @@ impl IntendantServer {
         if facade::facade_resolved_tool(name, args).is_some_and(|tool| {
             matches!(
                 tool,
-                "create_browser_workspace"
+                "execute_browser_workspace_keyboard"
+                    | "create_browser_workspace"
                     | "close_browser_workspace"
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"

@@ -43,6 +43,9 @@ pub(super) enum Operation {
         binding: u32,
         bounds: Bounds,
     },
+    ValidatePageWindow {
+        binding: u32,
+    },
     ReadWindowElements {
         binding: u32,
     },
@@ -120,6 +123,9 @@ pub(super) enum Outcome {
     },
     PlacedWindow {
         result: PlacementResult,
+    },
+    ValidatedPageWindow {
+        observation: super::placement::Observation,
     },
     WindowElements {
         controls: Vec<Control>,

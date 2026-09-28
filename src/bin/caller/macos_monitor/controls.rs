@@ -570,6 +570,46 @@ impl<E: Clone, F: PartialEq> Inventory<E, F> {
 }
 
 impl<N: Native> placement::Windows<N> {
+    /// Internal validation for page-addressed CDP input, not native event routing.
+    /// No semantic token is minted and no unrelated human AX focus is read.
+    /// Native input operations retain their existing, stricter focus witnesses.
+    pub(super) fn validate_page_window(
+        &mut self,
+        id: u32,
+        mut geometry: impl FnMut(u32) -> Result<Bounds, String>,
+    ) -> Result<Observation, String> {
+        let b = self.bindings.get(&id).ok_or("stale window binding")?;
+        let deadline = Instant::now() + placement::BUDGET;
+        let before = check_window(
+            &mut self.native,
+            &b.window,
+            b.identity,
+            b.geometry,
+            &mut || geometry(b.monitor),
+            deadline,
+        )?;
+        let root = self.native.root(&b.window)?;
+        let safety = self.native.safety(&root, deadline)?;
+        if safety.secure || safety.role != "AXWindow" {
+            return Err("managed page window root is protected or unknown".into());
+        }
+        let after = check_window(
+            &mut self.native,
+            &b.window,
+            b.identity,
+            b.geometry,
+            &mut || geometry(b.monitor),
+            deadline,
+        )?;
+        same_window(before, after)?;
+        let last = self.native.safety(&root, deadline)?;
+        if last.secure || last.role != "AXWindow" {
+            return Err("managed page window protection changed".into());
+        }
+        placement::time_left(deadline)?;
+        Ok(after)
+    }
+
     pub(super) fn read_elements(
         &mut self,
         id: u32,
@@ -764,6 +804,9 @@ mod tests {
         }
         fn focus(&mut self, deadline: Instant) -> Result<u8, String> {
             self.check(deadline)?;
+            if self.0.borrow().focus == u8::MAX {
+                return Err("unrelated human focus unavailable".into());
+            }
             Ok(self.0.borrow().focus)
         }
         fn position(&mut self, _: &u64, _: Bounds, _: Instant) -> Result<(), String> {
@@ -1356,5 +1399,66 @@ mod tests {
         }
         assert!(w.read_elements(b, |_| Ok(monitor())).is_err());
         assert!(w.elements.0.is_none());
+    }
+
+    #[test]
+    fn page_window_validation_never_mints_tokens_or_reads_unrelated_focus() {
+        let (mut windows, fake, binding) = rig();
+        fake.0.borrow_mut().focus = u8::MAX;
+        assert!(windows
+            .validate_page_window(binding, |_| Ok(monitor()))
+            .is_ok());
+        assert!(windows.elements.0.is_none());
+        assert_eq!(fake.0.borrow().writes, 0);
+        assert_eq!(fake.0.borrow().reads, 0);
+        assert_eq!(fake.0.borrow().forbidden_reads, 0);
+        // The semantic/native path still demands its original focus witness.
+        assert!(windows
+            .read_elements(binding, |_| Ok(monitor()))
+            .unwrap_err()
+            .contains("focus"));
+    }
+
+    #[test]
+    fn page_window_validation_refuses_changed_identity_protection_and_geometry() {
+        for scenario in [
+            "birth",
+            "window",
+            "secure",
+            "role",
+            "permission",
+            "timeout",
+            "bounds",
+        ] {
+            let (mut windows, fake, binding) = rig();
+            {
+                let mut state = fake.0.borrow_mut();
+                match scenario {
+                    "birth" => state.birth += 1,
+                    "window" => state.object += 1,
+                    "secure" => state.nodes.get_mut(&0).unwrap().secure = true,
+                    "role" => state.nodes.get_mut(&0).unwrap().role = "unknown".into(),
+                    "permission" => state.permission = false,
+                    "timeout" => state.timeout = true,
+                    "bounds" => state.window.x += 9999.0,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                windows
+                    .validate_page_window(binding, |_| Ok(monitor()))
+                    .is_err(),
+                "{scenario}"
+            );
+            assert_eq!(fake.0.borrow().writes, 0);
+        }
+        let (mut windows, _, binding) = rig();
+        assert!(windows
+            .validate_page_window(binding, |_| Err("monitor gone".into()))
+            .is_err());
+        windows.unbind(binding).unwrap();
+        assert!(windows
+            .validate_page_window(binding, |_| Ok(monitor()))
+            .is_err());
     }
 }

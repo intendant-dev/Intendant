@@ -282,6 +282,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "unbind_macos_window"
                     | "list_browser_workspaces"
                     | "browser_workspace_providers"
+                    | "execute_browser_workspace_keyboard"
                     | "create_browser_workspace"
                     | "close_browser_workspace"
                     | "acquire_browser_workspace"
@@ -513,6 +514,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "revoke_user_display"
         | "request_shared_view_input"
         | "execute_cu_actions"
+        | "execute_browser_workspace_keyboard"
         | "run_bounded_cu_task"
         | "external_cu_session"
         | "external_cu_proof" => PeerOperation::DisplayInput,

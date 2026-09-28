@@ -165,6 +165,13 @@ fn serve_with_windows<O: Owner, N: Native>(
                         })
                         .map(|result| Outcome::PlacedWindow { result }),
                 ),
+                Operation::ValidatePageWindow { binding } => window_outcome(
+                    windows
+                        .validate_page_window(binding, |id| {
+                            owner.bounds(handles.get(&id).ok_or("stale monitor generation")?)
+                        })
+                        .map(|observation| Outcome::ValidatedPageWindow { observation }),
+                ),
                 Operation::ReadWindowElements { binding } => window_outcome(
                     windows
                         .read_elements(binding, |id| {

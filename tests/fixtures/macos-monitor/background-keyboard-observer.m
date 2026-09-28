@@ -28,13 +28,16 @@ int main(int argc,const char **argv) { @autoreleasepool {
         puts("{\"ok\":true,\"counter_samples\":0,\"input_posting_calls\":0,\"application_created\":false}");
         return NSApp?1:0;
     }
-    if(argc!=2 || strcmp(argv[1],"--observe-readonly-30s")!=0) return 2;
+    if(argc!=2) return 2;
+    uint64_t duration=strcmp(argv[1],"--observe-readonly-30s")==0?30000000u:
+        (strcmp(argv[1],"--observe-readonly-120s")==0?120000000u:0);
+    if(!duration) return 2;
     int flags=fcntl(STDIN_FILENO,F_GETFL);
     if(flags<0 || fcntl(STDIN_FILENO,F_SETFL,flags|O_NONBLOCK)<0) return 3;
     uint64_t started=monotonic_us(); if(!started) return 4;
     NSMutableArray *samples=[NSMutableArray array];
     BOOL stopped=NO;
-    while(monotonic_us()-started<30000000u && samples.count<620) {
+    while(monotonic_us()-started<duration && samples.count<2420) {
         [samples addObject:sample()];
         if(samples.count==1) { puts("{\"ready\":true}"); fflush(stdout); }
         char c=0; ssize_t count=read(STDIN_FILENO,&c,1);

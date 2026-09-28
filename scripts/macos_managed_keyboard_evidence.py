@@ -64,7 +64,7 @@ def verify_witness(witness: dict, browser_pid: int, started_us: int, ended_us: i
     require(witness.get('input_posting_calls') == 0 and witness.get('application_created') is False,
             'observer unexpectedly produced input or an application')
     samples=witness.get('samples')
-    require(isinstance(samples,list) and 2 <= len(samples) <= 620,'missing observer samples')
+    require(isinstance(samples,list) and 2 <= len(samples) <= 2420,'missing observer samples')
     require(type(browser_pid) is int and browser_pid>0 and started_us<ended_us,'invalid action interval')
     previous=0
     for sample in samples:

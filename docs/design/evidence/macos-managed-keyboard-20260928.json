@@ -1,0 +1,296 @@
+{
+  "schema": "intendant-managed-keyboard-native-v1",
+  "source_base": "047d57c1739e558328699d3cfd59801a434ed31c",
+  "source_dirty": true,
+  "source_sha256": {
+    "src/bin/caller/browser_workspace/managed_keyboard.rs": "c33ae8ba14487ecbe7c9d511b339e2b6b4dbf5a0fa5e35e4782b3e72e8cbdd2f",
+    "src/bin/caller/macos_monitor/controls.rs": "e5d707aaf959b881e8a4e0643baeb203d0e9dfb065dd0f4b06ff3aa9a56809ef",
+    "src/bin/caller/macos_monitor/helper.rs": "512d68a650572a13dec15d07285f1f57c096ce3b134e11829817d9392681ae5c",
+    "src/bin/caller/macos_monitor/window_broker.rs": "aab3740ee398a6122fb10f8fcd14d7c8160d124ea963aa06749156f8fac096f6",
+    "src/bin/caller/macos_monitor/protocol.rs": "102d9b3c2e25f1b3090cb322fd4a95c8934957c73d82343e3705c9cce42908fc",
+    "scripts/verify-macos-managed-keyboard.py": "6dde1ad3bda931a672fe097ad69310a2d417d22ff5e5abf5a5314e4bf9dfad8c",
+    "scripts/macos_managed_keyboard_evidence.py": "898fbfba8987dea4e5bc055d4c465754c40f45d7e92904be358dc2d3b0d476fb",
+    "tests/fixtures/macos-monitor/managed-keyboard.html": "e9d4ce7600d578ae2ee924686cbb90e8efe55ef5a559c163692011659cd81d42",
+    "tests/fixtures/macos-monitor/managed-keyboard-plan.json": "260217db4f1219585e02aea7b9adcaaa11483042168946adb1b2b87662874a35"
+  },
+  "binary_version": "intendant 0.2.0-alpha.7 (commit 047d57c1-dirty, built 2026-09-28T01:04:28Z, aarch64-apple-darwin)",
+  "binary_sha256": "abcec7bbfdfbe40886b41b0bd97dc3d502f92f6fd431bcc54de0232f37b6ac7b",
+  "browser_version": "154.0.8037.57",
+  "observer_sha256": "7731fe81e4f736f69bd6ccab28c94009550b8d77aa506d7e2428f045f7d5f5b2",
+  "plan_sha256": "260217db4f1219585e02aea7b9adcaaa11483042168946adb1b2b87662874a35",
+  "checks": {
+    "launch_and_placement_verified": true,
+    "exact_monitor_capture_verified": true,
+    "keyboard_effects_verified": true,
+    "monitor_destruction_closes_browser": true
+  },
+  "witness": {
+    "sampled_focus_unchanged": true,
+    "sampled_clipboard_unchanged": true,
+    "keyboard_activity_observed_in_action_span": false,
+    "samples_in_action_span": 63,
+    "human_provenance_verified": false,
+    "continuous_isolation_verified": false
+  },
+  "steps": [
+    {
+      "index": 0,
+      "action": {
+        "type": "select_all"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 1,
+      "action": {
+        "type": "insert_text",
+        "text": "agent typing"
+      },
+      "reply_ok": true,
+      "commands_attempted": 1,
+      "commands_acknowledged": 1,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 0,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 2,
+      "action": {
+        "type": "key",
+        "key": "ArrowLeft"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 3,
+      "action": {
+        "type": "key",
+        "key": "Backspace"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 4,
+      "action": {
+        "type": "key",
+        "key": "Tab"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 5,
+      "action": {
+        "type": "insert_text",
+        "text": "Hello 東京 🙂"
+      },
+      "reply_ok": true,
+      "commands_attempted": 1,
+      "commands_acknowledged": 1,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 0,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 6,
+      "action": {
+        "type": "key",
+        "key": "Enter"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 7,
+      "action": {
+        "type": "insert_text",
+        "text": "Second line"
+      },
+      "reply_ok": true,
+      "commands_attempted": 1,
+      "commands_acknowledged": 1,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 0,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 8,
+      "action": {
+        "type": "key",
+        "key": "Tab"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 9,
+      "action": {
+        "type": "select_all"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 10,
+      "action": {
+        "type": "insert_text",
+        "text": "Edited rich text"
+      },
+      "reply_ok": true,
+      "commands_attempted": 1,
+      "commands_acknowledged": 1,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 0,
+        "input_events": 1,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 11,
+      "action": {
+        "type": "key",
+        "key": "Tab"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 12,
+      "action": {
+        "type": "key",
+        "key": "Enter"
+      },
+      "reply_ok": true,
+      "commands_attempted": 2,
+      "commands_acknowledged": 2,
+      "verification": {
+        "effect_verified": true,
+        "page_key_pairs": 1,
+        "input_events": 0,
+        "continuous_isolation_verified": false,
+        "physical_keyboard_provenance_verified": false
+      },
+      "refusal_no_effect_verified": false
+    },
+    {
+      "index": 13,
+      "action": {
+        "type": "key",
+        "key": "Enter"
+      },
+      "reply_ok": false,
+      "commands_attempted": 0,
+      "commands_acknowledged": 0,
+      "verification": null,
+      "refusal_no_effect_verified": true
+    }
+  ],
+  "key_pairs_verified": 9,
+  "input_events_verified": 6,
+  "initial_capture_sha256": "d17f8e06118ac78e97bc117ec2af1872cafba9735a9e1c27868d3b9e1a01058a",
+  "final_capture_sha256": "7be2331675c9309a6bb44e7ca9bc3f12aafcbad29dac3ab43778a6c809fbefb1",
+  "inventory_restored": true,
+  "daemon_reaped": true,
+  "installed_daemon_changed": false,
+  "limitations": [
+    "Development build; source hashes distinguish it from its cached version stamp.",
+    "No physical keyboard activity was observed during this successful action span.",
+    "Sampled focus and clipboard equality do not prove continuous isolation or human provenance.",
+    "Text insertion is browser input, not simulated physical alphabetic keystrokes.",
+    "The entry point remains owner-only; scoped agent delegation is not provided.",
+    "Arbitrary native macOS applications, system shortcuts and clipboard are not supported."
+  ]
+}
