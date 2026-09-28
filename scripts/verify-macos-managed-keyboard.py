@@ -5,7 +5,7 @@ import argparse, base64, hashlib, http.client, http.server, importlib.util
 import json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 import select, uuid
-from macos_managed_keyboard_evidence import verify_transition, verify_witness
+from macos_managed_keyboard_evidence import verify_transition, verify_witness, verify_request_activity
 
 def load(name, filename):
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
@@ -31,6 +31,35 @@ def read_ready_controls(tool, binding, evidence, pause=time.sleep):
             pause(.2)
     return result
 
+def validate_timing(start_delay_ms, step_delay_ms):
+    """Fixed operator coordination, never retry-until-success input."""
+    for name, value, maximum in (('start delay', start_delay_ms, 30000),
+                                  ('step delay', step_delay_ms, 2000)):
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ValueError(f'{name} must be an integer in 0..{maximum} milliseconds')
+
+
+def acquire_native_test_lock(path):
+    """Serialize updated harnesses across worktrees before display observation.
+
+    Keep the lock inode after release; unlinking permits two simultaneous owners.
+    Tests supply their own temporary path. This cannot coordinate older harnesses.
+    """
+    import fcntl, stat
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    handle = os.fdopen(fd, 'r+b', buffering=0)
+    try:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077):
+            raise RuntimeError('native acceptance lock must be a private owned regular file')
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin', required=True, type=Path)
@@ -40,7 +69,13 @@ def main():
     parser.add_argument('--plan', required=True, type=Path)
     parser.add_argument('--observer', required=True, type=Path)
     parser.add_argument('--require-activity', action='store_true')
+    parser.add_argument('--start-delay-ms', type=int, default=0)
+    parser.add_argument('--step-delay-ms', type=int, default=100)
     args = parser.parse_args()
+    try:
+        validate_timing(args.start_delay_ms, args.step_delay_ms)
+    except ValueError as error:
+        parser.error(str(error))
     plan = json.loads(args.plan.read_text())
     if not isinstance(plan, dict) or not isinstance(plan.get('keyboard_tool'), str):
         parser.error('a fixed keyboard tool and step plan are required')
@@ -57,6 +92,8 @@ def main():
     if args.report.exists():
         parser.error('report must be a fresh path; never overwrite an earlier attempt')
     args.report.parent.mkdir(parents=True, exist_ok=True)
+    native_lock = acquire_native_test_lock(
+        Path(tempfile.gettempdir()) / 'intendant-managed-keyboard-acceptance.lock')
     monitor_harness = load('workspace_monitor_harness', 'verify-macos-monitor-http.py')
     browser_harness = load('workspace_browser_harness', 'verify-macos-chromium-controls.py')
     root = Path(tempfile.mkdtemp(prefix='intendant-managed-keyboard-proof-'))
@@ -65,6 +102,8 @@ def main():
               'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'binary_version': subprocess.check_output([str(binary), '--version'], text=True).strip(),
               'automatic_input_retry': False, 'installed_daemon_changed': False, 'observer_clock':'CLOCK_MONOTONIC',
+              'start_delay_ms':args.start_delay_ms, 'step_delay_ms':args.step_delay_ms,
+              'native_acceptance_lock_held':True,
               'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'observer_sha256':hashlib.sha256(observer.read_bytes()).hexdigest(),
               'plan_sha256':hashlib.sha256(args.plan.read_bytes()).hexdigest(),
@@ -178,6 +217,8 @@ def main():
         # can activate a native window. No click, focus restoration or fallback.
         assert before['active'] == 'first', 'fixture page-local autofocus unavailable'
         report['setup_native_clicks'] = 0
+        checkpoint()
+        time.sleep(args.start_delay_ms / 1000)
         witness_process = subprocess.Popen([str(observer),'--observe-readonly-120s'],
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         assert select.select([witness_process.stdout],[],[],5)[0], 'observer did not become ready'
@@ -218,7 +259,7 @@ def main():
                 evidence['verification'] = verify_transition(prior,observed,step.get('expected',{}),
                     key=step.get('key'),receiver=step.get('receiver'),
                     minimum_input_events=step.get('minimum_input_events',0))
-            checkpoint(); time.sleep(.1)
+            checkpoint(); time.sleep(args.step_delay_ms / 1000)
         ended_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC)//1000
         time.sleep(.1)
         output, stderr = witness_process.communicate(b'q',timeout=4)
@@ -227,8 +268,9 @@ def main():
         report['observer'] = json.loads(output)
         witness_process = None
         report['witness_verification'] = verify_witness(report['observer'],workspace['process_id'],started_us,ended_us)
-        if args.require_activity:
-            assert report['witness_verification']['keyboard_activity_observed_in_action_span'], 'no observed concurrent keyboard activity'
+        report['request_activity'] = verify_request_activity(report['observer'], [
+            (step['started_us'], step['finished_us']) for step in report['keyboard_steps']
+            if 'verification' in step])
         verifications=[step['verification'] for step in report['keyboard_steps'] if 'verification' in step]
         assert any(v['page_key_pairs'] for v in verifications), 'no positive page key-pair evidence'
         assert any(v['input_events'] for v in verifications), 'no positive page text-input evidence'
@@ -250,6 +292,8 @@ def main():
         _, inventory = tool('list_macos_monitors', {}); assert inventory['monitors'] == [], inventory
         monitor = None; cleaned = True
         report['checks']['monitor_destruction_closes_browser'] = True
+        if args.require_activity:
+            assert report['request_activity']['keyboard_activity_observed_during_request'], 'no observed keyboard activity inside a keyboard request'
         report['ok'] = True
     except Exception as error:
         report['ok'] = False; report['error'] = str(error)
@@ -282,6 +326,7 @@ def main():
         report['ok'] = report.get('ok') is True and cleaned and report['inventory_restored']
         checkpoint()
         if cleaned: shutil.rmtree(root)
+        native_lock.close()
     print(json.dumps(report,indent=2))
     return 0 if report['ok'] else 1
 

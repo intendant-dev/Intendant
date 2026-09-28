@@ -90,3 +90,27 @@ def verify_witness(witness: dict, browser_pid: int, started_us: int, ended_us: i
     return {'sampled_focus_unchanged':True,'sampled_clipboard_unchanged':True,
             'keyboard_activity_observed_in_action_span':activity,'samples_in_action_span':len(inner),
             'human_provenance_verified':False,'continuous_isolation_verified':False}
+
+
+def verify_request_activity(witness: dict, intervals: list) -> dict:
+    """Count activity strictly inside requests, excluding deliberate pacing gaps.
+
+    Call only after verify_witness has validated the complete observer stream.
+    A request bracket is not an atomic OS dispatch or proof of human provenance.
+    """
+    require(isinstance(intervals, list) and 1 <= len(intervals) <= 32,
+            'invalid keyboard request intervals')
+    samples = witness['samples']
+    results = []
+    for index, (start, end) in enumerate(intervals):
+        require(type(start) is int and type(end) is int and 0 < start < end,
+                'invalid keyboard request interval')
+        inner = [sample for sample in samples if start <= sample['monotonic_us'] <= end]
+        observed = len(inner) >= 2 and any(
+            inner[-1][key] > inner[0][key] for key in ('hid_down', 'hid_up'))
+        results.append({'index': index, 'samples': len(inner),
+                        'keyboard_activity_observed': observed})
+    return {'keyboard_activity_observed_during_request':
+            any(result['keyboard_activity_observed'] for result in results),
+            'requests': results, 'human_provenance_verified': False,
+            'continuous_isolation_verified': False}

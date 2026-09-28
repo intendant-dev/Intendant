@@ -2,7 +2,7 @@
 """Hermetic evidence tests. Never opens a browser or posts native input."""
 import copy
 import unittest
-from macos_managed_keyboard_evidence import verify_transition, verify_witness
+from macos_managed_keyboard_evidence import verify_transition, verify_witness, verify_request_activity
 
 
 def state():
@@ -103,5 +103,74 @@ class WitnessEvidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'bracket'):
             verify_witness(value,99,5,45)
 
+
+
+class HarnessCoordination(unittest.TestCase):
+    def test_pacing_gap_cannot_manufacture_concurrency(self):
+        witness = {'samples': [dict(monotonic_us=t, hid_down=n, hid_up=n)
+                              for t, n in ((10, 0), (20, 0), (30, 3), (40, 3))]}
+        result = verify_request_activity(witness, [(9, 21), (29, 41)])
+        self.assertFalse(result['keyboard_activity_observed_during_request'])
+        self.assertTrue(verify_request_activity(witness, [(19, 31)])[
+            'keyboard_activity_observed_during_request'])
+        self.assertFalse(result['human_provenance_verified'])
+        with self.assertRaises(ValueError):
+            verify_request_activity(witness, [(30, 20)])
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            'managed_keyboard_harness_test',
+            Path(__file__).with_name('verify-macos-managed-keyboard.py'))
+        cls.harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.harness)
+
+    def test_fixed_coordination_bounds(self):
+        for start, step in ((0, 100), (10000, 1500), (30000, 2000), (0, 0)):
+            self.harness.validate_timing(start, step)
+        for start, step in ((-1, 100), (30001, 100), (0, -1), (0, 2001),
+                            (True, 100), (0, False), (1.5, 100), (0, 1.5)):
+            with self.subTest(start=start, step=step), self.assertRaises(ValueError):
+                self.harness.validate_timing(start, step)
+
+    @unittest.skipUnless(__import__('os').name == 'posix', 'POSIX harness lock')
+    def test_exclusive_lock_rejects_overlap_and_keeps_inode(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private.lock'
+            first = self.harness.acquire_native_test_lock(path)
+            inode = path.stat().st_ino
+            try:
+                with self.assertRaises(BlockingIOError):
+                    self.harness.acquire_native_test_lock(path)
+            finally:
+                first.close()
+            self.assertEqual(path.stat().st_ino, inode)
+            second = self.harness.acquire_native_test_lock(path)
+            second.close()
+            self.assertEqual(path.stat().st_ino, inode)
+
+    @unittest.skipUnless(__import__('os').name == 'posix', 'POSIX harness lock')
+    def test_lock_rejects_symlink_public_mode_and_hardlink(self):
+        import tempfile, os
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'private.lock'
+            path.touch(mode=0o600)
+            link = root / 'link'
+            link.symlink_to(path)
+            with self.assertRaises(OSError):
+                self.harness.acquire_native_test_lock(link)
+            path.chmod(0o644)
+            with self.assertRaises(RuntimeError):
+                self.harness.acquire_native_test_lock(path)
+            path.chmod(0o600)
+            os.link(path, root / 'hardlink')
+            with self.assertRaises(RuntimeError):
+                self.harness.acquire_native_test_lock(path)
 
 if __name__=='__main__': unittest.main()

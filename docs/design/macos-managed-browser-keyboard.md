@@ -110,3 +110,25 @@ span. This is not positive concurrent-human-typing acceptance or continuous isol
 The development binary and source hashes, steps and limitations are recorded in
 `evidence/macos-managed-keyboard-20260928.json`. Historical failed runs remain in the
 local proof directory; no failed or uncertain input was replayed in the same session.
+
+
+## Coordinated human-activity acceptance
+
+The opt-in harness supports fixed `--start-delay-ms` (0..30000, default 0)
+and `--step-delay-ms` (0..2000, default 100). A ten-second start delay and
+1500 ms step delay give the operator time to type normally while the fixed
+plan runs; they never wait for activity or retry input until acceptance.
+`--require-activity` requires counter progress strictly inside at least one
+successful request interval, not just between requests during pacing gaps.
+The report distinguishes request overlap from whole-plan activity. It still
+cannot authenticate human provenance or prove atomic/continuous isolation.
+
+An exclusive private POSIX lock serializes updated harnesses across worktrees
+before any display observation. Contention refuses rather than queues. The
+lock does not coordinate older harnesses; operators must stop concurrent test
+scheduling before this acceptance. Existing unrelated processes and displays
+are never killed or recreated to manufacture inventory restoration.
+
+Keyboard effects, the final exact screenshot, and owned cleanup are recorded
+even when the separate activity requirement fails. Such a run remains failed
+for concurrent acceptance; a successful baseline is not renamed as overlap.
