@@ -50,17 +50,6 @@ int main(void) { @autoreleasepool {
     ok &= key_shortcut_held(kCGEventFlagMaskShift);cases++;
     ok &= key_shortcut_held(kCGEventFlagMaskSecondaryFn);cases++;
     }
-    // Readiness policy is deliberately independent of ordinary nonmodifier key
-    // state. The private event itself is still zero-modifier and exact-target.
-    ok &= !arrow_input_conflict(0,0);cases++;
-    ok &= !arrow_input_conflict(kCGEventFlagMaskAlphaShift,0);cases++;
-    const CGEventFlags conflicts[]={kCGEventFlagMaskShift,kCGEventFlagMaskControl,
-        kCGEventFlagMaskAlternate,kCGEventFlagMaskCommand,kCGEventFlagMaskSecondaryFn};
-    for(unsigned i=0;i<sizeof(conflicts)/sizeof(conflicts[0]);i++) {
-        ok &= arrow_input_conflict(conflicts[i],0);cases++;
-    }
-    for(unsigned b=0;b<5;b++) { ok &= arrow_input_conflict(0,(uint8_t)(1u<<b));cases++; }
-    ok &= arrow_input_conflict(kCGEventFlagMaskCommand,1);cases++;
     ok &= intendant_arrow_create(getpid(),12345,2)==NULL;cases++;
     ok &= intendant_arrow_create(getpid(),12345,255)==NULL;cases++;
     NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"passed":@(ok),@"cases":@(cases),

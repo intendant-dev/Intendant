@@ -1,3 +1,14 @@
+# Status: native concurrency policy deferred
+
+The proposed native CGEvent policy below was not positively accepted under concurrent
+human typing. The browser-keyboard continuation restores the main-branch native
+held-key and exact human-focus guards in a forward commit. Historical commits and
+the evidence harness remain available; browser-page CDP tests are not acceptance
+for these native policy changes. The current deliverable is independently targeted
+managed-browser text and keyboard input, not a separate OS input seat.
+
+---
+
 # macOS concurrent ordinary-key typing with bound horizontal arrows
 
 This slice changes only the readiness policy for the existing retained-receiver

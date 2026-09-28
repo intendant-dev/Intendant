@@ -327,19 +327,6 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   never changes the frozen key. SDK keycode and Unicode readbacks must agree.
   All existing protections, bounds, one-shot lifetime and effect caveats remain.
   No other key, text, shortcut, activation, implicit click or global input is added.
-  The concurrent-typing refinement permits ordinary held nonmodifier human keys
-  while these fixed private-source arrows run against a different exact background
-  PID/window. Shift/Control/Option/Command/Fn and held mouse buttons still refuse.
-  Human-focus stability for this keyboard path is process-scoped (PID + process
-  birth), so caret/focus-object churn inside the same foreground app does not block
-  the independent background receiver; app/process switches still refuse, and the
-  target becoming foreground remains forbidden by native readiness.
-  Concurrent ordinary human key-down state is explicitly permitted for these
-  fixed private-source arrows: readiness does not query nonmodifier key state.
-  Shortcut modifiers (Shift/Control/Option/Command/Fn) and held human mouse
-  buttons still refuse before posting. This does not create an independent OS
-  input seat; exact human-focus/receiver rechecks, zero event flags, partial-effect
-  accounting and the no-replay rule remain mandatory.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

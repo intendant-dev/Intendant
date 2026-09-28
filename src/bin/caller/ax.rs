@@ -1158,7 +1158,7 @@ impl Native for PlacementNative {
         placement_permissions(deadline)?;
         placement_generation(window.identity)?;
         if !intendant_platform::bound_arrow::ready(window.identity.pid) {
-            return Err("horizontal arrow requires existing post-event permission, a background target, no held human mouse buttons, and no held shortcut modifiers".into());
+            return Err("horizontal arrow requires existing post-event permission, a background target, and no held human keys/buttons/modifiers".into());
         }
         placement::time_left(deadline)
     }
@@ -2135,18 +2135,6 @@ impl controls::Native for PlacementNative {
         placement_generation(identity)?;
         placement::time_left(deadline)?;
         Ok(RetainedElement::plain(focused))
-    }
-    fn keyboard_human_focus_same_context(
-        &self,
-        before: &PlacementFocus,
-        after: &PlacementFocus,
-    ) -> bool {
-        // The input event is addressed to a separately retained background PID
-        // and exact window. Human navigation within the same foreground process
-        // must not stall that independent target. A process restart or app switch
-        // remains a conflict; arrow_ready separately refuses if the target itself
-        // becomes foreground.
-        before.pid == after.pid && before.birth == after.birth
     }
     fn keyboard_metadata(
         &mut self,
