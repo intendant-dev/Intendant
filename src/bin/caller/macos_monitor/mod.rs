@@ -316,6 +316,9 @@ struct Request {
 /// start is one-shot, including failure. No GUI probes in ordinary startup.
 #[derive(Default)]
 pub(crate) struct Broker {
+    // Serializes managed browser creation/cleanup with tool-driven monitor
+    // destruction. It never runs on, or waits for, the native helper thread.
+    pub(crate) workspace_lane: std::sync::Arc<tokio::sync::Mutex<()>>,
     sender: OnceLock<Result<mpsc::Sender<Request>, String>>,
 }
 

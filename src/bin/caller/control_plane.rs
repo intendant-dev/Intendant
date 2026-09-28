@@ -827,7 +827,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 extension_manifest_version: *extension_manifest_version,
                 extension_version: extension_version.clone(),
             };
-            match crate::browser_workspace::create_workspace(request, &state.bus).await {
+            // This legacy bus message does not carry authenticated caller trust.
+            // Do not infer owner authority from a display selector. macOS-bound
+            // workspaces enter through the caller-aware MCP route.
+            match crate::browser_workspace::create_workspace(request, &state.bus, None).await {
                 Ok(_) => {}
                 Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "error".to_string(),
@@ -840,7 +843,14 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
         ControlMsg::CloseBrowserWorkspace {
             workspace_id,
             reason,
-        } => match crate::browser_workspace::close_workspace(workspace_id, reason.clone()).await {
+        } => match crate::browser_workspace::close_workspace(
+            workspace_id,
+            reason.clone(),
+            &state.bus,
+            None,
+        )
+        .await
+        {
             Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
                 kind: "closed".to_string(),
                 workspace_id: Some(workspace.id.clone()),

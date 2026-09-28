@@ -170,6 +170,15 @@ class StudyTests(unittest.TestCase):
         self.assertIsNone(unknown['native_status'])
         self.assertIsNone(unknown['native_timing'])
 
+    def test_read_cap_is_preserved_without_claiming_applied_timeout(self):
+        error = ('kAXErrorCannotComplete (-25204); value_present=false; '
+                 'ax_copy_us=17001; ax_timeout_cap_us=200000; '
+                 'budget_before_us=17000; budget_after_us=0')
+        result = study.classify_refusal(error)
+        self.assertEqual(result['native_timing']['ax_timeout_cap_us'], 200000)
+        self.assertNotIn('ax_timeout_us', result['native_timing'])
+        self.assertEqual(result['native_timing']['budget_after_us'], 0)
+
     def test_presence_and_status_preserved_not_treated_as_recoverable(self):
         r = study.classify_refusal('kAXErrorCannotComplete (-25204); value_present=true')
         self.assertTrue(r['native_status']['value_present'])

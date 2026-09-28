@@ -1007,24 +1007,43 @@ impl IntendantServer {
             "browser_workspace_providers" => {
                 Ok(text_tool_result(self.browser_workspace_providers().await))
             }
-            "list_browser_workspaces" => Ok(text_tool_result(self.list_browser_workspaces().await)),
+            "list_browser_workspaces" => Ok(text_tool_result(
+                self.list_browser_workspaces_as_caller(caller).await,
+            )),
             "create_browser_workspace" => {
-                let params = parse_params::<CreateBrowserWorkspaceParams>(args)?;
+                let Parameters(params) = parse_params::<CreateBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
-                    self.create_browser_workspace(params).await,
+                    self.create_browser_workspace_as_caller(params, caller)
+                        .await,
                 ))
             }
             "close_browser_workspace" => {
-                let params = parse_params::<CloseBrowserWorkspaceParams>(args)?;
-                Ok(text_tool_result(self.close_browser_workspace(params).await))
+                let Parameters(params) = parse_params::<CloseBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.close_browser_workspace_as_caller(params, caller).await,
+                ))
             }
             "acquire_browser_workspace" => {
+                if caller != ToolCallerTrust::OwnerSurface
+                    && crate::browser_workspace::macos_workspace_request(name, &args).await
+                {
+                    return Ok(text_tool_error(
+                        "macOS-bound browser workspaces require an owner surface",
+                    ));
+                }
                 let params = parse_params::<AcquireBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
                     self.acquire_browser_workspace(params).await,
                 ))
             }
             "release_browser_workspace" => {
+                if caller != ToolCallerTrust::OwnerSurface
+                    && crate::browser_workspace::macos_workspace_request(name, &args).await
+                {
+                    return Ok(text_tool_error(
+                        "macOS-bound browser workspaces require an owner surface",
+                    ));
+                }
                 let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
                 Ok(text_tool_result(
                     self.release_browser_workspace(params).await,

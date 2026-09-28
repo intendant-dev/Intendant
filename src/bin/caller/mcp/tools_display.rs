@@ -8,6 +8,33 @@ use super::*;
 const VIRTUAL_DISPLAY_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl IntendantServer {
+    /// Called after the primary runtime-control gate. Resolve facade arguments
+    /// exactly once here, so the additional display permissions cannot be
+    /// bypassed by spelling the same operation as argv instead of a raw tool.
+    pub(crate) async fn macos_browser_workspace_request(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        if facade::facade_resolved_tool(name, args).is_some_and(|tool| {
+            matches!(
+                tool,
+                "create_browser_workspace"
+                    | "close_browser_workspace"
+                    | "acquire_browser_workspace"
+                    | "release_browser_workspace"
+            )
+        }) {
+            return match facade::plan_for_meta(name, args) {
+                Ok(plan) => {
+                    crate::browser_workspace::macos_workspace_request(plan.tool, &plan.args).await
+                }
+                Err(_) => false, // Dispatch refuses malformed arguments without effects.
+            };
+        }
+        crate::browser_workspace::macos_workspace_request(name, args).await
+    }
+
     #[tool(
         description = "List browser workspace provider availability for local semantic browser control and streamed fallback."
     )]
@@ -20,16 +47,38 @@ impl IntendantServer {
         description = "List active browser workspaces. Browser workspaces are addressable CDP/Playwright/Agent Browser surfaces with per-workspace leases."
     )]
     pub(crate) async fn list_browser_workspaces(&self) -> String {
-        let workspaces = crate::browser_workspace::list_workspaces(&self.bus).await;
+        self.list_browser_workspaces_as_caller(ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(super) async fn list_browser_workspaces_as_caller(
+        &self,
+        caller: ToolCallerTrust,
+    ) -> String {
+        let mut workspaces = crate::browser_workspace::list_workspaces(&self.bus).await;
+        if caller != ToolCallerTrust::OwnerSurface {
+            // Do not expose owner-only native window tokens or loopback CDP
+            // endpoints through an otherwise read-only workspace inventory.
+            workspaces.retain(|workspace| !crate::browser_workspace::is_macos_workspace(workspace));
+        }
         serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_string())
     }
 
     #[tool(
-        description = "Create a browser workspace. provider=cdp launches managed Chromium with an isolated profile and CDP endpoint. On Linux, display_target can bind it to an explicit daemon-created virtual display returned by create_virtual_display; user-session, session-local, and foreign displays are rejected. provider=system_cdp deliberately uses the installed system browser."
+        description = "Create a browser workspace. provider=cdp launches managed Chromium with an isolated profile and CDP endpoint. Linux display_target binds to a daemon-created Xvfb display. On macOS an exact owned macos_virtual selector launches managed Chrome for Testing in a fresh background window and returns macos_window_binding for the existing owner-only controls; requires owner trust plus runtime-control, display-view and display-input permission. No generic input or streaming is enabled. User-session and foreign display bindings are rejected. provider=system_cdp deliberately uses the installed system browser."
     )]
     pub(crate) async fn create_browser_workspace(
         &self,
         Parameters(params): Parameters<CreateBrowserWorkspaceParams>,
+    ) -> String {
+        self.create_browser_workspace_as_caller(params, ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(super) async fn create_browser_workspace_as_caller(
+        &self,
+        params: CreateBrowserWorkspaceParams,
+        caller: ToolCallerTrust,
     ) -> String {
         let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
             url: params.url,
@@ -46,7 +95,16 @@ impl IntendantServer {
             extension_manifest_version: params.extension_manifest_version,
             extension_version: params.extension_version,
         };
-        match crate::browser_workspace::create_workspace(request, &self.bus).await {
+        let authority = if request
+            .display_target
+            .as_deref()
+            .is_some_and(crate::macos_monitor::exact_selector)
+        {
+            Some(self.macos_monitor_authority(caller).await)
+        } else {
+            None
+        };
+        match crate::browser_workspace::create_workspace(request, &self.bus, authority).await {
             Ok(workspace) => {
                 serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
             }
@@ -70,7 +128,24 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<CloseBrowserWorkspaceParams>,
     ) -> String {
-        match crate::browser_workspace::close_workspace(&params.workspace_id, params.reason).await {
+        self.close_browser_workspace_as_caller(params, ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(super) async fn close_browser_workspace_as_caller(
+        &self,
+        params: CloseBrowserWorkspaceParams,
+        caller: ToolCallerTrust,
+    ) -> String {
+        let authority = Some(self.macos_monitor_authority(caller).await);
+        match crate::browser_workspace::close_workspace(
+            &params.workspace_id,
+            params.reason,
+            &self.bus,
+            authority,
+        )
+        .await
+        {
             Ok(workspace) => {
                 self.bus.send(AppEvent::BrowserWorkspaceChanged {
                     kind: "closed".to_string(),

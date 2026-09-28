@@ -1,0 +1,120 @@
+{
+  "scope": "managed browser form; not general CU or concurrent-key acceptance",
+  "source_base": "6d28ac72aed449217a0456774d6cfe7cd75803dd",
+  "source_state": "uncommitted AX read-budget patch at native build; executable hashes identify actual tests",
+  "ax_source_sha256": "aa9b2db9fac4dba66551743cf64b3e74a7da463e927864e200f567e7915c6c44",
+  "read_cap_ms": 200,
+  "geometry_write_cap_ms": 50,
+  "operation_budget_ms": 4000,
+  "native_plan": "one initial run followed by two predetermined independent sessions; no repeated input",
+  "runs": [
+    {
+      "ok": true,
+      "checks": {
+        "launch_and_placement_verified": true,
+        "exact_monitor_capture_verified": true,
+        "form_effects_verified": true,
+        "monitor_destruction_closes_browser": true
+      },
+      "binary_sha256": "24c3b95435b71cf0f0595fe6e0e2aeb91e93499514e07f2bc68b3a9897cb0c01",
+      "binary_version": "intendant 0.2.0-alpha.7 (commit 6d28ac72-dirty, built 2026-09-27T01:37:31Z, aarch64-apple-darwin)",
+      "after_controls": {
+        "text": "Managed virtual-display workspace works",
+        "button_count": 1,
+        "canvas_count": 0,
+        "generation": 1
+      },
+      "daemon_reaped": true,
+      "inventory_restored": true,
+      "automatic_input_retry": false,
+      "initial_capture_png_sha256": "4d93bbf4c07fe0599189a2cb2865cc03c07d1b7a687bc15b7ce8d4fcb11f4341",
+      "capture_png_sha256": "b00c65f7517987df6f40e0e4257045a64048c06cbe24c4ad4ad42f9572b4c2a3",
+      "report": "live-200ms-01.json",
+      "report_sha256": "57dfab7b5d60ebcce746cdb0067f6d27d7f3c88c2c1c4a40d8918d3efde0c0b3",
+      "read_attempt_counts": [
+        1,
+        1
+      ],
+      "text_status": "verified",
+      "button_status": "dispatched",
+      "button_effect_verified_independently": true,
+      "focus_interference": [
+        false,
+        false
+      ],
+      "memory_only_captures": true
+    },
+    {
+      "ok": true,
+      "checks": {
+        "launch_and_placement_verified": true,
+        "exact_monitor_capture_verified": true,
+        "form_effects_verified": true,
+        "monitor_destruction_closes_browser": true
+      },
+      "binary_sha256": "24c3b95435b71cf0f0595fe6e0e2aeb91e93499514e07f2bc68b3a9897cb0c01",
+      "binary_version": "intendant 0.2.0-alpha.7 (commit 6d28ac72-dirty, built 2026-09-27T01:37:31Z, aarch64-apple-darwin)",
+      "after_controls": {
+        "text": "Managed virtual-display workspace works",
+        "button_count": 1,
+        "canvas_count": 0,
+        "generation": 1
+      },
+      "daemon_reaped": true,
+      "inventory_restored": true,
+      "automatic_input_retry": false,
+      "initial_capture_png_sha256": "d0b94c7f2eb55104e0bbad4133377fd0c3d1d19ea5709a8a8b422b1e68d93b5d",
+      "capture_png_sha256": "02aea614f9e86252829371b359726f7324b4c08012ddb1625cef76550bafafff",
+      "report": "live-200ms-02.json",
+      "report_sha256": "ab76bbec5e3f9427b1ed71d64a0e28ec86f3ea92f069683e74d9f664facf80ac",
+      "read_attempt_counts": [
+        1,
+        1
+      ],
+      "text_status": "verified",
+      "button_status": "dispatched",
+      "button_effect_verified_independently": true,
+      "focus_interference": [
+        false,
+        false
+      ],
+      "memory_only_captures": true
+    },
+    {
+      "ok": true,
+      "checks": {
+        "launch_and_placement_verified": true,
+        "exact_monitor_capture_verified": true,
+        "form_effects_verified": true,
+        "monitor_destruction_closes_browser": true
+      },
+      "binary_sha256": "24c3b95435b71cf0f0595fe6e0e2aeb91e93499514e07f2bc68b3a9897cb0c01",
+      "binary_version": "intendant 0.2.0-alpha.7 (commit 6d28ac72-dirty, built 2026-09-27T01:37:31Z, aarch64-apple-darwin)",
+      "after_controls": {
+        "text": "Managed virtual-display workspace works",
+        "button_count": 1,
+        "canvas_count": 0,
+        "generation": 1
+      },
+      "daemon_reaped": true,
+      "inventory_restored": true,
+      "automatic_input_retry": false,
+      "initial_capture_png_sha256": "b6fe44df39a4e3e4bb376c78c24a516297f921a86f4805a38b86b62d84040058",
+      "capture_png_sha256": "4ae2826e489330670913ad63adba523eeff52432f55cdd13b11be4d1a9dc50fb",
+      "report": "live-200ms-03.json",
+      "report_sha256": "ca694f4d6ceac758802a767bf43ae08df83b75fd5ced25b680a746cef7a810f0",
+      "read_attempt_counts": [
+        1,
+        1
+      ],
+      "text_status": "verified",
+      "button_status": "dispatched",
+      "button_effect_verified_independently": true,
+      "focus_interference": [
+        false,
+        false
+      ],
+      "memory_only_captures": true
+    }
+  ]
+}

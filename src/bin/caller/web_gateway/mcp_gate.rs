@@ -666,6 +666,26 @@ pub(crate) async fn handle_mcp_parsed_request(
                     error: None,
                 });
             }
+            if server.macos_browser_workspace_request(name, &args).await {
+                for operation in [
+                    crate::peer::access_policy::PeerOperation::DisplayView,
+                    crate::peer::access_policy::PeerOperation::DisplayInput,
+                ] {
+                    let extra = access.decision(operation);
+                    if !extra.allowed {
+                        return McpHttpOutcome::Response(McpHttpResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: Some(mcp_permission_denied_result(
+                                name,
+                                &access.principal,
+                                &extra,
+                            )),
+                            error: None,
+                        });
+                    }
+                }
+            }
             let caller = crate::mcp::ToolCaller::from_gate(&access.principal, gate_session.clone())
                 .with_fs_scope(access.fs_scope());
             let task_start = task_session.and_then(|_| {
@@ -1680,6 +1700,94 @@ pub(crate) fn mcp_agent_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn macos_browser_workspace_http_requires_runtime_and_both_display_permissions() {
+        use crate::access::iam::{self, AccessPrincipal, IamRole};
+        use crate::peer::access_policy::PeerOperation::{
+            DisplayInput, DisplayView, RuntimeControl,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::mcp::tests::test_state_with_log_dir(directory.path().to_path_buf());
+        state
+            .read()
+            .await
+            .autonomy
+            .write()
+            .await
+            .user_display_granted = true;
+        let bus = EventBus::new();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let owner = AccessPrincipal::root_dashboard_session("browser-gate", "http");
+        let target = format!("macos_virtual:{}:536870912", "a".repeat(32));
+        for permissions in [
+            vec!["runtime.control"],
+            vec!["runtime.control", "display.view"],
+            vec!["runtime.control", "display.input"],
+            vec!["runtime.control", "display.view", "display.input"],
+        ] {
+            let mut iam = iam::LocalIamState::default();
+            iam.roles.push(IamRole {
+                id: "role:browser-test".into(),
+                label: "test".into(),
+                status: "active".into(),
+                summary: String::new(),
+                source: "local".into(),
+                permissions: permissions.iter().map(|p| p.to_string()).collect(),
+            });
+            iam::upsert_user_client_grant(
+                &mut iam,
+                iam::UserClientGrantUpsertRequest {
+                    kind: "agent_session".into(),
+                    session_id: Some("browser-gate-agent".into()),
+                    role_id: Some("role:browser-test".into()),
+                    ..Default::default()
+                },
+                &owner,
+            )
+            .unwrap();
+            let principal =
+                iam::principal_for_agent_session(&iam, "browser-gate-agent", "http").unwrap();
+            let access = HttpAccessContext {
+                principal,
+                iam_state: Some(std::sync::Arc::new(iam)),
+                peer_filesystem: None,
+            };
+            assert!(access.decision(RuntimeControl).allowed);
+            let expected = if !access.decision(DisplayView).allowed {
+                "display.view"
+            } else if !access.decision(DisplayInput).allowed {
+                "display.input"
+            } else {
+                "owner-surface"
+            };
+            for (tool, args) in [
+                (
+                    "create_browser_workspace",
+                    serde_json::json!({"display_target":target,"url":"about:blank"}),
+                ),
+                (
+                    "act",
+                    serde_json::json!({"argv":["browser","create","about:blank","--display-target",target]}),
+                ),
+            ] {
+                let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":args}})
+                .to_string();
+                let McpHttpOutcome::Response(response) = handle_mcp_http_request(
+                    &request, &server, None, None, None, &access, None, &bus,
+                )
+                .await
+                else {
+                    panic!("expected response")
+                };
+                let result = response.result.unwrap();
+                let text = result["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains(expected), "{expected}: {text}");
+                assert!(bus.macos_monitors.not_started());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn macos_monitor_reads_require_live_display_view_before_dispatch() {

@@ -89,6 +89,9 @@
 set -euo pipefail
 
 BUNDLE_ID="com.intendant.app"
+# One deployment floor for the Mach-O launcher and its Info.plist. Without an
+# explicit target, swiftc can select an OS newer than the machine building it.
+MACOS_MIN_VERSION="14.0"
 
 PROFILE="${1:-release}"
 
@@ -260,10 +263,16 @@ mkdir -p "$MACOS" "$RESOURCES"
 # Compile Swift wrapper (main.swift must stay first: with multiple input
 # files, swiftc only allows top-level code in a file named main.swift)
 echo "Compiling macOS app wrapper..."
-swiftc -O -o "$MACOS/Intendant" macos-app/main.swift macos-app/BackendSupervisor.swift \
+swiftc -target "$(uname -m)-apple-macosx${MACOS_MIN_VERSION}" \
+    -O -o "$MACOS/Intendant" macos-app/main.swift macos-app/BackendSupervisor.swift \
     macos-app/UpdateChecker.swift macos-app/AgentViewModel.swift \
     macos-app/AgentViewTransport.swift macos-app/AgentView.swift \
     -framework Cocoa -framework WebKit
+
+# Refuse an incompatible launcher before signing or replacing the installed app.
+WRAPPER_MIN_VERSION="$(xcrun vtool -show-build "$MACOS/Intendant" | awk '$1 == "minos" { print $2 }')"
+[ "$WRAPPER_MIN_VERSION" = "$MACOS_MIN_VERSION" ] \
+    || die "launcher requires macOS $WRAPPER_MIN_VERSION; expected $MACOS_MIN_VERSION"
 
 # Copy Rust binaries
 cp "$BINARY" "$MACOS/intendant-bin"
@@ -308,7 +317,7 @@ cat > "$CONTENTS/Info.plist" << PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>${MACOS_MIN_VERSION}</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
