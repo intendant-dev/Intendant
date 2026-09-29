@@ -100,6 +100,46 @@ The independent fixture now verifies a changed document URL in the same retained
 before continuing its keyboard/click/scroll plan; that expanded native plan has not run.
 
 
+## Separately authorized acceptance application (2026-09-29)
+
+The development acceptance host is **Intendant CU Candidate**, bundle identifier
+`dev.intendant.cu-candidate`. It is distinct from the installed Intendant app and
+is never installed over it. Its startup only displays read-only permission status;
+no display, screenshot, input, or test daemon is created on opening the host.
+
+Build a clean, exact controller in the existing worktree, then package it:
+
+```sh
+cargo build --locked -p intendant --bin intendant
+python3 scripts/build-macos-cu-candidate.py --binary target/debug/intendant \
+  --browser-app '/absolute/path/Google Chrome for Testing.app' \
+  --output "$HOME/Applications/Intendant CU Candidate.app"
+```
+
+The builder refuses an existing app path or a stale/dirty controller. It snapshots
+and hashes the exact controller, fixture dependencies and test page, relocates the
+known libvpx library, and verifies local ad-hoc signatures. It does not touch the
+signing keychain, TCC database, installed daemon, provider accounts or personal
+browser. This frozen local build is not a notarized distribution; rebuilding it
+may require a fresh macOS approval because its ad-hoc identity can change.
+
+The owner opens this app and uses its Accessibility and Screen Recording buttons
+to request **that app's own** OS permissions. These are broad macOS permissions;
+the test remains limited to the disposable workspace. No Full Disk Access,
+Terminal/Desktop Commander grant, or grant borrowed from the installed app is
+requested. Permission approval alone never starts the test. The separate Run
+button asks to run one fixed supervised-session browser scenario. Stop interrupts
+only that runner once, allowing its existing cleanup to finish. There is no
+automatic native retry or re-run after reopening the app.
+
+The signed snapshot can run outside the checkout. Its report records the exact
+source commit/tree and verifies all bundled payload hashes before native work.
+The test still checks its own candidate controller's OS authority; a successful
+host preflight is not evidence that input delivery or the full workflow passed.
+Results are private under `~/Library/Application Support/Intendant CU Candidate/`.
+The app never labels a launch-only result or a protocol acknowledgement as full
+acceptance, and does not assert simultaneous human typing or native-app completion.
+
 ## Product contract
 
 The normal workflow is: the owner starts a task with an agent workspace, the

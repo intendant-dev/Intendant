@@ -9,6 +9,7 @@ import argparse, base64, hashlib, http.client, http.server, importlib.util, json
 import os, re, secrets, shlex, shutil, socket, struct, subprocess, sys, tempfile
 import threading, time, urllib.parse, uuid
 from pathlib import Path
+from macos_candidate_manifest import source_metadata
 
 def require(ok, message):
     if not ok: raise RuntimeError(message)
@@ -54,12 +55,14 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--bin',required=True,type=Path);ap.add_argument('--browser-app',required=True,type=Path)
     ap.add_argument('--report',required=True,type=Path);ap.add_argument('--allow-shared-session-monitor',action='store_true')
+    ap.add_argument('--candidate-manifest', type=Path, help='Validate a pinned standalone candidate bundle instead of querying a checkout')
     ap.add_argument('--launch-only', action='store_true', help='Verify session-owned launch and task-stop cleanup only; never send tested input')
     args=ap.parse_args()
     if sys.platform!='darwin' or not args.allow_shared_session_monitor or not __debug__:
         ap.error('requires macOS and explicit shared-session monitor opt-in')
     require(not args.report.exists(),'report must be fresh')
     binary=args.bin.resolve(strict=True);app=args.browser_app.resolve(strict=True)
+    provenance=source_metadata(binary, Path(__file__).resolve().parent.parent, args.candidate_manifest)
     helper=load('task_keyboard_helper','verify-macos-managed-keyboard.py')
     mon=load('task_monitor_helper','verify-macos-monitor-http.py')
     browser=load('task_browser_helper','verify-macos-chromium-controls.py')
@@ -69,11 +72,10 @@ def main():
     report={'ok':False,'before':mon.inventory(),'checks':{},'steps':[],
       'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
       'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-      'source_head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parent.parent,text=True).strip(),
+      **provenance,
       'installed_daemon_changed':False,'owner_input_requests':0,'manual_assignment_requests':0,
       'scope':'launch_and_cleanup_only' if args.launch_only else 'full_task_browser',
       'full_workflow_verified':False,
-      'source_dirty':subprocess.run(['git','diff','--quiet','HEAD'],cwd=Path(__file__).resolve().parent.parent).returncode!=0,
       'automatic_input_retry':False,'human_typing_overlap_verified':False,'rig':str(root)}
     args.report.parent.mkdir(parents=True,exist_ok=True)
     def save(): args.report.write_text(json.dumps(report,indent=2)+'\n')
