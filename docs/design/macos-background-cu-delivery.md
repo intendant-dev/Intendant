@@ -33,6 +33,21 @@ stay consistent as input backends evolve.
    real nonbrowser app. Mark each operation's tested compatibility explicitly.
    App-specific failures are data, not permission to activate the human's desktop.
 
+## Browser milestone acceptance (2026-09-29)
+
+The fixed ordinary-session integration for milestones 1 and 2 passed in the
+operator-authorized `b43c0e2f` candidate: automatic workspace, navigation, two
+screenshots, Unicode text and editing keys, canvas click, scroll, duplicate and
+foreign-session refusals, and task-stop cleanup. See
+`evidence/macos-task-browser-accepted-20260929.json`. This establishes the browser
+control path, not autonomous LLM visual reasoning or concurrent physical typing.
+
+**The next implementation milestone is 3: native-app background input.** Start
+with the AppKit editor and nonsemantic canvas tasks already specified above;
+keep the human-foreground witness separate. Browser polish and automatic Agent
+View reveal must not displace this work. No additional native compatibility is
+claimed from the successful browser run.
+
 ## Native-app decision gate
 
 Prove actual receiver effects and the human's foreground cursor/keyboard/clipboard
@@ -54,5 +69,5 @@ active agent workspace without activation and respect an explicit user hide.
 Streaming and cosmetic preview work do not block delivering the input workflow.
 
 Existing foundation: #968 managed browser lifecycle, #970 privacy/cleanup, and
-#967 managed-page keyboard are merged. That is component evidence, not an automatic
-ordinary-agent or arbitrary-native-app completion claim.
+#967 managed-page keyboard are merged. That was component evidence. The task-browser acceptance above now covers the
+ordinary-session integration; arbitrary native-app completion remains separate.

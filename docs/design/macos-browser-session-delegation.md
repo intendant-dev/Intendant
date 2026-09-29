@@ -1,9 +1,10 @@
 # Automatic use of a session-assigned managed browser
 
-Status: production candidate in #971; native task-browser acceptance has not passed.
-No installed-daemon grant, app update or owner-permission change.
-Base: #967 merged as ec04fa076043fc3a3aa5662833dd35e9b9cb9b59. Continue in #971.
-Product clarification: 2026-09-28; this document specifies the target, not shipped behavior.
+Status: the ordinary-session browser-control acceptance passed on 2026-09-29,
+against clean candidate b43c0e2f824b95989eac7e272ac14669192a18b8 in #971.
+The operator approved and ran the separately identified test application.
+The installed Intendant app/daemon was not replaced. Base: #967/#970 on main
+ec04fa076043fc3a3aa5662833dd35e9b9cb9b59. Native-app support is the next milestone.
 
 ## Implemented candidate interface (2026-09-29)
 
@@ -54,17 +55,27 @@ recorded only after successful exclusive creation and removed only after owned
 browser cleanup. Another workspace on the monitor prevents task cleanup destroying
 that reused monitor.
 
-The committed native-attempt record is a FAILURE: the injected session credential
-was accepted, but browser launch failed before any tested screenshot/keyboard/
-pointer action. Its daemon exited and display inventory was restored. That attempt
-predates the later diagnostic-stage/profile-cleanup corrections. Unit tests and
-compilation are not native acceptance. A successful full normal-session run and
-foreground/human-activity measurements remain unverified. Same-workspace URL
-navigation is now implemented and mock-tested, not yet live-accepted. Arbitrary
-native-app input remains the next major delivery in
-`macos-background-cu-delivery.md`; this candidate does not implement it.
+### Accepted ordinary-session browser run
 
-### Launch diagnosis and original-page navigation
+The operator-started candidate run passed all eight checks: authenticated session,
+automatic provisioning, same-workspace navigation, screenshots, keyboard effects,
+coordinate click/scroll with replay refusal, foreign-session refusal, and task-stop
+cleanup. It made 18 requests using two genuine supervised-session credentials,
+with zero owner-input requests or manual workspace assignments. Seven keyboard
+requests produced the expected Unicode text, Tab, Backspace and Enter effects;
+the page recorded one button activation, one canvas click and 180 pixels of scroll.
+Two 1024x768 screenshots were delivered to the owning session. Stopping it removed
+the browser/profile/monitor; the temporary daemon exited and display inventory was
+restored. The report matches the signed bundle, source tree and payload hashes.
+
+Evidence: `evidence/macos-task-browser-accepted-20260929.json`. This is a fixed
+protocol fixture using the real supervised-session input path, not an autonomous
+LLM visual-reasoning benchmark. Physically simultaneous human typing was not
+measured, and arbitrary native apps were not exercised. Those remain distinct
+measurements/features, not additional prerequisites for this browser handoff.
+Earlier failed attempts are retained below as history, not the current result.
+
+### Earlier launch diagnosis and original-page navigation
 
 The task-profile check now pins the exact absolute path from the daemon's workspace
 reservation. It no longer assumes the profile leaf is the workspace ID: production
@@ -82,7 +93,7 @@ A separate owner-plugin about:blank launch succeeded in the installed app contex
 and was cleaned up. It is not candidate-build or ordinary-session acceptance.
 Evidence: `evidence/macos-task-browser-launch-diagnosis-20260929.json`.
 Do not work around this OS refusal through another input route or silently change
-privacy settings. The next live run needs an explicitly authorized candidate context.
+privacy settings. The subsequent accepted run used the operator-authorized candidate app.
 The `--launch-only` harness mode records its narrow scope and never claims the full loop.
 
 `task_browser {op:navigate,workspace_id,request_id,url}` keeps the original managed
@@ -97,7 +108,7 @@ the result. Cancellation is checked before dispatch; an uncertain sent request i
 replayed, and uncertainty blocks further task input pending observation/cleanup.
 The existing task permit, UUID ledger, IAM, revocation and read-only route split apply.
 The independent fixture now verifies a changed document URL in the same retained page
-before continuing its keyboard/click/scroll plan; that expanded native plan has not run.
+before continuing its keyboard/click/scroll plan; that plan passed in the accepted run.
 
 
 ## Separately authorized acceptance application (2026-09-29)
@@ -256,5 +267,5 @@ looking up the latest epoch for an old request is insufficient. Unregistered
 legacy token routes carry no epoch and cannot gain a delegated browser permit
 merely by naming a session. Existing IAM gates and owner posture are unchanged.
 
-This is a production prerequisite, not the completed provision/capture/input
-workflow. Assignment, exact-resource permits and lifecycle cleanup still apply.
+These identity checks are part of the implemented and accepted browser workflow.
+Assignment, exact-resource permits and lifecycle cleanup remain enforced.
