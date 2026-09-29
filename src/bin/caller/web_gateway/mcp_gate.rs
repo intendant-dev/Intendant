@@ -3568,8 +3568,17 @@ mod tests {
         register_supervised_mcp_session(&id, &log);
         let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
         drop(log);
+        // Registration sweeps dead weak entries. Force that interleaving here
+        // rather than racing unrelated concurrent tests: after the sweep the
+        // resolver may return an unregistered legacy expectation, but NEVER
+        // a live epoch or the old registered credential.
+        let sweep_log = temp_session_log(&tmp.path().join("sweep"));
+        register_supervised_mcp_session(&format!("sweep-{}", uuid::Uuid::new_v4()), &sweep_log);
         assert!(supervised_mcp_registration_epoch(&id).is_none());
-        assert!(expected_session_mcp_credential(loopback_mcp_auth_token(), &id).is_none());
+        assert!(
+            expected_session_mcp_credential(loopback_mcp_auth_token(), &id)
+                .is_none_or(|(candidate, epoch)| epoch.is_none() && candidate != token)
+        );
         assert_eq!(
             mcp_request_token_binding(&registration_request(&id, &token, false)),
             McpTokenBinding::Invalid

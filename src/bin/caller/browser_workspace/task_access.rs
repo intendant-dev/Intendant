@@ -191,6 +191,9 @@ struct Resources {
     monitor: Option<crate::macos_monitor::Monitor>,
     workspace: Option<String>,
     profile: Option<PathBuf>,
+    // Pinned by the trusted reservation; cleanup ownership begins only after
+    // create_fresh_macos_profile succeeds and record_profile acknowledges it.
+    expected_profile: Option<PathBuf>,
     stage: &'static str,
     process: Option<(u32, (u64, u32))>,
     binding: Option<String>,
@@ -432,6 +435,10 @@ impl Permit {
                         .is_some_and(|m| Some(m.selector.as_str()) == selector)
             })
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn allows_page_input(&self, workspace: &BrowserWorkspace) -> bool {
+        self.mode == Mode::Input && self.uses_workspace(workspace)
+    }
     pub(crate) fn uses_workspace(&self, workspace: &BrowserWorkspace) -> bool {
         matches!(self.mode, Mode::Observe | Mode::Input)
             && self.allocation.resources.lock().is_ok_and(|r| {
@@ -466,7 +473,14 @@ impl Permit {
         {
             return Err("unexpected task browser reservation".into());
         }
+        let profile = workspace
+            .profile_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or("task reservation has no absolute managed profile")?;
         r.workspace = Some(workspace.id.clone());
+        r.expected_profile = Some(profile);
         r.stage = "workspace_reserved";
         Ok(())
     }
@@ -480,7 +494,8 @@ impl Permit {
             || r.ready
             || r.profile.is_some()
             || !profile.is_absolute()
-            || profile.file_name().and_then(|name| name.to_str()) != r.workspace.as_deref()
+            || r.workspace.is_none()
+            || r.expected_profile.as_deref() != Some(profile)
         {
             return Err("unexpected task-owned profile".into());
         }
@@ -952,6 +967,33 @@ mod tests {
             .await
             .is_err());
     }
+    #[test]
+    fn production_profile_layout_is_pinned_before_fresh_creation_acknowledgement() {
+        let root = tempfile::tempdir().unwrap();
+        let (entry, _) = fixture();
+        let monitor = entry.resources.lock().unwrap().monitor.clone();
+        *entry.resources.lock().unwrap() = Resources {
+            monitor,
+            ..Resources::default()
+        };
+        let mut workspace = super::super::tests::sample_workspace("bw-profile-layout");
+        let path = root.path().join(&workspace.id).join("profile");
+        workspace.profile_dir = Some(path.display().to_string());
+        workspace.display_target = Some(selector(&entry));
+        let permit = entry.authority(Mode::Provision).task.unwrap();
+        permit.record_workspace(&workspace).unwrap();
+        assert!(entry.resources.lock().unwrap().profile.is_none());
+        assert!(permit
+            .record_profile(&root.path().join(&workspace.id))
+            .is_err());
+        assert!(permit.record_profile(&path).is_ok());
+        assert_eq!(
+            entry.resources.lock().unwrap().profile.as_ref(),
+            Some(&path)
+        );
+        assert!(permit.record_profile(&path).is_err());
+    }
+
     #[test]
     fn delayed_request_cannot_retarget_reopened_workspace() {
         let (entry, _) = fixture();

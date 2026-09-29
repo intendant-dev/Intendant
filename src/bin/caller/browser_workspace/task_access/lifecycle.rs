@@ -12,6 +12,11 @@ pub(crate) enum Request {
     Open {
         url: String,
     },
+    Navigate {
+        workspace_id: String,
+        request_id: String,
+        url: String,
+    },
     Status {},
     Screenshot {
         workspace_id: String,
@@ -43,12 +48,17 @@ impl Request {
     fn input(&self) -> bool {
         matches!(
             self,
-            Self::Open { .. } | Self::Keyboard { .. } | Self::Click { .. } | Self::Scroll { .. }
+            Self::Open { .. }
+                | Self::Navigate { .. }
+                | Self::Keyboard { .. }
+                | Self::Click { .. }
+                | Self::Scroll { .. }
         )
     }
     fn workspace_id(&self) -> Option<&str> {
         match self {
-            Self::Screenshot { workspace_id }
+            Self::Navigate { workspace_id, .. }
+            | Self::Screenshot { workspace_id }
             | Self::Keyboard { workspace_id, .. }
             | Self::Click { workspace_id, .. }
             | Self::Scroll { workspace_id, .. }
@@ -64,21 +74,8 @@ impl Request {
             return Err("invalid task workspace identity".into());
         }
         match self {
-            Self::Open { url } => {
-                if url.len() > 4096 {
-                    return Err("browser URL exceeds 4096 bytes".into());
-                }
-                launch_policy::navigation(Some(url)).map_err(str::to_string)?;
-                if url != "about:blank"
-                    && !url::Url::parse(url).is_ok_and(|u| {
-                        matches!(u.scheme(), "http" | "https")
-                            && u.host_str().is_some()
-                            && u.username().is_empty()
-                            && u.password().is_none()
-                    })
-                {
-                    return Err("task browser URL must be http, https or about:blank".into());
-                }
+            Self::Open { url } | Self::Navigate { url, .. } => {
+                super::super::navigation::validate_url(url)?;
             }
             Self::Click { x, y, .. } | Self::Scroll { x, y, .. } => {
                 crate::macos_monitor::pointer::Point { x: *x, y: *y }.validate()?;
@@ -228,7 +225,7 @@ fn summary(entry: &Allocation) -> Result<Value, String> {
         "input_uncertain":entry.quarantined.load(Ordering::SeqCst),
         "width":WIDTH,"height":HEIGHT,"coordinate_space":"window_logical_points",
         "window_on_monitor":{"x":40,"y":40,"width":720,"height":530},
-        "supported_operations":["screenshot","click","scroll","keyboard","close"],
+        "supported_operations":["screenshot","click","scroll","keyboard","navigate","close"],
         "automatic_assignment":true,"per_action_approval":false}))
 }
 
@@ -247,6 +244,27 @@ async fn perform(
                 entry.check(false).await?;
             }
             Ok(Response::Json(summary(entry)?))
+        }
+        Request::Navigate {
+            workspace_id,
+            request_id,
+            url,
+        } => {
+            entry.claim(&request_id)?;
+            let result = super::super::navigation::execute(
+                &workspace_id,
+                &url,
+                bus,
+                &operation_authority(entry, Mode::Input, cancelled),
+            )
+            .await;
+            if !result.ok && result.effects_unconfirmed {
+                entry.quarantined.store(true, Ordering::SeqCst);
+            }
+            let mut value =
+                serde_json::to_value(result).map_err(|_| "navigation receipt encoding failed")?;
+            value["request_id"] = request_id.into();
+            Ok(Response::Json(value))
         }
         Request::Status {} => Ok(Response::Json(summary(entry)?)),
         Request::Screenshot { .. } => screenshot(entry, bus, cancelled).await,
@@ -293,6 +311,20 @@ async fn perform(
             pointer(entry, bus, request_id, x, y, Some(delta_y), cancelled).await
         }
         Request::Close { .. } => unreachable!("cleanup uses separate admission"),
+    }
+}
+
+fn launch_failure_category(error: &BrowserWorkspaceError) -> &'static str {
+    match error {
+        BrowserWorkspaceError::Launch(message)
+            if message == crate::ax::WINDOW_PERMISSION_REQUIRED =>
+        {
+            "os_authorization_missing"
+        }
+        BrowserWorkspaceError::Unsupported(_) => "unsupported",
+        BrowserWorkspaceError::Io(_) => "filesystem",
+        BrowserWorkspaceError::Launch(_) => "launch",
+        _ => "workspace",
     }
 }
 
@@ -347,12 +379,10 @@ async fn provision(
         .await
         .map_err(|error| {
             let stage = entry.resources.lock().map(|r| r.stage).unwrap_or("unknown");
-            let kind = match error {
-                BrowserWorkspaceError::Unsupported(_) => "unsupported",
-                BrowserWorkspaceError::Io(_) => "filesystem",
-                BrowserWorkspaceError::Launch(_) => "launch",
-                _ => "workspace",
-            };
+            // Owner-side diagnostics only. The session response below retains
+            // a closed vocabulary and never receives the native error body.
+            eprintln!("[task-browser] launch failure at {stage}: {error}");
+            let kind = launch_failure_category(&error);
             // Closed diagnostic vocabulary only: no app-provided error body,
             // private profile path, native handle or debugging endpoint leaks.
             format!("managed task browser {kind} failure at {stage}; no input sent")
@@ -753,6 +783,29 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn launch_diagnostic_names_os_authorization_without_echoing_native_details() {
+        assert_eq!(
+            launch_failure_category(&BrowserWorkspaceError::Launch(
+                crate::ax::WINDOW_PERMISSION_REQUIRED.into()
+            )),
+            "os_authorization_missing"
+        );
+        assert_eq!(
+            launch_failure_category(&BrowserWorkspaceError::Launch(
+                "private /Users/example/profile /devtools/page/id".into()
+            )),
+            "launch"
+        );
+    }
+    #[test]
+    fn explicit_navigation_is_input_and_pins_the_original_workspace() {
+        let request: Request = serde_json::from_value(json!({"op":"navigate","workspace_id":"bw-first","request_id":uuid::Uuid::new_v4().to_string(),"url":"https://example.test/new"})).unwrap();
+        assert!(request.input());
+        assert_eq!(request.workspace_id(), Some("bw-first"));
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
     fn drop_marks_only_request_cancellation_not_session_revocation() {
         let flag = Arc::new(AtomicBool::new(false));
         let guard = CancelOnDrop(flag.clone());
@@ -765,25 +818,25 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (entry, _) = super::super::tests::fixture();
         let id = format!("bw-test-{}", uuid::Uuid::new_v4().simple());
-        let profile = root.path().join(&id);
+        let profile = root.path().join(&id).join("profile");
         let unrelated = root.path().join("unrelated");
-        fs::create_dir(&profile).unwrap();
+        fs::create_dir_all(&profile).unwrap();
         fs::create_dir(&unrelated).unwrap();
         {
             let mut resources = entry.resources.lock().unwrap();
             resources.monitor = None;
             resources.workspace = Some(id);
+            resources.expected_profile = Some(profile.clone());
             resources.binding = None;
             resources.process = None;
             resources.ready = false;
         }
-        entry
-            .authority(Mode::Provision)
-            .task
-            .as_ref()
-            .unwrap()
-            .record_profile(&profile)
-            .unwrap();
+        let permit = entry.authority(Mode::Provision).task.unwrap();
+        assert!(entry.resources.lock().unwrap().profile.is_none());
+        assert!(permit.record_profile(&unrelated.join("profile")).is_err());
+        assert!(entry.resources.lock().unwrap().profile.is_none());
+        permit.record_profile(&profile).unwrap();
+        assert!(permit.record_profile(&profile).is_err());
         let bus = EventBus::new();
         bus.macos_monitors
             .task_browsers

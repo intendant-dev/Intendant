@@ -2,6 +2,7 @@ mod extension_policy;
 #[cfg(target_os = "macos")]
 mod macos;
 pub(crate) mod managed_keyboard;
+mod navigation;
 pub(crate) mod task_access;
 mod viewport;
 
@@ -4758,7 +4759,7 @@ mod tests {
         assert!(recorded_browser_launch_arguments(&command).is_err());
     }
 
-    fn sample_workspace(id: &str) -> BrowserWorkspace {
+    pub(super) fn sample_workspace(id: &str) -> BrowserWorkspace {
         BrowserWorkspace {
             id: id.to_string(),
             label: "Test".to_string(),

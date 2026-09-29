@@ -14,8 +14,8 @@ principal, credential epoch and live supervisor incarnation. It does not ask the
 owner for a separate assignment. At most two task allocations exist per broker.
 Repeated open reuses the current allocation without navigating it.
 
-Open/status returns a redacted `workspace_id`. Screenshot, keyboard, click, scroll
-and close requests must carry that exact ID, so a delayed request cannot land in a
+Open/status returns a redacted `workspace_id`. Screenshot, keyboard, click, scroll,
+navigate and close requests must carry that exact ID, so a delayed request cannot land in a
 reopened browser. Input also requires a canonical, single-use request UUID. The ID
 is a resource selector, never a bearer capability: another session still refuses.
 The task API accepts no caller session, profile path, native handle or CDP endpoint.
@@ -28,6 +28,7 @@ act browser task-open URL
 inspect browser task-status
 inspect browser task-screenshot WORKSPACE
 act browser task-keyboard WORKSPACE REQUEST_ID ACTION_JSON
+act browser task-navigate WORKSPACE REQUEST_ID URL
 act browser task-close WORKSPACE
 ```
 
@@ -57,10 +58,47 @@ The committed native-attempt record is a FAILURE: the injected session credentia
 was accepted, but browser launch failed before any tested screenshot/keyboard/
 pointer action. Its daemon exited and display inventory was restored. That attempt
 predates the later diagnostic-stage/profile-cleanup corrections. Unit tests and
-compilation are not native acceptance. Same-workspace URL navigation, a successful
-full normal-session run, and foreground/human-activity measurements remain distinct
-unverified items. Arbitrary native-app input remains the next major delivery in
+compilation are not native acceptance. A successful full normal-session run and
+foreground/human-activity measurements remain unverified. Same-workspace URL
+navigation is now implemented and mock-tested, not yet live-accepted. Arbitrary
+native-app input remains the next major delivery in
 `macos-background-cu-delivery.md`; this candidate does not implement it.
+
+### Launch diagnosis and original-page navigation
+
+The task-profile check now pins the exact absolute path from the daemon's workspace
+reservation. It no longer assumes the profile leaf is the workspace ID: production
+uses `.../bw-ID/profile`. Only successful fresh creation establishes cleanup ownership;
+a same-named path elsewhere or a duplicate acknowledgement still refuses.
+
+Two additional launch-only attempts authenticated the real supervised child, then
+stopped before input. The second captured the precise native refusal in the private
+daemon log: existing Accessibility and Screen Recording permissions are required for
+window binding. The native gate reports the combined requirement, not which individual
+permission is missing. The public response uses `os_authorization_missing`, not raw
+paths/handles. Both temporary daemons exited, display inventories were restored, and
+review found no remaining browser processes or private profiles for those rigs.
+A separate owner-plugin about:blank launch succeeded in the installed app context
+and was cleaned up. It is not candidate-build or ordinary-session acceptance.
+Evidence: `evidence/macos-task-browser-launch-diagnosis-20260929.json`.
+Do not work around this OS refusal through another input route or silently change
+privacy settings. The next live run needs an explicitly authorized candidate context.
+The `--launch-only` harness mode records its narrow scope and never claims the full loop.
+
+`task_browser {op:navigate,workspace_id,request_id,url}` keeps the original managed
+page/window/monitor and checks the same process, profile and endpoint ownership used
+by keyboard. It accepts only HTTP(S) or exactly about:blank, without URL credentials.
+It sends one Page.navigate to the original top frame, never a desktop shortcut,
+new tab, arbitrary script or caller-supplied endpoint. A matching frame/loader commit
+(or exact URL/fragment for same-document navigation) is checked separately from the
+protocol acknowledgement. Protocol commit is not independent application-effect
+verification or proof that the website has finished loading. The task still observes
+the result. Cancellation is checked before dispatch; an uncertain sent request is not
+replayed, and uncertainty blocks further task input pending observation/cleanup.
+The existing task permit, UUID ledger, IAM, revocation and read-only route split apply.
+The independent fixture now verifies a changed document URL in the same retained page
+before continuing its keyboard/click/scroll plan; that expanded native plan has not run.
+
 
 ## Product contract
 

@@ -22,6 +22,8 @@
 
 use std::ffi::c_void;
 
+pub(crate) const WINDOW_PERMISSION_REQUIRED: &str = "window binding/placement requires existing Accessibility and Screen Recording permissions; no permission prompt requested";
+
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute,
     kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess, kAXFocusedAttribute,
@@ -567,7 +569,7 @@ fn placement_focus_from_application(deadline: Instant) -> Result<PlacementFocus,
 fn placement_permissions(deadline: Instant) -> Result<(), String> {
     placement::time_left(deadline)?;
     if !is_trusted() || !core_graphics::access::ScreenCaptureAccess.preflight() {
-        return Err("window binding/placement requires existing Accessibility and Screen Recording permissions; no permission prompt requested".into());
+        return Err(WINDOW_PERMISSION_REQUIRED.into());
     }
     Ok(())
 }

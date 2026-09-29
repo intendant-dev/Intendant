@@ -54,6 +54,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--bin',required=True,type=Path);ap.add_argument('--browser-app',required=True,type=Path)
     ap.add_argument('--report',required=True,type=Path);ap.add_argument('--allow-shared-session-monitor',action='store_true')
+    ap.add_argument('--launch-only', action='store_true', help='Verify session-owned launch and task-stop cleanup only; never send tested input')
     args=ap.parse_args()
     if sys.platform!='darwin' or not args.allow_shared_session_monitor or not __debug__:
         ap.error('requires macOS and explicit shared-session monitor opt-in')
@@ -70,6 +71,9 @@ def main():
       'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
       'source_head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parent.parent,text=True).strip(),
       'installed_daemon_changed':False,'owner_input_requests':0,'manual_assignment_requests':0,
+      'scope':'launch_and_cleanup_only' if args.launch_only else 'full_task_browser',
+      'full_workflow_verified':False,
+      'source_dirty':subprocess.run(['git','diff','--quiet','HEAD'],cwd=Path(__file__).resolve().parent.parent).returncode!=0,
       'automatic_input_retry':False,'human_typing_overlap_verified':False,'rig':str(root)}
     args.report.parent.mkdir(parents=True,exist_ok=True)
     def save(): args.report.write_text(json.dumps(report,indent=2)+'\n')
@@ -125,7 +129,7 @@ def main():
         contents=(Path(__file__).resolve().parent.parent/'tests/fixtures/macos-monitor/task-browser.html').read_bytes()
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path!='/fixture':self.send_error(404);return
+                if urllib.parse.urlsplit(self.path).path!='/fixture':self.send_error(404);return
                 self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(contents)));self.end_headers();self.wfile.write(contents)
             def log_message(self,*unused):pass
         web=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=web.serve_forever,daemon=True).start()
@@ -154,38 +158,57 @@ def main():
         workspaces=owner('list_browser_workspaces',{});work=[w for w in workspaces if w['id']==opened['workspace_id']]
         require(len(work)==1,'task workspace not unique');workspace=work[0];profile=Path(workspace['profile_dir'])
         report['private_profile']=str(profile)
-        lines=(profile/'DevToolsActivePort').read_text().splitlines();cdp=browser.CDP(int(lines[0]),lines[1])
-        cdp_session=cdp.call('Target.attachToTarget',{'targetId':workspace['active_target_id'],'flatten':True})['sessionId']
-        def state():return cdp.call('Runtime.evaluate',{'expression':'window.taskFixtureStatus()','returnByValue':True},session=cdp_session)['result']['value']
-        initial=state();require(initial['first']=='seed' and initial['count']==0,'fixture not pristine')
-        shot=issue(project,sid,{'op':'screenshot'},tool='inspect_task_browser');payload(shot);require(len(shot['images'])==1,'session did not receive screenshot')
-        report['checks']['session_screenshot']=True
-        def keyboard(action):return payload(issue(project,sid,{'op':'keyboard','request_id':str(uuid.uuid4()),'action':action}))
-        keyboard({'type':'select_all'});keyboard({'type':'insert_text','text':'Independent agent typing 🙂'})
-        require(state()['first']=='Independent agent typing 🙂','typed text not observed')
-        keyboard({'type':'key','key':'Tab'});keyboard({'type':'insert_text','text':'Second field!'})
-        keyboard({'type':'key','key':'Backspace'});require(state()['second']=='Second field','Backspace effect missing')
-        keyboard({'type':'key','key':'Tab'});keyboard({'type':'key','key':'Enter'})
-        require(state()['count']==1,'Enter did not activate the focused button exactly once')
-        report['checks']['session_keyboard']=True
-        status=state();m=status['metrics'];require(m['scale']==1 and m['outerWidth']==720,'unexpected coordinate scale')
-        def point(rect):return {'x':rect['x']+rect['width']/2,'y':m['outerHeight']-m['innerHeight']+rect['y']+rect['height']/2}
-        clickid=str(uuid.uuid4());click={'op':'click','request_id':clickid,**point(status['canvasRect'])}
-        payload(issue(project,sid,click));require(state()['canvasClicks']==1,'native coordinate click effect missing')
-        repeated=issue(project,sid,click);require(repeated.get('tool_error') is True and state()['canvasClicks']==1,'duplicate click was replayed')
-        payload(issue(project,sid,{'op':'scroll','request_id':str(uuid.uuid4()),'delta_y':180,**point(status['paneRect'])}))
-        time.sleep(.2);require(state()['scroll']>0,'scroll effect missing')
-        report['checks']['session_pointer_and_no_replay']=True
-        finalshot=issue(project,sid,{'op':'screenshot'},tool='inspect_task_browser');payload(finalshot);require(len(finalshot['images'])==1,'final screenshot missing')
-        other=root/'session-two';setup_project(other);other_who=issue(other,None,{},tool='whoami',first=True);other_sid=other_who['token_bound_session']
-        missing=payload(issue(other,other_sid,{'op':'status'}));require(missing.get('workspace') is None,'other session saw task workspace')
-        refused=issue(other,other_sid,{'op':'keyboard','workspace_id':opened['workspace_id'],'request_id':str(uuid.uuid4()),'action':{'type':'insert_text','text':'must not appear'}})
-        require(refused.get('tool_error') is True and state()['second']=='Second field','foreign session gained access')
-        report['checks']['foreign_session_refused']=True
-        report['final_page']=state();cdp.close();cdp=None
+        other_sid=None
+        if not args.launch_only:
+            lines=(profile/'DevToolsActivePort').read_text().splitlines();cdp=browser.CDP(int(lines[0]),lines[1])
+            cdp_session=cdp.call('Target.attachToTarget',{'targetId':workspace['active_target_id'],'flatten':True})['sessionId']
+            def state():return cdp.call('Runtime.evaluate',{'expression':'window.taskFixtureStatus()','returnByValue':True},session=cdp_session)['result']['value']
+            initial=state();require(initial['first']=='seed' and initial['count']==0,'fixture not pristine')
+            next_url=url+'?navigation=verified'
+            navigation=payload(issue(project,sid,{'op':'navigate','request_id':str(uuid.uuid4()),'url':next_url}))
+            require(navigation.get('navigation_committed') is True,'navigation not committed')
+            # The browser protocol's acknowledgment is not enough: read our own
+            # fixture in the SAME retained target and observe the new document.
+            deadline=time.monotonic()+5
+            observed=None
+            while time.monotonic()<deadline:
+                try:observed=state()
+                except (RuntimeError,KeyError):observed=None
+                if isinstance(observed,dict) and observed.get('url')==next_url:break
+                time.sleep(.1)
+            require(isinstance(observed,dict) and observed.get('url')==next_url,'new document URL not independently observed')
+            require(observed['first']=='seed' and observed['count']==0,'new document is not pristine')
+            report['checks']['same_workspace_navigation']=True
+
+            shot=issue(project,sid,{'op':'screenshot'},tool='inspect_task_browser');payload(shot);require(len(shot['images'])==1,'session did not receive screenshot')
+            report['checks']['session_screenshot']=True
+            def keyboard(action):return payload(issue(project,sid,{'op':'keyboard','request_id':str(uuid.uuid4()),'action':action}))
+            keyboard({'type':'select_all'});keyboard({'type':'insert_text','text':'Independent agent typing 🙂'})
+            require(state()['first']=='Independent agent typing 🙂','typed text not observed')
+            keyboard({'type':'key','key':'Tab'});keyboard({'type':'insert_text','text':'Second field!'})
+            keyboard({'type':'key','key':'Backspace'});require(state()['second']=='Second field','Backspace effect missing')
+            keyboard({'type':'key','key':'Tab'});keyboard({'type':'key','key':'Enter'})
+            require(state()['count']==1,'Enter did not activate the focused button exactly once')
+            report['checks']['session_keyboard']=True
+            status=state();m=status['metrics'];require(m['scale']==1 and m['outerWidth']==720,'unexpected coordinate scale')
+            def point(rect):return {'x':rect['x']+rect['width']/2,'y':m['outerHeight']-m['innerHeight']+rect['y']+rect['height']/2}
+            clickid=str(uuid.uuid4());click={'op':'click','request_id':clickid,**point(status['canvasRect'])}
+            payload(issue(project,sid,click));require(state()['canvasClicks']==1,'native coordinate click effect missing')
+            repeated=issue(project,sid,click);require(repeated.get('tool_error') is True and state()['canvasClicks']==1,'duplicate click was replayed')
+            payload(issue(project,sid,{'op':'scroll','request_id':str(uuid.uuid4()),'delta_y':180,**point(status['paneRect'])}))
+            time.sleep(.2);require(state()['scroll']>0,'scroll effect missing')
+            report['checks']['session_pointer_and_no_replay']=True
+            finalshot=issue(project,sid,{'op':'screenshot'},tool='inspect_task_browser');payload(finalshot);require(len(finalshot['images'])==1,'final screenshot missing')
+            other=root/'session-two';setup_project(other);other_who=issue(other,None,{},tool='whoami',first=True);other_sid=other_who['token_bound_session']
+            missing=payload(issue(other,other_sid,{'op':'status'}));require(missing.get('workspace') is None,'other session saw task workspace')
+            refused=issue(other,other_sid,{'op':'keyboard','workspace_id':opened['workspace_id'],'request_id':str(uuid.uuid4()),'action':{'type':'insert_text','text':'must not appear'}})
+            require(refused.get('tool_error') is True and state()['second']=='Second field','foreign session gained access')
+            report['checks']['foreign_session_refused']=True
+            report['final_page']=state();cdp.close();cdp=None
         # Stop the owning session WITHOUT a separate close/grant call. Lifecycle
         # cleanup must terminate the browser and remove its private profile/monitor.
-        dashboard.send({'action':'stop_session','session_id':sid});dashboard.send({'action':'stop_session','session_id':other_sid})
+        dashboard.send({'action':'stop_session','session_id':sid})
+        if other_sid:dashboard.send({'action':'stop_session','session_id':other_sid})
         end=time.monotonic()+40
         while time.monotonic()<end:
             inv=owner('list_macos_monitors',{})
@@ -194,6 +217,7 @@ def main():
         require(inv.get('monitors')==[] and not profile.exists(),'task-stop cleanup incomplete')
         report['checks']['task_stop_cleanup']=True
         report['ok']=True
+        report['full_workflow_verified']=not args.launch_only
     except Exception as exc:
         report['error_type']=type(exc).__name__;report['error']=str(exc)
     finally:

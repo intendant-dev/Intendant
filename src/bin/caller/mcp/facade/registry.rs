@@ -1139,6 +1139,11 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "Type or use page keys in your own task browser, without an owner credential",
     },
     CommandSpec {
+        path: &["browser", "task-navigate"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"navigate"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false), p_str("URL", "url", true, false)], flags: &[],
+        help: "Navigate this session's original browser page without a desktop shortcut or new tab",
+    },
+    CommandSpec {
         path: &["browser", "task-close"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"close"}"#,
         positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[], help: "Close your task browser and its owned monitor",
     },

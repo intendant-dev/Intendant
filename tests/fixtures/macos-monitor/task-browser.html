@@ -14,7 +14,7 @@ const first=document.getElementById('first'),second=document.getElementById('sec
 button.onclick=()=>count++;canvas.onclick=()=>canvasClicks++;
 document.addEventListener('keydown',e=>keys.push({key:e.key,target:e.target.id,trusted:e.isTrusted}));
 function rect(id){let r=document.getElementById(id).getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}
-window.taskFixtureStatus=()=>({first:first.value,second:second.value,count,canvasClicks,scroll:document.getElementById('pane').scrollTop,
+window.taskFixtureStatus=()=>({url:location.href,first:first.value,second:second.value,count,canvasClicks,scroll:document.getElementById('pane').scrollTop,
  active:document.activeElement.id,keys:keys.slice(),canvasRect:rect('canvas'),paneRect:rect('pane'),buttonRect:rect('button'),
  metrics:{outerWidth,outerHeight,innerWidth,innerHeight,scale:devicePixelRatio}});
 </script>
