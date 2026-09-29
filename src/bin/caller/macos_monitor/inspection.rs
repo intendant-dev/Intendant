@@ -12,6 +12,12 @@ pub(crate) enum Inspection {
 
 impl Inspection {
     pub(super) async fn check(&self, authority: &Authority) -> Result<(), String> {
+        if let Some(task) = &authority.task {
+            task.check().await?;
+            if !task.allows(&Action::Inspect(self.clone())) {
+                return Err("monitor is outside this task browser".into());
+            }
+        }
         if matches!(self, Self::Inventory) && !authority.owner_surface {
             return Err("macOS monitor inventory requires an owner surface; a user-display grant does not authorize daemon-wide handle enumeration".into());
         }

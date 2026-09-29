@@ -27,7 +27,7 @@ import uuid
 
 SCHEMA = "intendant-browser-delegation-fixture-v1"
 TOOLS = frozenset({
-    "whoami", "execute_browser_workspace_keyboard",
+    "whoami", "task_browser", "inspect_task_browser", "execute_browser_workspace_keyboard",
     "grant_browser_workspace_session", "revoke_browser_workspace_session",
     "list_assigned_browser_workspaces", "observe_browser_workspace",
 })
@@ -236,6 +236,12 @@ def backend():
                       "effects_unconfirmed": True, "effects_verified": False}
         emit({"type": "result", "subtype": "success", "is_error": result.get("probe_failed", False),
               "result": json.dumps(result), "session_id": backend_id})
+        if manifest.get("record_probes") is True:
+            # Fixed private test path, never a caller-selected artifact target.
+            destination = Path.cwd() / (".intendant-probe-" + probe["id"] + ".json")
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as output:
+                json.dump(result, output)
         if manifest.get("single_probe") is True:
             destination = Path.cwd() / ".intendant-delegation-result.json"
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

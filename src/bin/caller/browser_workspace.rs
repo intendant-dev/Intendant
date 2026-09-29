@@ -2,6 +2,7 @@ mod extension_policy;
 #[cfg(target_os = "macos")]
 mod macos;
 pub(crate) mod managed_keyboard;
+pub(crate) mod task_access;
 mod viewport;
 
 pub(crate) mod launch_policy;
@@ -436,7 +437,7 @@ impl Drop for MacosBindingGuard {
             return;
         };
         let bus = self.bus.clone();
-        let authority = self.authority.clone();
+        let authority = self.authority.cleanup_scope();
         runtime.spawn(async move {
             if let Ok(receipt) = bus
                 .macos_monitors
@@ -1141,9 +1142,9 @@ async fn create_workspace_inner(
                 "macos_virtual browser workspaces require an owner-surface caller".into(),
             )
         })?;
-        if !authority.owner_surface {
+        if !authority.creates_workspace_on(selector) {
             return Err(BrowserWorkspaceError::Unsupported(
-                "macos_virtual browser workspaces require an owner-surface caller".into(),
+                "macos_virtual browser workspaces require an owner-surface caller or exact task allocation".into(),
             ));
         }
         if request.profile_dir.is_some() {
@@ -1240,6 +1241,10 @@ async fn create_workspace_inner(
         id,
     };
 
+    if let Some(task) = macos_authority.as_ref().and_then(|a| a.task.as_ref()) {
+        task.record_workspace(&workspace)
+            .map_err(BrowserWorkspaceError::Unsupported)?;
+    }
     // Publish the Starting reservation before filesystem work or browser
     // launch. Display teardown can now retire this exact binding instead of
     // racing past a workspace that exists only on this task's stack.
@@ -1287,6 +1292,10 @@ async fn create_workspace_inner(
                 );
                 reservation.cleanup(&message).await;
                 return Err(BrowserWorkspaceError::Io(message));
+            }
+            if let Some(task) = macos_authority.as_ref().and_then(|a| a.task.as_ref()) {
+                task.record_profile(&profile_dir)
+                    .map_err(BrowserWorkspaceError::Unsupported)?;
             }
             None
         }
@@ -1642,9 +1651,10 @@ async fn unbind_macos_workspace(
     let Some(binding) = workspace.macos_window_binding.as_ref() else {
         return Ok(());
     };
-    if !authority.owner_surface {
+    if !authority.cleans_workspace(&workspace.id, workspace.display_target.as_deref()) {
         return Err(BrowserWorkspaceError::Unsupported(
-            "macOS-bound browser workspace cleanup requires an owner surface".into(),
+            "macOS-bound browser workspace cleanup requires an owner or exact task allocation"
+                .into(),
         ));
     }
     let receipt = match bus
@@ -1762,6 +1772,10 @@ pub async fn close_workspace(
             "closing a macOS-bound browser workspace requires an owner surface".into(),
         ));
     }
+    bus.macos_monitors
+        .task_browsers
+        .invalidate_workspace(id)
+        .await;
     let bus = bus.clone();
     let id = id.to_owned();
     let (send, receive) = tokio::sync::oneshot::channel();
@@ -1786,6 +1800,7 @@ async fn close_workspace_inner(
     bus: &EventBus,
     macos_authority: Option<crate::macos_monitor::Authority>,
 ) -> Result<BrowserWorkspace, BrowserWorkspaceError> {
+    let macos_authority = macos_authority.map(|a| a.cleanup_scope());
     #[cfg(not(target_os = "macos"))]
     let _ = bus;
     let _display_access = acquire_workspace_display_access(id).await?;
@@ -1794,9 +1809,12 @@ async fn close_workspace_inner(
         let mut registry = registry.write().await;
         let needs_macos = registry.workspaces.get(id).is_some_and(is_macos_workspace);
         if needs_macos
-            && !macos_authority
-                .as_ref()
-                .is_some_and(|authority| authority.owner_surface)
+            && !macos_authority.as_ref().is_some_and(|authority| {
+                registry
+                    .workspaces
+                    .get(id)
+                    .is_some_and(|w| authority.cleans_workspace(id, w.display_target.as_deref()))
+            })
         {
             return Err(BrowserWorkspaceError::Unsupported(
                 "closing a macOS-bound browser workspace requires an owner surface".into(),
@@ -2011,6 +2029,10 @@ pub async fn close_macos_workspaces_for_display(
     }
     let mut closed = Vec::new();
     for id in ids {
+        bus.macos_monitors
+            .task_browsers
+            .invalidate_workspace(&id)
+            .await;
         let workspace =
             close_workspace_inner(&id, Some(reason.into()), bus, Some(authority.clone())).await?;
         publish_workspace_event(bus, "display_retired", &workspace);
@@ -4515,10 +4537,12 @@ mod tests {
         let autonomy = state.read().await.autonomy.clone();
         let owner = crate::macos_monitor::Authority {
             owner_surface: true,
+            task: None,
             autonomy: autonomy.clone(),
         };
         let non_owner = crate::macos_monitor::Authority {
             owner_surface: false,
+            task: None,
             autonomy,
         };
         let bus = EventBus::new();
@@ -4628,6 +4652,7 @@ mod tests {
             None,
             Some(crate::macos_monitor::Authority {
                 owner_surface: false,
+                task: None,
                 autonomy: autonomy.clone(),
             }),
         ] {
@@ -4648,6 +4673,7 @@ mod tests {
         autonomy.write().await.user_display_granted = true;
         let authority = crate::macos_monitor::Authority {
             owner_surface: false,
+            task: None,
             autonomy,
         };
         let bus = EventBus::new();

@@ -1121,6 +1121,28 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         help: "One owner-authorized managed-browser text/key/edit action; request UUID is single-use",
     },
     CommandSpec {
+        path: &["browser", "task-open"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"open"}"#,
+        positionals: &[p_str("URL", "url", true, false)], flags: &[],
+        help: "Automatically open/reuse this supervised session's own background browser",
+    },
+    CommandSpec {
+        path: &["browser", "task-status"], lane: RiskLane::Inspect, tool: "inspect_task_browser", seed: r#"{"op":"status"}"#,
+        positionals: &[], flags: &[], help: "Read only your task browser's redacted status",
+    },
+    CommandSpec {
+        path: &["browser", "task-screenshot"], lane: RiskLane::Inspect, tool: "inspect_task_browser", seed: r#"{"op":"screenshot"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[], help: "Capture only your assigned task monitor, in memory",
+    },
+    CommandSpec {
+        path: &["browser", "task-keyboard"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"keyboard"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false), p_json("ACTION_JSON", "action", true)], flags: &[],
+        help: "Type or use page keys in your own task browser, without an owner credential",
+    },
+    CommandSpec {
+        path: &["browser", "task-close"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"close"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[], help: "Close your task browser and its owned monitor",
+    },
+    CommandSpec {
         path: &["browser", "create"],
         lane: RiskLane::Act,
         tool: "create_browser_workspace",

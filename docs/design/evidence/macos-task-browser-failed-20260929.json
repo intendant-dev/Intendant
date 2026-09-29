@@ -1,0 +1,22 @@
+{
+  "schema": "intendant-task-browser-native-attempt-v1",
+  "accepted": false,
+  "tested_binary_sha256": "032f275c1a7e5b953d1b4e17e36f28d57344ebef2d5e3bfadb65f5b2c90024ef",
+  "harness_sha256": "0e2d803f3f3e715c3febcdb69734aca5a64284890cb281b46fc238e290a3d8d5",
+  "source_parent": "f72f110fd85af3537639b26ff43859effcb4aa01",
+  "source_was_uncommitted": true,
+  "predates_followup_diagnostics_and_profile_cleanup": true,
+  "session_bearer_identity_verified": true,
+  "owner_fallback_used": false,
+  "manual_assignment_requests": 0,
+  "last_operation": "open",
+  "result": "browser launch failed; exact underlying cause not recorded",
+  "screenshot_requests": 0,
+  "keyboard_requests": 0,
+  "pointer_requests": 0,
+  "temporary_daemon_reaped": true,
+  "display_inventory_restored": true,
+  "human_typing_overlap_verified": false,
+  "installed_daemon_changed": false,
+  "note": "A private failed-test rig was retained. This is not a successful browser delegation, keyboard or cleanup acceptance for the final source head."
+}

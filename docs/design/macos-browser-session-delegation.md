@@ -1,8 +1,66 @@
 # Automatic use of a session-assigned managed browser
 
-Status: implementation in progress; no installed-daemon grant or behavior change.
+Status: production candidate in #971; native task-browser acceptance has not passed.
+No installed-daemon grant, app update or owner-permission change.
 Base: #967 merged as ec04fa076043fc3a3aa5662833dd35e9b9cb9b59. Continue in #971.
 Product clarification: 2026-09-28; this document specifies the target, not shipped behavior.
+
+## Implemented candidate interface (2026-09-29)
+
+The ordinary supervised session calls `task_browser` with `op=open` and an HTTP(S)
+URL (or `about:blank`). Trusted daemon code lazily creates a 1024x768 owned monitor
+and one fresh managed browser, then binds them to that session's authenticated
+principal, credential epoch and live supervisor incarnation. It does not ask the
+owner for a separate assignment. At most two task allocations exist per broker.
+Repeated open reuses the current allocation without navigating it.
+
+Open/status returns a redacted `workspace_id`. Screenshot, keyboard, click, scroll
+and close requests must carry that exact ID, so a delayed request cannot land in a
+reopened browser. Input also requires a canonical, single-use request UUID. The ID
+is a resource selector, never a bearer capability: another session still refuses.
+The task API accepts no caller session, profile path, native handle or CDP endpoint.
+
+`inspect_task_browser` is a separate, closed read-only shape for status/screenshot.
+The facade preserves the historical `browser open` alias and adds:
+
+```text
+act browser task-open URL
+inspect browser task-status
+inspect browser task-screenshot WORKSPACE
+act browser task-keyboard WORKSPACE REQUEST_ID ACTION_JSON
+act browser task-close WORKSPACE
+```
+
+The full `task_browser` schema also provides window-local coordinate click/scroll.
+Images include the window's monitor-relative origin and pixel-to-logical scaling.
+Frozen AX/CG geometry is checked before serving screenshots and pointer input;
+keyboard uses the existing exact-page CDP path. No system cursor, clipboard,
+activation, generic display-input fallback or independent macOS seat is added.
+
+Raw/facade dispatch derives identity from the authenticated edge and rechecks the
+current local IAM principal/permissions at admission and before native/page input.
+The read-only facade remains DisplayView-classified; the task service also requires
+RuntimeControl. Provision/input require DisplayInput. Closing an owned allocation
+is cleanup, not input. Existing owner-only inventory and broad window tools retain
+their owner checks; the sealed task permit authorizes only the allocator's freshly
+created monitor, supervised browser PID/birth, retained window and original page.
+
+Owned workers retain request/cleanup responsibility through cancellation. Stop
+revokes admission first and drains the current operation; a key pair already
+started can release once. Failed create waits for cleanup or retains recovery;
+cleanup-only retries never replay input or adopt a replacement. A fresh profile is
+recorded only after successful exclusive creation and removed only after owned
+browser cleanup. Another workspace on the monitor prevents task cleanup destroying
+that reused monitor.
+
+The committed native-attempt record is a FAILURE: the injected session credential
+was accepted, but browser launch failed before any tested screenshot/keyboard/
+pointer action. Its daemon exited and display inventory was restored. That attempt
+predates the later diagnostic-stage/profile-cleanup corrections. Unit tests and
+compilation are not native acceptance. Same-workspace URL navigation, a successful
+full normal-session run, and foreground/human-activity measurements remain distinct
+unverified items. Arbitrary native-app input remains the next major delivery in
+`macos-background-cu-delivery.md`; this candidate does not implement it.
 
 ## Product contract
 
@@ -52,10 +110,10 @@ not act. The trusted create-and-assign/task-provisioning path performs the same
 authority decision once, without requiring a second owner interaction.
 Delegate authorization must use an unforgeable internal exact-workspace permit;
 never set owner_surface=true or enable the global user-display grant for an agent.
-Broker exceptions are limited to the already-authorized exact window validation,
-monitor resolution and memory-only capture. All native mutation and inventory
-operations retain their existing owner checks. Existing owner keyboard behavior
-and protected-receiver checks remain unchanged.
+The task allocator has a sealed fresh-resource provisioning/cleanup permit. Its
+use permit covers exact validation/capture and the existing bound click/scroll
+operations; broad public native mutation and inventory retain their owner checks.
+Existing owner keyboard behavior and protected-receiver checks remain unchanged.
 
 Revocation must serialize with the first input dispatch. An accepted key pair may
 finish its one release, but revocation completion cannot allow another key-down.

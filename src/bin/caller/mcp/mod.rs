@@ -80,6 +80,7 @@ mod tools_events;
 mod tools_feedback;
 mod tools_macos_monitor;
 pub(crate) use tools_feedback::DogfoodReportParams;
+mod tools_task_browser;
 mod tools_terminal;
 pub(crate) use tools_terminal::{
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
@@ -1018,6 +1019,19 @@ impl IntendantServer {
                     self.remote_command_scoped(params, McpToolScope::from_actor(&actor))
                         .await,
                 ))
+            }
+            "inspect_task_browser" => {
+                let Parameters(params) = parse_params::<tools_task_browser::InspectRequest>(args)?;
+                Ok(self
+                    .task_browser_as_session(params.into(), actor, session_credential_epoch)
+                    .await)
+            }
+            "task_browser" => {
+                let Parameters(params) =
+                    parse_params::<crate::browser_workspace::task_access::Request>(args)?;
+                Ok(self
+                    .task_browser_as_session(params, actor, session_credential_epoch)
+                    .await)
             }
             "browser_workspace_providers" => {
                 Ok(text_tool_result(self.browser_workspace_providers().await))

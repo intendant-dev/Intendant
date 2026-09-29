@@ -347,8 +347,13 @@ async fn validate_native(
         Action as MonitorAction, Value as MonitorValue, WindowAction, WindowValue,
     };
     authority.check().await?;
-    if !authority.owner_surface {
-        return Err("managed browser keyboard requires owner authority".into());
+    if !authority.owner_surface
+        && !authority
+            .task
+            .as_ref()
+            .is_some_and(|p| p.uses_workspace(workspace))
+    {
+        return Err("managed browser keyboard requires owner or exact task authority".into());
     }
     if workspace.status != BrowserWorkspaceStatus::Ready
         || workspace.provider != BrowserWorkspaceProvider::Cdp
@@ -392,6 +397,10 @@ async fn validate_native(
             observation.ax.validate().is_ok()
                 && observation.cg.validate().is_ok()
                 && observation.ax.close(observation.cg)
+                && authority
+                    .task
+                    .as_ref()
+                    .is_none_or(|p| p.checks_window(*observation))
         }
         _ => false,
     };
@@ -423,7 +432,17 @@ pub(crate) async fn execute(
     authority: crate::macos_monitor::Authority,
 ) -> ResultReceipt {
     let mut result = ResultReceipt::new(request.request_id.clone());
-    if let Err(error) = admission(&request, authority.owner_surface) {
+    let task_workspace = if let Some(task) = authority.task.as_ref() {
+        global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&request.workspace_id)
+            .is_some_and(|w| task.uses_workspace(w))
+    } else {
+        false
+    };
+    if let Err(error) = admission(&request, authority.owner_surface || task_workspace) {
         result.error = Some(error);
         return result;
     }
@@ -570,6 +589,9 @@ async fn execute_inner(
     if response.is_closed() {
         return Err("keyboard request cancelled before input".into());
     }
+    // Recheck the authenticated task immediately before its first key edge.
+    // Once down may be sent, dispatch_input owns the matching release.
+    authority.check().await?;
     if let Err(error) = dispatch_input(&mut client, &request.action, result).await {
         let mut registry = registry.write().await;
         if let Some(current) = registry.workspaces.get_mut(&workspace.id) {
@@ -1147,6 +1169,7 @@ mod tests {
         let bus = EventBus::new();
         let authority = crate::macos_monitor::Authority {
             owner_surface: false,
+            task: None,
             autonomy: state.read().await.autonomy.clone(),
         };
         let result = execute(request(Action::SelectAll), &bus, authority).await;

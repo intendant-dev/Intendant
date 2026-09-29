@@ -459,6 +459,15 @@ pub(crate) struct LiveSessionRegistry {
 }
 
 impl LiveSessionRegistry {
+    /// Exact registered running instance, alias-resolved without active-session
+    /// fallback. Idle/waiting turns remain live; a closed channel does not.
+    pub(crate) async fn live_incarnation(&self, session_id: &str) -> Option<u64> {
+        let state = self.state.upgrade()?;
+        let state = state.lock().await;
+        let id = state.resolve_session_id(session_id)?;
+        let session = state.sessions.get(&id)?;
+        (!session.follow_up_tx.is_closed()).then_some(session.instance_id)
+    }
     /// Live sessions whose backend is `source`
     /// (`AgentBackend::as_short_str` vocabulary), sorted by session id for
     /// stable rendering. Every registry entry of the source is a candidate

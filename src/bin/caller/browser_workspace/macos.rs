@@ -440,6 +440,10 @@ async fn bind_and_place(
             ));
         }
     };
+    if let Some(task) = &authority.task {
+        task.record_binding(&binding)
+            .map_err(BrowserWorkspaceError::Launch)?;
+    }
     if !receipt.commit() {
         return Err(BrowserWorkspaceError::Launch(
             "macOS browser binding receipt expired".into(),
@@ -476,6 +480,14 @@ async fn bind_and_place(
             serde_json::json!({"error":"unexpected placement result"}),
         ),
     };
+    if let (
+        Some(task),
+        crate::macos_monitor::Value::Window(crate::macos_monitor::WindowValue::Placed(result)),
+    ) = (&authority.task, &receipt.value)
+    {
+        task.record_placement(result)
+            .map_err(BrowserWorkspaceError::Launch)?;
+    }
     if !receipt.commit() {
         return Err(BrowserWorkspaceError::Launch(format!(
             "macOS browser placement receipt expired; no retry attempted; {evidence}"
@@ -600,6 +612,10 @@ pub(super) async fn launch(
         let endpoint = browser_endpoint(&mut child, profile_dir).await?;
         let target_id = create_background_target(&endpoint, navigation).await?;
         let page_ws = exact_page_websocket(&mut child, &endpoint, &target_id).await?;
+        if let Some(task) = &authority.task {
+            task.record_process(browser_pid, birth)
+                .map_err(BrowserWorkspaceError::Launch)?;
+        }
         let guard = bind_and_place(bus, authority, selector, browser_pid, birth).await?;
         match child.try_wait() {
             Ok(None) => {}

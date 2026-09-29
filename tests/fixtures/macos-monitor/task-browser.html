@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'">
+<title>Disposable task browser acceptance</title>
+<style>body{font:16px system-ui;margin:18px}input,textarea{display:block;width:400px;margin:5px 0}textarea{height:45px}button{display:block;margin:8px 0}#pane{height:80px;width:450px;overflow:auto;border:1px solid}#inside{height:700px;background:linear-gradient(white,#ccc)}canvas{border:1px solid;display:block;margin:8px 0}</style>
+<label>First field<input id="first" aria-label="First field" value="seed" autofocus></label>
+<label>Second field<textarea id="second" aria-label="Second field"></textarea></label>
+<button id="button">Increment</button>
+<canvas id="canvas" width="180" height="45"></canvas>
+<div id="pane" aria-label="Scroll pane"><div id="inside">Scroll this disposable pane</div></div>
+<script>
+'use strict';
+let count=0,canvasClicks=0;const keys=[];
+const first=document.getElementById('first'),second=document.getElementById('second'),button=document.getElementById('button'),canvas=document.getElementById('canvas');
+button.onclick=()=>count++;canvas.onclick=()=>canvasClicks++;
+document.addEventListener('keydown',e=>keys.push({key:e.key,target:e.target.id,trusted:e.isTrusted}));
+function rect(id){let r=document.getElementById(id).getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}
+window.taskFixtureStatus=()=>({first:first.value,second:second.value,count,canvasClicks,scroll:document.getElementById('pane').scrollTop,
+ active:document.activeElement.id,keys:keys.slice(),canvasRect:rect('canvas'),paneRect:rect('pane'),buttonRect:rect('button'),
+ metrics:{outerWidth,outerHeight,innerWidth,innerHeight,scale:devicePixelRatio}});
+</script>

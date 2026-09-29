@@ -655,6 +655,9 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     access_cert_dir: std::path::PathBuf,
     relay_ingress_listener: Option<TcpListener>,
 ) -> tokio::task::JoinHandle<()> {
+    bus.macos_monitors
+        .task_browsers
+        .configure(access_cert_dir.clone());
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
     let display_media_relay_configured = config.ice_servers.iter().any(|server| {
