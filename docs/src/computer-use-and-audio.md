@@ -347,6 +347,62 @@ physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
 
+### Task-owned background browser on macOS
+
+For a supervised agent that should use its own browser rather than the human's
+foreground desktop, use **`task_browser`**, not generic `execute_cu_actions`.
+Intendant automatically provisions one private-profile managed Chrome for Testing
+window on an owned virtual monitor when that session calls `op:open`. It returns
+`workspace_id`; there is no separate assignment or per-click/per-key approval.
+The session keeps that workspace across turns and its stop triggers cleanup.
+The app still needs its normal macOS Accessibility and Screen Recording permissions,
+and the caller's existing RuntimeControl, DisplayView and DisplayInput IAM limits
+remain enforced. The session does not become an owner or gain the human's display.
+
+From the agent's MCP connection, a minimal sequence is:
+
+```json
+{"name":"task_browser","arguments":{"op":"open","url":"https://example.com"}}
+```
+
+Retain the returned workspace ID. `inspect_task_browser` with
+`{"op":"screenshot","workspace_id":"<returned ID>"}` returns a PNG and
+coordinate metadata; `op:status` discovers only this session's assignment.
+Use `task_browser` for the following operations, always with the same workspace ID:
+
+| Operation | Additional fields |
+| --- | --- |
+| `keyboard` | A fresh `request_id` UUID and `action:{"type":"insert_text","text":"…"}`, `{"type":"key","key":"Tab"}`, or `{"type":"select_all"}` |
+| `click` | A fresh `request_id` UUID and window-local logical `x`,`y` |
+| `scroll` | A fresh `request_id` UUID, window-local logical `x`,`y`, and nonzero `delta_y` in -600..600 (positive down) |
+| `navigate` | A fresh `request_id` UUID and `url` (HTTP(S) or `about:blank`) |
+| `close` | No additional fields; alternatively stop the owning task/session |
+
+The capture covers the monitor, while pointer coordinates are window-local.
+Convert image pixels using `pixel_to_logical_x/y`, then subtract the
+`window_on_monitor.x/y` offsets supplied in the screenshot metadata. Observe
+again after an action: input dispatch acknowledgment is not application-effect
+verification. Do not replay uncertain input with a new request UUID.
+
+Use the ordinary injected session credential throughout; do not copy an owner's
+token, call an owner-only browser inventory, or grant the user display to make
+this work. The command facade also exposes `browser task-open`, `task-status`,
+`task-screenshot`, `task-keyboard`, `task-navigate` and `task-close`; see `help browser`.
+The full MCP schema supplies coordinate click/scroll. Repeating `open` reuses the
+existing assignment; use `navigate` to change its URL.
+
+This path supports page text insertion, Enter, Tab/ShiftTab, Backspace/Delete,
+arrows, Home/End, PageUp/PageDown, Escape, Space and select-all. It targets the
+original browser page, not browser chrome or system shortcuts, and keeps existing
+protected-receiver refusals. It is a browser workstation, not arbitrary native-app
+keyboard/drag support or an independent macOS login seat. At most two task-owned
+monitors are allocated; creating/removing a monitor can rearrange desktop windows.
+
+The fixed, operator-started supervised-session test passed against `b43c0e2f`
+on 2026-09-29, including real page effects, coordinate input and task-stop cleanup.
+See the [acceptance record](../design/evidence/macos-task-browser-accepted-20260929.json)
+and [native-app delivery target](../design/macos-background-cu-delivery.md).
+
 ### Experimental macOS monitor lifecycle and read-only controller
 
 `intendant_platform::cgvirtual::VirtualDisplays` is an experimental main-thread

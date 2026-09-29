@@ -3736,11 +3736,14 @@ pub(crate) mod tests {
              Authorization: Bearer ws-token\r\n\r\n",
         )
         .await;
-        assert!(
-            resp.contains("101 Switching Protocols"),
+        // The response may already contain WebSocket frames with arbitrary
+        // IDs/dates that include "401". Assert the HTTP status, not a substring
+        // of unrelated post-upgrade payload bytes.
+        assert_eq!(
+            resp.lines().next(),
+            Some("HTTP/1.1 101 Switching Protocols"),
             "expected upgrade success, got: {resp}"
         );
-        assert!(!resp.contains("401"));
         handle.abort();
     }
 

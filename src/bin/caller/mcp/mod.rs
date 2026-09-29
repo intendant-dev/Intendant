@@ -80,6 +80,7 @@ mod tools_events;
 mod tools_feedback;
 mod tools_macos_monitor;
 pub(crate) use tools_feedback::DogfoodReportParams;
+mod tools_task_browser;
 mod tools_terminal;
 pub(crate) use tools_terminal::{
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
@@ -621,8 +622,22 @@ impl IntendantServer {
         let ToolCaller {
             trust: caller,
             actor,
+            session_credential_epoch,
             fs_scope,
         } = caller;
+        if let Some(epoch) = session_credential_epoch.as_deref() {
+            let current = actor
+                .session_id
+                .as_deref()
+                .and_then(crate::web_gateway::supervised_mcp_registration_epoch);
+            if actor.kind != crate::access::actor::ActorKind::AgentSession
+                || current.as_deref() != Some(epoch)
+            {
+                return Ok(text_tool_error(
+                    "supervised session credential changed; no action dispatched",
+                ));
+            }
+        }
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -696,6 +711,7 @@ impl IntendantServer {
                             ToolCaller {
                                 trust: caller,
                                 actor,
+                                session_credential_epoch,
                                 fs_scope,
                             },
                         ))
@@ -1003,6 +1019,19 @@ impl IntendantServer {
                     self.remote_command_scoped(params, McpToolScope::from_actor(&actor))
                         .await,
                 ))
+            }
+            "inspect_task_browser" => {
+                let Parameters(params) = parse_params::<tools_task_browser::InspectRequest>(args)?;
+                Ok(self
+                    .task_browser_as_session(params.into(), actor, session_credential_epoch)
+                    .await)
+            }
+            "task_browser" => {
+                let Parameters(params) =
+                    parse_params::<crate::browser_workspace::task_access::Request>(args)?;
+                Ok(self
+                    .task_browser_as_session(params, actor, session_credential_epoch)
+                    .await)
             }
             "browser_workspace_providers" => {
                 Ok(text_tool_result(self.browser_workspace_providers().await))
@@ -3255,6 +3284,9 @@ impl ToolCallerTrust {
 pub struct ToolCaller {
     pub trust: ToolCallerTrust,
     pub actor: crate::access::actor::ActorBinding,
+    /// Epoch matched with the session bearer at ingress. Never filled by looking
+    /// up a newer live session, or accepted from a tool request. Not authority.
+    pub session_credential_epoch: Option<String>,
     /// The filesystem scope sandboxing any shell this caller spawns
     /// (`terminal_open`): `None` = unrestricted (owner surfaces and
     /// scope-less grants — dashboard-tunnel parity). Constructors default
@@ -3270,6 +3302,7 @@ impl ToolCaller {
         Self {
             trust: ToolCallerTrust::Scoped,
             actor: crate::access::actor::ActorBinding::unattributed(),
+            session_credential_epoch: None,
             fs_scope: Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
         }
     }
@@ -3284,6 +3317,9 @@ impl ToolCaller {
     ) -> Self {
         Self {
             trust: ToolCallerTrust::from_principal(principal),
+            session_credential_epoch: gate_session
+                .as_ref()
+                .and_then(|_| crate::web_gateway::supervised_mcp_epoch_from_principal(principal)),
             actor: crate::access::actor::ActorBinding::from_principal(principal, gate_session),
             // Fail-closed until the gate states the real scope — an
             // ungated ToolCaller sandboxes any shell it spawns to nothing.

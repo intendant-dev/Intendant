@@ -237,6 +237,8 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
+                    | "task_browser"
+                    | "inspect_task_browser"
                     // remote_command deliberately does NOT ride here
                     // (2026-08-07 ratification): its schema was the
                     // largest single item in this bootstrap set while the
@@ -295,6 +297,8 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
+                    | "task_browser"
+                    | "inspect_task_browser"
                     | "display_readiness"
                     | "list_frames"
                     | "read_frame"
@@ -477,7 +481,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // display_readiness classifies here too: it reveals display/CU
         // capability metadata (grant state, OS permission booleans), the
         // same audience and sensitivity as list_displays.
-        "list_displays"
+        "inspect_task_browser"
+        | "list_displays"
         | "list_macos_monitors"
         | "list_macos_windows"
         | "read_macos_window_elements"
@@ -520,7 +525,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "external_cu_proof" => PeerOperation::DisplayInput,
         // Browser workspaces, live audio, autonomy/verbosity, lifecycle, and
         // controller-restart orchestration are runtime-control surfaces.
-        "create_browser_workspace"
+        "task_browser"
+        | "create_browser_workspace"
         | "close_browser_workspace"
         | "acquire_browser_workspace"
         | "release_browser_workspace"
@@ -777,6 +783,18 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             ClaimFissionCanonicalParams
         ),
     );
+    for (name, tool) in [
+        (
+            "inspect_task_browser",
+            IntendantServer::inspect_task_browser_tool_attr(),
+        ),
+        ("task_browser", IntendantServer::task_browser_tool_attr()),
+    ] {
+        let mut definition = serde_json::to_value(tool).expect("task browser schema");
+        inline_schema_refs(&mut definition["inputSchema"]);
+        ensure_object_typed_schema_root(&mut definition["inputSchema"]);
+        push(name, definition);
+    }
     push(
         "agenda_list",
         manual_http_tool_definition!(

@@ -52,10 +52,33 @@ pub(crate) fn has_browser_origin_headers(header_text: &str) -> bool {
 /// it is preimage-bound to one session id, so a backend cannot present
 /// another session's identity (or recover the process token) from it.
 pub(crate) fn session_scoped_mcp_token(base_token: &str, session_id: &str) -> String {
-    let mut input = Vec::with_capacity(base_token.len() + session_id.len() + 1);
+    expected_session_mcp_credential(base_token, session_id)
+        .map(|(token, _)| token)
+        .unwrap_or_else(|| {
+            // Never drop authentication or fall back to the process credential
+            // when registered-session state is unavailable. The gate has no
+            // matching expectation for this deliberately unusable credential.
+            derive_session_mcp_credential(
+                base_token,
+                session_id,
+                Some(&uuid::Uuid::new_v4().to_string()),
+            )
+        })
+}
+
+fn derive_session_mcp_credential(
+    base_token: &str,
+    session_id: &str,
+    epoch: Option<&str>,
+) -> String {
+    let mut input = Vec::with_capacity(base_token.len() + session_id.len() + 64);
     input.extend_from_slice(base_token.as_bytes());
     input.push(0);
     input.extend_from_slice(session_id.as_bytes());
+    if let Some(epoch) = epoch {
+        input.extend_from_slice(b"\0supervised-session-incarnation-v1\0");
+        input.extend_from_slice(epoch.as_bytes());
+    }
     ring::digest::digest(&ring::digest::SHA256, &input)
         .as_ref()
         .iter()
@@ -79,6 +102,9 @@ struct SupervisedMcpServeEntry {
     /// the owning session ends and its log is dropped, the entry is dead
     /// (skipped on serve, swept on the next registration).
     session_log: std::sync::Weak<Mutex<crate::session_log::SessionLog>>,
+    // Same task/log respawns keep the epoch; replacing the session log rotates
+    // it even if the old process still retains its old log and bearer token.
+    credential_epoch: String,
     initialize_reported: bool,
     tools_reported: bool,
 }
@@ -92,6 +118,33 @@ static SUPERVISED_MCP_SERVES: OnceLock<Mutex<HashMap<String, SupervisedMcpServeE
 
 fn supervised_mcp_serves() -> &'static Mutex<HashMap<String, SupervisedMcpServeEntry>> {
     SUPERVISED_MCP_SERVES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Internal identity metadata only, not a bearer or permission. Consumers
+/// must carry the epoch authenticated at ingress, never look up the latest
+/// epoch and attach it to an older request.
+pub(crate) fn supervised_mcp_registration_epoch(session_id: &str) -> Option<String> {
+    let map = supervised_mcp_serves().lock().ok()?;
+    let entry = map.get(session_id)?;
+    entry.session_log.upgrade()?;
+    Some(entry.credential_epoch.clone())
+}
+
+fn expected_session_mcp_credential(base: &str, session: &str) -> Option<(String, Option<String>)> {
+    let map = supervised_mcp_serves().lock().ok()?;
+    let epoch = match map.get(session) {
+        Some(entry) => {
+            entry.session_log.upgrade()?;
+            Some(entry.credential_epoch.clone())
+        }
+        // Legacy/unregistered token lanes retain their existing semantics.
+        // They have NO registration epoch and cannot acquire a delegated permit.
+        None => None,
+    };
+    Some((
+        derive_session_mcp_credential(base, session, epoch.as_deref()),
+        epoch,
+    ))
 }
 
 /// Register a supervised backend session for daemon-side `/mcp` serve
@@ -108,10 +161,17 @@ pub(crate) fn register_supervised_mcp_session(
         return;
     };
     map.retain(|_, entry| entry.session_log.strong_count() > 0);
+    let log_identity = Arc::downgrade(session_log);
+    let credential_epoch = map
+        .get(session_id)
+        .filter(|entry| entry.session_log.ptr_eq(&log_identity))
+        .map(|entry| entry.credential_epoch.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     map.insert(
         session_id.to_string(),
         SupervisedMcpServeEntry {
-            session_log: Arc::downgrade(session_log),
+            session_log: log_identity,
+            credential_epoch,
             initialize_reported: false,
             tools_reported: false,
         },
@@ -198,17 +258,23 @@ pub(crate) enum McpTokenBinding {
 }
 
 pub(crate) fn mcp_request_token_binding(header_text: &str) -> McpTokenBinding {
+    mcp_request_token_authentication(header_text).0
+}
+
+// The matched bearer and its epoch are one snapshot, taken under the same
+// registry lock. A later session replacement cannot relabel this request.
+fn mcp_request_token_authentication(header_text: &str) -> (McpTokenBinding, Option<String>) {
     let expected = loopback_mcp_auth_token();
     let request_line = header_text.lines().next().unwrap_or("");
     let (session_id, _, _) = mcp_context_from_request_line(request_line);
     let derived = session_id
         .as_deref()
-        .map(|sid| session_scoped_mcp_token(expected, sid));
+        .and_then(|sid| expected_session_mcp_credential(expected, sid));
     let classify = |candidate: &str| {
         if candidate == expected {
-            Some(McpTokenBinding::Process)
-        } else if derived.as_deref() == Some(candidate) {
-            session_id.clone().map(McpTokenBinding::Session)
+            Some((McpTokenBinding::Process, None))
+        } else if let (Some(sid), Some((token, epoch))) = (&session_id, &derived) {
+            (token == candidate).then(|| (McpTokenBinding::Session(sid.clone()), epoch.clone()))
         } else {
             None
         }
@@ -216,21 +282,54 @@ pub(crate) fn mcp_request_token_binding(header_text: &str) -> McpTokenBinding {
     let explicit = query_param(request_line, "mcp_token")
         .or_else(|| http_header_value(header_text, "x-intendant-mcp-token").map(str::to_string));
     if let Some(candidate) = explicit {
-        return classify(&candidate).unwrap_or(McpTokenBinding::Invalid);
+        return classify(&candidate).unwrap_or((McpTokenBinding::Invalid, None));
     }
     let bearer = http_header_value(header_text, "authorization").and_then(|value| {
         let value = value.trim();
         value
             .strip_prefix("Bearer ")
             .or_else(|| value.strip_prefix("bearer "))
-            .map(|token| token.trim().to_string())
+            .map(str::trim)
     });
-    if let Some(candidate) = bearer {
-        if let Some(binding) = classify(&candidate) {
-            return binding;
-        }
+    if let Some(binding) = bearer.and_then(classify) {
+        return binding;
     }
-    McpTokenBinding::Missing
+    (McpTokenBinding::Missing, None)
+}
+
+const REGISTRATION_AUTHN_KIND: &str = "supervised_mcp_registration";
+
+fn stamp_mcp_registration(
+    mut access: HttpAccessContext,
+    epoch: Option<String>,
+) -> HttpAccessContext {
+    // Only the authenticated edge may mint this identity fact; remove any
+    // same-kind carried metadata before appending the actual matched epoch.
+    access
+        .principal
+        .authn
+        .retain(|row| row["kind"] != REGISTRATION_AUTHN_KIND);
+    if let Some(epoch) = epoch {
+        access
+            .principal
+            .authn
+            .push(serde_json::json!({"kind":REGISTRATION_AUTHN_KIND,"epoch":epoch}));
+    }
+    access
+}
+
+pub(crate) fn supervised_mcp_epoch_from_principal(
+    principal: &crate::access::iam::AccessPrincipal,
+) -> Option<String> {
+    let mut records = principal
+        .authn
+        .iter()
+        .filter(|row| row["kind"] == REGISTRATION_AUTHN_KIND);
+    let epoch = records.next()?["epoch"].as_str()?;
+    if records.next().is_some() || uuid::Uuid::parse_str(epoch).ok()?.to_string() != epoch {
+        return None;
+    }
+    Some(epoch.to_owned())
 }
 
 /// The session identity the MCP token binding itself names, for actor
@@ -1481,9 +1580,11 @@ pub(crate) fn session_only_mcp_access_context(
     cert_dir: &std::path::Path,
     header_text: &str,
 ) -> Result<HttpAccessContext, (u16, String)> {
-    match mcp_request_token_binding(header_text) {
+    let (binding, epoch) = mcp_request_token_authentication(header_text);
+    match binding {
         McpTokenBinding::Session(session_id) => {
             mcp_agent_session_context(cert_dir, &session_id, "http", true)
+                .map(|access| stamp_mcp_registration(access, epoch))
         }
         McpTokenBinding::Invalid => Err((
             401,
@@ -1556,13 +1657,15 @@ pub(crate) fn mcp_http_access_context(
     let transport = if is_tls { "https" } else { "http" };
     let load_state =
         || load_local_iam_state_for_request(cert_dir).map_err(|message| (500u16, message));
-    match mcp_request_token_binding(header_text) {
+    let (binding, epoch) = mcp_request_token_authentication(header_text);
+    match binding {
         McpTokenBinding::Invalid => Err((
             401,
             "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
         )),
         McpTokenBinding::Session(session_id) => {
             mcp_agent_session_context(cert_dir, &session_id, transport, true)
+                .map(|access| stamp_mcp_registration(access, epoch))
         }
         McpTokenBinding::Process => {
             let request_line = header_text.lines().next().unwrap_or("");
@@ -3407,6 +3510,231 @@ mod tests {
         Arc::new(Mutex::new(
             crate::session_log::SessionLog::open(dir.to_path_buf()).unwrap(),
         ))
+    }
+
+    fn registration_request(session: &str, token: &str, bearer: bool) -> String {
+        if bearer {
+            format!("POST /mcp?session_id={session} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n")
+        } else {
+            format!("POST /mcp?session_id={session}&mcp_token={token} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        }
+    }
+
+    #[test]
+    fn registered_session_credentials_rotate_for_replacement_not_same_task_respawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = format!("credential-{}", uuid::Uuid::new_v4());
+        let log = temp_session_log(&tmp.path().join("original"));
+        register_supervised_mcp_session(&id, &log);
+        let epoch = supervised_mcp_registration_epoch(&id).unwrap();
+        let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        register_supervised_mcp_session(&id, &log);
+        assert_eq!(
+            supervised_mcp_registration_epoch(&id).as_deref(),
+            Some(epoch.as_str())
+        );
+        assert_eq!(
+            session_scoped_mcp_token(loopback_mcp_auth_token(), &id),
+            token
+        );
+
+        // Keep the old log alive: old credential holders must not survive a
+        // replacement just because some old thread retained the session log.
+        let replacement = temp_session_log(&tmp.path().join("replacement"));
+        register_supervised_mcp_session(&id, &replacement);
+        assert_ne!(
+            supervised_mcp_registration_epoch(&id).as_deref(),
+            Some(epoch.as_str())
+        );
+        let new_token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        assert_ne!(new_token, token);
+        for bearer in [false, true] {
+            assert!(!matches!(
+                mcp_request_token_binding(&registration_request(&id, &token, bearer)),
+                McpTokenBinding::Session(_)
+            ));
+            assert_eq!(
+                mcp_request_token_binding(&registration_request(&id, &new_token, bearer)),
+                McpTokenBinding::Session(id.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn registered_session_dead_log_cannot_mint_live_epoch_or_reuse_old_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = format!("retired-{}", uuid::Uuid::new_v4());
+        let log = temp_session_log(&tmp.path().join("log"));
+        register_supervised_mcp_session(&id, &log);
+        let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        drop(log);
+        // Registration sweeps dead weak entries. Force that interleaving here
+        // rather than racing unrelated concurrent tests: after the sweep the
+        // resolver may return an unregistered legacy expectation, but NEVER
+        // a live epoch or the old registered credential.
+        let sweep_log = temp_session_log(&tmp.path().join("sweep"));
+        register_supervised_mcp_session(&format!("sweep-{}", uuid::Uuid::new_v4()), &sweep_log);
+        assert!(supervised_mcp_registration_epoch(&id).is_none());
+        assert!(
+            expected_session_mcp_credential(loopback_mcp_auth_token(), &id)
+                .is_none_or(|(candidate, epoch)| epoch.is_none() && candidate != token)
+        );
+        assert_eq!(
+            mcp_request_token_binding(&registration_request(&id, &token, false)),
+            McpTokenBinding::Invalid
+        );
+        // The ordinary serve cleanup may remove dead weak entries. That cannot
+        // recreate the old registered credential as a legacy credential.
+        note_supervised_mcp_serve(&EventBus::new(), &id, McpServeMilestone::Initialize);
+        assert_eq!(
+            mcp_request_token_binding(&registration_request(&id, &token, false)),
+            McpTokenBinding::Invalid
+        );
+    }
+
+    #[test]
+    fn registered_session_epoch_is_bound_at_both_http_ingress_ladders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = format!("ingress-{}", uuid::Uuid::new_v4());
+        let log = temp_session_log(&tmp.path().join("log"));
+        register_supervised_mcp_session(&id, &log);
+        let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        let epoch = supervised_mcp_registration_epoch(&id).unwrap();
+        for bearer in [false, true] {
+            let header = registration_request(&id, &token, bearer);
+            let isolated = session_only_mcp_access_context(tmp.path(), &header).unwrap();
+            let ordinary = mcp_http_access_context(
+                tmp.path(),
+                None,
+                None,
+                false,
+                false,
+                "127.0.0.1:54321".parse().unwrap(),
+                &header,
+            )
+            .unwrap();
+            for context in [isolated, ordinary] {
+                assert_eq!(
+                    supervised_mcp_epoch_from_principal(&context.principal).as_deref(),
+                    Some(epoch.as_str())
+                );
+                let caller = crate::mcp::ToolCaller::from_gate(
+                    &context.principal,
+                    mcp_gate_session(&header),
+                );
+                assert_eq!(
+                    caller.session_credential_epoch.as_deref(),
+                    Some(epoch.as_str())
+                );
+                assert_eq!(caller.actor.session_id.as_deref(), Some(id.as_str()));
+                assert_eq!(caller.trust, crate::mcp::ToolCallerTrust::Scoped);
+            }
+        }
+        // A query string cannot assert the credential epoch for a process token.
+        let header = registration_request(&id, loopback_mcp_auth_token(), false);
+        let context = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            "127.0.0.1:54321".parse().unwrap(),
+            &header,
+        )
+        .unwrap();
+        assert!(supervised_mcp_epoch_from_principal(&context.principal).is_none());
+        assert!(session_only_mcp_access_context(tmp.path(), &header).is_err());
+    }
+
+    #[test]
+    fn registered_session_ingress_snapshot_is_not_relabelled_by_new_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = format!("snapshot-{}", uuid::Uuid::new_v4());
+        let first = temp_session_log(&tmp.path().join("first"));
+        register_supervised_mcp_session(&id, &first);
+        let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        let (matched, epoch) =
+            mcp_request_token_authentication(&registration_request(&id, &token, true));
+        assert_eq!(matched, McpTokenBinding::Session(id.clone()));
+        let replacement = temp_session_log(&tmp.path().join("new"));
+        register_supervised_mcp_session(&id, &replacement);
+        let context = stamp_mcp_registration(
+            mcp_agent_session_context(tmp.path(), &id, "http", true).unwrap(),
+            epoch.clone(),
+        );
+        assert_eq!(
+            supervised_mcp_epoch_from_principal(&context.principal),
+            epoch
+        );
+        assert_ne!(
+            supervised_mcp_epoch_from_principal(&context.principal),
+            supervised_mcp_registration_epoch(&id)
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_session_stale_dispatch_refuses_raw_and_facade_before_native_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = format!("dispatch-{}", uuid::Uuid::new_v4());
+        let first = temp_session_log(&tmp.path().join("first"));
+        register_supervised_mcp_session(&id, &first);
+        let token = session_scoped_mcp_token(loopback_mcp_auth_token(), &id);
+        let header = registration_request(&id, &token, true);
+        let context = session_only_mcp_access_context(tmp.path(), &header).unwrap();
+        let old_caller =
+            crate::mcp::ToolCaller::from_gate(&context.principal, mcp_gate_session(&header));
+        let replacement = temp_session_log(&tmp.path().join("replacement"));
+        register_supervised_mcp_session(&id, &replacement);
+        let state = crate::mcp::tests::test_state_with_log_dir(tmp.path().join("state"));
+        let bus = EventBus::new();
+        let (_home, server) = crate::mcp::tests::test_server(state, bus.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        for (tool, args) in [
+            (
+                "execute_browser_workspace_keyboard",
+                serde_json::json!({"workspace_id":"absent","request_id":request_id,"action":{"type":"key","key":"Tab"}}),
+            ),
+            (
+                "act",
+                serde_json::json!({"argv":["browser","keyboard","absent",request_id,"{\"type\":\"key\",\"key\":\"Tab\"}"]}),
+            ),
+        ] {
+            let result = server
+                .call_tool_by_name_as_caller(tool, args, Some(&id), None, old_caller.clone())
+                .await
+                .unwrap();
+            let text = serde_json::to_string(&result).unwrap();
+            assert!(
+                text.contains("supervised session credential changed"),
+                "{text}"
+            );
+            assert!(bus.macos_monitors.not_started());
+        }
+    }
+
+    #[test]
+    fn registered_session_epoch_parser_rejects_duplicate_and_malformed_metadata() {
+        let mut principal = crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+            "test", "http", true,
+        );
+        assert!(supervised_mcp_epoch_from_principal(&principal).is_none());
+        for epoch in [
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!("bad-uuid"),
+        ] {
+            principal
+                .authn
+                .push(serde_json::json!({"kind":REGISTRATION_AUTHN_KIND,"epoch":epoch}));
+            assert!(supervised_mcp_epoch_from_principal(&principal).is_none());
+            principal.authn.pop();
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let record = serde_json::json!({"kind":REGISTRATION_AUTHN_KIND,"epoch":epoch});
+        principal.authn.push(record.clone());
+        assert_eq!(supervised_mcp_epoch_from_principal(&principal), Some(epoch));
+        principal.authn.push(record);
+        assert!(supervised_mcp_epoch_from_principal(&principal).is_none());
     }
 
     #[test]

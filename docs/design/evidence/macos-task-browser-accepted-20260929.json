@@ -1,0 +1,112 @@
+{
+  "schema": "intendant-task-browser-acceptance-v1",
+  "accepted_on": "2026-09-29",
+  "status": "passed",
+  "execution": "operator_started_separately_authorized_candidate_app",
+  "source_head": "b43c0e2f824b95989eac7e272ac14669192a18b8",
+  "source_tree": "3d246ae761098e8dbb3c7cb394cf073fb1babf95",
+  "source_dirty": false,
+  "binary_sha256": "af4c4246185f71abebcf3a936a98c5cb598fd21830fe17d1be2206d812cb5303",
+  "harness_sha256": "903e280bedf3afaf7a63d2de656fc4dc661ad01a3de39b2fdffda1ae3f746200",
+  "raw_report_sha256": "8faf3369e40ca37d7472ccfdf69005fa3e5148167f7c93c4cd49f2898c43f8bb",
+  "candidate_bundle_id": "dev.intendant.cu-candidate",
+  "candidate_payload_verified": true,
+  "independent_review": {
+    "bundle_signature_verified": true,
+    "manifest_payload_hashes_verified": true,
+    "report_matches_sealed_binary_and_harness": true,
+    "source_tree_matches_git": true,
+    "runner_log_matches_report": true,
+    "temporary_rig_and_profile_absent_after_run": true
+  },
+  "checks": {
+    "authentic_session": true,
+    "automatic_provision": true,
+    "same_workspace_navigation": true,
+    "session_screenshot": true,
+    "session_keyboard": true,
+    "session_pointer_and_no_replay": true,
+    "foreign_session_refused": true,
+    "task_stop_cleanup": true
+  },
+  "request_count": 18,
+  "authentication": {
+    "supervised_sessions": 2,
+    "tested_operations_use_injected_session_bearer": true,
+    "owner_fallback_used": false,
+    "owner_input_requests": 0,
+    "manual_assignment_requests": 0,
+    "per_action_workspace_approval": false
+  },
+  "effects": {
+    "navigation": "new document URL observed in the same retained page",
+    "first_field": "Independent agent typing 🙂",
+    "second_field": "Second field",
+    "keyboard_requests_succeeded": 7,
+    "keyboard_protocol_commands_acknowledged": 12,
+    "observed_key_downs": [
+      {
+        "key": "a",
+        "target": "first",
+        "trusted": true
+      },
+      {
+        "key": "Tab",
+        "target": "first",
+        "trusted": true
+      },
+      {
+        "key": "Backspace",
+        "target": "second",
+        "trusted": true
+      },
+      {
+        "key": "Tab",
+        "target": "second",
+        "trusted": true
+      },
+      {
+        "key": "Enter",
+        "target": "button",
+        "trusted": true
+      }
+    ],
+    "button_activations": 1,
+    "canvas_clicks": 1,
+    "scroll_position": 180,
+    "screenshots": [
+      {
+        "sha256": "4184ad1f3dbe657783cae0e6ab9a5792e1ce7a4aa3001bb23a8a22d4adafeb95",
+        "width": 1024,
+        "height": 768
+      },
+      {
+        "sha256": "5a577991fc4022d7b6b4f62d99ba0195871483f968f4839aeed30e0b650e2c89",
+        "width": 1024,
+        "height": 768
+      }
+    ]
+  },
+  "negative_checks": {
+    "duplicate_click_refused_without_second_click": true,
+    "second_session_without_assignment_sees_no_workspace": true,
+    "second_session_input_refused_without_page_change": true
+  },
+  "cleanup": {
+    "trigger": "owning_session_stop_without_workspace_close",
+    "task_stop_cleanup": true,
+    "temporary_daemon_reaped": true,
+    "original_display_inventory_restored": true,
+    "private_test_rig_removed": true
+  },
+  "scope": {
+    "fixed_supervised_protocol_fixture": true,
+    "full_task_browser_workflow_verified": true,
+    "autonomous_llm_visual_reasoning_tested": false,
+    "human_typing_overlap_verified": false,
+    "arbitrary_native_apps_tested": false,
+    "installed_daemon_changed": false,
+    "automatic_input_retry": false
+  },
+  "redaction": "Omitted personal filesystem paths, native IDs, session/workspace/request IDs, and loopback address; retained only disposable fixture text, counters and integrity hashes."
+}

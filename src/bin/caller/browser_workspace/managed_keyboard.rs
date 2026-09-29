@@ -141,7 +141,7 @@ fn input_commands(action: &Action) -> Vec<(&'static str, Value)> {
     ]
 }
 #[cfg(any(target_os = "macos", test))]
-struct Client {
+pub(super) struct Client {
     socket: WebSocketStream<TcpStream>,
     next: u64,
     bytes: usize,
@@ -149,7 +149,7 @@ struct Client {
 }
 #[cfg(any(target_os = "macos", test))]
 impl Client {
-    async fn connect(port: u16, url: &str, target: &str) -> Result<Self, String> {
+    pub(super) async fn connect(port: u16, url: &str, target: &str) -> Result<Self, String> {
         Self::connect_exact(port, url, &format!("/devtools/page/{target}")).await
     }
     async fn connect_exact(port: u16, url: &str, path: &str) -> Result<Self, String> {
@@ -178,7 +178,7 @@ impl Client {
         .await;
         result.map_err(|_| "keyboard connection deadline".to_string())?
     }
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    pub(super) async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         tokio::time::timeout(Duration::from_secs(2), self.call_inner(method, params))
             .await
             .map_err(|_| "keyboard CDP deadline; effects unconfirmed".to_string())?
@@ -301,7 +301,7 @@ fn parse_foreground(bytes: &[u8]) -> Result<(i32, (u64, u32)), String> {
     Ok((value.pid, (value.seconds, value.micros)))
 }
 #[cfg(target_os = "macos")]
-async fn foreground() -> Result<(i32, (u64, u32)), String> {
+pub(super) async fn foreground() -> Result<(i32, (u64, u32)), String> {
     use tokio::io::AsyncReadExt;
     let exe = std::env::current_exe().map_err(|_| "foreground probe executable unavailable")?;
     let mut child = tokio::process::Command::new(exe)
@@ -337,9 +337,8 @@ async fn foreground() -> Result<(i32, (u64, u32)), String> {
     result.map_err(|_| "foreground probe deadline".to_string())?
 }
 #[cfg(target_os = "macos")]
-async fn validate_native(
+pub(super) async fn validate_native(
     workspace: &BrowserWorkspace,
-    _action: &Action,
     bus: &EventBus,
     authority: &crate::macos_monitor::Authority,
 ) -> Result<(), String> {
@@ -347,8 +346,13 @@ async fn validate_native(
         Action as MonitorAction, Value as MonitorValue, WindowAction, WindowValue,
     };
     authority.check().await?;
-    if !authority.owner_surface {
-        return Err("managed browser keyboard requires owner authority".into());
+    if !authority.owner_surface
+        && !authority
+            .task
+            .as_ref()
+            .is_some_and(|p| p.allows_page_input(workspace))
+    {
+        return Err("managed browser keyboard requires owner or exact task authority".into());
     }
     if workspace.status != BrowserWorkspaceStatus::Ready
         || workspace.provider != BrowserWorkspaceProvider::Cdp
@@ -392,6 +396,10 @@ async fn validate_native(
             observation.ax.validate().is_ok()
                 && observation.cg.validate().is_ok()
                 && observation.ax.close(observation.cg)
+                && authority
+                    .task
+                    .as_ref()
+                    .is_none_or(|p| p.checks_window(*observation))
         }
         _ => false,
     };
@@ -423,7 +431,17 @@ pub(crate) async fn execute(
     authority: crate::macos_monitor::Authority,
 ) -> ResultReceipt {
     let mut result = ResultReceipt::new(request.request_id.clone());
-    if let Err(error) = admission(&request, authority.owner_surface) {
+    let task_workspace = if let Some(task) = authority.task.as_ref() {
+        global_registry()
+            .read()
+            .await
+            .workspaces
+            .get(&request.workspace_id)
+            .is_some_and(|w| task.uses_workspace(w))
+    } else {
+        false
+    };
+    if let Err(error) = admission(&request, authority.owner_surface || task_workspace) {
         result.error = Some(error);
         return result;
     }
@@ -471,39 +489,30 @@ pub(crate) async fn execute(
     }
 }
 #[cfg(target_os = "macos")]
-async fn execute_inner(
-    request: &Request,
-    bus: &EventBus,
-    authority: &crate::macos_monitor::Authority,
-    response: &tokio::sync::oneshot::Sender<ResultReceipt>,
-    result: &mut ResultReceipt,
-) -> Result<(), String> {
+pub(super) async fn owned_workspace(id: &str) -> Result<BrowserWorkspace, String> {
     let registry = global_registry();
-    let workspace = {
-        let mut registry = registry.write().await;
-        let workspace = registry
-            .workspaces
-            .get(&request.workspace_id)
-            .cloned()
-            .ok_or("unknown keyboard workspace")?;
-        let child = registry
-            .children
-            .get_mut(&request.workspace_id)
-            .ok_or("owned browser supervisor missing")?;
-        if child
-            .try_wait()
-            .map_err(|_| "browser supervisor state unavailable")?
-            .is_some()
-        {
-            return Err("owned browser supervisor stopped".into());
-        }
-        workspace
-    };
-    validate_native(&workspace, &request.action, bus, authority).await?;
+    let mut registry = registry.write().await;
+    let workspace = registry
+        .workspaces
+        .get(id)
+        .cloned()
+        .ok_or("unknown keyboard workspace")?;
+    let child = registry
+        .children
+        .get_mut(id)
+        .ok_or("owned browser supervisor missing")?;
+    if child
+        .try_wait()
+        .map_err(|_| "browser supervisor state unavailable")?
+        .is_some()
     {
-        let mut ledger = REQUESTS.get_or_init(Default::default).lock().await;
-        claim_request(&mut ledger, request)?;
+        return Err("owned browser supervisor stopped".into());
     }
+    Ok(workspace)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn connect_owned_page(workspace: &BrowserWorkspace) -> Result<Client, String> {
     let port = workspace
         .debugging_port
         .ok_or("missing browser debugging port")?;
@@ -542,6 +551,19 @@ async fn execute_inner(
         return Err("CDP endpoint is not owned by the retained native browser process".into());
     }
     let mut client = Client::connect(port, url, target).await?;
+    validate_original_page(&mut client, workspace).await?;
+    Ok(client)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn validate_original_page(
+    client: &mut Client,
+    workspace: &BrowserWorkspace,
+) -> Result<(), String> {
+    let target = workspace
+        .active_target_id
+        .as_deref()
+        .ok_or("missing exact browser page target")?;
     let info = client
         .call("Target.getTargetInfo", json!({"targetId":target}))
         .await?;
@@ -558,8 +580,27 @@ async fn execute_inner(
     if pages.len() != 1 || pages[0]["targetId"] != target {
         return Err("keyboard requires exactly the managed workspace's original page".into());
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_inner(
+    request: &Request,
+    bus: &EventBus,
+    authority: &crate::macos_monitor::Authority,
+    response: &tokio::sync::oneshot::Sender<ResultReceipt>,
+    result: &mut ResultReceipt,
+) -> Result<(), String> {
+    let registry = global_registry();
+    let workspace = owned_workspace(&request.workspace_id).await?;
+    validate_native(&workspace, bus, authority).await?;
+    {
+        let mut ledger = REQUESTS.get_or_init(Default::default).lock().await;
+        claim_request(&mut ledger, request)?;
+    }
+    let mut client = connect_owned_page(&workspace).await?;
     let receiver = page_receiver(&mut client, &request.action).await?;
-    validate_native(&workspace, &request.action, bus, authority).await?;
+    validate_native(&workspace, bus, authority).await?;
     let before = foreground().await?;
     if page_receiver(&mut client, &request.action).await? != receiver {
         return Err("focused page receiver or document changed before keyboard dispatch".into());
@@ -570,6 +611,9 @@ async fn execute_inner(
     if response.is_closed() {
         return Err("keyboard request cancelled before input".into());
     }
+    // Recheck the authenticated task immediately before its first key edge.
+    // Once down may be sent, dispatch_input owns the matching release.
+    authority.check().await?;
     if let Err(error) = dispatch_input(&mut client, &request.action, result).await {
         let mut registry = registry.write().await;
         if let Some(current) = registry.workspaces.get_mut(&workspace.id) {
@@ -1147,6 +1191,7 @@ mod tests {
         let bus = EventBus::new();
         let authority = crate::macos_monitor::Authority {
             owner_surface: false,
+            task: None,
             autonomy: state.read().await.autonomy.clone(),
         };
         let result = execute(request(Action::SelectAll), &bus, authority).await;

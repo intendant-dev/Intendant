@@ -31,6 +31,7 @@ async fn request(tx: &mpsc::Sender<Request>, action: Action) -> Result<Receipt, 
         action,
         authority: Authority {
             owner_surface: true,
+            task: None,
             autonomy: std::sync::Arc::new(tokio::sync::RwLock::new(Default::default())),
         },
         reply,

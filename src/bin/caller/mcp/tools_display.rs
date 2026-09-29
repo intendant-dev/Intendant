@@ -2547,6 +2547,7 @@ mod tests {
                     Some("session-a"),
                     None,
                     ToolCaller {
+                        session_credential_epoch: None,
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
                         fs_scope: None,
@@ -3169,6 +3170,7 @@ mod tests {
                     Some("managed-session"),
                     Some(true),
                     ToolCaller {
+                        session_credential_epoch: None,
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
                         fs_scope: None,
@@ -3417,6 +3419,7 @@ mod tests {
                     Some("managed-session"),
                     Some(true),
                     ToolCaller {
+                        session_credential_epoch: None,
                         trust: ToolCallerTrust::OwnerSurface,
                         actor: crate::access::actor::ActorBinding::unattributed(),
                         fs_scope: None,

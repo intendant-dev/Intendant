@@ -30,6 +30,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, oneshot};
 
+// Shared diagnostic vocabulary; the native producer remains macOS-only.
+pub(crate) const WINDOW_PERMISSION_REQUIRED: &str = "window binding/placement requires existing Accessibility and Screen Recording permissions; no permission prompt requested";
+
 const QUEUE_SIZE: usize = 8;
 // Below the macOS window range (0x40000000); never native/helper IDs.
 pub(crate) const DISPLAY_ID_MIN: u32 = 0x2000_0000;
@@ -117,10 +120,36 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
 pub(crate) struct Authority {
     pub owner_surface: bool,
     pub autonomy: SharedAutonomy,
+    pub(crate) task: Option<crate::browser_workspace::task_access::Permit>,
 }
 
 impl Authority {
+    pub(crate) fn cleanup_scope(&self) -> Self {
+        Self {
+            owner_surface: self.owner_surface,
+            autonomy: self.autonomy.clone(),
+            task: self.task.as_ref().map(|task| task.cleanup()),
+        }
+    }
+    pub(crate) fn creates_workspace_on(&self, selector: &str) -> bool {
+        self.owner_surface
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|task| task.creates_on(selector))
+    }
+    pub(crate) fn cleans_workspace(&self, id: &str, selector: Option<&str>) -> bool {
+        self.owner_surface
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|task| task.cleans_workspace(id, selector))
+    }
+
     pub(crate) async fn check(&self) -> Result<(), String> {
+        if let Some(task) = &self.task {
+            return task.check().await;
+        }
         if self.owner_surface || self.autonomy.read().await.user_display_granted {
             Ok(())
         } else {
@@ -137,6 +166,20 @@ pub(crate) struct Monitor {
     pub height: u32,
     native_id: u32,
     helper_handle: u32,
+}
+
+#[cfg(test)]
+impl Monitor {
+    pub(crate) fn task_fixture(id: u32, width: u32, height: u32) -> Self {
+        Self {
+            display_id: id,
+            selector: format!("macos_virtual:00000000000000000000000000000000:{id}"),
+            width,
+            height,
+            native_id: 7,
+            helper_handle: 1,
+        }
+    }
 }
 
 pub(crate) struct Screenshot {
@@ -291,6 +334,16 @@ pub(crate) enum Action {
 
 impl Action {
     async fn check(&self, authority: &Authority) -> Result<(), String> {
+        if let Some(task) = &authority.task {
+            task.check().await?;
+            if !task.allows(self) {
+                return Err("operation is outside this task browser's exact resources".into());
+            }
+            return match self {
+                Self::Window(action) => action.validate(),
+                _ => Ok(()),
+            };
+        }
         match self {
             Self::Inspect(inspection) => inspection.check(authority).await,
             Self::Window(action) => {
@@ -325,6 +378,7 @@ pub(crate) struct Broker {
     // Serializes managed browser creation/cleanup with tool-driven monitor
     // destruction. It never runs on, or waits for, the native helper thread.
     pub(crate) workspace_lane: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) task_browsers: crate::browser_workspace::task_access::Registry,
     sender: OnceLock<Result<mpsc::Sender<Request>, String>>,
 }
 
@@ -339,7 +393,13 @@ impl Broker {
         binding: String,
         authority: Authority,
     ) -> Result<CleanupUnbindReceipt, String> {
-        if !authority.owner_surface {
+        if !authority.owner_surface
+            && !authority.task.as_ref().is_some_and(|p| {
+                p.allows(&Action::Window(WindowAction::Unbind {
+                    binding: binding.clone(),
+                }))
+            })
+        {
             return Err("macOS browser cleanup requires an owner surface".into());
         }
         match self
@@ -969,6 +1029,7 @@ mod tests {
     fn authority(owner_surface: bool) -> Authority {
         Authority {
             owner_surface,
+            task: None,
             autonomy: Arc::new(tokio::sync::RwLock::new(Default::default())),
         }
     }

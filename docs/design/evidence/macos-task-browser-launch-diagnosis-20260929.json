@@ -1,0 +1,45 @@
+{
+  "schema": "intendant-task-browser-launch-diagnosis-v1",
+  "acceptance_passed": false,
+  "attempts": [
+    {
+      "attempt": "launch-02.json",
+      "ok": false,
+      "scope": "launch_and_cleanup_only",
+      "source_head": "ac76df44234754a223dd40e8030e05666476210a",
+      "source_dirty": true,
+      "binary_sha256": "0fd9a2ad18a23375eab848b6acef0fe3de0b6db7074d56fff325adf35d5c9c56",
+      "harness_sha256": "09372a4f13d28c87eea84ca5ed27297d891c732c9a6ed21ec1e7c4b6b6e71e54",
+      "ordinary_session_authenticated": true,
+      "input_requests": 0,
+      "manual_assignment_requests": 0,
+      "inventory_restored": true,
+      "temporary_daemon_reaped": true,
+      "owned_browser_processes_remaining_at_review": [],
+      "fresh_profiles_remaining_at_review": 0
+    },
+    {
+      "attempt": "launch-03.json",
+      "ok": false,
+      "scope": "launch_and_cleanup_only",
+      "source_head": "ac76df44234754a223dd40e8030e05666476210a",
+      "source_dirty": true,
+      "binary_sha256": "e7dac7702d5a638c3add83d04e7540ae44b6e558f76886e53bce986244e0f2c6",
+      "harness_sha256": "09372a4f13d28c87eea84ca5ed27297d891c732c9a6ed21ec1e7c4b6b6e71e54",
+      "ordinary_session_authenticated": true,
+      "input_requests": 0,
+      "manual_assignment_requests": 0,
+      "inventory_restored": true,
+      "temporary_daemon_reaped": true,
+      "owned_browser_processes_remaining_at_review": [],
+      "fresh_profiles_remaining_at_review": 0
+    }
+  ],
+  "diagnosis": "The native permission gate refused window binding/placement: existing Accessibility and Screen Recording permissions are required. The message does not distinguish which authorization is missing.",
+  "diagnostic_source": "private temporary daemon stderr from launch-03",
+  "tested_scope": "Uncommitted candidate containing the profile-layout correction; before subsequent navigation changes. No tested screenshot, pointer or keyboard action was reached.",
+  "installed_app_baseline": "Direct Intendant plugin created one disposable 1024x768 monitor and about:blank managed browser, returned Ready, then closed browser and destroyed that exact monitor. This is an owner-surface baseline, not ordinary-session acceptance.",
+  "installed_daemon_changed": false,
+  "privacy_settings_changed": false,
+  "next_gate": "Explicitly authorized candidate application context; do not bypass macOS authorization via alternate input or IPC routes."
+}

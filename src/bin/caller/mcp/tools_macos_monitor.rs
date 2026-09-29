@@ -101,6 +101,7 @@ impl IntendantServer {
     pub(super) async fn macos_monitor_authority(&self, caller: ToolCallerTrust) -> Authority {
         Authority {
             owner_surface: caller == ToolCallerTrust::OwnerSurface,
+            task: None,
             autonomy: self.state.read().await.autonomy.clone(),
         }
     }
@@ -677,6 +678,7 @@ mod tests {
         );
         let authority = Authority {
             owner_surface: true,
+            task: None,
             autonomy: std::sync::Arc::new(tokio::sync::RwLock::new(Default::default())),
         };
         let snapshot = broker
@@ -739,6 +741,7 @@ mod tests {
                             None,
                             None,
                             ToolCaller {
+                                session_credential_epoch: None,
                                 trust,
                                 actor: crate::access::actor::ActorBinding::unattributed(),
                                 fs_scope: None,
@@ -1286,6 +1289,7 @@ mod tests {
                         None,
                         None,
                         ToolCaller {
+                            session_credential_epoch: None,
                             trust: ToolCallerTrust::Scoped,
                             actor: crate::access::actor::ActorBinding::unattributed(),
                             fs_scope: None,
@@ -1342,6 +1346,7 @@ mod tests {
                         None,
                         None,
                         ToolCaller {
+                            session_credential_epoch: None,
                             trust: ToolCallerTrust::Scoped,
                             actor: crate::access::actor::ActorBinding::unattributed(),
                             fs_scope: None,
