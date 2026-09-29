@@ -317,7 +317,7 @@ async fn perform(
 fn launch_failure_category(error: &BrowserWorkspaceError) -> &'static str {
     match error {
         BrowserWorkspaceError::Launch(message)
-            if message == crate::ax::WINDOW_PERMISSION_REQUIRED =>
+            if message == crate::macos_monitor::WINDOW_PERMISSION_REQUIRED =>
         {
             "os_authorization_missing"
         }
@@ -786,7 +786,7 @@ mod tests {
     fn launch_diagnostic_names_os_authorization_without_echoing_native_details() {
         assert_eq!(
             launch_failure_category(&BrowserWorkspaceError::Launch(
-                crate::ax::WINDOW_PERMISSION_REQUIRED.into()
+                crate::macos_monitor::WINDOW_PERMISSION_REQUIRED.into()
             )),
             "os_authorization_missing"
         );

@@ -30,6 +30,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, oneshot};
 
+// Shared diagnostic vocabulary; the native producer remains macOS-only.
+pub(crate) const WINDOW_PERMISSION_REQUIRED: &str = "window binding/placement requires existing Accessibility and Screen Recording permissions; no permission prompt requested";
+
 const QUEUE_SIZE: usize = 8;
 // Below the macOS window range (0x40000000); never native/helper IDs.
 pub(crate) const DISPLAY_ID_MIN: u32 = 0x2000_0000;
