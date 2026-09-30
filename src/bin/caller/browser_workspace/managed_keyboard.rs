@@ -65,7 +65,7 @@ pub(crate) struct ResultReceipt {
     pub mechanism: &'static str,
 }
 impl ResultReceipt {
-    fn new(id: String) -> Self {
+    pub(super) fn new(id: String) -> Self {
         Self {
             ok: false,
             request_id: id,
@@ -90,7 +90,11 @@ fn admission(request: &Request, owner: bool) -> Result<(), String> {
     if id.to_string() != request.request_id {
         return Err("keyboard UUID must be canonical".into());
     }
-    if let Action::InsertText { text } = &request.action {
+    validate_action(&request.action)
+}
+
+pub(super) fn validate_action(action: &Action) -> Result<(), String> {
+    if let Action::InsertText { text } = action {
         if text.is_empty() || text.len() > 4096 || text.contains('\0') {
             return Err("keyboard text must contain 1..4096 UTF-8 bytes and no NUL".into());
         }
@@ -145,6 +149,7 @@ pub(super) struct Client {
     socket: WebSocketStream<TcpStream>,
     next: u64,
     bytes: usize,
+    byte_budget: usize,
     contexts: BTreeMap<i64, Value>,
 }
 #[cfg(any(target_os = "macos", test))]
@@ -152,7 +157,28 @@ impl Client {
     pub(super) async fn connect(port: u16, url: &str, target: &str) -> Result<Self, String> {
         Self::connect_exact(port, url, &format!("/devtools/page/{target}")).await
     }
-    async fn connect_exact(port: u16, url: &str, path: &str) -> Result<Self, String> {
+    pub(super) async fn connect_capture(
+        port: u16,
+        url: &str,
+        target: &str,
+    ) -> Result<Self, String> {
+        Self::connect_limits(
+            port,
+            url,
+            &format!("/devtools/page/{target}"),
+            12 * 1024 * 1024,
+        )
+        .await
+    }
+    pub(super) async fn connect_exact(port: u16, url: &str, path: &str) -> Result<Self, String> {
+        Self::connect_limits(port, url, path, 1024 * 1024).await
+    }
+    async fn connect_limits(
+        port: u16,
+        url: &str,
+        path: &str,
+        message_limit: usize,
+    ) -> Result<Self, String> {
         if !exact_loopback_websocket_url(url, port, path) {
             return Err("keyboard endpoint is not the exact owned page".into());
         }
@@ -162,8 +188,8 @@ impl Client {
                 .await
                 .map_err(|_| "keyboard loopback connection failed")?;
             let config = WebSocketConfig::default()
-                .max_message_size(Some(1024 * 1024))
-                .max_frame_size(Some(1024 * 1024));
+                .max_message_size(Some(message_limit))
+                .max_frame_size(Some(message_limit));
             let (socket, _) =
                 tokio_tungstenite::client_async_with_config(url, stream, Some(config))
                     .await
@@ -172,6 +198,7 @@ impl Client {
                 socket,
                 next: 0,
                 bytes: 0,
+                byte_budget: message_limit.max(4 * 1024 * 1024),
                 contexts: BTreeMap::new(),
             })
         })
@@ -204,7 +231,7 @@ impl Client {
             match message {
                 Message::Text(text) => {
                     self.bytes = self.bytes.saturating_add(text.len());
-                    if self.bytes > 4 * 1024 * 1024 {
+                    if self.bytes > self.byte_budget {
                         return Err("keyboard response byte budget".into());
                     }
                     let reply: Value =
@@ -795,7 +822,7 @@ fn isolated_context(context: &Value, frame: &str) -> Result<String, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-async fn page_receiver(
+pub(super) async fn page_receiver(
     client: &mut Client,
     action: &Action,
 ) -> Result<(String, String, i64), String> {
@@ -897,7 +924,7 @@ async fn page_receiver(
 }
 
 #[cfg(any(target_os = "macos", test))]
-async fn dispatch_input(
+pub(super) async fn dispatch_input(
     client: &mut Client,
     action: &Action,
     result: &mut ResultReceipt,
