@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fixed no-wallet extension acceptance via a real supervised session.
 
-Rabby scenario stops at onboarding and the wallet's own uninitialized state.
-No password, seed/private key, account import, signing, transaction or real funds.
-The synthetic scenario verifies actual popup and extension-created notification UI.
+Tests only the deterministic repository extension and local page.
+No account, credentials, financial operation or third-party package is used.
+Verifies actual toolbar popup and extension-created notification UI.
 """
 from __future__ import annotations
 import os,sys,subprocess,tempfile,time,json,re,hashlib,uuid,shlex,threading,http.server,importlib.util,shutil,base64
@@ -13,7 +13,6 @@ parser=argparse.ArgumentParser(description="Opt-in isolated supervised-session e
 parser.add_argument('--bin',required=True,type=Path)
 parser.add_argument('--browser-app',required=True,type=Path)
 parser.add_argument('--report',required=True,type=Path)
-parser.add_argument('--rabby-archive',type=Path,help='Official pinned Rabby v0.94.10 ZIP; omit to test the repository synthetic extension')
 parser.add_argument('--allow-offscreen-extension',action='store_true')
 args=parser.parse_args()
 if sys.platform!='darwin' or not args.allow_offscreen_extension or args.report.exists():parser.error('requires macOS, an explicit opt-in, and a fresh report path')
@@ -21,20 +20,15 @@ os.umask(0o077)
 repo=Path(__file__).resolve().parent.parent;sys.path.insert(0,str(repo/'scripts'))
 def load(name,path):
  sp=importlib.util.spec_from_file_location(name,repo/'scripts'/path);m=importlib.util.module_from_spec(sp);sys.modules[name]=m;sp.loader.exec_module(m);return m
-h=load('rabby_task_harness','verify-macos-task-browser.py');probe=load('rabby_session_client','verify-macos-browser-delegation.py');cdplib=load('rabby_observer','verify-macos-chromium-controls.py')
-root=Path(tempfile.mkdtemp(prefix='intendant-rabby-session-'));root.chmod(0o700)
+h=load('extension_task_harness','verify-macos-task-browser.py');probe=load('extension_session_client','verify-macos-browser-delegation.py');cdplib=load('extension_observer','verify-macos-chromium-controls.py')
+root=Path(tempfile.mkdtemp(prefix='intendant-extension-session-'));root.chmod(0o700)
 binary=args.bin.resolve(strict=True)
-if args.rabby_archive:
- archive=args.rabby_archive.resolve(strict=True);version='0.94.10';worker='sw.js'
- expected='e17f74b230ec31c5b7ba4bea72d7f7028047bdfcb39defd0e95a20f803a7f5a5'
-else:
- archive=root/'fixture.zip';version='1.0.0';worker='worker.js';expected=None
- with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
-  for p in sorted((repo/'tests/fixtures/macos-monitor/extension').iterdir()):
-   if p.is_file():z.writestr(zipfile.ZipInfo(p.name,date_time=(2020,1,1,0,0,0)),p.read_bytes())
+archive=root/'fixture.zip';version='1.0.0';worker='worker.js'
+with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
+ for p in sorted((repo/'tests/fixtures/macos-monitor/extension').iterdir()):
+  if p.is_file():z.writestr(zipfile.ZipInfo(p.name,date_time=(2020,1,1,0,0,0)),p.read_bytes())
 digest=hashlib.sha256(archive.read_bytes()).hexdigest()
-if expected and digest!=expected:raise ValueError('not the pinned official Rabby archive')
-report={'ok':False,'scope':'rabby_onboarding' if args.rabby_archive else 'synthetic_extension_complete','native_input_calls':0,'owner_input_requests':0,'seed_or_private_key_used':False,'transactions_requested':0,'signatures_requested':0,'source_head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),'source_dirty':subprocess.run(['git','diff','--quiet','HEAD'],cwd=repo).returncode!=0,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'extension_sha256':digest,'extension_version':version,'steps':[],'rig':str(root)}
+report={'ok':False,'scope':'synthetic_extension_complete','native_input_calls':0,'owner_input_requests':0,'seed_or_private_key_used':False,'transactions_requested':0,'signatures_requested':0,'source_head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),'source_dirty':subprocess.run(['git','diff','--quiet','HEAD'],cwd=repo).returncode!=0,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'extension_sha256':digest,'extension_version':version,'steps':[],'rig':str(root)}
 out=args.report.absolute();out.parent.mkdir(parents=True,exist_ok=True)
 def save():out.write_text(json.dumps(report,indent=2)+'\n')
 daemon=dashboard=cdp=web=None;sid=None;assigned=None;profile=None;port=None
@@ -44,7 +38,7 @@ try:
  home=root/'home';home.mkdir();base=root/'base';base.mkdir();(base/'intendant.toml').write_text('');mock=root/'mock.json';mock.write_text('{"profiles":[]}')
  cache=home/'Library/Caches/intendant/browser-workspaces';cache.mkdir(parents=True);(cache/'Google Chrome for Testing.app').symlink_to(args.browser_app.resolve(strict=True),target_is_directory=True)
  policy=root/'policy.json';policy.write_text(json.dumps({'schema_version':1,'extensions':[{'archive_sha256':digest,'archive_byte_length':archive.stat().st_size,'manifest_version':3,'version':version,'service_worker':worker}]}));pin=hashlib.sha256(policy.read_bytes()).hexdigest()
- html=b'''<!doctype html><meta charset="utf-8"><title>Intendant disposable Rabby test</title><h1>Disposable wallet connection</h1><button id="connect">Connect read-only test account</button><pre id="result">Not connected</pre><input id="plain" aria-label="Fixture text"><button id="notice" onclick="window.postMessage({type:'intendant-fixture-notification'},location.origin)">Open fixture notification</button><script>window.rabbyTest={accounts:[],error:null};let p;addEventListener('eip6963:announceProvider',e=>{if(e.detail.info.rdns==='io.rabby')p=e.detail.provider});dispatchEvent(new Event('eip6963:requestProvider'));document.getElementById('connect').onclick=async()=>{try{window.rabbyTest.accounts=await (p||window.ethereum).request({method:'eth_requestAccounts'});document.getElementById('result').textContent=JSON.stringify(window.rabbyTest)}catch(e){window.rabbyTest.error={code:e.code,message:e.message};document.getElementById('result').textContent=JSON.stringify(window.rabbyTest)}};</script>'''
+ html=b'''<!doctype html><meta charset="utf-8"><title>Disposable extension test</title><h1>Extension fixture</h1><input id="plain" aria-label="Fixture text"><button id="notice" onclick="window.postMessage({type:'intendant-fixture-notification'},location.origin)">Open fixture notification</button>'''
  class Handler(http.server.BaseHTTPRequestHandler):
   def do_GET(self):
    self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(html)));self.end_headers();self.wfile.write(html)
@@ -98,91 +92,63 @@ try:
  def click_text(text,handle,target):
   expr='''(()=>{const wanted=TEXT;const es=[...document.querySelectorAll('button,a,[role="button"],div,span')].filter(e=>e.textContent.trim()===wanted).map(e=>({e,r:e.getBoundingClientRect()})).filter(({r})=>r.width>1&&r.height>1);es.sort((a,b)=>a.r.width*a.r.height-b.r.width*b.r.height);if(!es.length)return null;const r=es[0].r;return {x:r.x+r.width/2,y:r.y+r.height/2}})()'''.replace('TEXT',json.dumps(text))
   pt=eval_target(target,expr);assert pt,'no control '+text;issue({'op':'click','view_id':handle,**pt})
- if args.rabby_archive:
-  for _ in range(80):
-   providers=eval_target(original,'({ethereum:Boolean(window.ethereum),rabby:Boolean(window.rabby),ethereumRabby:Boolean(window.ethereum?.isRabby)})')
-   if providers['ethereum'] or providers['rabby']:break
-   time.sleep(.1)
-  report['injected_provider']=providers
-  issue({'op':'extension_popup'})
-  time.sleep(1);handle,target=view()
-  for _ in range(50):
-   text=eval_target(target,'document.body.innerText')
-   if text and 'Welcome' in text:break
-   time.sleep(.1)
-  report['onboarding_text']=text
-  issue({'op':'screenshot','view_id':handle},'inspect_task_browser')
-  click_text('I already have an address',handle,target);time.sleep(.5)
-  report['after_existing_address']=eval_target(target,'document.body.innerText')
-  report['controls']=eval_target(target,'Array.from(document.querySelectorAll("button,input,a")).map(e=>({tag:e.tagName,type:e.type,placeholder:e.placeholder,text:e.innerText}))')
-  # Exercise a real site connection request; a fresh wallet must retain its own
-  # initialization requirement. Never fake an account or settle internal approvals.
-  point=eval_target(original,'(()=>{let r=document.querySelector("#connect").getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
-  issue({'op':'click',**point});time.sleep(1)
-  report['connection_result']=eval_target(original,'window.rabbyTest')
-  report['connection_views']=issue({'op':'extension_views'},'inspect_task_browser')['texts'][0]['views']
-  report['wallet_connected']=bool(report['connection_result']['accounts'])
-  report['wallet_signing_tested']=False
-  assert report['injected_provider']['ethereumRabby'], 'Rabby page provider did not initialize'
-  report['ok']=True
- else:
-  issue({'op':'extension_popup'})
-  time.sleep(.5);handle,target=view()
-  # Only the repository fixture exposes this independent readback function.
+ issue({'op':'extension_popup'})
+ time.sleep(.5);handle,target=view()
+ # Only the repository fixture exposes this independent readback function.
+ state=eval_target(target,'window.extensionFixtureStatus()')
+ assert state['activeUrl']==url+'?extension-ready=1',state
+ report['actual_popup_has_original_tab_context']=True
+ shot=issue({'op':'screenshot','view_id':handle},'inspect_task_browser');assert len(shot['images'])==1
+ issue({'op':'keyboard','view_id':handle,'action':{'type':'select_all'}})
+ issue({'op':'keyboard','view_id':handle,'action':{'type':'insert_text','text':'Offscreen extension typing 🙂'}})
+ assert eval_target(target,'window.extensionFixtureStatus().text')=='Offscreen extension typing 🙂'
+ issue({'op':'keyboard','view_id':handle,'action':{'type':'key','key':'Tab'}})
+ issue({'op':'keyboard','view_id':handle,'action':{'type':'key','key':'Enter'}})
+ for _ in range(50):
   state=eval_target(target,'window.extensionFixtureStatus()')
-  assert state['activeUrl']==url+'?extension-ready=1',state
-  report['actual_popup_has_original_tab_context']=True
-  shot=issue({'op':'screenshot','view_id':handle},'inspect_task_browser');assert len(shot['images'])==1
-  issue({'op':'keyboard','view_id':handle,'action':{'type':'select_all'}})
-  issue({'op':'keyboard','view_id':handle,'action':{'type':'insert_text','text':'Offscreen extension typing 🙂'}})
-  assert eval_target(target,'window.extensionFixtureStatus().text')=='Offscreen extension typing 🙂'
-  issue({'op':'keyboard','view_id':handle,'action':{'type':'key','key':'Tab'}})
-  issue({'op':'keyboard','view_id':handle,'action':{'type':'key','key':'Enter'}})
-  for _ in range(50):
-   state=eval_target(target,'window.extensionFixtureStatus()')
-   if state['saved']==1:break
-   time.sleep(.1)
-  assert state['saved']==1 and state['text']=='Offscreen extension typing 🙂',state
-  report['popup_keyboard_and_worker_effects']=True
-  foreign=issue({'op':'screenshot','view_id':'bv-not-assigned'},'inspect_task_browser',expect_error=True)
-  report['foreign_view_refused']=foreign.get('tool_error') is True
-  state=eval_target(target,'window.extensionFixtureStatus()');rect=state['buttonRect']
-  once={'op':'click','view_id':handle,'request_id':str(uuid.uuid4()),'x':rect['x']+rect['width']/2,'y':rect['y']+rect['height']/2}
-  issue(once)
-  for _ in range(30):
-   if eval_target(target,'window.extensionFixtureStatus().saved')==2:break
-   time.sleep(.05)
-  assert eval_target(target,'window.extensionFixtureStatus().saved')==2
-  issue(once,expect_error=True)
-  assert eval_target(target,'window.extensionFixtureStatus().saved')==2
-  report['duplicate_click_not_replayed']=True
-  # The real popup is intentionally allowed to close on its own focus lifecycle.
-  # The site issues the fixture request; the extension creates a focused popup
-  # window inside the headless browser. No synthetic popup.html tab is used.
-  pt=eval_target(original,'(()=>{const r=document.querySelector("#notice").getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
-  issue({'op':'click',**pt})
-  notice=None
-  for _ in range(60):
-   views=issue({'op':'extension_views'},'inspect_task_browser')['texts'][0]['views']
-   notice=next((v for v in views if v['resource']=='/notification.html'),None)
-   if notice:break
-   time.sleep(.1)
-  assert notice,'extension notification window not discovered'
-  note_target=next(t['targetId'] for t in cdp.call('Target.getTargets')['targetInfos'] if t['type']=='page' and t['url'].endswith('/notification.html'))
-  shot=issue({'op':'screenshot','view_id':notice['view_id']},'inspect_task_browser');assert len(shot['images'])==1
-  click_text('Acknowledge fixture',notice['view_id'],note_target)
-  for _ in range(40):
-   accepted=eval_target(original,'document.documentElement.dataset.notificationAccepted')
-   if accepted=='true':break
-   time.sleep(.1)
-  assert accepted=='true','notification acknowledgement not independently observed'
-  report['extension_created_notification_clicked']=True
-  other=issue({},'whoami',first=True);owner_sid=sid;sid=other['token_bound_session']
-  assert sid!=owner_sid
-  rejected=issue({'op':'keyboard','action':{'type':'insert_text','text':'must not appear'}},expect_error=True)
-  report['other_session_refused']=rejected.get('tool_error') is True
-  dashboard.send({'action':'stop_session','session_id':sid});sid=owner_sid
-  report['ok']=True
+  if state['saved']==1:break
+  time.sleep(.1)
+ assert state['saved']==1 and state['text']=='Offscreen extension typing 🙂',state
+ report['popup_keyboard_and_worker_effects']=True
+ foreign=issue({'op':'screenshot','view_id':'bv-not-assigned'},'inspect_task_browser',expect_error=True)
+ report['foreign_view_refused']=foreign.get('tool_error') is True
+ state=eval_target(target,'window.extensionFixtureStatus()');rect=state['buttonRect']
+ once={'op':'click','view_id':handle,'request_id':str(uuid.uuid4()),'x':rect['x']+rect['width']/2,'y':rect['y']+rect['height']/2}
+ issue(once)
+ for _ in range(30):
+  if eval_target(target,'window.extensionFixtureStatus().saved')==2:break
+  time.sleep(.05)
+ assert eval_target(target,'window.extensionFixtureStatus().saved')==2
+ issue(once,expect_error=True)
+ assert eval_target(target,'window.extensionFixtureStatus().saved')==2
+ report['duplicate_click_not_replayed']=True
+ # The real popup is intentionally allowed to close on its own focus lifecycle.
+ # The site issues the fixture request; the extension creates a focused popup
+ # window inside the headless browser. No synthetic popup.html tab is used.
+ pt=eval_target(original,'(()=>{const r=document.querySelector("#notice").getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
+ issue({'op':'click',**pt})
+ notice=None
+ for _ in range(60):
+  views=issue({'op':'extension_views'},'inspect_task_browser')['texts'][0]['views']
+  notice=next((v for v in views if v['resource']=='/notification.html'),None)
+  if notice:break
+  time.sleep(.1)
+ assert notice,'extension notification window not discovered'
+ note_target=next(t['targetId'] for t in cdp.call('Target.getTargets')['targetInfos'] if t['type']=='page' and t['url'].endswith('/notification.html'))
+ shot=issue({'op':'screenshot','view_id':notice['view_id']},'inspect_task_browser');assert len(shot['images'])==1
+ click_text('Acknowledge fixture',notice['view_id'],note_target)
+ for _ in range(40):
+  accepted=eval_target(original,'document.documentElement.dataset.notificationAccepted')
+  if accepted=='true':break
+  time.sleep(.1)
+ assert accepted=='true','notification acknowledgement not independently observed'
+ report['extension_created_notification_clicked']=True
+ other=issue({},'whoami',first=True);owner_sid=sid;sid=other['token_bound_session']
+ assert sid!=owner_sid
+ rejected=issue({'op':'keyboard','action':{'type':'insert_text','text':'must not appear'}},expect_error=True)
+ report['other_session_refused']=rejected.get('tool_error') is True
+ dashboard.send({'action':'stop_session','session_id':sid});sid=owner_sid
+ report['ok']=True
 except Exception as e:report['error']=str(e)
 finally:
  if cdp:cdp.close()

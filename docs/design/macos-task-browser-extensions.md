@@ -1,11 +1,11 @@
 # Task-owned offscreen browser extensions
 
-Status: implementation candidate, not installed or merged. The first real Rabby
-run is onboarding/provider detection only; not a connected-wallet/signing test.
+Status: implementation candidate, not installed or merged. Third-party application
+compatibility evidence is recorded separately from the generic fixture.
 
 ## Why this backend is separate
 
-Rabby's own approval window code requests browser focus. Loading it into a
+Extensions may request browser focus for their own windows. Loading it into a
 `CGVirtualDisplay` window would not establish freedom from desktop interruption.
 An extension-enabled task instead owns a fresh **headless Chrome for Testing**
 process. Unified Chrome headless renders extension pages and popup windows without
@@ -59,8 +59,7 @@ It does not introduce per-key/per-click approvals or timed renewal prompts.
 A session starts with `task_browser` open and an `extension` tuple. Prefer opening
 about:blank, then navigating to the target website after extension startup; an
 extension's asynchronous content-script registration is not a document-ready
-signal for a website already loading. The tested Rabby sequence explicitly navigates
-before checking its injected provider.
+signal for a website already loading. The generic fixture explicitly navigates before checking its content script.
 
 ```
 act browser task-open about:blank --extension '<approved archive tuple JSON>'
@@ -83,24 +82,15 @@ a financial action, or establish hardware-wallet/native-messaging compatibility.
 Password/protected receiver checks remain unchanged. No personal Chrome profile,
 keychain, seed/private key, wallet storage reset or internal approval bypass is used.
 
-The tested upstream package is RabbyHub/Rabby release v0.94.10, ZIP SHA-256
-`e17f74b230ec31c5b7ba4bea72d7f7028047bdfcb39defd0e95a20f803a7f5a5`.
-It was checked against the publisher's GitHub release asset digest. It is not
-claimed to be a byte-identical Chrome Web Store CRX. Its unpacked runtime ID differs
-from the store ID and is bound dynamically from the approved worker at launch.
-The release ZIP is not vendored in this repository.
+`verify-headless-extension.py` creates only the deterministic repository fixture.
+It verifies real toolbar context, renderer screenshots, Unicode typing/editing
+and worker-side effects, a focused extension-created notification, duplicate-request
+and foreign-view/session refusals, and cleanup. No third-party package, download
+URL, version pin or application policy is embedded in the generic harness.
+Application compatibility checks belong to the operator's own external workflow;
+they cannot modify the daemon's extension approval policy.
 
-`verify-headless-extension.py` has two explicit, separate no-wallet scenarios:
-
-* The repository fixture verifies real toolbar context, renderer screenshots,
-  Unicode typing/editing and worker-side effects, a focused extension-created
-  notification, duplicate-request and foreign-view/session refusals, and cleanup.
-* `--rabby-archive` loads the official pinned package, observes actual Rabby
-  onboarding and injected provider, and clicks its existing-address UI. The wallet
-  remains uninitialized. A pending connection is not labeled account connection,
-  approval success, signing or transaction execution.
-
-Both use a real supervised fixture backend's own injected credential, not owner
+The fixture uses a real supervised backend's own injected credential, not owner
 input. The observer reads DOM/state to independently verify fixed test effects;
 this is not an autonomous visual-reasoning benchmark. Foreground before/after
 snapshots are endpoint observations only; physical simultaneous-human typing is
@@ -108,7 +98,7 @@ not claimed. Each run has its own daemon/HOME/profile and reports actual cleanup
 
 ## Next product acceptance
 
-The actual user's Rabby job still needs its wallet mode specified and safe
+Any real wallet job still needs its wallet mode specified and safe
 owner-controlled wallet provisioning. A passing empty-wallet onboarding test must
 not be sold as a complete signing workflow. Arbitrary native-app input remains a
 separate core project; this headless browser feature does not replace that goal.
