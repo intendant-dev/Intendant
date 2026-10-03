@@ -4,6 +4,7 @@ mod macos;
 pub(crate) mod managed_keyboard;
 mod navigation;
 pub(crate) mod task_access;
+pub(crate) mod task_extension;
 mod viewport;
 
 pub(crate) mod launch_policy;
@@ -1134,7 +1135,7 @@ async fn create_workspace_inner(
         }
         if extension_spec.is_some() {
             return Err(BrowserWorkspaceError::Unsupported(
-                "macos_virtual browser workspaces do not admit extension archives in this slice"
+                "extensions can request native focus; use task_browser with its headless extension backend instead of macos_virtual"
                     .into(),
             ));
         }

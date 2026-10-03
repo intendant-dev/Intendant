@@ -11,6 +11,22 @@ pub(crate) enum Request {
     /// Lazily create this session's private browser; repeating open reuses it.
     Open {
         url: String,
+        #[serde(default)]
+        extension: Option<super::super::task_extension::TaskExtension>,
+    },
+    ExtensionPopup {
+        workspace_id: String,
+        request_id: String,
+    },
+    ExtensionViews {
+        workspace_id: String,
+    },
+    ExtensionPage {
+        workspace_id: String,
+        request_id: String,
+        /// Relative extension HTML resource; omitted selects action.default_popup.
+        #[serde(default)]
+        path: Option<String>,
     },
     Navigate {
         workspace_id: String,
@@ -20,21 +36,29 @@ pub(crate) enum Request {
     Status {},
     Screenshot {
         workspace_id: String,
+        #[serde(default)]
+        view_id: Option<String>,
     },
     Keyboard {
         workspace_id: String,
+        #[serde(default)]
+        view_id: Option<String>,
         request_id: String,
         action: managed_keyboard::Action,
     },
     /// Coordinates are window-local logical points, as described with each image.
     Click {
         workspace_id: String,
+        #[serde(default)]
+        view_id: Option<String>,
         request_id: String,
         x: f64,
         y: f64,
     },
     Scroll {
         workspace_id: String,
+        #[serde(default)]
+        view_id: Option<String>,
         request_id: String,
         x: f64,
         y: f64,
@@ -45,10 +69,12 @@ pub(crate) enum Request {
     },
 }
 impl Request {
-    fn input(&self) -> bool {
+    pub(super) fn input(&self) -> bool {
         matches!(
             self,
             Self::Open { .. }
+                | Self::ExtensionPopup { .. }
+                | Self::ExtensionPage { .. }
                 | Self::Navigate { .. }
                 | Self::Keyboard { .. }
                 | Self::Click { .. }
@@ -57,8 +83,11 @@ impl Request {
     }
     fn workspace_id(&self) -> Option<&str> {
         match self {
-            Self::Navigate { workspace_id, .. }
-            | Self::Screenshot { workspace_id }
+            Self::ExtensionPopup { workspace_id, .. }
+            | Self::ExtensionViews { workspace_id }
+            | Self::ExtensionPage { workspace_id, .. }
+            | Self::Navigate { workspace_id, .. }
+            | Self::Screenshot { workspace_id, .. }
             | Self::Keyboard { workspace_id, .. }
             | Self::Click { workspace_id, .. }
             | Self::Scroll { workspace_id, .. }
@@ -74,13 +103,20 @@ impl Request {
             return Err("invalid task workspace identity".into());
         }
         match self {
-            Self::Open { url } | Self::Navigate { url, .. } => {
+            Self::Open { url, .. } | Self::Navigate { url, .. } => {
                 super::super::navigation::validate_url(url)?;
             }
             Self::Click { x, y, .. } | Self::Scroll { x, y, .. } => {
                 crate::macos_monitor::pointer::Point { x: *x, y: *y }.validate()?;
             }
             _ => {}
+        }
+        if let Self::Open {
+            extension: Some(extension),
+            ..
+        } = self
+        {
+            extension.validate()?;
         }
         if let Self::Scroll { delta_y, .. } = self {
             crate::macos_monitor::scroll::validate_delta(*delta_y)?;
@@ -130,6 +166,13 @@ pub(crate) async fn execute(
                 return failure("task browser capacity is full");
             }
             let entry = Arc::new(Allocation::new(key, actor, probe, autonomy));
+            if let Request::Open { extension, .. } = &request {
+                entry
+                    .resources
+                    .lock()
+                    .expect("new allocation")
+                    .requested_extension = extension.clone();
+            }
             entries.insert(entry.key.session.clone(), entry.clone());
             (entry, true)
         }
@@ -205,7 +248,7 @@ impl Drop for CancelOnDrop {
         self.0.store(true, Ordering::SeqCst);
     }
 }
-fn operation_authority(
+pub(super) fn operation_authority(
     entry: &Arc<Allocation>,
     mode: Mode,
     cancelled: &Arc<AtomicBool>,
@@ -220,13 +263,28 @@ fn summary(entry: &Allocation) -> Result<Value, String> {
         .resources
         .lock()
         .map_err(|_| "task browser state unavailable")?;
+    let headless = r.requested_extension.is_some();
+    let mut operations = vec![
+        "screenshot",
+        "click",
+        "scroll",
+        "keyboard",
+        "navigate",
+        "close",
+    ];
+    if headless {
+        operations.extend(["extension_popup", "extension_views", "extension_page"]);
+    }
     Ok(json!({"ok":true,"workspace_id":r.workspace,"ready":r.ready,
         "stopped":entry.revoked.load(Ordering::SeqCst),
         "input_uncertain":entry.quarantined.load(Ordering::SeqCst),
-        "width":WIDTH,"height":HEIGHT,"coordinate_space":"window_logical_points",
-        "window_on_monitor":{"x":40,"y":40,"width":720,"height":530},
-        "supported_operations":["screenshot","click","scroll","keyboard","navigate","close"],
-        "automatic_assignment":true,"per_action_approval":false}))
+        "backend":if headless{"headless_extension"}else{"macos_virtual"},
+        "coordinate_space":if headless{"page_css_pixels"}else{"window_logical_points"},
+        "width":WIDTH,"height":HEIGHT,
+        "window_on_monitor":if headless{Value::Null}else{json!({"x":40,"y":40,"width":720,"height":530})},
+        "extension":r.extension.as_ref().map(|e|json!({"archive_sha256":e.archive_sha256,"version":e.version})),
+        "profile_lifetime":"task_session_ephemeral",
+        "supported_operations":operations,"automatic_assignment":true,"per_action_approval":false}))
 }
 
 async fn perform(
@@ -236,12 +294,38 @@ async fn perform(
     created: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Response, String> {
+    #[cfg(target_os = "macos")]
+    if !matches!(request, Request::Open { .. } | Request::Status {})
+        && entry
+            .resources
+            .lock()
+            .map_err(|_| "task resources unavailable")?
+            .headless
+            .is_some()
+    {
+        return headless_extension::execute(entry, request, cancelled).await;
+    }
     match request {
-        Request::Open { url } => {
+        Request::ExtensionPopup { .. }
+        | Request::ExtensionPage { .. }
+        | Request::ExtensionViews { .. } => {
+            Err("this task browser has no extension backend".into())
+        }
+        Request::Open { url, extension } => {
             if created {
                 provision(entry, bus, url, cancelled).await?;
             } else {
                 entry.check(false).await?;
+                let resources = entry
+                    .resources
+                    .lock()
+                    .map_err(|_| "task resources unavailable")?;
+                if extension
+                    .as_ref()
+                    .is_some_and(|e| !e.matches(resources.extension.as_ref()))
+                {
+                    return Err("existing workspace has a different extension; close before creating a replacement".into());
+                }
             }
             Ok(Response::Json(summary(entry)?))
         }
@@ -267,10 +351,21 @@ async fn perform(
             Ok(Response::Json(value))
         }
         Request::Status {} => Ok(Response::Json(summary(entry)?)),
-        Request::Screenshot { .. } => screenshot(entry, bus, cancelled).await,
+        Request::Screenshot { view_id, .. } => {
+            if view_id.is_some() {
+                return Err("view is not assigned to this task browser".into());
+            }
+            screenshot(entry, bus, cancelled).await
+        }
         Request::Keyboard {
-            request_id, action, ..
+            request_id,
+            action,
+            view_id,
+            ..
         } => {
+            if view_id.is_some() {
+                return Err("view is not assigned to this task browser".into());
+            }
             entry.claim(&request_id)?;
             let workspace = ready_workspace(entry).await?;
             let mut result = managed_keyboard::execute(
@@ -295,8 +390,15 @@ async fn perform(
             Ok(Response::Json(json!(result)))
         }
         Request::Click {
-            request_id, x, y, ..
+            request_id,
+            x,
+            y,
+            view_id,
+            ..
         } => {
+            if view_id.is_some() {
+                return Err("view is not assigned to this task browser".into());
+            }
             entry.claim(&request_id)?;
             pointer(entry, bus, request_id, x, y, None, cancelled).await
         }
@@ -305,8 +407,12 @@ async fn perform(
             x,
             y,
             delta_y,
+            view_id,
             ..
         } => {
+            if view_id.is_some() {
+                return Err("view is not assigned to this task browser".into());
+            }
             entry.claim(&request_id)?;
             pointer(entry, bus, request_id, x, y, Some(delta_y), cancelled).await
         }
@@ -334,6 +440,16 @@ async fn provision(
     url: String,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if entry
+        .resources
+        .lock()
+        .map_err(|_| "task resources unavailable")?
+        .requested_extension
+        .is_some()
+    {
+        return headless_extension::provision(entry, &url, cancelled).await;
+    }
     let _lane = bus.macos_monitors.workspace_lane.clone().lock_owned().await;
     entry.check(true).await?;
     let authority = operation_authority(entry, Mode::Provision, cancelled);
@@ -641,6 +757,12 @@ async fn cleanup(entry: &Arc<Allocation>, bus: &EventBus) -> Result<(), String> 
         .lock()
         .map_err(|_| "task resources unavailable")?
         .clone();
+    #[cfg(target_os = "macos")]
+    if let Some(headless) = resources.headless.as_ref() {
+        headless.close().await?;
+        bus.macos_monitors.task_browsers.forget(entry).await;
+        return Ok(());
+    }
     let authority = entry.authority(Mode::Cleanup);
     if let Some(id) = resources.workspace.as_deref() {
         if global_registry().read().await.workspaces.contains_key(id) {
@@ -719,7 +841,18 @@ fn watch(entry: Arc<Allocation>, bus: EventBus) {
             };
             let active = entry.check(false).await.is_ok();
             let resources = entry.resources.lock().ok().map(|r| r.clone());
-            let child_live = if let Some(id) = resources.and_then(|r| r.workspace) {
+            #[cfg(target_os = "macos")]
+            let offscreen_alive =
+                if let Some(headless) = resources.as_ref().and_then(|r| r.headless.clone()) {
+                    Some(headless.alive().await)
+                } else {
+                    None
+                };
+            #[cfg(not(target_os = "macos"))]
+            let offscreen_alive: Option<bool> = None;
+            let child_live = if let Some(alive) = offscreen_alive {
+                alive
+            } else if let Some(id) = resources.and_then(|r| r.workspace) {
                 global_registry()
                     .write()
                     .await
@@ -757,15 +890,22 @@ mod tests {
             "https://user:pass@example.test",
             "custom://open",
         ] {
-            assert!(Request::Open { url: url.into() }.validate().is_err());
+            assert!(Request::Open {
+                url: url.into(),
+                extension: None
+            }
+            .validate()
+            .is_err());
         }
         assert!(Request::Open {
-            url: "about:blank".into()
+            url: "about:blank".into(),
+            extension: None
         }
         .validate()
         .is_ok());
         assert!(Request::Click {
             workspace_id: "bw-fixture".into(),
+            view_id: None,
             request_id: uuid::Uuid::new_v4().to_string(),
             x: f64::NAN,
             y: 2.0
@@ -774,6 +914,7 @@ mod tests {
         .is_err());
         assert!(Request::Scroll {
             workspace_id: "bw-fixture".into(),
+            view_id: None,
             request_id: uuid::Uuid::new_v4().to_string(),
             x: 1.0,
             y: 2.0,

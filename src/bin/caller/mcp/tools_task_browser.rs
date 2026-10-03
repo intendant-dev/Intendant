@@ -9,20 +9,36 @@ use crate::browser_workspace::task_access::{self, Request, Response};
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum InspectRequest {
     Status {},
-    Screenshot { workspace_id: String },
+    ExtensionViews {
+        workspace_id: String,
+    },
+    Screenshot {
+        workspace_id: String,
+        #[serde(default)]
+        view_id: Option<String>,
+    },
 }
 impl From<InspectRequest> for Request {
     fn from(value: InspectRequest) -> Self {
         match value {
             InspectRequest::Status {} => Request::Status {},
-            InspectRequest::Screenshot { workspace_id } => Request::Screenshot { workspace_id },
+            InspectRequest::ExtensionViews { workspace_id } => {
+                Request::ExtensionViews { workspace_id }
+            }
+            InspectRequest::Screenshot {
+                workspace_id,
+                view_id,
+            } => Request::Screenshot {
+                workspace_id,
+                view_id,
+            },
         }
     }
 }
 
 impl IntendantServer {
     #[tool(
-        description = "Use your own background browser on macOS without taking over the user's desktop. First call op=open with an http(s) URL or about:blank; Intendant automatically provisions one browser for your authenticated supervised session. Keep the returned workspace_id and include it in screenshot/input/close calls so stale requests cannot target a replacement. Then use status, screenshot, keyboard {request_id,action:{type:insert_text,text}|{type:key,key}|{type:select_all}}, click {request_id,x,y}, scroll {request_id,x,y,delta_y}, navigate {request_id,url} in the same original page, or close. Input UUIDs are single-use; never replay uncertain input with a new UUID. Coordinates are window-local logical points; screenshot metadata gives the window origin and pixel scale. No per-action workspace approval. Keys are bounded page keys (Enter, Tab, ShiftTab, Backspace, Delete, arrows, Home, End, PageUp, PageDown, Escape, Space). No global cursor, system shortcuts, clipboard, personal profiles or arbitrary native-app keyboard. The browser lives across task turns and is cleaned up when its session ends. Only the registered supervised-session credential is accepted; owner/anonymous identity is not substituted."
+        description = "Use your own browser with the authenticated supervised-session credential. Call op=open with url (http(s) or about:blank), then keep workspace_id on every screenshot/input/close request. Without an extension, this uses the macOS virtual monitor. Optional extension={archive_path,archive_sha256,archive_byte_length,manifest_version,version} selects an MV3 archive already approved by immutable daemon startup policy; it cannot grant itself approval. Extension workspaces use backend=headless_extension: no visible browser windows or native desktop input. For the real toolbar action call extension_popup with request_id, then inspect extension_views to discover current opaque view_id handles (including extension-created notification windows). Use view_id with screenshot, keyboard, click, scroll; omit it for the original website. extension_page with an explicit relative resource opens a normal extension tab, NOT an equivalent toolbar popup. Input/navigation use canonical single-use request_id UUIDs; do not replay uncertain actions. Keyboard action={type:insert_text,text}|{type:key,key}|{type:select_all}; keys Enter, Tab, ShiftTab, Backspace, Delete, arrows, Home, End, PageUp, PageDown, Escape, Space. Screenshot metadata defines coordinates: headless pages use page_css_pixels, native windows use window_logical_points. Navigate uses url and retains the original page. Close or session stop destroys this task's ephemeral browser/profile/extension state. Do not create or import a real funded wallet or its seed into this disposable profile. Password/protected receiver checks remain in force; wallet unlock, hardware signing and actual financial authorization are not granted by this tool. No personal profiles, generic script execution, caller endpoints, system shortcuts, clipboard, user-desktop fallback, or new per-action workspace approval."
     )]
     pub(crate) async fn task_browser(
         &self,
@@ -32,7 +48,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Read only your authenticated supervised session's task browser: op=status returns its redacted handle; op=screenshot with that workspace_id returns memory-only pixels. Cannot create a browser or send input. Current session identity and IAM are rechecked; no owner credential or other session's workspace is substituted."
+        description = "Read only your authenticated supervised session's task browser: op=status returns its redacted handle; op=screenshot with workspace_id and optional view_id returns memory-only pixels; op=extension_views lists only the owning task's current offscreen extension views. Cannot create a browser or send input. Current session identity and IAM are rechecked; no owner credential or other session's workspace is substituted."
     )]
     pub(crate) async fn inspect_task_browser(
         &self,
@@ -78,8 +94,8 @@ mod tests {
         let read = serde_json::to_value(IntendantServer::inspect_task_browser_tool_attr()).unwrap();
         assert_eq!(full["inputSchema"]["type"], "object");
         assert_eq!(read["inputSchema"]["type"], "object");
-        assert_eq!(full["inputSchema"]["oneOf"].as_array().unwrap().len(), 8);
-        assert_eq!(read["inputSchema"]["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(full["inputSchema"]["oneOf"].as_array().unwrap().len(), 11);
+        assert_eq!(read["inputSchema"]["oneOf"].as_array().unwrap().len(), 3);
         assert!(serde_json::from_value::<InspectRequest>(
             serde_json::json!({"op":"open","url":"about:blank"})
         )
@@ -96,5 +112,29 @@ mod tests {
             crate::mcp::mcp_tool_operation("inspect_task_browser"),
             crate::peer::access_policy::PeerOperation::DisplayView
         );
+    }
+    #[test]
+    fn popup_control_cannot_hide_in_read_only_schema_or_forge_a_target() {
+        for op in ["extension_popup", "extension_page", "keyboard"] {
+            assert!(serde_json::from_value::<InspectRequest>(
+                serde_json::json!({"op":op,"workspace_id":"bw-task","request_id":"id"})
+            )
+            .is_err());
+        }
+        assert!(serde_json::from_value::<InspectRequest>(
+            serde_json::json!({"op":"extension_views","workspace_id":"bw-task"})
+        )
+        .is_ok());
+        for key in [
+            "target_id",
+            "cdp_ws_url",
+            "runtime_id",
+            "expression",
+            "owner_surface",
+        ] {
+            let mut value = serde_json::json!({"op":"extension_popup","workspace_id":"bw-task","request_id":"id"});
+            value[key] = serde_json::json!("foreign");
+            assert!(serde_json::from_value::<Request>(value).is_err());
+        }
     }
 }
