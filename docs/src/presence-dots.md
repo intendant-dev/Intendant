@@ -43,7 +43,7 @@ The shipped application's bundles establish separate protocol families:
 | Lane | Observed app interface | Validation here |
 |---|---|---|
 | Cloud thread transport | Authenticated JSON-RPC WebSocket at `wss://codex-cloud-backend.chatgpt.com/` | Subscription login, initialize, thread list, and metadata read succeeded |
-| Dot profile and root mapping | `/tbo`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Shapes inspected; HTTP access not established |
+| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest account-bound primary GET returned JSON 200; identity cross-check implemented, live validation pending |
 | Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | Inspected, not sent |
 | Voice | `/tbo/{tbo_id}/voice/calls`, then call-specific attach and stop | SDP/Location lifecycle inspected, not called |
 | Desktop | `/tbo/{tbo_id}/computer/sessions?thread_id=...` | SDP and observe/control lifecycle inspected, not connected |
@@ -60,7 +60,7 @@ The bundled CLI's generated experimental App Server schema had 167 request
 methods and no dots/aeon/orbit control methods. `thread/startAeon` and
 `turn/addUserMessage` are cloud extensions, not local App Server methods.
 
-Direct read-only HTTP requests to the inspected profile routes, and the
+Earlier direct read-only HTTP requests to the inspected profile routes, and the
 cloud metadata HTTP route, returned **403 with HTML**, while WebSocket
 metadata reads succeeded. This does not establish whether the HTTP rejection
 is an edge/network restriction, account scope, or another requirement. It
@@ -81,8 +81,13 @@ The profile responses carry `cf-mitigated: challenge` with HTML, including
 an unauthenticated baseline request. This is a provider-edge challenge,
 not a dots eligibility result. The header's meaning is documented by
 [Cloudflare](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/).
-Legitimate HTTP admission remains unresolved; no alternate origin, copied
-cookie/proof, desktop impersonation, or automatic challenge solver was used.
+Those observations are historical, not a permanent admission verdict. After
+the startup account-binding fix, a live probe of commit `3e30f916` with
+desktop **26.930.31428** and its bundled Codex CLI **0.160.0** returned
+**JSON HTTP 200** from the pinned primary route. It downloaded no body, so
+that observation alone established neither stable identity nor eligibility.
+No alternate origin, copied cookie/proof, desktop impersonation, or automatic
+challenge solver was used.
 Desktop-app access alone neither proves nor disproves that an Intendant
 client can obtain the necessary provider admission.
 
@@ -92,6 +97,7 @@ The first implementation slice is an explicitly invoked controller command:
 intendant presence-dots doctor
 intendant presence-dots doctor --json
 intendant presence-dots doctor --http --json
+intendant presence-dots doctor --profile --json
 ```
 
 It needs the existing Codex ChatGPT subscription login but no running daemon,
@@ -126,6 +132,29 @@ status and response headers only, not a profile or challenge body.
 is `profile_response_unvalidated`, with `eligibility_validated` and
 `stable_dot_identity_validated` false. This command diagnoses the current
 gate; it neither solves a challenge nor enables a dots feature.
+
+`--profile` explicitly opts into bounded JSON metadata reads and implies
+`--http`. The primary endpoint is a **selection envelope**, not a flat dot
+profile. Its selected thread can be historical. The diagnostic resolves that
+thread's profile, reads the stable profile's current root, resolves the
+current root back to the same active `orbit` profile, and verifies the exact
+cloud thread with `thread/read` and `includeTurns: false`. Optional identity,
+active-root and room fields must agree when present. It then re-reads the
+root and primary selection and refuses observed rotation or selection changes
+during inspection, without automatic retry. These observations are not an
+atomic provider lock or a durable Presence binding.
+
+Only the pinned GET-only routes are available. Each successful JSON response
+is capped at 256 KiB, including unknown-length/chunked bodies; body errors,
+schema drift, redirects and challenges are sanitized. The HTTP/profile phase
+has a 90-second total deadline. Reports contain booleans and named outcomes,
+never dot/root/room IDs, names, transcripts or response bodies. A fully
+consistent result can set `stable_dot_identity_validated` and report whether
+the selected thread was historical and whether room metadata linked. It still
+leaves eligibility, Presence activation, messaging, voice and desktop
+validation false. Inspecting the primary selection does **not** authorize
+repurposing it: product activation and E2E use an explicitly selected separate
+test dot, without changing the account's primary selection.
 
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
