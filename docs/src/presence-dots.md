@@ -68,6 +68,24 @@ does not prove that the account lacks dots access. Do not silently work
 around the rejection, invent route aliases, or advertise those HTTP lanes
 as usable.
 
+### Account routing and the HTTP gate
+
+The follow-up read-only investigation used the bundled Codex App Server
+`account/read` and `configRequirements/read` methods. The returned workspace
+routing matched the selected subscription account and specified the same
+`https://chatgpt.com` origin with `NO_CONSTRAINT`; a routing mismatch was not
+the cause of this account's fixed-origin probe failure. The app normally
+performs that discovery before HTTP and invalidates it on account changes.
+
+The profile responses carry `cf-mitigated: challenge` with HTML, including
+an unauthenticated baseline request. This is a provider-edge challenge,
+not a dots eligibility result. The header's meaning is documented by
+[Cloudflare](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/).
+Legitimate HTTP admission remains unresolved; no alternate origin, copied
+cookie/proof, desktop impersonation, or automatic challenge solver was used.
+Desktop-app access alone neither proves nor disproves that an Intendant
+client can obtain the necessary provider admission.
+
 The first implementation slice is an explicitly invoked controller command:
 
 ```bash
