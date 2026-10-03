@@ -68,6 +68,21 @@ does not prove that the account lacks dots access. Do not silently work
 around the rejection, invent route aliases, or advertise those HTTP lanes
 as usable.
 
+The first implementation slice is an explicitly invoked controller command:
+
+```bash
+intendant presence-dots doctor
+intendant presence-dots doctor --json
+```
+
+It needs the existing Codex ChatGPT subscription login but no running daemon,
+model API key, or local ChatGPT GUI. The report deliberately excludes account
+IDs, titles, previews, environment IDs, and raw provider bodies. A successful
+report proves catalog/metadata access only. `presence_backend_enabled`,
+`message_send_validated`, `dots_voice_validated`, and
+`cloud_desktop_validated` remain false; it is not a setup-success signal for
+the proposed product plugin.
+
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
 legitimate provider authentication/integrity contract; copying the app's
