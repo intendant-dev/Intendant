@@ -13,7 +13,10 @@ struct Selection {
     thread: String,
     generation: String,
     selected_at: String,
-    dot: Option<String>,
+    // Optional internal aeon identity is NOT the TBO profile's route id.
+    // Preserve it only for primary-selection consistency; never build a URL
+    // or infer a stable profile, account or local authority from it.
+    runtime_aeon: Option<String>,
     room: Option<String>,
 }
 
@@ -97,7 +100,7 @@ impl SchemaObservation {
                     "available",
                     value.get("available").is_some_and(Value::is_boolean),
                 ),
-                ("aeon_id", optional_id(value, "aeon_id", false).is_ok()),
+                ("aeon_id", optional_opaque(value, "aeon_id").is_ok()),
                 (
                     "messaging_room_id",
                     optional_id(value, "messaging_room_id", false).is_ok(),
@@ -222,6 +225,16 @@ fn optional_id(value: &Value, field: &str, thread: bool) -> Result<Option<String
     }
 }
 
+fn optional_opaque(value: &Value, field: &str) -> Result<Option<String>, ()> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.len() <= 256 && !s.chars().any(char::is_control) => {
+            Ok(Some(s.clone()))
+        }
+        _ => Err(()),
+    }
+}
+
 fn bounded_token(value: &Value, field: &str) -> Option<String> {
     value
         .get(field)
@@ -250,7 +263,7 @@ fn parse_selection(value: &Value) -> Result<Selection, Failure> {
         thread: thread.into(),
         generation: bounded_token(value, "generation").ok_or(Failure::SelectionSchema)?,
         selected_at: bounded_token(value, "selected_at").ok_or(Failure::SelectionSchema)?,
-        dot: optional_id(value, "aeon_id", false).map_err(|_| Failure::SelectionSchema)?,
+        runtime_aeon: optional_opaque(value, "aeon_id").map_err(|_| Failure::SelectionSchema)?,
         room: optional_id(value, "messaging_room_id", false)
             .map_err(|_| Failure::SelectionSchema)?,
     })
@@ -319,12 +332,7 @@ fn cross_check(
     root: &str,
     current_profile: &Profile,
 ) -> Result<bool, Failure> {
-    if selected_profile.dot != current_profile.dot
-        || selection
-            .dot
-            .as_ref()
-            .is_some_and(|id| id != &current_profile.dot)
-    {
+    if selected_profile.dot != current_profile.dot {
         return Err(Failure::IdentityMismatch);
     }
     if [selected_profile, current_profile]
@@ -372,13 +380,6 @@ where
             .read(ProfileRoute::ByThread(&selection.thread))
             .await?,
     )?;
-    if selection
-        .dot
-        .as_ref()
-        .is_some_and(|id| id != &selected_profile.dot)
-    {
-        return Err(Failure::IdentityMismatch.report());
-    }
     let root = root_response(
         client
             .read(ProfileRoute::RootThread(&selected_profile.dot))
@@ -424,11 +425,12 @@ mod tests {
     const ROOT: &str = "00000000-0000-7000-8000-000000000002";
     const DOT: &str = "fixture-dot-private";
     const ROOM: &str = "fixture-room-private";
+    const RUNTIME: &str = "runtime:fixture/private-aeon";
 
     fn selection(thread: &str) -> Value {
         json!({"selection": {"thread_id": thread, "generation": "generation-1",
             "selected_at": "2026-10-03T00:00:00Z", "available": true,
-            "aeon_id": DOT, "messaging_room_id": ROOM}})
+            "aeon_id": RUNTIME, "messaging_room_id": ROOM}})
     }
 
     fn profile(root: &str) -> Value {
@@ -467,12 +469,39 @@ mod tests {
             "ü",
         ] {
             let mut changed = value.clone();
-            changed["selection"]["aeon_id"] = json!(invalid);
+            changed["selection"]["messaging_room_id"] = json!(invalid);
             assert!(parse_selection(&changed).is_err());
             assert!(!valid_segment(invalid));
         }
         assert!(!valid_thread_id(&format!("urn:uuid:{ROOT}")));
         assert!(!valid_segment(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn internal_aeon_metadata_is_opaque_not_a_profile_or_route_identity() {
+        let selected = parse_selection(&selection(ROOT)).ok().unwrap();
+        assert_eq!(selected.runtime_aeon.as_deref(), Some(RUNTIME));
+        assert!(!valid_segment(RUNTIME));
+        let first = parse_profile(&profile(ROOT)).ok().unwrap();
+        let current = parse_profile(&profile(ROOT)).ok().unwrap();
+        assert!(cross_check(&selected, &first, ROOT, &current).is_ok());
+        let mut changed = selection(ROOT);
+        changed["selection"]["aeon_id"] = json!("different:internal/aeon");
+        assert!(parse_selection(&changed).ok().unwrap() != selected);
+        for invalid in [
+            json!(true),
+            json!([RUNTIME]),
+            json!({"id": RUNTIME}),
+            json!("a".repeat(257)),
+            json!("private\r\nheader"),
+        ] {
+            changed["selection"]["aeon_id"] = invalid;
+            assert!(parse_selection(&changed).is_err());
+        }
+        for allowed in [Value::Null, json!(""), json!("../opaque-not-a-path")] {
+            changed["selection"]["aeon_id"] = allowed;
+            assert!(parse_selection(&changed).is_ok());
+        }
     }
 
     #[test]
@@ -617,6 +646,7 @@ mod tests {
                 assert!(request.contains("chatgpt-account-id: fixture-account\r\n"));
                 assert!(request.contains("originator: intendant\r\n"));
                 assert!(!request.contains("cookie:"));
+                assert!(!request.contains(&RUNTIME.to_ascii_lowercase()));
                 let body = value.to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
@@ -649,6 +679,7 @@ mod tests {
             ROOT,
             DOT,
             ROOM,
+            RUNTIME,
             "fixture-token",
             "fixture-account",
             "provider-secret",
@@ -689,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn drift_and_refused_root_metadata_do_not_claim_a_stable_binding() {
-        for scenario in 0..3 {
+        for scenario in 0..4 {
             let mut responses = prefix();
             if scenario != 2 {
                 responses.push((
@@ -697,9 +728,13 @@ mod tests {
                     json!({"root_thread_id": if scenario == 0 { OLD } else { ROOT }}),
                 ));
             }
-            if scenario == 1 {
+            if scenario == 1 || scenario == 3 {
                 let mut changed = selection(OLD);
-                changed["selection"]["generation"] = json!("generation-2");
+                if scenario == 1 {
+                    changed["selection"]["generation"] = json!("generation-2");
+                } else {
+                    changed["selection"]["aeon_id"] = json!("different:internal/aeon");
+                }
                 responses.push(("primary".into(), changed));
             }
             let (client, server) = fixture(responses).await;
@@ -715,7 +750,7 @@ mod tests {
                 report.state_label(),
                 match scenario {
                     0 => "dot_root_changed_during_inspection",
-                    1 => "primary_selection_changed_during_inspection",
+                    1 | 3 => "primary_selection_changed_during_inspection",
                     _ => "dot_current_root_metadata_refused",
                 }
             );

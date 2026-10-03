@@ -138,8 +138,12 @@ gate; it neither solves a challenge nor enables a dots feature.
 profile. Its selected thread can be historical. The diagnostic resolves that
 thread's profile, reads the stable profile's current root, resolves the
 current root back to the same active `orbit` profile, and verifies the exact
-cloud thread with `thread/read` and `includeTurns: false`. Optional identity,
-active-root and room fields must agree when present. It then re-reads the
+cloud thread with `thread/read` and `includeTurns: false`. Both by-thread
+profiles must name the same stable TBO profile ID; optional active-root and
+room fields must agree when present. The selection's optional `aeon_id` is
+separate, opaque internal metadata, not a TBO route ID. It is bounded, never
+used in a URL or as profile/account/local authority, and compared only as part
+of primary-selection consistency. The diagnostic then re-reads the
 root and primary selection and refuses observed rotation or selection changes
 during inspection, without automatic retry. These observations are not an
 atomic provider lock or a durable Presence binding.
@@ -167,6 +171,16 @@ It exposes no scalar values, string lengths, unknown keys, IDs or raw bodies.
 The headers-only `--http` probe and successful identity reports omit this
 observation. It is evidence for reconciling a private schema, not permission
 to activate Presence or to bind a dot from an ambiguous response.
+
+The live field-type observation at commit `107ba59b` found the selection
+envelope and all required fields valid; only `aeon_id` refused the diagnostic's
+assumed URL-path-atom contract. The app's profile/root requests route by the
+by-thread profile's `id`, not by that optional selection field. These namespaces
+must not be equated. The follow-up keeps stable identity rooted in the two
+matching active profiles, their root mapping and exact cloud metadata; it
+preserves the bounded opaque `aeon_id` solely to detect primary-selection
+changes. This reconciles the observed private contract, not a grant to bind
+Presence, route by arbitrary identifiers, or weaken account/root/room checks.
 
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
