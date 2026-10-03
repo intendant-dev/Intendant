@@ -87,6 +87,7 @@ mod pgp_identity;
 mod plugin_registry;
 pub(crate) use intendant_platform::platform;
 mod presence;
+mod presence_dots;
 mod project;
 mod prompts;
 mod provider;
@@ -536,6 +537,7 @@ fn print_help() {
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!("    auth                  Manage native provider authentication");
     println!("    codex-cloud           Submit and track ephemeral Codex Cloud workers");
+    println!("    presence-dots         Read-only experimental dots backend diagnostic");
     println!();
     println!("SESSION LOGS:");
     println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
@@ -4066,6 +4068,19 @@ async fn normal_main() -> Result<(), CallerError> {
     if env::args().nth(1).as_deref() == Some("codex-cloud") {
         let argv: Vec<String> = env::args().skip(2).collect();
         return match codex_cloud::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // Explicit read-only diagnostic; this does not select a Presence provider
+    // or start a daemon, dot, call, or desktop session.
+    if env::args().nth(1).as_deref() == Some("presence-dots") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match presence_dots::run(argv).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");

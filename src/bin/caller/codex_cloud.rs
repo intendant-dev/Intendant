@@ -1108,6 +1108,50 @@ impl std::fmt::Debug for CodexAuth {
     }
 }
 
+/// The read-only dots diagnostic reuses this controller-only credential
+/// loader, not the voice broker's closed App Server method vocabulary.
+/// Mark the entire subprotocol header sensitive: it contains the bearer.
+pub(crate) fn subscription_cloud_websocket_headers(
+) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap, String> {
+    cloud_websocket_headers(&load_codex_auth(&codex_home())?)
+}
+
+fn cloud_websocket_headers(
+    auth: &CodexAuth,
+) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap, String> {
+    use tokio_tungstenite::tungstenite::http::{
+        header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, HeaderValue,
+    };
+    // A WebSocket subprotocol is an HTTP token, not an arbitrary header
+    // value. Refuse separators/whitespace rather than forwarding malformed
+    // credential material or accidentally advertising another protocol.
+    if auth.access_token.is_empty()
+        || !auth
+            .access_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    {
+        return Err("Codex subscription access token is not a valid WebSocket credential".into());
+    }
+    let mut header = HeaderValue::from_str(&format!(
+        "codex-app-server, codex-client.intendant, openai-bearer.{}",
+        auth.access_token
+    ))
+    .map_err(|_| "Codex subscription access token cannot authenticate a WebSocket".to_string())?;
+    header.set_sensitive(true);
+    if auth.account_id.is_empty() {
+        return Err("Codex subscription account identity is missing".into());
+    }
+    let mut account = HeaderValue::from_str(&auth.account_id).map_err(|_| {
+        "Codex subscription account identity cannot authenticate a WebSocket".to_string()
+    })?;
+    account.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(SEC_WEBSOCKET_PROTOCOL, header);
+    headers.insert("chatgpt-account-id", account);
+    Ok(headers)
+}
+
 /// Upstream's own state-home convention (`CODEX_HOME`, default `~/.codex`).
 fn codex_home() -> PathBuf {
     if let Some(path) = std::env::var_os("CODEX_HOME") {
@@ -3791,6 +3835,48 @@ index 0000000..ce01362\n\
         .unwrap();
         let error = load_codex_auth(dir.path()).unwrap_err();
         assert!(error.contains("codex login"), "{error}");
+    }
+
+    #[test]
+    fn subscription_websocket_header_is_sensitive_and_honest() {
+        let auth = CodexAuth {
+            access_token: "header-secret.jwt".into(),
+            account_id: "account-secret".into(),
+        };
+        let headers = cloud_websocket_headers(&auth).unwrap();
+        let header = &headers["sec-websocket-protocol"];
+        assert!(header.is_sensitive());
+        assert_eq!(
+            header.to_str().unwrap(),
+            "codex-app-server, codex-client.intendant, openai-bearer.header-secret.jwt"
+        );
+        assert!(!format!("{header:?}").contains("header-secret"));
+        assert!(!header.to_str().unwrap().contains("account-secret"));
+        assert_eq!(headers["chatgpt-account-id"], "account-secret");
+        assert!(headers["chatgpt-account-id"].is_sensitive());
+        assert!(!format!("{headers:?}").contains("account-secret"));
+        for token in ["bad token", "bad,token", "bad\r\nheader", "bad/token"] {
+            let auth = CodexAuth {
+                access_token: token.into(),
+                account_id: "account-secret".into(),
+            };
+            let error = cloud_websocket_headers(&auth).unwrap_err();
+            assert!(!error.contains(token));
+        }
+        assert!(cloud_websocket_headers(&CodexAuth {
+            access_token: String::new(),
+            account_id: "account-secret".into(),
+        })
+        .is_err());
+        for account_id in ["", "account-secret\r\nheader"] {
+            let error = cloud_websocket_headers(&CodexAuth {
+                access_token: "header-secret.jwt".into(),
+                account_id: account_id.into(),
+            })
+            .unwrap_err();
+            assert!(!error.contains("account-secret"));
+            assert!(!error.contains("header-secret"));
+        }
     }
 
     #[test]

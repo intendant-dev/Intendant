@@ -22,6 +22,7 @@
 - [Externally driven CU sessions](./external-cu-session.md)
 - [Browser Extension Approval](./browser-extensions.md)
 - [Presence Layer](./presence.md)
+- [Dots Backend Integration Research](./presence-dots.md)
 - [Autonomy & Approvals](./autonomy.md)
 - [Web Dashboard](./web-dashboard.md)
 - [Station](./station.md)

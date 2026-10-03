@@ -9,6 +9,11 @@ and questions on the user's behalf.
 
 ## Why a Separate AI
 
+For the requested integration of OpenAI dots as a persistent Presence backend,
+see [Dots Backend Integration Research](./presence-dots.md). That work is
+separate from the existing ChatGPT-subscription voice lane below; dots is not
+currently an enabled Presence provider.
+
 Presence is a distinct model with its own conversation, system prompt, tool set,
 and token budget — **not** a chat wrapper around the worker agent. Two reasons:
 
