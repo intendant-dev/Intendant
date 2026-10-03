@@ -42,6 +42,8 @@ pub(super) struct HttpReport {
     root_rotation_observed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     messaging_room_linked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_observation: Option<profile::SchemaObservation>,
 }
 
 impl HttpReport {
@@ -54,6 +56,7 @@ impl HttpReport {
             stable_dot_identity_validated: false,
             root_rotation_observed: None,
             messaging_room_linked: None,
+            schema_observation: None,
         }
     }
 
@@ -63,6 +66,11 @@ impl HttpReport {
 
     pub(super) fn identity_validated(&self) -> bool {
         self.stable_dot_identity_validated
+    }
+
+    pub(super) fn with_schema(mut self, observation: profile::SchemaObservation) -> Self {
+        self.schema_observation = Some(observation);
+        self
     }
 
     pub(super) fn identity_verified(rotated: bool, room_linked: bool) -> Self {
