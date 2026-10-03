@@ -1124,6 +1124,42 @@ pub(crate) fn subscription_cloud_auth() -> Result<CodexAuth, String> {
 }
 
 impl CodexAuth {
+    /// Private continuity key for a dedicated dots binding, not an authority
+    /// claim. The JWT payload is unverified local login metadata; fresh routing
+    /// discovery and authenticated provider reads must still precede every
+    /// operation. Include the subject so switching people inside one workspace
+    /// cannot silently reuse another person's test-dot journal. Token refreshes
+    /// with the same subject/account retain the key. Never expose the raw claims.
+    pub(crate) fn dots_binding_fingerprint(&self) -> Result<String, String> {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let failed = || "subscription continuity identity unavailable".to_string();
+        let mut parts = self.access_token.split('.');
+        let _header = parts.next().ok_or_else(failed)?;
+        let payload = parts
+            .next()
+            .filter(|s| s.len() <= 16 * 1024)
+            .ok_or_else(failed)?;
+        let _signature = parts.next().ok_or_else(failed)?;
+        if parts.next().is_some() || self.account_id.is_empty() {
+            return Err(failed());
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| failed())?;
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| failed())?;
+        let subject = claims
+            .get("sub")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+            .ok_or_else(failed)?;
+        let closed = serde_json::json!(["intendant-dots-binding-v1", self.account_id, subject]);
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(closed.to_string().as_bytes())
+        ))
+    }
+
     pub(crate) fn websocket_headers(
         &self,
     ) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap, String> {
@@ -3871,6 +3907,51 @@ index 0000000..ce01362\n\
         .unwrap();
         let error = load_codex_auth(dir.path()).unwrap_err();
         assert!(error.contains("codex login"), "{error}");
+    }
+
+    #[test]
+    fn dots_binding_key_tracks_subject_and_account_not_token_refresh() {
+        use base64::Engine as _;
+        let auth = |subject: &str, account: &str, expiry: u64| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::json!({"sub":subject,"exp":expiry}).to_string());
+            CodexAuth {
+                access_token: format!("h.{payload}.s"),
+                account_id: account.into(),
+            }
+        };
+        let first = auth("fixture-private-person", "fixture-private-account", 1)
+            .dots_binding_fingerprint()
+            .unwrap();
+        assert_eq!(
+            first,
+            auth("fixture-private-person", "fixture-private-account", 2)
+                .dots_binding_fingerprint()
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            auth("another-person", "fixture-private-account", 1)
+                .dots_binding_fingerprint()
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            auth("fixture-private-person", "another-account", 1)
+                .dots_binding_fingerprint()
+                .unwrap()
+        );
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("private"));
+        for token in ["opaque", "h.not-base64!.s", "h.e30.s", "h.e30.s.extra"] {
+            let auth = CodexAuth {
+                access_token: token.into(),
+                account_id: "fixture-private-account".into(),
+            };
+            let error = auth.dots_binding_fingerprint().unwrap_err();
+            assert_eq!(error, "subscription continuity identity unavailable");
+            assert!(!error.contains(token));
+        }
     }
 
     #[test]

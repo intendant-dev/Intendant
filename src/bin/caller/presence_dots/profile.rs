@@ -5,6 +5,7 @@
 use super::http::{HttpReport, ProfileClient, ProfileRoute};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::future::Future;
 
 // No Debug/Serialize: these are private provider identities, not diagnostics.
@@ -24,6 +25,47 @@ struct Profile {
     dot: String,
     active_root: Option<String>,
     room: Option<String>,
+}
+
+// Controller-private identities. Never put these in diagnostic reports or
+// treat them as local IAM; the test-dot journal is the only persistence edge.
+pub(super) struct VerifiedDot {
+    pub(super) dot: String,
+    pub(super) root: String,
+    pub(super) room: Option<String>,
+}
+
+pub(super) struct PrimarySnapshot {
+    pub(super) identity: VerifiedDot,
+    pub(super) selection_guard: String,
+    pub(super) selected_thread: String,
+    rotated: bool,
+    room_linked: bool,
+}
+
+fn selection_guard(selection: &Selection) -> String {
+    // Hash only the closed, validated consistency vocabulary. Unknown profile
+    // keys, names, previews and unrelated account data are not retained.
+    let closed = serde_json::json!([
+        selection.thread,
+        selection.generation,
+        selection.selected_at,
+        selection.runtime_aeon,
+        selection.room
+    ]);
+    format!("{:x}", Sha256::digest(closed.to_string().as_bytes()))
+}
+
+pub(super) async fn read_selection_guard(client: &ProfileClient) -> Result<String, HttpReport> {
+    let selection = selection_response(client.read(ProfileRoute::Primary).await?)?;
+    Ok(selection_guard(&selection))
+}
+
+pub(super) async fn read_current_root(
+    client: &ProfileClient,
+    dot: &str,
+) -> Result<String, HttpReport> {
+    root_response(client.read(ProfileRoute::RootThread(dot)).await?)
 }
 
 /// Closed diagnostic vocabulary: field names are chosen here, and only JSON
@@ -122,7 +164,7 @@ impl SchemaObservation {
                     value
                         .get("id")
                         .and_then(Value::as_str)
-                        .is_some_and(valid_segment),
+                        .is_some_and(valid_resource_id),
                 ),
                 (
                     "aeon_kind",
@@ -193,8 +235,8 @@ impl Failure {
     }
 }
 
-// Path atoms are deliberately narrower than URL escaping. Unknown identity
-// encodings fail closed; neither a provider body nor argv can redirect auth.
+// Plain atoms still validate room metadata. TBO ids have a different private
+// contract: opaque strings encoded as ONE path component, never interpolated.
 pub(super) fn valid_segment(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -202,6 +244,14 @@ pub(super) fn valid_segment(id: &str) -> bool {
         && id
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
+pub(super) fn valid_resource_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 512
+        && id.trim() == id
+        && !matches!(id, "." | "..")
+        && !id.chars().any(char::is_control)
 }
 
 pub(super) fn valid_thread_id(id: &str) -> bool {
@@ -276,7 +326,7 @@ fn parse_profile(value: &Value) -> Result<Profile, Failure> {
     let dot = value
         .get("id")
         .and_then(Value::as_str)
-        .filter(|id| valid_segment(id))
+        .filter(|id| valid_resource_id(id))
         .ok_or(Failure::ProfileSchema)?;
     let kind = value.get("aeon_kind").and_then(Value::as_str);
     let status = value.get("status").and_then(Value::as_str);
@@ -363,13 +413,16 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    match inspect(client, verify_root).await {
-        Ok((rotated, room_linked)) => HttpReport::identity_verified(rotated, room_linked),
+    match inspect_primary(client, verify_root).await {
+        Ok(snapshot) => HttpReport::identity_verified(snapshot.rotated, snapshot.room_linked),
         Err(report) => report,
     }
 }
 
-async fn inspect<F, Fut>(client: &ProfileClient, verify_root: F) -> Result<(bool, bool), HttpReport>
+pub(super) async fn inspect_primary<F, Fut>(
+    client: &ProfileClient,
+    verify_root: F,
+) -> Result<PrimarySnapshot, HttpReport>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), String>>,
@@ -412,7 +465,55 @@ where
     if final_selection != selection {
         return Err(Failure::SelectionChanged.report());
     }
-    Ok((root != selection.thread, room_linked))
+    Ok(PrimarySnapshot {
+        rotated: root != selection.thread,
+        room_linked,
+        selection_guard: selection_guard(&selection),
+        selected_thread: selection.thread,
+        identity: VerifiedDot {
+            dot: current_profile.dot,
+            root,
+            room: current_profile.room,
+        },
+    })
+}
+
+/// Resolve a dedicated, explicitly journaled TBO id. Never substitute the
+/// current primary, a catalog candidate, or the opaque internal aeon id.
+pub(super) async fn inspect_dedicated<F, Fut>(
+    client: &ProfileClient,
+    dot: &str,
+    expected_label: &str,
+    verify_root: F,
+) -> Result<VerifiedDot, HttpReport>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let root = root_response(client.read(ProfileRoute::RootThread(dot)).await?)?;
+    let value = client.read(ProfileRoute::ByThread(&root)).await?;
+    if value.get("display_name").and_then(Value::as_str) != Some(expected_label) {
+        return Err(HttpReport::new("test_dot_label_mismatch", true, Some(200)));
+    }
+    let profile = profile_response(value)?;
+    if profile.dot != dot {
+        return Err(Failure::IdentityMismatch.report());
+    }
+    if profile.active_root.as_deref().is_some_and(|id| id != root) {
+        return Err(Failure::RootChanged.report());
+    }
+    verify_root(root.clone())
+        .await
+        .map_err(|_| Failure::RootMetadata.report())?;
+    let final_root = root_response(client.read(ProfileRoute::RootThread(dot)).await?)?;
+    if final_root != root {
+        return Err(Failure::RootChanged.report());
+    }
+    Ok(VerifiedDot {
+        dot: profile.dot,
+        root,
+        room: profile.room,
+    })
 }
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
-//! Read-only preparation for dots powering Presence: an explicitly invoked
-//! subscription-authenticated diagnostic. This is NOT a ChatProvider and
-//! does not enable a Presence backend. See docs/src/presence-dots.md.
+//! Preparation for dots powering Presence: read-only diagnostics and an
+//! explicitly invoked, journaled ADDITIONAL test-dot creation. This is NOT a
+//! ChatProvider and does not enable Presence. See docs/src/presence-dots.md.
 //!
 //! The private provider transport is pinned; there is no arbitrary URL,
-//! generic RPC, account switch, thread resume, message, voice, or input lane.
+//! generic RPC, account switch, primary selection, resume, message, voice, or input lane.
 //! Raw request/response bodies and credential-bearing errors never escape.
 
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +17,8 @@ use tokio_tungstenite::tungstenite::{
 mod http;
 mod profile;
 mod routing;
+mod test_dot;
+mod test_store;
 
 const CLOUD_URL: &str = "wss://codex-cloud-backend.chatgpt.com/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -72,7 +74,11 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
              --profile additionally reads bounded profile/root metadata,\n\
              checks its cloud thread, and verifies primary selection stability."
         );
+        println!("\nExplicit separate-dot preparation (does not enable Presence):\n  intendant presence-dots test-dot <create|status|reconcile> [--json]\n\ncreate records one additional-dot attempt; never changes primary selection.\nreconcile reads existing intent; never retries creation or sends messages.");
         return Ok(());
+    }
+    if argv[0] == "test-dot" {
+        return test_dot::run(&argv[1..]).await;
     }
     if argv[0] != "doctor"
         || argv[1..]

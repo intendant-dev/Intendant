@@ -23,6 +23,17 @@ pub(super) enum ProfileRoute<'a> {
     Primary,
     ByThread(&'a str),
     RootThread(&'a str),
+    List(Option<&'a str>),
+}
+
+// No Debug: successful bodies contain private provider identities. Every
+// failed POST is outcome-unknown, even a rejection, until read reconciliation.
+pub(super) enum CreationOutcome {
+    Received(Value, u16),
+    Unknown {
+        state: &'static str,
+        status: Option<u16>,
+    },
 }
 
 pub(super) struct ProfileClient {
@@ -117,9 +128,47 @@ async fn diagnose_inner(auth: &CodexAuth, read_profile: bool) -> HttpReport {
 }
 
 impl ProfileClient {
+    pub(super) async fn account_bound(auth: &CodexAuth) -> Result<Self, HttpReport> {
+        routing::discover(auth)
+            .await
+            .map_err(|failure| HttpReport::new(failure.label(), false, None))?;
+        let headers = auth
+            .diagnostic_http_headers()
+            .map_err(|_| HttpReport::new("subscription_credential_invalid", true, None))?;
+        let client = client_builder()
+            .build()
+            .map_err(|_| HttpReport::new("http_client_unavailable", true, None))?;
+        Ok(Self {
+            client,
+            base: "https://chatgpt.com/backend-api/tbo".into(),
+            headers,
+        })
+    }
+
     pub(super) async fn read(&self, route: ProfileRoute<'_>) -> Result<Value, HttpReport> {
-        let suffix = match route {
-            ProfileRoute::Primary => "primary".to_string(),
+        if let ProfileRoute::List(cursor) = route {
+            if cursor
+                .is_some_and(|s| s.is_empty() || s.len() > 512 || s.chars().any(char::is_control))
+            {
+                return Err(HttpReport::new("profile_cursor_invalid", true, None));
+            }
+            let mut url = reqwest::Url::parse(&self.base)
+                .map_err(|_| HttpReport::new("profile_route_identity_invalid", true, None))?;
+            url.query_pairs_mut().append_pair("limit", "25");
+            if let Some(cursor) = cursor {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            }
+            return read_json(&self.client, url.as_str(), self.headers.clone()).await;
+        }
+        let mut url = reqwest::Url::parse(&self.base)
+            .map_err(|_| HttpReport::new("profile_route_identity_invalid", true, None))?;
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| HttpReport::new("profile_route_identity_invalid", true, None))?;
+        match route {
+            ProfileRoute::Primary => {
+                segments.push("primary");
+            }
             ProfileRoute::ByThread(id) => {
                 if !profile::valid_thread_id(id) {
                     return Err(HttpReport::new(
@@ -128,25 +177,62 @@ impl ProfileClient {
                         None,
                     ));
                 }
-                format!("by-thread/{id}")
+                segments.push("by-thread").push(id);
             }
             ProfileRoute::RootThread(id) => {
-                if !profile::valid_segment(id) {
+                if !profile::valid_resource_id(id) {
                     return Err(HttpReport::new(
                         "profile_route_identity_invalid",
                         true,
                         None,
                     ));
                 }
-                format!("{id}/root-thread")
+                // Url's segment API escapes slash, query, fragment and percent
+                // characters. Provider ids cannot replace the pinned origin,
+                // base route, or this fixed suffix, even when not plain atoms.
+                segments.push(id).push("root-thread");
             }
+            ProfileRoute::List(_) => unreachable!("handled above"),
+        }
+        drop(segments);
+        read_json(&self.client, url.as_str(), self.headers.clone()).await
+    }
+
+    /// Exactly one explicitly additional-dot POST, not primary selection,
+    /// onboarding messages, attestation or an alternate transport. The caller
+    /// must durably journal intent BEFORE invoking this method.
+    pub(super) async fn create_additional(&self, label: &str) -> CreationOutcome {
+        let unknown = |state, status| CreationOutcome::Unknown { state, status };
+        let response = match self
+            .client
+            .post(&self.base)
+            .headers(self.headers.clone())
+            .header(ACCEPT, "application/json")
+            .timeout(Duration::from_secs(540))
+            .json(&serde_json::json!({
+                "display_name": label,
+                "create_thread": true,
+                "create_additional": true,
+                "should_initialize": true
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return unknown("creation_transport_outcome_unknown", None),
         };
-        read_json(
-            &self.client,
-            &format!("{}/{suffix}", self.base),
-            self.headers.clone(),
-        )
-        .await
+        let status = response.status();
+        let gate = classify(status, response.headers());
+        if gate.state != "profile_response_unvalidated" {
+            return unknown(gate.state, Some(status.as_u16()));
+        }
+        if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return unknown("creation_status_unconfirmed", Some(status.as_u16()));
+        }
+        match bounded_json(response).await {
+            Ok(value) => CreationOutcome::Received(value, status.as_u16()),
+            Err(_) => unknown("creation_response_outcome_unknown", Some(status.as_u16())),
+        }
     }
 
     #[cfg(test)]
@@ -163,6 +249,7 @@ fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(Policy::none())
+        .retry(reqwest::retry::never())
         .user_agent(format!(
             "intendant-dots-diagnostic/{}",
             env!("CARGO_PKG_VERSION")
@@ -193,7 +280,7 @@ async fn read_json(
     url: &str,
     headers: HeaderMap,
 ) -> Result<Value, HttpReport> {
-    let mut response = client
+    let response = client
         .get(url)
         .headers(headers)
         .header(ACCEPT, "application/json")
@@ -212,27 +299,28 @@ async fn read_json(
             Some(status.as_u16()),
         ));
     }
-    let failed = |state| HttpReport::new(state, true, Some(status.as_u16()));
+    bounded_json(response)
+        .await
+        .map_err(|state| HttpReport::new(state, true, Some(status.as_u16())))
+}
+
+async fn bounded_json(mut response: reqwest::Response) -> Result<Value, &'static str> {
     if response
         .content_length()
         .is_some_and(|n| n > MAX_PROFILE_BYTES as u64)
     {
-        return Err(failed("profile_body_oversized"));
+        return Err("profile_body_oversized");
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| failed("profile_body_failed"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| "profile_body_failed")? {
         if chunk.len() > MAX_PROFILE_BYTES.saturating_sub(body.len()) {
-            return Err(failed("profile_body_oversized"));
+            return Err("profile_body_oversized");
         }
         body.extend_from_slice(&chunk);
     }
     // serde_json retains its recursion bound. Never include parse errors or
     // raw JSON: provider content can reflect credentials or private text.
-    serde_json::from_slice(&body).map_err(|_| failed("profile_body_invalid_json"))
+    serde_json::from_slice(&body).map_err(|_| "profile_body_invalid_json")
 }
 
 fn classify(status: StatusCode, headers: &HeaderMap) -> HttpReport {
@@ -401,13 +489,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_profile_id_is_one_component_with_pinned_origin_and_suffix() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/tbo", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap();
+            let path = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let parsed = reqwest::Url::parse(&format!("http://fixture.invalid{path}")).unwrap();
+            assert_eq!(parsed.path_segments().unwrap().count(), 3);
+            assert!(parsed.path().starts_with("/tbo/fixture:"));
+            assert!(parsed.path().ends_with("/root-thread"));
+            assert!(parsed.path().contains("%2F"));
+            assert!(parsed.path().contains("%25"));
+            assert!(parsed.query().is_none());
+            assert!(parsed.fragment().is_none());
+            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+        });
+        let client = ProfileClient::fixture(base, HeaderMap::new());
+        client
+            .read(ProfileRoute::RootThread(
+                "fixture:dot/opaque?query#fragment%2f",
+            ))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        for bad in ["", ".", "..", "\nprivate", " leading", "trailing "] {
+            assert!(!profile::valid_resource_id(bad));
+        }
+        assert!(!profile::valid_resource_id(&"a".repeat(513)));
+    }
+
+    #[tokio::test]
     async fn profile_routes_refuse_path_injection_before_sending_any_request() {
         let client = ProfileClient::fixture("http://127.0.0.1:9/tbo".into(), HeaderMap::new());
         for route in [
             ProfileRoute::ByThread("../escape"),
             ProfileRoute::ByThread("00000000-0000-7000-8000-000000000001?query"),
-            ProfileRoute::RootThread("https://other.invalid"),
-            ProfileRoute::RootThread("dot%2fescape"),
+            ProfileRoute::RootThread(".."),
+            ProfileRoute::RootThread("dot\ninvalid"),
         ] {
             assert_eq!(
                 client.read(route).await.unwrap_err().state_label(),

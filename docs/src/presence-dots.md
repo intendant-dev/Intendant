@@ -1,7 +1,7 @@
 # Dots powering Presence: integration research
 
-Status (2026-10-03): **backend research and read-only diagnostic, not an
-enabled Presence provider.** The requested direction is to use OpenAI's actual
+Status (2026-10-03): **backend research, read-only diagnostic and explicit
+separate test-dot preparation, not an enabled Presence provider.** The requested direction is to use OpenAI's actual
 dots backend behind Intendant Presence, analogous to the Codex Cloud remote
 compute integration. Recreating dots with another model, capturing the
 ChatGPT window, or merely exposing Intendant's MCP tools to a dot is not the
@@ -43,7 +43,7 @@ The shipped application's bundles establish separate protocol families:
 | Lane | Observed app interface | Validation here |
 |---|---|---|
 | Cloud thread transport | Authenticated JSON-RPC WebSocket at `wss://codex-cloud-backend.chatgpt.com/` | Subscription login, initialize, thread list, and metadata read succeeded |
-| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest account-bound primary GET returned JSON 200; live primary metadata refused the inspected app-side schema, identity not yet established |
+| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest primary and by-thread GETs returned JSON 200; selection parsed, live profile ID refused the diagnostic's plain-atom assumption; full identity not yet established |
 | Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | Inspected, not sent |
 | Voice | `/tbo/{tbo_id}/voice/calls`, then call-specific attach and stop | SDP/Location lifecycle inspected, not called |
 | Desktop | `/tbo/{tbo_id}/computer/sessions?thread_id=...` | SDP and observe/control lifecycle inspected, not connected |
@@ -182,6 +182,17 @@ preserves the bounded opaque `aeon_id` solely to detect primary-selection
 changes. This reconciles the observed private contract, not a grant to bind
 Presence, route by arbitrary identifiers, or weaken account/root/room checks.
 
+The live probe at `f043c644` passed selection parsing and reached the by-thread
+profile with JSON 200. Its `aeon_kind`, status, root and room fields met the
+contract; only `id` refused our assumed plain URL-atom grammar. The app's request
+helper substitutes path-parameter strings directly into its template. Intendant
+does **not** copy that unsafe interpolation: TBO IDs are bounded opaque resource
+strings (512 bytes, no controls, no leading/trailing whitespace or exact `.`/`..`)
+and its pinned URL builder adds them as a single encoded path segment. Slash,
+query, fragment and percent characters cannot replace the origin, base route or
+fixed suffix. Equality checks compare the original IDs, not guessed aliases.
+This encoding fix still needs live acceptance of the full identity chain.
+
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
 legitimate provider authentication/integrity contract; copying the app's
@@ -189,6 +200,65 @@ proofs, spoofing desktop identity, and bypassing those checks are not an
 implementation plan. No public dots embedding/control API was found in the
 official documentation reviewed on this date. All inspected interfaces above
 are **private and version-sensitive**, not a supported API guarantee.
+
+## Explicit separate test-dot preparation
+
+The owner selected a **separate test dot** for E2E. This is an experimental,
+explicitly invoked preparation command, not product setup or Presence activation:
+
+```bash
+intendant presence-dots test-dot create --json
+intendant presence-dots test-dot status --json
+intendant presence-dots test-dot reconcile --json
+```
+
+`create` first verifies the held subscription's routing and the complete primary
+profile/current-root chain. It records a private, synced intent under the Intendant
+state root at `presence-dots/test-dot.json`, with a unique generated test label,
+before sending **one** `POST /tbo`. Its closed body uses `create_thread: true`,
+`create_additional: true` and `should_initialize: true`. This can initialize the
+new dot and its cloud resources; it never PUTs or DELETEs primary selection,
+repurposes an existing dot, sends a message, places a call or takes desktop control.
+The request uses honest Intendant identity, no redirects/cookies/native proofs,
+and an explicitly disabled HTTP retry policy. The app's observed creation deadline
+is nine minutes; the command gives that request the same bounded deadline.
+
+An advisory cross-process lock prevents concurrent preparations. Unix journal
+directories/files are created 0700/0600, and symlinks, hard-linked state files,
+loose Unix permissions, corrupt/oversized/unknown journal formats refuse instead
+of resetting intent. The existing synced staging seam preserves atomic reads;
+Unix also syncs the directory entry before the POST. Tests pass explicit temp roots
+and never read a real login, home, daemon store or provider endpoint.
+
+The journal's continuity hash includes the selected account and login subject,
+but never tokens or raw account/subject claims. Local JWT payload decoding is
+**unverified continuity metadata, not authority**: every operation still needs
+fresh matching App Server account routing and authenticated provider reads.
+Token refresh with the same subject/account preserves the hash; observed account
+or subject changes refuse. These observations are not an atomic account lock.
+
+A response, including an HTTP rejection, is not enough to silently discard an
+attempt. Transport loss, unexpected status/media/body/identity, cancellation or
+restart leaves existing intent; `create` refuses another POST while that journal
+exists. Do not erase an uncertain journal to retry. `reconcile` performs reads only:
+it scans at most four 25-profile pages for one exact, unique journal-generated
+label, then resolves that candidate's stable profile/current-root/room and exact
+cloud thread metadata. Missing, ambiguous, incomplete or drifting evidence stays
+unconfirmed and never triggers another creation attempt.
+
+Binding requires a distinct stable TBO ID and root from the protected primary,
+the exact generated label, matching room metadata, a stable current root and an
+unchanged primary-selection fingerprint. Root rotation between the creation
+receipt and later verification is allowed only through the same stable dot;
+observed rotation during verification refuses. Primary or identity/room conflicts
+require owner review, with no automatic restoration, deletion, pause or other
+corrective effect. The primary dot is never a fallback.
+
+`status` reads the journal without auth, provider access or lock/directory creation.
+It distinguishes a **recorded historical binding** from one **live-verified now**.
+Even a freshly verified separate dot leaves Presence, messaging, voice and desktop
+flags false. No product plugin should show setup success from this preparation.
+Creation and all full-provider lanes still require live acceptance.
 
 ## Implementation sequence and acceptance
 
