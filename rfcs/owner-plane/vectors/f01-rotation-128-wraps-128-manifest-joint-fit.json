@@ -1,0 +1,21 @@
+{
+  "case_kind": "cap-fit",
+  "expected": {
+    "result": {
+      "fits": true,
+      "sizes": {
+        "body": 57158
+      }
+    }
+  },
+  "family": 1,
+  "inputs": {
+    "template": "ckekrotate-128-128-worst"
+  },
+  "name": "rotation-128-wraps-128-manifest-joint-fit",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
