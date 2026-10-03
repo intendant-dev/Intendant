@@ -3,6 +3,7 @@
 //! names, account details, room contents, or raw responses enter the report.
 
 use super::http::{HttpReport, ProfileClient, ProfileRoute};
+use serde::Serialize;
 use serde_json::Value;
 use std::future::Future;
 
@@ -20,6 +21,141 @@ struct Profile {
     dot: String,
     active_root: Option<String>,
     room: Option<String>,
+}
+
+/// Closed diagnostic vocabulary: field names are chosen here, and only JSON
+/// type/contract booleans escape. Never copy a key, value, length, scalar or
+/// parse error from a provider body into this observation.
+#[derive(Debug, Serialize)]
+pub(super) struct SchemaObservation {
+    phase: &'static str,
+    document_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_type: Option<&'static str>,
+    fields: Vec<SchemaField>,
+}
+
+#[derive(Debug, Serialize)]
+struct SchemaField {
+    name: &'static str,
+    json_type: &'static str,
+    contract_valid: bool,
+}
+
+fn json_type(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+impl SchemaObservation {
+    fn new(
+        phase: &'static str,
+        document: &Value,
+        value: &Value,
+        checks: &[(&'static str, bool)],
+    ) -> Self {
+        Self {
+            phase,
+            document_type: json_type(Some(document)),
+            selection_type: None,
+            fields: checks
+                .iter()
+                .map(|&(name, contract_valid)| SchemaField {
+                    name,
+                    json_type: json_type(value.get(name)),
+                    contract_valid,
+                })
+                .collect(),
+        }
+    }
+
+    fn selection(document: &Value) -> Self {
+        let null = Value::Null;
+        let value = document.get("selection").unwrap_or(&null);
+        let mut observed = Self::new(
+            "primary_selection",
+            document,
+            value,
+            &[
+                (
+                    "thread_id",
+                    value
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_thread_id),
+                ),
+                ("generation", bounded_token(value, "generation").is_some()),
+                ("selected_at", bounded_token(value, "selected_at").is_some()),
+                (
+                    "available",
+                    value.get("available").is_some_and(Value::is_boolean),
+                ),
+                ("aeon_id", optional_id(value, "aeon_id", false).is_ok()),
+                (
+                    "messaging_room_id",
+                    optional_id(value, "messaging_room_id", false).is_ok(),
+                ),
+            ],
+        );
+        observed.selection_type = Some(json_type(document.get("selection")));
+        observed
+    }
+
+    fn profile(value: &Value) -> Self {
+        Self::new(
+            "dot_profile",
+            value,
+            value,
+            &[
+                (
+                    "id",
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_segment),
+                ),
+                (
+                    "aeon_kind",
+                    value.get("aeon_kind").and_then(Value::as_str) == Some("orbit"),
+                ),
+                (
+                    "status",
+                    value.get("status").and_then(Value::as_str) == Some("active"),
+                ),
+                (
+                    "active_root_thread_id",
+                    optional_id(value, "active_root_thread_id", true).is_ok(),
+                ),
+                (
+                    "messaging_room_id",
+                    optional_id(value, "messaging_room_id", false).is_ok(),
+                ),
+            ],
+        )
+    }
+
+    fn root(value: &Value) -> Self {
+        Self::new(
+            "current_root",
+            value,
+            value,
+            &[(
+                "root_thread_id",
+                matches!(value.get("root_thread_id"), Some(Value::Null))
+                    || value
+                        .get("root_thread_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_thread_id),
+            )],
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +289,30 @@ fn parse_root(value: &Value) -> Result<String, Failure> {
     }
 }
 
+fn selection_response(value: Value) -> Result<Selection, HttpReport> {
+    parse_selection(&value).map_err(|failure| {
+        failure
+            .report()
+            .with_schema(SchemaObservation::selection(&value))
+    })
+}
+
+fn profile_response(value: Value) -> Result<Profile, HttpReport> {
+    parse_profile(&value).map_err(|failure| {
+        failure
+            .report()
+            .with_schema(SchemaObservation::profile(&value))
+    })
+}
+
+fn root_response(value: Value) -> Result<String, HttpReport> {
+    parse_root(&value).map_err(|failure| {
+        failure
+            .report()
+            .with_schema(SchemaObservation::root(&value))
+    })
+}
+
 fn cross_check(
     selection: &Selection,
     selected_profile: &Profile,
@@ -206,14 +366,12 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    let selection =
-        parse_selection(&client.read(ProfileRoute::Primary).await?).map_err(Failure::report)?;
-    let selected_profile = parse_profile(
-        &client
+    let selection = selection_response(client.read(ProfileRoute::Primary).await?)?;
+    let selected_profile = profile_response(
+        client
             .read(ProfileRoute::ByThread(&selection.thread))
             .await?,
-    )
-    .map_err(Failure::report)?;
+    )?;
     if selection
         .dot
         .as_ref()
@@ -221,14 +379,12 @@ where
     {
         return Err(Failure::IdentityMismatch.report());
     }
-    let root = parse_root(
-        &client
+    let root = root_response(
+        client
             .read(ProfileRoute::RootThread(&selected_profile.dot))
             .await?,
-    )
-    .map_err(Failure::report)?;
-    let current_profile = parse_profile(&client.read(ProfileRoute::ByThread(&root)).await?)
-        .map_err(Failure::report)?;
+    )?;
+    let current_profile = profile_response(client.read(ProfileRoute::ByThread(&root)).await?)?;
     let room_linked = cross_check(&selection, &selected_profile, &root, &current_profile)
         .map_err(Failure::report)?;
 
@@ -238,17 +394,20 @@ where
 
     // Roots and selections are mutable provider state. Reject observed drift
     // without automatic retry; these are consistency observations, not locks.
-    let final_root = parse_root(
-        &client
+    let final_root = root_response(
+        client
             .read(ProfileRoute::RootThread(&current_profile.dot))
             .await?,
-    )
-    .map_err(Failure::report)?;
+    )?;
     if final_root != root {
         return Err(Failure::RootChanged.report());
     }
-    let final_selection = parse_selection(&client.read(ProfileRoute::Primary).await?)
-        .map_err(|_| Failure::SelectionChanged.report())?;
+    let final_value = client.read(ProfileRoute::Primary).await?;
+    let final_selection = parse_selection(&final_value).map_err(|_| {
+        Failure::SelectionChanged
+            .report()
+            .with_schema(SchemaObservation::selection(&final_value))
+    })?;
     if final_selection != selection {
         return Err(Failure::SelectionChanged.report());
     }
@@ -314,6 +473,78 @@ mod tests {
         }
         assert!(!valid_thread_id(&format!("urn:uuid:{ROOT}")));
         assert!(!valid_segment(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn schema_observations_use_only_closed_field_names_types_and_contract_booleans() {
+        let mut value = selection(ROOT);
+        value["selection"]["thread_id"] = json!("fixture-token private transcript");
+        value["selection"]["generation"] = json!(42);
+        value["selection"]["selected_at"] = json!({"fixture-account": "private dot name"});
+        value["selection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("available");
+        value["selection"]["fixture-account"] = json!("provider-secret");
+        let report = selection_response(value).err().unwrap();
+        assert_redacted(&report);
+        let observed = serde_json::to_value(&report).unwrap()["schema_observation"].clone();
+        assert_eq!(observed["phase"], "primary_selection");
+        assert_eq!(observed["document_type"], "object");
+        assert_eq!(observed["selection_type"], "object");
+        assert_eq!(
+            observed["fields"][0],
+            json!({"name": "thread_id", "json_type": "string", "contract_valid": false})
+        );
+        assert_eq!(
+            observed["fields"][1],
+            json!({"name": "generation", "json_type": "number", "contract_valid": false})
+        );
+        assert_eq!(
+            observed["fields"][2],
+            json!({"name": "selected_at", "json_type": "object", "contract_valid": false})
+        );
+        assert_eq!(
+            observed["fields"][3],
+            json!({"name": "available", "json_type": "missing", "contract_valid": false})
+        );
+        for value in [
+            Value::Null,
+            json!(["provider-secret"]),
+            json!({"provider-secret": "fixture-account"}),
+        ] {
+            let observed = SchemaObservation::selection(&value);
+            assert_eq!(observed.selection_type, Some("missing"));
+            assert!(!serde_json::to_string(&observed)
+                .unwrap()
+                .contains("provider-secret"));
+        }
+        let report = root_response(json!({"root_thread_id": {"provider-secret": "fixture-token"}}))
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["schema_observation"]["phase"],
+            "current_root"
+        );
+        assert_redacted(&report);
+        let report = profile_response(
+            json!({"id": "provider-secret", "aeon_kind": ["fixture-token"], "status": "active"}),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["schema_observation"]["phase"],
+            "dot_profile"
+        );
+        assert_redacted(&report);
+        for report in [
+            HttpReport::new("profile_response_unvalidated", true, Some(200)),
+            HttpReport::identity_verified(false, false),
+        ] {
+            assert!(serde_json::to_value(report)
+                .unwrap()
+                .get("schema_observation")
+                .is_none());
+        }
     }
 
     #[test]
@@ -420,6 +651,7 @@ mod tests {
             ROOM,
             "fixture-token",
             "fixture-account",
+            "provider-secret",
             "private transcript",
             "private dot name",
         ] {

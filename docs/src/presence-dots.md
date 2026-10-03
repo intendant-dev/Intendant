@@ -43,7 +43,7 @@ The shipped application's bundles establish separate protocol families:
 | Lane | Observed app interface | Validation here |
 |---|---|---|
 | Cloud thread transport | Authenticated JSON-RPC WebSocket at `wss://codex-cloud-backend.chatgpt.com/` | Subscription login, initialize, thread list, and metadata read succeeded |
-| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest account-bound primary GET returned JSON 200; identity cross-check implemented, live validation pending |
+| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest account-bound primary GET returned JSON 200; live primary metadata refused the inspected app-side schema, identity not yet established |
 | Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | Inspected, not sent |
 | Voice | `/tbo/{tbo_id}/voice/calls`, then call-specific attach and stop | SDP/Location lifecycle inspected, not called |
 | Desktop | `/tbo/{tbo_id}/computer/sessions?thread_id=...` | SDP and observe/control lifecycle inspected, not connected |
@@ -155,6 +155,18 @@ leaves eligibility, Presence activation, messaging, voice and desktop
 validation false. Inspecting the primary selection does **not** authorize
 repurposing it: product activation and E2E use an explicitly selected separate
 test dot, without changing the account's primary selection.
+
+Live acceptance of commit `9f716d9a` reached an authenticated JSON 200 but
+returned `primary_selection_schema_changed`; stable identity was not
+established. An earlier attempt conservatively refused a later account
+notification before HTTP. Do not widen the parser or ignore account updates
+just to obtain a green report. On metadata parse refusal, the diagnostic now
+adds a closed `schema_observation`: phase, document/selection JSON types,
+fixed allowlisted field names, their JSON types, and contract-valid booleans.
+It exposes no scalar values, string lengths, unknown keys, IDs or raw bodies.
+The headers-only `--http` probe and successful identity reports omit this
+observation. It is evidence for reconciling a private schema, not permission
+to activate Presence or to bind a dot from an ambiguous response.
 
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
