@@ -286,14 +286,44 @@ unconfirmed, and the private intent journal is preserved to prevent duplicate
 creation. No binding, message, call, desktop input, primary mutation, daemon
 replacement or Presence activation was performed.
 
-The next useful owner-assisted step is a separate test dot created through the
-official app, followed by fresh exact identity/binding review and independent
-admission tests for messaging, voice and desktop. Creation's 403 alone does not
-establish the outcome of those other lanes. If app setup changes primary
-selection, that is an explicit review/re-baseline condition, never permission to
-silently restore selection, erase pending intent or adopt an existing busy dot.
-The full integration remains open; accepted reads and passing CI are not an
-end-to-end Presence provider.
+The proposed next step of asking the owner to create an additional test dot in
+the official app was **withdrawn**: the owner checked the UI and could not perform
+that setup. It assumed an exposed additional-dot option that had not been
+verified. The [official setup guide](https://learn.chatgpt.com/docs/dots/getting-started)
+documents initial dot creation, not provisioning an additional test dot in an
+account that already has one. Do not repeat the withdrawn setup instructions.
+
+Read-only inspection of desktop 26.930.31428 found an `Add` dot-draft component,
+but its cloud path is conditional on account dots availability and provider-managed
+cloud-mode capability flags. Its legacy local path also depends on a custom app
+runtime. Bundled code is not evidence that either option is exposed to this owner
+or admits an additional backend dot. No hidden flags or app configuration were
+changed, and no gated function was invoked directly. The packaged scripting
+dictionary has generic Electron/browser commands, not a dots-specific
+creation/message/call/desktop integration interface. That is not an alternate
+authority or credential bridge. The creation403's cause remains unestablished;
+these static observations do not diagnose the backend rejection.
+
+The useful alternatives require an explicit choice or external access: a provider-
+supported isolated test resource/integration grant, or an already eligible separate
+test account in its own isolated login and state. A separate account would address
+test isolation, not prove programmatic write admission. It is not permission to
+change the current login, reuse/reset its uncertain journal, buy access or substitute
+the existing busy dot. Testing the existing dot would revise the owner's separate-
+dot decision; a new chat/root thread does not create a separate persistent dot and
+cannot guarantee that test effects stay out of its memory or background work.
+
+An official app/plugin bridge is a narrower, different option: the dot can use
+[connected plugins](https://learn.chatgpt.com/docs/dots/computers-and-apps#connect-apps),
+but that alone does not give Intendant a backend-control interface for the requested
+Presence text, voice and cloud-desktop experience. Do not silently substitute that
+integration direction, a GUI mirror, or the existing subscription-voice lane.
+
+Fresh exact binding and independent message, voice and desktop admission still need
+live acceptance. Creation's403 alone establishes none of their outcomes. Any
+selection change requires explicit owner review; there is no silent restoration or
+fallback. The full integration remains open; accepted reads, source inspection and
+passing CI are not an end-to-end Presence provider.
 
 ## Implementation sequence and acceptance
 
