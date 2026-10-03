@@ -11,10 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue},
-    protocol::WebSocketConfig,
-    Message,
+    client::IntoClientRequest, http::HeaderMap, protocol::WebSocketConfig, Message,
 };
 
 const CLOUD_URL: &str = "wss://codex-cloud-backend.chatgpt.com/";
@@ -71,8 +68,8 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
     if argv[0] != "doctor" || argv[1..].iter().any(|arg| arg != "--json") {
         return Err("Usage: intendant presence-dots doctor [--json]".into());
     }
-    let protocol = crate::codex_cloud::subscription_cloud_websocket_protocol()?;
-    let report = tokio::time::timeout(DIAGNOSTIC_TIMEOUT, diagnose(CLOUD_URL, protocol))
+    let headers = crate::codex_cloud::subscription_cloud_websocket_headers()?;
+    let report = tokio::time::timeout(DIAGNOSTIC_TIMEOUT, diagnose(CLOUD_URL, headers))
         .await
         .map_err(|_| "dots backend diagnostic exceeded its 60-second deadline".to_string())??;
     if argv.iter().any(|arg| arg == "--json") {
@@ -105,13 +102,11 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
 
 // Production only calls the pinned WSS origin above. The endpoint seam is
 // private and exists for hermetic loopback transport tests, never configuration.
-async fn diagnose(url: &str, protocol: HeaderValue) -> Result<DoctorReport, String> {
+async fn diagnose(url: &str, headers: HeaderMap) -> Result<DoctorReport, String> {
     let mut request = url
         .into_client_request()
         .map_err(|_| "invalid pinned dots transport URL".to_string())?;
-    request
-        .headers_mut()
-        .insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+    request.headers_mut().extend(headers);
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES));
@@ -229,7 +224,7 @@ where
         Err("dots transport exceeded the bounded read-only response window".into())
     })
     .await
-    .map_err(|_| "dots read-only request timed out; no write was sent".to_string())?
+    .map_err(|_| "dots read-only request timed out; no mutating request was sent".to_string())?
 }
 
 fn read_response(mut value: Value, expected_id: u64) -> Result<Option<Value>, String> {
@@ -317,6 +312,7 @@ fn validate_candidate_read(value: &Value, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
 
     const ID: &str = "00000000-0000-7000-8000-000000000001";
 
@@ -423,12 +419,14 @@ mod tests {
             }
             seen
         });
-        let report = diagnose(
-            &format!("ws://{address}/"),
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("codex-app-server"),
-        )
-        .await
-        .unwrap();
+        );
+        let report = diagnose(&format!("ws://{address}/"), headers)
+            .await
+            .unwrap();
         assert_eq!(
             server.await.unwrap(),
             ["initialize", "initialized", "thread/list", "thread/read"]
