@@ -14,6 +14,9 @@ use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderMap, protocol::WebSocketConfig, Message,
 };
 
+mod http;
+mod routing;
+
 const CLOUD_URL: &str = "wss://codex-cloud-backend.chatgpt.com/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -53,25 +56,36 @@ struct DoctorReport {
     message_send_validated: bool,
     dots_voice_validated: bool,
     cloud_desktop_validated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http: Option<http::HttpReport>,
 }
 
 pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
     if argv.is_empty() || argv.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: intendant presence-dots doctor [--json]\n\n\
+            "Usage: intendant presence-dots doctor [--json] [--http]\n\n\
              Read-only experimental dots backend diagnostic using the existing\n\
              Codex ChatGPT login. Creates no dot, sends no message, places no\n\
-             call, and takes no desktop control. Does not enable Presence."
+             call, and takes no desktop control. Does not enable Presence.\n\
+             --http also checks account routing and the HTTP admission gate."
         );
         return Ok(());
     }
-    if argv[0] != "doctor" || argv[1..].iter().any(|arg| arg != "--json") {
-        return Err("Usage: intendant presence-dots doctor [--json]".into());
+    if argv[0] != "doctor"
+        || argv[1..]
+            .iter()
+            .any(|arg| arg != "--json" && arg != "--http")
+    {
+        return Err("Usage: intendant presence-dots doctor [--json] [--http]".into());
     }
-    let headers = crate::codex_cloud::subscription_cloud_websocket_headers()?;
-    let report = tokio::time::timeout(DIAGNOSTIC_TIMEOUT, diagnose(CLOUD_URL, headers))
+    let auth = crate::codex_cloud::subscription_cloud_auth()?;
+    let headers = auth.websocket_headers()?;
+    let mut report = tokio::time::timeout(DIAGNOSTIC_TIMEOUT, diagnose(CLOUD_URL, headers))
         .await
         .map_err(|_| "dots backend diagnostic exceeded its 60-second deadline".to_string())??;
+    if argv.iter().any(|arg| arg == "--http") {
+        report.http = Some(http::diagnose(&auth).await);
+    }
     if argv.iter().any(|arg| arg == "--json") {
         println!(
             "{}",
@@ -96,6 +110,10 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
         println!("  Presence backend: NOT enabled");
         println!("  message admission, dots voice, cloud desktop: NOT validated");
         println!("  root threads are not stable dot identities");
+        if let Some(http) = &report.http {
+            println!("  HTTP admission: {}", http.state_label());
+            println!("  HTTP probe does not validate dots eligibility or a stable dot identity");
+        }
     }
     Ok(())
 }
@@ -175,6 +193,7 @@ async fn diagnose(url: &str, headers: HeaderMap) -> Result<DoctorReport, String>
             message_send_validated: false,
             dots_voice_validated: false,
             cloud_desktop_validated: false,
+            http: None,
         })
     }.await;
     // A private provider may not finish a close handshake. Do not hang the
