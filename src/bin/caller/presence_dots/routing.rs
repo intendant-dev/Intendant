@@ -128,6 +128,7 @@ struct Client<R, W> {
     writer: W,
     bytes: usize,
     notifications: usize,
+    account_bound: bool,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
@@ -138,6 +139,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
             writer,
             bytes: 0,
             notifications: 0,
+            account_bound: false,
         }
     }
 
@@ -182,7 +184,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
                     if object.contains_key("id") {
                         return Err(Failure::Protocol);
                     }
-                    if object.get("method").and_then(Value::as_str) == Some("account/updated") {
+                    if self.account_bound
+                        && object.get("method").and_then(Value::as_str) == Some("account/updated")
+                    {
                         return Err(Failure::AccountChanged);
                     }
                     self.notifications += 1;
@@ -231,6 +235,11 @@ async fn read_account<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .request(2, ReadRequest::Account, json!({"refreshToken": false}))
         .await?;
     validate_account(&account, auth)?;
+    // A fresh App Server can announce its initial auth mode before its
+    // first account snapshot. Notifications mint no account authority:
+    // only the validated snapshot binds this child to the held credential.
+    // Any subsequent account update refuses the remaining discovery.
+    client.account_bound = true;
     let requirements = client
         .request(3, ReadRequest::Requirements, json!({}))
         .await?;
@@ -401,9 +410,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_pipe_binds_snapshot_after_startup_status_and_refuses_later_changes() {
+        for (notify_at, mismatch, expected) in [
+            (1, false, Ok(())),
+            (2, false, Ok(())),
+            (3, false, Err(Failure::AccountChanged)),
+            (2, true, Err(Failure::AccountMismatch)),
+        ] {
+            let auth =
+                crate::codex_cloud::fixture_subscription_auth("fixture-token", "fixture-account");
+            let (client, server) = tokio::io::duplex(8192);
+            let (reader, writer) = tokio::io::split(client);
+            let fixture = tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(server);
+                let mut reader = BufReader::new(reader);
+                for (id, method, mut result) in [
+                    (1, "initialize", json!({"userAgent": "fixture"})),
+                    (2, "account/read", account_fixture()),
+                    (3, "configRequirements/read", json!({"requirements": null})),
+                ] {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["id"], id);
+                    assert_eq!(request["method"], method);
+                    if id == 2 {
+                        assert_eq!(request["params"]["refreshToken"], false);
+                        if mismatch {
+                            result["workspaceRouting"]["chatgptAccountId"] =
+                                json!("different-account");
+                        }
+                    }
+                    let response = format!("{}\n", json!({"id": id, "result": result}));
+                    let response = if id == notify_at {
+                        format!(
+                            "{}\n{response}",
+                            json!({"method": "account/updated", "params": {
+                                "authMode": "chatgpt", "planType": "fixture"
+                            }})
+                        )
+                    } else {
+                        response
+                    };
+                    writer.write_all(response.as_bytes()).await.unwrap();
+                    if id == 1 {
+                        line.clear();
+                        reader.read_line(&mut line).await.unwrap();
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&line).unwrap(),
+                            json!({"method": "initialized"})
+                        );
+                    }
+                    if mismatch && id == 2 {
+                        break;
+                    }
+                }
+            });
+            assert_eq!(read_account(reader, writer, &auth).await, expected);
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn routing_pipe_refuses_actions_drift_and_unbounded_output_without_reflection() {
         for response in [
             json!({"id": 1, "method": "item/tool/call", "params": {"secret": "provider-secret"}}),
+            json!({"id": 1, "method": "account/updated", "params": {"secret": "provider-secret"}}),
             json!({"id": 99, "result": {"secret": "provider-secret"}}),
             json!({"id": 1, "error": {"message": "provider-secret"}}),
             json!({"method": "account/updated", "params": {"secret": "provider-secret"}}),
@@ -418,6 +490,16 @@ mod tests {
         }
         let oversized = vec![b'x'; MAX_OUTPUT_BYTES + 1];
         let mut client = Client::new(oversized.as_slice(), tokio::io::sink());
+        assert_eq!(
+            client.request(1, ReadRequest::Initialize, json!({})).await,
+            Err(Failure::Protocol)
+        );
+        let initial_status = format!(
+            "{}\n",
+            json!({"method": "account/updated", "params": {"authMode": "chatgpt"}})
+        )
+        .repeat(MAX_NOTIFICATIONS + 1);
+        let mut client = Client::new(initial_status.as_bytes(), tokio::io::sink());
         assert_eq!(
             client.request(1, ReadRequest::Initialize, json!({})).await,
             Err(Failure::Protocol)

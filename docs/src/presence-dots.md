@@ -1,6 +1,6 @@
 # Dots powering Presence: integration research
 
-Status (2026-10-02): **backend research and read-only diagnostic, not an
+Status (2026-10-03): **backend research and read-only diagnostic, not an
 enabled Presence provider.** The requested direction is to use OpenAI's actual
 dots backend behind Intendant Presence, analogous to the Codex Cloud remote
 compute integration. Recreating dots with another model, capturing the
@@ -109,6 +109,14 @@ discovery. It starts an isolated, short-lived App Server child for only
 tool allowlists. A selected-account mismatch, unknown schema, or unhandled
 residency/network requirement refuses the HTTP probe. Only the researched
 normal account origin is supported in this diagnostic slice.
+
+A fresh App Server can announce its initial `account/updated` auth mode
+before its first account snapshot. The diagnostic counts and bounds those
+startup notifications, then binds only the `account/read` result that matches
+the held subscription credential and supported route. An update after that
+binding still refuses discovery. A new CLI version alone does not guarantee
+that the private workspace-routing fields are available; missing fields are
+not permission to guess the account's origin.
 
 Once account routing is verified, it sends one profile GET, with an honest
 Intendant identity and no redirects, cookies, or native proofs. It examines
