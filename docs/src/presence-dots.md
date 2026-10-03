@@ -43,11 +43,11 @@ The shipped application's bundles establish separate protocol families:
 | Lane | Observed app interface | Validation here |
 |---|---|---|
 | Cloud thread transport | Authenticated JSON-RPC WebSocket at `wss://codex-cloud-backend.chatgpt.com/` | Subscription login, initialize, thread list, and metadata read succeeded |
-| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Honest primary and by-thread GETs returned JSON 200; selection parsed, live profile ID refused the diagnostic's plain-atom assumption; full identity not yet established |
+| Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Full account/profile/current-root/room/cloud-metadata consistency chain passed live at `b0b06dc8` |
 | Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | Inspected, not sent |
 | Voice | `/tbo/{tbo_id}/voice/calls`, then call-specific attach and stop | SDP/Location lifecycle inspected, not called |
 | Desktop | `/tbo/{tbo_id}/computer/sessions?thread_id=...` | SDP and observe/control lifecycle inspected, not connected |
-| Lifecycle | Dot onboarding, pause/resume, and environment recreation | Inspected, not invoked |
+| Lifecycle | Additional-dot creation, onboarding, pause/resume, environment recreation | One journaled additional-dot POST returned 403; no matching creation observed; other lifecycle methods not invoked |
 
 The backend accepts an honest `codex-client.intendant` client identifier and
 the existing Codex subscription login. The cloud catalog returned `aeon`
@@ -191,7 +191,8 @@ strings (512 bytes, no controls, no leading/trailing whitespace or exact `.`/`..
 and its pinned URL builder adds them as a single encoded path segment. Slash,
 query, fragment and percent characters cannot replace the origin, base route or
 fixed suffix. Equality checks compare the original IDs, not guessed aliases.
-This encoding fix still needs live acceptance of the full identity chain.
+Live acceptance of that encoding fix at `b0b06dc8` subsequently passed the full
+identity chain, as recorded below.
 
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,
@@ -254,11 +255,45 @@ observed rotation during verification refuses. Primary or identity/room conflict
 require owner review, with no automatic restoration, deletion, pause or other
 corrective effect. The primary dot is never a fallback.
 
-`status` reads the journal without auth, provider access or lock/directory creation.
+`status` reads the journal without auth, provider access or test-dot lock/directory creation.
 It distinguishes a **recorded historical binding** from one **live-verified now**.
 Even a freshly verified separate dot leaves Presence, messaging, voice and desktop
 flags false. No product plugin should show setup success from this preparation.
 Creation and all full-provider lanes still require live acceptance.
+
+### Live acceptance and the remaining write gate
+
+PR #979 merged as `b0b06dc8` after full Linux, macOS and Windows runtime,
+Clippy, E2E and smoke validation. On the actual host with desktop
+26.930.31428 and bundled CLI 0.160.0, the CI-built binary's read-only profile
+check reported `profile_identity_verified`, matching account routing, JSON 200,
+stable dot identity, no observed root rotation and linked room metadata. An
+earlier attempt refused an observed startup account update before HTTP; one
+explicit read-only repeat passed. That notification guard was not disabled.
+
+The owner chose a separate test dot. Status first confirmed no previous intent;
+the explicitly journaled additional-dot creation then returned **HTTP 403**,
+`forbidden_unknown`, with primary selection verified unchanged. The response
+did not carry the diagnostic's explicit edge-challenge marker. Its cause is
+unestablished: this is not proof of plan ineligibility, native-integrity refusal,
+or permanent API impossibility. The client did not download an error/challenge
+body, retry the POST, change its identity, use another origin, copy app proofs or
+cookies, or fall back to a cloud RPC to bypass the refusal.
+
+Read-only reconciliation completed bounded profile pagination and observed no
+exact matching generated test label. The outcome remains conservatively
+unconfirmed, and the private intent journal is preserved to prevent duplicate
+creation. No binding, message, call, desktop input, primary mutation, daemon
+replacement or Presence activation was performed.
+
+The next useful owner-assisted step is a separate test dot created through the
+official app, followed by fresh exact identity/binding review and independent
+admission tests for messaging, voice and desktop. Creation's 403 alone does not
+establish the outcome of those other lanes. If app setup changes primary
+selection, that is an explicit review/re-baseline condition, never permission to
+silently restore selection, erase pending intent or adopt an existing busy dot.
+The full integration remains open; accepted reads and passing CI are not an
+end-to-end Presence provider.
 
 ## Implementation sequence and acceptance
 
