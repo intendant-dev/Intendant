@@ -1,4 +1,4 @@
-//! Stage A of dots powering Presence: an explicitly invoked, read-only
+//! Read-only preparation for dots powering Presence: an explicitly invoked
 //! subscription-authenticated diagnostic. This is NOT a ChatProvider and
 //! does not enable a Presence backend. See docs/src/presence-dots.md.
 //!
@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::{
 };
 
 mod http;
+mod profile;
 mod routing;
 
 const CLOUD_URL: &str = "wss://codex-cloud-backend.chatgpt.com/";
@@ -63,28 +64,31 @@ struct DoctorReport {
 pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
     if argv.is_empty() || argv.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: intendant presence-dots doctor [--json] [--http]\n\n\
+            "Usage: intendant presence-dots doctor [--json] [--http | --profile]\n\n\
              Read-only experimental dots backend diagnostic using the existing\n\
              Codex ChatGPT login. Creates no dot, sends no message, places no\n\
              call, and takes no desktop control. Does not enable Presence.\n\
-             --http also checks account routing and the HTTP admission gate."
+             --http checks account routing and HTTP response headers only.\n\
+             --profile additionally reads bounded profile/root metadata,\n\
+             checks its cloud thread, and verifies primary selection stability."
         );
         return Ok(());
     }
     if argv[0] != "doctor"
         || argv[1..]
             .iter()
-            .any(|arg| arg != "--json" && arg != "--http")
+            .any(|arg| arg != "--json" && arg != "--http" && arg != "--profile")
     {
-        return Err("Usage: intendant presence-dots doctor [--json] [--http]".into());
+        return Err("Usage: intendant presence-dots doctor [--json] [--http | --profile]".into());
     }
     let auth = crate::codex_cloud::subscription_cloud_auth()?;
     let headers = auth.websocket_headers()?;
     let mut report = tokio::time::timeout(DIAGNOSTIC_TIMEOUT, diagnose(CLOUD_URL, headers))
         .await
         .map_err(|_| "dots backend diagnostic exceeded its 60-second deadline".to_string())??;
-    if argv.iter().any(|arg| arg == "--http") {
-        report.http = Some(http::diagnose(&auth).await);
+    let read_profile = argv.iter().any(|arg| arg == "--profile");
+    if read_profile || argv.iter().any(|arg| arg == "--http") {
+        report.http = Some(http::diagnose(&auth, read_profile).await);
     }
     if argv.iter().any(|arg| arg == "--json") {
         println!(
@@ -112,7 +116,11 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
         println!("  root threads are not stable dot identities");
         if let Some(http) = &report.http {
             println!("  HTTP admission: {}", http.state_label());
-            println!("  HTTP probe does not validate dots eligibility or a stable dot identity");
+            println!(
+                "  stable dot identity validated: {}",
+                http.identity_validated()
+            );
+            println!("  HTTP/profile checks do not validate messaging, voice or desktop support");
         }
     }
     Ok(())
@@ -121,6 +129,58 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
 // Production only calls the pinned WSS origin above. The endpoint seam is
 // private and exists for hermetic loopback transport tests, never configuration.
 async fn diagnose(url: &str, headers: HeaderMap) -> Result<DoctorReport, String> {
+    let mut socket = connect(url, headers).await?;
+
+    let result = async {
+        initialize(&mut socket).await?;
+        let catalog = rpc(
+            &mut socket,
+            2,
+            ReadRequest::ListThreads,
+            json!({"limit": PAGE_LIMIT, "archived": false, "useStateDbOnly": true}),
+        )
+        .await?;
+        let (candidates, has_more) = parse_catalog(&catalog)?;
+        let mut metadata_verified = false;
+        if let Some(id) = candidates.first() {
+            let read = rpc(
+                &mut socket,
+                3,
+                ReadRequest::ReadThread,
+                json!({"threadId": id, "includeTurns": false}),
+            )
+            .await?;
+            validate_candidate_read(&read, id)?;
+            metadata_verified = true;
+        }
+        Ok(DoctorReport {
+            integration_status: "read_only_diagnostic",
+            transport: CLOUD_URL,
+            authenticated_catalog: true,
+            candidate_root_threads_on_page: candidates.len(),
+            catalog_has_more: has_more,
+            candidate_metadata_verified: metadata_verified,
+            presence_backend_enabled: false,
+            message_send_validated: false,
+            dots_voice_validated: false,
+            cloud_desktop_validated: false,
+            http: None,
+        })
+    }
+    .await;
+    // A private provider may not finish a close handshake. Do not hang the
+    // diagnostic or let cleanup replace its observed result.
+    let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
+    result
+}
+
+async fn connect(
+    url: &str,
+    headers: HeaderMap,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
     let mut request = url
         .into_client_request()
         .map_err(|_| "invalid pinned dots transport URL".to_string())?;
@@ -128,7 +188,7 @@ async fn diagnose(url: &str, headers: HeaderMap) -> Result<DoctorReport, String>
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES));
-    let (mut socket, _) = tokio::time::timeout(
+    let (socket, _) = tokio::time::timeout(
         REQUEST_TIMEOUT,
         tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
@@ -147,57 +207,62 @@ async fn diagnose(url: &str, headers: HeaderMap) -> Result<DoctorReport, String>
         }
     })?;
 
+    Ok(socket)
+}
+
+async fn initialize<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let initialized = rpc(
+        socket,
+        1,
+        ReadRequest::Initialize,
+        json!({
+            "clientInfo": {"name": "intendant-dots-diagnostic", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }),
+    ).await?;
+    if initialized
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err("dots initialize response has an unrecognized private schema".into());
+    }
+    socket
+        .send(Message::Text(
+            json!({"method": "initialized"}).to_string().into(),
+        ))
+        .await
+        .map_err(|_| "dots initialized notification could not be delivered".to_string())?;
+    Ok(())
+}
+
+async fn verify_current_root(auth: &crate::codex_cloud::CodexAuth, id: &str) -> Result<(), String> {
+    // The same held subscription credential binds the HTTP profile and this
+    // cloud read. No account reload, resume, turn contents, or generic RPC.
+    let headers = auth.websocket_headers()?;
+    verify_root_at(CLOUD_URL, headers, id).await
+}
+
+async fn verify_root_at(url: &str, headers: HeaderMap, id: &str) -> Result<(), String> {
+    if !profile::valid_thread_id(id) {
+        return Err("dots current-root identity schema changed".into());
+    }
+    let mut socket = connect(url, headers).await?;
     let result = async {
-        let initialized = rpc(
-            &mut socket,
-            1,
-            ReadRequest::Initialize,
-            json!({
-                "clientInfo": {"name": "intendant-dots-diagnostic", "version": env!("CARGO_PKG_VERSION")},
-                "capabilities": {"experimentalApi": true}
-            }),
-        ).await?;
-        if initialized.get("userAgent").and_then(Value::as_str).is_none() {
-            return Err("dots initialize response has an unrecognized private schema".into());
-        }
-        socket
-            .send(Message::Text(json!({"method": "initialized"}).to_string().into()))
-            .await
-            .map_err(|_| "dots initialized notification could not be delivered".to_string())?;
-        let catalog = rpc(
+        initialize(&mut socket).await?;
+        let read = rpc(
             &mut socket,
             2,
-            ReadRequest::ListThreads,
-            json!({"limit": PAGE_LIMIT, "archived": false, "useStateDbOnly": true}),
-        ).await?;
-        let (candidates, has_more) = parse_catalog(&catalog)?;
-        let mut metadata_verified = false;
-        if let Some(id) = candidates.first() {
-            let read = rpc(
-                &mut socket,
-                3,
-                ReadRequest::ReadThread,
-                json!({"threadId": id, "includeTurns": false}),
-            ).await?;
-            validate_candidate_read(&read, id)?;
-            metadata_verified = true;
-        }
-        Ok(DoctorReport {
-            integration_status: "read_only_diagnostic",
-            transport: CLOUD_URL,
-            authenticated_catalog: true,
-            candidate_root_threads_on_page: candidates.len(),
-            catalog_has_more: has_more,
-            candidate_metadata_verified: metadata_verified,
-            presence_backend_enabled: false,
-            message_send_validated: false,
-            dots_voice_validated: false,
-            cloud_desktop_validated: false,
-            http: None,
-        })
-    }.await;
-    // A private provider may not finish a close handshake. Do not hang the
-    // diagnostic or let cleanup replace its observed result.
+            ReadRequest::ReadThread,
+            json!({"threadId": id, "includeTurns": false}),
+        )
+        .await?;
+        validate_candidate_read(&read, id)
+    }
+    .await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
     result
 }
@@ -459,5 +524,54 @@ mod tests {
         assert!(!serde_json::to_string(&report)
             .unwrap()
             .contains("fixture-private"));
+    }
+
+    #[tokio::test]
+    async fn current_root_verification_reads_exact_metadata_without_listing_or_resuming() {
+        for source in ["aeon", "user"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut seen = Vec::new();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    seen.push(method.to_string());
+                    let result = match method {
+                        "initialize" => json!({"userAgent": "fixture"}),
+                        "initialized" => continue,
+                        "thread/read" => {
+                            assert_eq!(request["params"]["threadId"], ID);
+                            assert_eq!(request["params"]["includeTurns"], false);
+                            json!({"thread": {"id": ID, "threadSource": source, "preview": "private transcript"}})
+                        }
+                        _ => panic!("current-root verifier sent an unexpected method"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": request["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "thread/read" {
+                        break;
+                    }
+                }
+                seen
+            });
+            let result = verify_root_at(&url, HeaderMap::new(), ID).await;
+            assert_eq!(result.is_ok(), source == "aeon");
+            if let Err(error) = result {
+                assert!(!error.contains("private transcript"));
+            }
+            assert_eq!(
+                server.await.unwrap(),
+                ["initialize", "initialized", "thread/read"]
+            );
+        }
     }
 }

@@ -1,7 +1,8 @@
-//! A single account-bound profile GET. An edge challenge is not a dots
-//! eligibility decision. No body, cookies, attestation, or challenge solver.
+//! Account-bound, pinned profile GETs. The default probe reads headers only;
+//! explicit identity inspection downloads bounded JSON, never challenge or
+//! error bodies. No cookies, attestation, redirect, or challenge solver.
 
-use super::routing;
+use super::{profile, routing};
 use crate::codex_cloud::CodexAuth;
 use reqwest::{
     header::{HeaderMap, ACCEPT, CONTENT_TYPE},
@@ -9,10 +10,26 @@ use reqwest::{
     StatusCode,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::time::Duration;
 
 const PROFILE_URL: &str = "https://chatgpt.com/backend-api/tbo/primary";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const IDENTITY_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_PROFILE_BYTES: usize = 256 * 1024;
+
+// Closed GET-only routes, never arbitrary paths or caller-selected origins.
+pub(super) enum ProfileRoute<'a> {
+    Primary,
+    ByThread(&'a str),
+    RootThread(&'a str),
+}
+
+pub(super) struct ProfileClient {
+    client: reqwest::Client,
+    base: String,
+    headers: HeaderMap,
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct HttpReport {
@@ -21,25 +38,50 @@ pub(super) struct HttpReport {
     http_status: Option<u16>,
     eligibility_validated: bool,
     stable_dot_identity_validated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_rotation_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messaging_room_linked: Option<bool>,
 }
 
 impl HttpReport {
-    fn new(state: &'static str, routed: bool, status: Option<u16>) -> Self {
+    pub(super) fn new(state: &'static str, routed: bool, status: Option<u16>) -> Self {
         Self {
             state,
             account_routing_verified: routed,
             http_status: status,
             eligibility_validated: false,
             stable_dot_identity_validated: false,
+            root_rotation_observed: None,
+            messaging_room_linked: None,
         }
     }
 
     pub(super) fn state_label(&self) -> &'static str {
         self.state
     }
+
+    pub(super) fn identity_validated(&self) -> bool {
+        self.stable_dot_identity_validated
+    }
+
+    pub(super) fn identity_verified(rotated: bool, room_linked: bool) -> Self {
+        Self {
+            stable_dot_identity_validated: true,
+            root_rotation_observed: Some(rotated),
+            messaging_room_linked: Some(room_linked),
+            ..Self::new("profile_identity_verified", true, Some(200))
+        }
+    }
 }
 
-pub(super) async fn diagnose(auth: &CodexAuth) -> HttpReport {
+pub(super) async fn diagnose(auth: &CodexAuth, read_profile: bool) -> HttpReport {
+    tokio::time::timeout(IDENTITY_TIMEOUT, diagnose_inner(auth, read_profile))
+        .await
+        .unwrap_or_else(|_| HttpReport::new("profile_diagnostic_timed_out", false, None))
+}
+
+async fn diagnose_inner(auth: &CodexAuth, read_profile: bool) -> HttpReport {
     if let Err(failure) = routing::discover(auth).await {
         return HttpReport::new(failure.label(), false, None);
     }
@@ -52,7 +94,61 @@ pub(super) async fn diagnose(auth: &CodexAuth) -> HttpReport {
         Ok(client) => client,
         Err(_) => return HttpReport::new("http_client_unavailable", true, None),
     };
-    probe(&client, PROFILE_URL, headers).await
+    if !read_profile {
+        return probe(&client, PROFILE_URL, headers).await;
+    }
+    let profile_client = ProfileClient {
+        client,
+        base: "https://chatgpt.com/backend-api/tbo".into(),
+        headers,
+    };
+    profile::diagnose(&profile_client, |id| async move {
+        super::verify_current_root(auth, &id).await
+    })
+    .await
+}
+
+impl ProfileClient {
+    pub(super) async fn read(&self, route: ProfileRoute<'_>) -> Result<Value, HttpReport> {
+        let suffix = match route {
+            ProfileRoute::Primary => "primary".to_string(),
+            ProfileRoute::ByThread(id) => {
+                if !profile::valid_thread_id(id) {
+                    return Err(HttpReport::new(
+                        "profile_route_identity_invalid",
+                        true,
+                        None,
+                    ));
+                }
+                format!("by-thread/{id}")
+            }
+            ProfileRoute::RootThread(id) => {
+                if !profile::valid_segment(id) {
+                    return Err(HttpReport::new(
+                        "profile_route_identity_invalid",
+                        true,
+                        None,
+                    ));
+                }
+                format!("{id}/root-thread")
+            }
+        };
+        read_json(
+            &self.client,
+            &format!("{}/{suffix}", self.base),
+            self.headers.clone(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(base: String, headers: HeaderMap) -> Self {
+        Self {
+            client: client_builder().no_proxy().build().unwrap(),
+            base,
+            headers,
+        }
+    }
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
@@ -82,6 +178,53 @@ async fn probe(client: &reqwest::Client, url: &str, headers: HeaderMap) -> HttpR
         }
         Err(_) => HttpReport::new("http_transport_failed", true, None),
     }
+}
+
+async fn read_json(
+    client: &reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+) -> Result<Value, HttpReport> {
+    let mut response = client
+        .get(url)
+        .headers(headers)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| HttpReport::new("http_transport_failed", true, None))?;
+    let status = response.status();
+    let gate = classify(status, response.headers());
+    if gate.state != "profile_response_unvalidated" {
+        return Err(gate);
+    }
+    if status != StatusCode::OK {
+        return Err(HttpReport::new(
+            "profile_status_unexpected",
+            true,
+            Some(status.as_u16()),
+        ));
+    }
+    let failed = |state| HttpReport::new(state, true, Some(status.as_u16()));
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_PROFILE_BYTES as u64)
+    {
+        return Err(failed("profile_body_oversized"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| failed("profile_body_failed"))?
+    {
+        if chunk.len() > MAX_PROFILE_BYTES.saturating_sub(body.len()) {
+            return Err(failed("profile_body_oversized"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    // serde_json retains its recursion bound. Never include parse errors or
+    // raw JSON: provider content can reflect credentials or private text.
+    serde_json::from_slice(&body).map_err(|_| failed("profile_body_invalid_json"))
 }
 
 fn classify(status: StatusCode, headers: &HeaderMap) -> HttpReport {
@@ -188,6 +331,80 @@ mod tests {
             assert!(!report.eligibility_validated);
             assert!(!report.stable_dot_identity_validated);
             server.await.unwrap();
+        }
+    }
+
+    async fn json_fixture(response: Vec<u8>) -> Result<Value, HttpReport> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/profile", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            // An oversized declared body is intentionally never downloaded.
+            let _ = socket.write_all(&response).await;
+        });
+        let client = client_builder().no_proxy().build().unwrap();
+        let result = read_json(&client, &url, HeaderMap::new()).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn profile_json_bounds_known_and_chunked_bodies_and_sanitizes_failures() {
+        let result = json_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_object());
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            MAX_PROFILE_BYTES + 1
+        )
+        .into_bytes();
+        let mut chunked = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        chunked.extend_from_slice(format!("{:x}\r\n", MAX_PROFILE_BYTES + 1).as_bytes());
+        chunked.extend(vec![b'x'; MAX_PROFILE_BYTES + 1]);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let nested = format!("{}0{}", "[".repeat(200), "]".repeat(200));
+        let invalid = "fixture-token private transcript";
+        for (response, state) in [
+            (oversized, "profile_body_oversized"),
+            (chunked, "profile_body_oversized"),
+            (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{nested}", nested.len()).into_bytes(), "profile_body_invalid_json"),
+            (format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid}", invalid.len()).into_bytes(), "profile_body_invalid_json"),
+            (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{".to_vec(), "profile_body_failed"),
+            (b"HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n".to_vec(), "provider_edge_challenge"),
+            (b"HTTP/1.1 302 Found\r\nLocation: https://other.invalid/private\r\nContent-Length: 0\r\n\r\n".to_vec(), "redirect_refused"),
+        ] {
+            let report = json_fixture(response).await.unwrap_err();
+            assert_eq!(report.state_label(), state);
+            assert!(!report.identity_validated());
+            for secret in ["fixture-token", "private transcript", "other.invalid"] {
+                assert!(!serde_json::to_string(&report).unwrap().contains(secret));
+                assert!(!format!("{report:?}").contains(secret));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_routes_refuse_path_injection_before_sending_any_request() {
+        let client = ProfileClient::fixture("http://127.0.0.1:9/tbo".into(), HeaderMap::new());
+        for route in [
+            ProfileRoute::ByThread("../escape"),
+            ProfileRoute::ByThread("00000000-0000-7000-8000-000000000001?query"),
+            ProfileRoute::RootThread("https://other.invalid"),
+            ProfileRoute::RootThread("dot%2fescape"),
+        ] {
+            assert_eq!(
+                client.read(route).await.unwrap_err().state_label(),
+                "profile_route_identity_invalid"
+            );
         }
     }
 }
