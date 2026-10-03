@@ -48,19 +48,21 @@ pub(super) async fn diagnose(auth: &CodexAuth) -> HttpReport {
         Err(_) => return HttpReport::new("subscription_credential_invalid", true, None),
     };
     // Honest identity, no cookie jar, no arbitrary origin or redirect.
-    let client = match reqwest::Client::builder()
+    let client = match client_builder().build() {
+        Ok(client) => client,
+        Err(_) => return HttpReport::new("http_client_unavailable", true, None),
+    };
+    probe(&client, PROFILE_URL, headers).await
+}
+
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(Policy::none())
         .user_agent(format!(
             "intendant-dots-diagnostic/{}",
             env!("CARGO_PKG_VERSION")
         ))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return HttpReport::new("http_client_unavailable", true, None),
-    };
-    probe(&client, PROFILE_URL, headers).await
 }
 
 // Only production's pinned URL is used. The private URL seam is for
@@ -170,11 +172,12 @@ mod tests {
                 assert!(request.contains("authorization: bearer fixture-token\r\n"));
                 assert!(request.contains("chatgpt-account-id: fixture-account\r\n"));
                 assert!(request.contains("originator: intendant\r\n"));
+                assert!(request.contains("user-agent: intendant-dots-diagnostic/"));
                 assert!(!request.contains("cookie:"));
                 socket.write_all(response.as_bytes()).await.unwrap();
             });
             let auth = crate::codex_cloud::fixture_subscription_auth("fixture-token", "fixture-account");
-            let client = reqwest::Client::builder().no_proxy().redirect(Policy::none()).timeout(HTTP_TIMEOUT).build().unwrap();
+            let client = client_builder().no_proxy().build().unwrap();
             let report = probe(&client, &url, auth.diagnostic_http_headers().unwrap()).await;
             assert_eq!(report.state, if response.contains("403") { "provider_edge_challenge" } else { "redirect_refused" });
             let encoded = serde_json::to_string(&report).unwrap();

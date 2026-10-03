@@ -269,6 +269,12 @@ fn validate_requirements(response: &Value) -> Result<(), Failure> {
     match response.get("requirements") {
         Some(Value::Null) => Ok(()),
         Some(Value::Object(requirements)) => {
+            if requirements
+                .get("application")
+                .is_some_and(|value| !value.is_null() && !value.is_object())
+            {
+                return Err(Failure::Protocol);
+            }
             // Managed routing/network requirements need their own reviewed
             // enforcement, not a diagnostic that silently disregards them.
             if ["chatgptBaseUrl", "enforceResidency"]
@@ -348,6 +354,10 @@ mod tests {
             );
         }
         assert_eq!(validate_requirements(&json!({})), Err(Failure::Protocol));
+        assert_eq!(
+            validate_requirements(&json!({"requirements": {"application": false}})),
+            Err(Failure::Protocol)
+        );
     }
 
     #[tokio::test]
