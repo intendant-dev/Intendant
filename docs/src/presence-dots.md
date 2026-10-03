@@ -91,6 +91,7 @@ The first implementation slice is an explicitly invoked controller command:
 ```bash
 intendant presence-dots doctor
 intendant presence-dots doctor --json
+intendant presence-dots doctor --http --json
 ```
 
 It needs the existing Codex ChatGPT subscription login but no running daemon,
@@ -100,6 +101,23 @@ report proves catalog/metadata access only. `presence_backend_enabled`,
 `message_send_validated`, `dots_voice_validated`, and
 `cloud_desktop_validated` remain false; it is not a setup-success signal for
 the proposed product plugin.
+
+`--http` additionally needs a current Codex CLI with workspace-routing
+discovery. It starts an isolated, short-lived App Server child for only
+`initialize`, `account/read` without token refresh, and
+`configRequirements/read`; it does not widen the voice broker's method or
+tool allowlists. A selected-account mismatch, unknown schema, or unhandled
+residency/network requirement refuses the HTTP probe. Only the researched
+normal account origin is supported in this diagnostic slice.
+
+Once account routing is verified, it sends one profile GET, with an honest
+Intendant identity and no redirects, cookies, or native proofs. It examines
+status and response headers only, not a profile or challenge body.
+`provider_edge_challenge` specifically identifies `cf-mitigated: challenge`;
+`forbidden_unknown` does not guess the cause of another 403. Even a JSON 200
+is `profile_response_unvalidated`, with `eligibility_validated` and
+`stable_dot_identity_validated` false. This command diagnoses the current
+gate; it neither solves a challenge nor enables a dots feature.
 
 The app's message path also has integrity preparation and an optional
 app-attestation challenge. A working integration must use an available,

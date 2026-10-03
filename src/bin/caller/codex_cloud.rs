@@ -1108,12 +1108,48 @@ impl std::fmt::Debug for CodexAuth {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_subscription_auth(token: &str, account: &str) -> CodexAuth {
+    CodexAuth {
+        access_token: token.into(),
+        account_id: account.into(),
+    }
+}
+
 /// The read-only dots diagnostic reuses this controller-only credential
 /// loader, not the voice broker's closed App Server method vocabulary.
-/// Mark the entire subprotocol header sensitive: it contains the bearer.
-pub(crate) fn subscription_cloud_websocket_headers(
-) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap, String> {
-    cloud_websocket_headers(&load_codex_auth(&codex_home())?)
+/// Load once so both diagnostic lanes bind the same subscription snapshot.
+pub(crate) fn subscription_cloud_auth() -> Result<CodexAuth, String> {
+    load_codex_auth(&codex_home())
+}
+
+impl CodexAuth {
+    pub(crate) fn websocket_headers(
+        &self,
+    ) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap, String> {
+        cloud_websocket_headers(self)
+    }
+
+    pub(crate) fn matches_account(&self, account: &str) -> bool {
+        !account.is_empty() && account == self.account_id
+    }
+
+    pub(crate) fn diagnostic_http_headers(&self) -> Result<reqwest::header::HeaderMap, String> {
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+        // Share token/account validation with the established WS lane.
+        let validated = cloud_websocket_headers(self)?;
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", self.access_token))
+            .map_err(|_| "invalid subscription HTTP credential".to_string())?;
+        bearer.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, bearer);
+        headers.insert(
+            "chatgpt-account-id",
+            validated["chatgpt-account-id"].clone(),
+        );
+        headers.insert("originator", HeaderValue::from_static("intendant"));
+        Ok(headers)
+    }
 }
 
 fn cloud_websocket_headers(
@@ -3877,6 +3913,30 @@ index 0000000..ce01362\n\
             assert!(!error.contains("account-secret"));
             assert!(!error.contains("header-secret"));
         }
+    }
+
+    #[test]
+    fn subscription_http_headers_are_sensitive_and_bound_to_selected_account() {
+        let auth = test_auth();
+        let headers = auth.diagnostic_http_headers().unwrap();
+        assert!(headers["authorization"].is_sensitive());
+        assert!(headers["chatgpt-account-id"].is_sensitive());
+        assert_eq!(headers["originator"], "intendant");
+        assert_eq!(
+            headers["authorization"].to_str().unwrap(),
+            format!("Bearer {}", auth.access_token)
+        );
+        assert_eq!(headers["chatgpt-account-id"], auth.account_id);
+        assert!(!format!("{headers:?}").contains(&auth.access_token));
+        assert!(!format!("{headers:?}").contains(&auth.account_id));
+        assert!(auth.matches_account(&auth.account_id));
+        assert!(!auth.matches_account(""));
+        assert!(!auth.matches_account("other-account"));
+        assert!(
+            fixture_subscription_auth("bad\r\ncredential", "fixture-account")
+                .diagnostic_http_headers()
+                .is_err()
+        );
     }
 
     #[test]
