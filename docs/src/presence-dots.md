@@ -327,9 +327,7 @@ selection change requires explicit owner review; there is no silent restoration 
 fallback. The full integration remains open; accepted reads, source inspection and
 passing CI are not an end-to-end Presence provider.
 
-## Implementation sequence and acceptance
-
-### Owner-elected existing-dot text acceptance
+## Owner-elected existing-dot text acceptance
 
 On 2026-10-04 the owner explicitly permitted limited tests on the existing dot,
 revising the earlier separate-test-dot-only choice. The owner reported that it
@@ -376,6 +374,8 @@ reconciliation, voice, desktop, ongoing Presence or product setup. Every
 Presence/voice/desktop enablement flag remains false. Live acceptance must be
 recorded separately; static contract inspection and hermetic tests are not
 a usable provider.
+
+## Implementation sequence and acceptance
 
 1. **Read-only transport diagnostic.** Reuse controller-held subscription
    credentials; identify as Intendant; allow only initialize, thread list,
