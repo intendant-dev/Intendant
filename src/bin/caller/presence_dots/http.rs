@@ -36,6 +36,15 @@ pub(super) enum CreationOutcome {
     },
 }
 
+// A receipt is private, bounded provider data, never a diagnostic or IAM grant.
+pub(super) enum ProbeOutcome {
+    Received(Value, u16),
+    Unknown {
+        state: &'static str,
+        status: Option<u16>,
+    },
+}
+
 pub(super) struct ProfileClient {
     client: reqwest::Client,
     base: String,
@@ -233,6 +242,83 @@ impl ProfileClient {
             Ok(value) => CreationOutcome::Received(value, status.as_u16()),
             Err(_) => unknown("creation_response_outcome_unknown", Some(status.as_u16())),
         }
+    }
+
+    fn message_url(&self, room: &str) -> Result<reqwest::Url, HttpReport> {
+        if !profile::valid_segment(room) {
+            return Err(HttpReport::new("probe_room_identity_invalid", true, None));
+        }
+        let mut url = reqwest::Url::parse(&self.base)
+            .map_err(|_| HttpReport::new("probe_route_invalid", true, None))?;
+        url.path_segments_mut()
+            .map_err(|_| HttpReport::new("probe_route_invalid", true, None))?
+            .pop()
+            .push("messaging")
+            .push("rooms")
+            .push(room)
+            .push("messages");
+        Ok(url)
+    }
+
+    /// One fixed, clearly labeled probe. No arbitrary text, native proofs,
+    /// integrity flags, resume, alternate transport or automatic retry.
+    /// Durable intent and fresh primary identity must precede this call.
+    pub(super) async fn send_existing_probe(&self, room: &str, attempt: &str) -> ProbeOutcome {
+        let unknown = |state, status| ProbeOutcome::Unknown { state, status };
+        let url = match self.message_url(room) {
+            Ok(url) => url,
+            Err(_) => return unknown("probe_room_identity_invalid", None),
+        };
+        if !profile::valid_thread_id(attempt) {
+            return unknown("probe_request_identity_invalid", None);
+        }
+        let response = match self
+            .client
+            .post(url)
+            .headers(self.headers.clone())
+            .header(ACCEPT, "application/json")
+            .timeout(Duration::from_secs(30))
+            .json(&super::text_probe::request_body(attempt))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return unknown("probe_transport_outcome_unknown", None),
+        };
+        let status = response.status();
+        let gate = classify(status, response.headers());
+        if gate.state != "profile_response_unvalidated" {
+            return unknown(gate.state, Some(status.as_u16()));
+        }
+        if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return unknown("probe_status_unconfirmed", Some(status.as_u16()));
+        }
+        match bounded_json(response).await {
+            Ok(value) => ProbeOutcome::Received(value, status.as_u16()),
+            Err(_) => unknown("probe_receipt_outcome_unknown", Some(status.as_u16())),
+        }
+    }
+
+    /// Bounded room reads only. Provider text is data and never leaves the
+    /// caller's closed receipt/nonce matcher or authorizes a local action.
+    pub(super) async fn read_probe_messages(
+        &self,
+        room: &str,
+        around: Option<&str>,
+    ) -> Result<Value, HttpReport> {
+        if around.is_some_and(|id| !profile::valid_resource_id(id)) {
+            return Err(HttpReport::new(
+                "probe_message_identity_invalid",
+                true,
+                None,
+            ));
+        }
+        let mut url = self.message_url(room)?;
+        url.query_pairs_mut().append_pair("limit", "20");
+        if let Some(around) = around {
+            url.query_pairs_mut().append_pair("around", around);
+        }
+        read_json(&self.client, url.as_str(), self.headers.clone()).await
     }
 
     #[cfg(test)]

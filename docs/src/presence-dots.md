@@ -1,7 +1,8 @@
 # Dots powering Presence: integration research
 
-Status (2026-10-03): **backend research, read-only diagnostic and explicit
-separate test-dot preparation, not an enabled Presence provider.** The requested direction is to use OpenAI's actual
+Status (2026-10-04): **backend research, read-only diagnostics, journaled
+test preparation and explicitly elected one-shot text acceptance, not an enabled
+Presence provider.** The requested direction is to use OpenAI's actual
 dots backend behind Intendant Presence, analogous to the Codex Cloud remote
 compute integration. Recreating dots with another model, capturing the
 ChatGPT window, or merely exposing Intendant's MCP tools to a dot is not the
@@ -157,8 +158,9 @@ consistent result can set `stable_dot_identity_validated` and report whether
 the selected thread was historical and whether room metadata linked. It still
 leaves eligibility, Presence activation, messaging, voice and desktop
 validation false. Inspecting the primary selection does **not** authorize
-repurposing it: product activation and E2E use an explicitly selected separate
-test dot, without changing the account's primary selection.
+repurposing it: binding and test effects require an explicit owner selection.
+Separate-dot preparation remains the isolated default; the separately elected
+existing-dot diagnostic below is not a product activation or a primary mutation.
 
 Live acceptance of commit `9f716d9a` reached an authenticated JSON 200 but
 returned `primary_selection_schema_changed`; stable identity was not
@@ -325,6 +327,54 @@ selection change requires explicit owner review; there is no silent restoration 
 fallback. The full integration remains open; accepted reads, source inspection and
 passing CI are not an end-to-end Presence provider.
 
+## Owner-elected existing-dot text acceptance
+
+On 2026-10-04 the owner explicitly permitted limited tests on the existing dot,
+revising the earlier separate-test-dot-only choice. The owner reported that it
+may be active. The [official task guide](https://learn.chatgpt.com/docs/dots/tasks-and-memory)
+supports talking to a dot while its background agents work; that is not a promise
+that voice calls or desktop takeover share resources without interference.
+Profile status "active" also does not establish whether its main task is running.
+
+The experimental CLI exposes one fixed connectivity message, not arbitrary
+messaging or a generic transport:
+
+```bash
+intendant presence-dots existing-dot status --json
+intendant presence-dots existing-dot send-probe --allow-existing-dot --json
+intendant presence-dots existing-dot observe-probe --json
+```
+
+The election flag makes the existing-dot effect explicit; it does not mint
+provider or daemon authority or substitute for the owner's permission. Before
+the POST, the command verifies held-account routing and the full primary,
+current-root, room and cloud metadata chain. A unique request/idempotency ID
+and private binding are synced to a separate journal,
+presence-dots/existing-dot-probe.json. It never alters the uncertain
+additional-creation journal, test-dot.json.
+
+The fixed message identifies itself as an Intendant connectivity test and asks
+for an exact nonce acknowledgement, with no tools, file/app/computer access,
+stopping, reprioritization or changes to existing work. It can still leave
+conversation and memory traces. It sends only once with honest Intendant
+identity: no native flags, copied app proofs/cookies, integrity workaround,
+automatic resume, retry, alternate RPC, call or desktop input. Any receipt
+loss, rejection or restart preserves intent; there is no reset/resend verb.
+
+Status reads historical local state only. Observation performs fresh identity
+checks and one bounded 20-message room read (256 KiB maximum), matching only
+the exact user probe and assistant nonce. It emits no IDs or transcripts and
+executes no remote instructions. A limited read window that lacks evidence
+does not establish nondelivery or allow another POST. Account, selection,
+root or room drift requires review, never automatic restoration.
+
+Passing this probe validates only its observed message/acknowledgement lane.
+It does not validate reconnect/idempotency under real loss, background-task
+reconciliation, voice, desktop, ongoing Presence or product setup. Every
+Presence/voice/desktop enablement flag remains false. Live acceptance must be
+recorded separately; static contract inspection and hermetic tests are not
+a usable provider.
+
 ## Implementation sequence and acceptance
 
 1. **Read-only transport diagnostic.** Reuse controller-held subscription
@@ -333,11 +383,13 @@ passing CI are not an end-to-end Presence provider.
    reject server-initiated requests, never emit raw credentials or RPC bodies,
    and distinguish a reachable catalog from a usable Presence backend.
 2. **Stable identity and admission.** Resolve account/user/dot/root identities;
-   bind explicitly to a dedicated dot rather than silently selecting the
-   account's primary dot. Establish the legitimate HTTP/integrity lane. Prove
+   bind explicitly to an owner-selected dot, preferably dedicated, rather than
+   silently selecting the account's primary dot. Limited existing-dot tests
+   require explicit election and must preserve its ongoing work. Establish the
+   legitimate HTTP/integrity lane. Prove
    an isolated message send, acknowledgement, response, reconnect, root
    rotation, and outcome-unknown handling without duplicate sends. Never
-   interrupt or repurpose an existing busy dot for a test.
+   interrupt or silently repurpose an existing busy dot for a test.
 3. **Presence text and worker reconciliation.** Preserve provider-owned
    conversation history instead of replaying `ChatProvider` transcripts into
    it. Map background dot work and Intendant workers as separate task

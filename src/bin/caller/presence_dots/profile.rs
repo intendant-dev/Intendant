@@ -43,6 +43,12 @@ pub(super) struct PrimarySnapshot {
     room_linked: bool,
 }
 
+impl PrimarySnapshot {
+    pub(super) fn room_linked(&self) -> bool {
+        self.room_linked
+    }
+}
+
 fn selection_guard(selection: &Selection) -> String {
     // Hash only the closed, validated consistency vocabulary. Unknown profile
     // keys, names, previews and unrelated account data are not retained.

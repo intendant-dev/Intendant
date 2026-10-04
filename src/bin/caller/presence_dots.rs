@@ -3,7 +3,8 @@
 //! ChatProvider and does not enable Presence. See docs/src/presence-dots.md.
 //!
 //! The private provider transport is pinned; there is no arbitrary URL,
-//! generic RPC, account switch, primary selection, resume, message, voice, or input lane.
+//! generic RPC, account switch, primary selection, resume, voice, or input lane.
+//! Existing-dot text acceptance is a separately elected, fixed one-shot probe.
 //! Raw request/response bodies and credential-bearing errors never escape.
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,10 +16,12 @@ use tokio_tungstenite::tungstenite::{
 };
 
 mod http;
+mod probe_store;
 mod profile;
 mod routing;
 mod test_dot;
 mod test_store;
+mod text_probe;
 
 const CLOUD_URL: &str = "wss://codex-cloud-backend.chatgpt.com/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -75,10 +78,14 @@ pub(crate) async fn run(argv: Vec<String>) -> Result<(), String> {
              checks its cloud thread, and verifies primary selection stability."
         );
         println!("\nExplicit separate-dot preparation (does not enable Presence):\n  intendant presence-dots test-dot <create|status|reconcile> [--json]\n\ncreate records one additional-dot attempt; never changes primary selection.\nreconcile reads existing intent; never retries creation or sends messages.");
+        println!("\nExplicit existing-dot text acceptance (does not enable Presence):\n  intendant presence-dots existing-dot send-probe --allow-existing-dot [--json]\n  intendant presence-dots existing-dot <status|observe-probe> [--json]\n\nOne fixed, journaled connectivity message. Requires owner election; can leave\nconversation/memory traces. Never resumes/stops work, places a call, changes\nprimary selection or sends desktop input. No automatic retry or journal reset.");
         return Ok(());
     }
     if argv[0] == "test-dot" {
         return test_dot::run(&argv[1..]).await;
+    }
+    if argv[0] == "existing-dot" {
+        return text_probe::run(&argv[1..]).await;
     }
     if argv[0] != "doctor"
         || argv[1..]

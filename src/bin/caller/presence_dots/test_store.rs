@@ -113,7 +113,7 @@ pub(super) struct Store {
     _lock: File,
 }
 
-fn check_private(path: &Path, directory: bool) -> Result<(), &'static str> {
+pub(super) fn check_private(path: &Path, directory: bool) -> Result<(), &'static str> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
