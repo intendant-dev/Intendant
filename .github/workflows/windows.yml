@@ -475,6 +475,32 @@ jobs:
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
 
+      # Live platform diagnostics should reuse the exact binaries exercised
+      # above, not rebuild on the owner's overloaded machine or reach into a
+      # protected runner account. Only public build outputs cross this seam;
+      # these unsigned development artifacts are NOT install trust anchors.
+      - name: Stage e2e-tested macOS binaries
+        if: github.event_name == 'merge_group' && runner.os == 'macOS' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir=$(mktemp -d "$RUNNER_TEMP/intendant-validation.XXXXXX")
+          binary_dir="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug"
+          cp "$binary_dir/intendant" "$binary_dir/intendant-runtime" "$artifact_dir/"
+          printf '%s\n' "$GITHUB_SHA" > "$artifact_dir/REVISION"
+          (cd "$artifact_dir" && shasum -a 256 intendant intendant-runtime > SHA256SUMS)
+          echo "MACOS_VALIDATION_ARTIFACT_DIR=$artifact_dir" >> "$GITHUB_ENV"
+
+      - name: Upload e2e-tested macOS binaries
+        if: github.event_name == 'merge_group' && runner.os == 'macOS' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validated-macos-${{ github.sha }}
+          path: ${{ env.MACOS_VALIDATION_ARTIFACT_DIR }}/
+          if-no-files-found: error
+          compression-level: 3
+          retention-days: 3
+
       # The dev doctrine's bare `cargo build` and (historically) the install
       # scripts compile the FULL workspace natively with no `--target` — a
       # unit-graph / feature-unification configuration none of the

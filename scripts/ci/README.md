@@ -7,6 +7,21 @@ snowflake config. **The repo is public: host-specific values (account
 names, LAN addresses, listener labels) belong in `/etc/intendant-ci/`
 on the host, never in these files.**
 
+## Live diagnostic binaries
+
+Successful, code-relevant macOS merge-group legs export the exact controller
+and runtime used by the headless E2E suite as `validated-macos-<group-sha>`
+GitHub Actions artifacts (three-day retention). They contain only those two
+public build outputs, a `REVISION` file and `SHA256SUMS`; no runner state,
+configuration, credentials or logs. Verify the workflow/group revision, the
+checksums and the binary's reported commit before a live diagnostic. Run a
+temporary copy without replacing or restarting the owner's daemon.
+
+These are unsigned development outputs, not release/install trust anchors.
+Their purpose is to avoid redundant local builds and private runner-cache
+access for platform-specific acceptance. Docs-only and PR check-only macOS
+legs do not export binaries.
+
 ## fleet-watchdog
 
 The in-job disk preflight (`windows.yml`) fails a job
