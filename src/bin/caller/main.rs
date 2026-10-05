@@ -537,7 +537,7 @@ fn print_help() {
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!("    auth                  Manage native provider authentication");
     println!("    codex-cloud           Submit and track ephemeral Codex Cloud workers");
-    println!("    presence-dots         Read-only experimental dots backend diagnostic");
+    println!("    presence-dots         Experimental dots diagnostics and explicitly elected test probes");
     println!();
     println!("SESSION LOGS:");
     println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
