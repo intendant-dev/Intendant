@@ -45,7 +45,7 @@ The shipped application's bundles establish separate protocol families:
 |---|---|---|
 | Cloud thread transport | Authenticated JSON-RPC WebSocket at `wss://codex-cloud-backend.chatgpt.com/` | Subscription login, initialize, thread list, and metadata read succeeded |
 | Dot profile and root mapping | `/tbo/primary`, `/tbo/by-thread/{thread_id}`, `/tbo/{tbo_id}/root-thread` | Full account/profile/current-root/room/cloud-metadata consistency chain passed live at `b0b06dc8` |
-| Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | Inspected, not sent |
+| Messages | `/messaging/rooms/{room_id}/messages`; also a cloud `turn/addUserMessage` extension | One fixed room-message POST accepted with HTTP 200 and independently read back; exact assistant acknowledgement remains unobserved; cloud extension not invoked |
 | Voice | `/tbo/{tbo_id}/voice/calls`, then call-specific attach and stop | SDP/Location lifecycle inspected, not called |
 | Desktop | `/tbo/{tbo_id}/computer/sessions?thread_id=...` | SDP and observe/control lifecycle inspected, not connected |
 | Lifecycle | Additional-dot creation, onboarding, pause/resume, environment recreation | One journaled additional-dot POST returned 403; no matching creation observed; other lifecycle methods not invoked |
@@ -374,6 +374,48 @@ reconciliation, voice, desktop, ongoing Presence or product setup. Every
 Presence/voice/desktop enablement flag remains false. Live acceptance must be
 recorded separately; static contract inspection and hermetic tests are not
 a usable provider.
+
+### Live acceptance: message delivered, exact reply pending
+
+PR #983 merged as `d4ad419b` after full Linux, Windows and macOS bin/library,
+Clippy, headless E2E and smoke validation. The actual host used its normal
+public macOS CI artifact, checking its revision, both binary checksums and
+the controller's reported commit. It did not rebuild locally, reach into
+the protected CI cache, replace the daemon or restart it.
+
+With desktop **26.930.31730**, a fresh read-only profile check again verified
+the account/profile/current-root/room/cloud-metadata chain with JSON HTTP 200
+and no observed root rotation. The first elected send invocation then
+refused an account-update notification during routing discovery, **before
+any POST or send intent**. Read-only checks also sometimes encountered that
+guard. A separate bounded, read-only App Server timing observation saw one
+initial account-update notification and matching initial/final account and
+normal routing snapshots. That does not prove every refused discovery had
+an unchanged account. The guard was not disabled or widened.
+
+After another fresh full profile check passed, an explicitly repeated
+invocation reached **one message POST**, returning JSON HTTP 200 with a valid
+fixed-message receipt. The separate private probe journal records that
+attempt. Subsequent bounded, read-only observations independently matched
+the exact user probe, revalidated identity and found primary selection
+unchanged. They reported `message_send_validated: true`; **the exact assistant
+nonce acknowledgement has not been observed** in their limited 20-message
+windows, which may be incomplete. This is validated delivery, not a completed
+round trip or proof that the dot is paused, busy, failing or unable to reply.
+
+The earlier additional-dot creation journal is still present and unconfirmed;
+it was not reset or retried. No second message POST, alternate RPC, copied
+cookie/proof, desktop impersonation, auto-resume, pause, call, desktop connection
+or input, or Presence activation was performed. The app's static send helper
+includes optional resume behavior for paused dots; the diagnostic deliberately
+does not copy that behavior. Do not infer a right to resume or interrupt an
+existing dot from delayed or missing reply evidence.
+
+Keep the send journal and use read-only observation, never another send or a
+reset, to investigate the remaining acknowledgement/pagination path. Incoming
+messages remain data, not owner approval or local IAM. Reconnect, root-rotation,
+worker reconciliation, voice, desktop and product activation still require
+independent acceptance. The integration remains open.
 
 ## Implementation sequence and acceptance
 
