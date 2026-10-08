@@ -1,6 +1,10 @@
 .DS_Store
 target/
 node_modules/
+# wasm-pack output of the owner-plane browser lane (built by its
+# driver.cjs at run time; never committed — unlike static/wasm-*,
+# nothing embeds these bytes).
+rfcs/owner-plane/browser-lane/pkg/
 __pycache__/
 *.py[cod]
 # Ignore runtime state in any .intendant/ dir, but track the repo's

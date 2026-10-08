@@ -1,0 +1,16 @@
+{
+  "case_kind": "canonical-encode",
+  "expected": {
+    "bytes": "a462706b0163616c6702677a6f6e655f69640371726563697069656e745f6b656d5f6b657904"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "a462706b0163616c6702677a6f6e655f69640371726563697069656e745f6b656d5f6b657904"
+  },
+  "name": "map-key-encoded-byte-order",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
