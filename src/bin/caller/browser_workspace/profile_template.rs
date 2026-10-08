@@ -16,6 +16,8 @@ use super::{
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct ProfileTemplate {
+    // Parsing rejects this feature off Linux; only the Linux snapshot uses it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     path: PathBuf,
     sha256: String,
     byte_length: u64,
