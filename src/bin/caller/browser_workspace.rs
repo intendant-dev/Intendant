@@ -198,7 +198,7 @@ pub struct BrowserWorkspace {
     pub extension: Option<BrowserWorkspaceExtension>,
     /// Public byte-identity receipt, without the private template path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_template: Option<BrowserWorkspaceProfileTemplate>,
+    pub profile_template: Option<Box<BrowserWorkspaceProfileTemplate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_executable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1330,7 +1330,7 @@ async fn create_workspace_inner(
 
     if let Some(template) = profile_template.as_ref() {
         match template.materialize(&profile_dir) {
-            Ok(receipt) => workspace.profile_template = Some(receipt),
+            Ok(receipt) => workspace.profile_template = Some(Box::new(receipt)),
             Err(error) => {
                 reservation.cleanup(&error.to_string()).await;
                 return Err(error);

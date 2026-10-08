@@ -145,7 +145,7 @@ impl ProfileTemplate {
     fn snapshot(&self) -> Result<Vec<u8>, BrowserWorkspaceError> {
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(invalid("profile templates require Linux"));
+            Err(invalid("profile templates require Linux"))
         }
         #[cfg(target_os = "linux")]
         {
