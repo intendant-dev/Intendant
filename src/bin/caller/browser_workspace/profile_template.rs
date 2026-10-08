@@ -115,6 +115,26 @@ impl ProfileTemplate {
         // another user can replace beneath a writable parent.
         #[cfg(target_os = "linux")]
         let pinned = PinnedDestination::open(destination)?;
+        let result = self.materialize_contents(
+            destination,
+            #[cfg(target_os = "linux")]
+            &pinned,
+        );
+        #[cfg(target_os = "linux")]
+        if result.is_err() {
+            // Even a renamed reservation stays ours through the retained fd.
+            // Do not leave private Chrome state stranded outside the guard's
+            // original pathname when extraction or final identity checks fail.
+            pinned.clean_contents()?;
+        }
+        result
+    }
+
+    fn materialize_contents(
+        &self,
+        destination: &Path,
+        #[cfg(target_os = "linux")] pinned: &PinnedDestination,
+    ) -> Result<BrowserWorkspaceProfileTemplate, BrowserWorkspaceError> {
         let bytes = self.snapshot()?;
         if bytes.len() as u64 != self.byte_length
             || format!("{:x}", Sha256::digest(&bytes)) != self.sha256
@@ -224,6 +244,20 @@ struct PinnedDestination(fs::File);
 impl PinnedDestination {
     fn open(path: &Path) -> Result<Self, BrowserWorkspaceError> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        // Chrome will later launch by path. Third-party writable non-sticky
+        // ancestors could rename an owned child even with its private mode.
+        for ancestor in path.ancestors().skip(1) {
+            let m = fs::symlink_metadata(ancestor)
+                .map_err(|_| invalid("cannot inspect profile destination ancestry"))?;
+            if !m.is_dir()
+                || m.file_type().is_symlink()
+                || (m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0)
+            {
+                return Err(invalid(
+                    "profile-template destination requires stable non-writable or sticky ancestors",
+                ));
+            }
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -273,6 +307,31 @@ impl PinnedDestination {
             || held.mode() & 0o7777 != 0o700
         {
             return Err(invalid("profile-template destination identity changed"));
+        }
+        Ok(())
+    }
+
+    fn clean_contents(&self) -> Result<(), BrowserWorkspaceError> {
+        // The pin admitted an empty, private, owned directory. Only the newly
+        // imported attempt data is removed; never follow its replaced path.
+        let entries = fs::read_dir(self.fd_path())
+            .map_err(|_| invalid("cannot enumerate owned failed profile import for cleanup"))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|_| invalid("cannot inspect owned failed import entry"))?
+                .path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|_| invalid("cannot inspect owned failed import object"))?;
+            let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            result.map_err(|_| {
+                invalid(
+                    "owned failed profile import cleanup incomplete; manual inspection required",
+                )
+            })?;
         }
         Ok(())
     }
@@ -391,6 +450,27 @@ mod tests {
             0o700
         );
         assert!(pinned.verify_path(&destination).is_err());
+        pinned.clean_contents().unwrap();
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&attacker).unwrap().count(), 0);
         assert!(spec.materialize(&destination).is_err());
+    }
+
+    #[test]
+    fn import_refuses_unstable_writable_ancestry_before_reading_archive() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut spec) = fixture(&[
+            ("Local State", b"private"),
+            ("Default/Preferences", b"private"),
+        ]);
+        let parent = root.path().join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let destination = parent.join("fresh");
+        fresh(&destination);
+        spec.path = root.path().join("missing-archive.zip");
+        let error = spec.materialize(&destination).unwrap_err().to_string();
+        assert!(error.contains("ancestors"));
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
     }
 }
