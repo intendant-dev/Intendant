@@ -53,7 +53,7 @@ impl Receipt {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn top_frame(tree: &Value) -> Result<&Value, String> {
+pub(super) fn top_frame(tree: &Value) -> Result<&Value, String> {
     let frame = &tree["frameTree"]["frame"];
     if frame.get("parentId").is_some()
         || frame["id"]
@@ -66,7 +66,7 @@ fn top_frame(tree: &Value) -> Result<&Value, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn acknowledge(reply: &Value, frame_id: &str) -> Result<Option<String>, String> {
+pub(super) fn acknowledge(reply: &Value, frame_id: &str) -> Result<Option<String>, String> {
     if reply["frameId"].as_str() != Some(frame_id)
         || reply.get("errorText").is_some()
         || reply
@@ -86,7 +86,7 @@ fn acknowledge(reply: &Value, frame_id: &str) -> Result<Option<String>, String> 
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn committed(
+pub(super) fn committed(
     tree: &Value,
     frame_id: &str,
     loader: Option<&str>,
