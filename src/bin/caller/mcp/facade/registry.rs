@@ -1172,6 +1172,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 "daemon-created virtual display"
             ),
             flag!("profile-dir", "profile_dir", Str, "browser profile dir"),
+            flag!("profile-template-archive", "profile_template_archive_path", Str, "owner-only private profile template ZIP"),
+            flag!("profile-template-sha256", "profile_template_archive_sha256", Str, "exact profile template ZIP SHA-256"),
+            flag!("profile-template-bytes", "profile_template_archive_byte_length", U64, "exact profile template ZIP length"),
             flag!("viewport", "viewport", Str, "exact CSS viewport WIDTHxHEIGHT"),
             flag!(
                 "extension-archive",

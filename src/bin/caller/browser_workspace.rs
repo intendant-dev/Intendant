@@ -3,6 +3,7 @@ mod extension_policy;
 mod macos;
 pub(crate) mod managed_keyboard;
 mod navigation;
+mod profile_template;
 pub(crate) mod task_access;
 mod viewport;
 
@@ -195,6 +196,9 @@ pub struct BrowserWorkspace {
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension: Option<BrowserWorkspaceExtension>,
+    /// Public byte-identity receipt, without the private template path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_template: Option<Box<BrowserWorkspaceProfileTemplate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_executable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,9 +315,24 @@ pub struct CreateBrowserWorkspaceRequest {
     pub extension_manifest_version: Option<u32>,
     #[serde(default)]
     pub extension_version: Option<String>,
+    /// Optional owner-surface-only profile template. All three fields are
+    /// required together; imported only into a new Linux extension profile.
+    #[serde(default)]
+    pub profile_template_archive_path: Option<String>,
+    #[serde(default)]
+    pub profile_template_archive_sha256: Option<String>,
+    #[serde(default)]
+    pub profile_template_archive_byte_length: Option<u64>,
     /// Optional exact CSS viewport WIDTHxHEIGHT; Linux display-bound profiles only.
     #[serde(default)]
     pub viewport: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserWorkspaceProfileTemplate {
+    pub archive_sha256: String,
+    pub archive_byte_length: u64,
+    pub imported_into_fresh_profile: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,6 +1185,12 @@ async fn create_workspace_inner(
     let bound_display_id = display_binding
         .as_ref()
         .and_then(BrowserDisplayBinding::linux_display_id);
+    let profile_template = profile_template::parse(
+        &request,
+        extension_spec.is_some()
+            && provider == BrowserWorkspaceProvider::Cdp
+            && bound_display_id.is_some(),
+    )?;
     let bound_display_target = display_binding
         .as_ref()
         .map(|binding| binding.canonical().to_string());
@@ -1226,6 +1251,7 @@ async fn create_workspace_inner(
         ),
         profile_dir: Some(profile_dir.display().to_string()),
         extension: None,
+        profile_template: None,
         browser_executable: None,
         browser_executable_source: None,
         launch_arguments: None,
@@ -1302,6 +1328,15 @@ async fn create_workspace_inner(
         }
     };
 
+    if let Some(template) = profile_template.as_ref() {
+        match template.materialize(&profile_dir) {
+            Ok(receipt) => workspace.profile_template = Some(Box::new(receipt)),
+            Err(error) => {
+                reservation.cleanup(&error.to_string()).await;
+                return Err(error);
+            }
+        }
+    }
     if let Some(spec) = extension_spec.as_ref() {
         let extension_root = extension_root.as_ref().expect("presence checked");
         match prepare_browser_extension(spec, extension_root) {
@@ -2530,7 +2565,7 @@ fn extract_browser_extension_archive<R: Read + Seek>(
 
         let output_path = destination.join(&relative);
         if entry.is_dir() {
-            fs::create_dir(&output_path)
+            create_private_archive_directory(&output_path, false)
                 .or_else(|error| {
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         Ok(())
@@ -2547,23 +2582,26 @@ fn extract_browser_extension_archive<R: Read + Seek>(
             continue;
         }
         if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
+            create_private_archive_directory(parent, true).map_err(|error| {
                 BrowserWorkspaceError::Io(format!(
                     "failed to create extension parent {}: {error}",
                     parent.display()
                 ))
             })?;
         }
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-            .map_err(|error| {
-                BrowserWorkspaceError::Io(format!(
-                    "failed to create extension file {}: {error}",
-                    output_path.display()
-                ))
-            })?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&output_path).map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to create extension file {}: {error}",
+                output_path.display()
+            ))
+        })?;
         let copied = std::io::copy(
             &mut entry.by_ref().take(BROWSER_EXTENSION_MAX_ENTRY_BYTES + 1),
             &mut output,
@@ -2588,6 +2626,17 @@ fn extract_browser_extension_archive<R: Read + Seek>(
         }
     }
     Ok(seen)
+}
+
+fn create_private_archive_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn protect_extension_tree(path: &Path) -> Result<(), BrowserWorkspaceError> {
@@ -4774,6 +4823,7 @@ mod tests {
             owner_only_native: Some(false),
             profile_dir: None,
             extension: None,
+            profile_template: None,
             browser_executable: None,
             browser_executable_source: None,
             launch_arguments: None,
@@ -4805,6 +4855,9 @@ mod tests {
             extension_archive_byte_length: None,
             extension_manifest_version: None,
             extension_version: None,
+            profile_template_archive_path: None,
+            profile_template_archive_sha256: None,
+            profile_template_archive_byte_length: None,
         }
     }
 

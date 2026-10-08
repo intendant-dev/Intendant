@@ -826,6 +826,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 extension_archive_byte_length: *extension_archive_byte_length,
                 extension_manifest_version: *extension_manifest_version,
                 extension_version: extension_version.clone(),
+                profile_template_archive_path: None,
+                profile_template_archive_sha256: None,
+                profile_template_archive_byte_length: None,
             };
             // This legacy bus message does not carry authenticated caller trust.
             // Do not infer owner authority from a display selector. macOS-bound

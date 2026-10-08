@@ -1209,6 +1209,9 @@ async fn run_browser(
                     "--extension-bytes",
                     "--extension-manifest-version",
                     "--extension-version",
+                    "--profile-template-archive",
+                    "--profile-template-sha256",
+                    "--profile-template-bytes",
                 ],
                 &[],
             )?;
@@ -1223,6 +1226,21 @@ async fn run_browser(
             insert_string(&mut map, "owner_session_id", args.one("--session"));
             insert_string(&mut map, "display_target", args.one("--display-target"));
             insert_string(&mut map, "profile_dir", args.one("--profile-dir"));
+            insert_string(
+                &mut map,
+                "profile_template_archive_path",
+                args.one("--profile-template-archive"),
+            );
+            insert_string(
+                &mut map,
+                "profile_template_archive_sha256",
+                args.one("--profile-template-sha256"),
+            );
+            insert_u64(
+                &mut map,
+                "profile_template_archive_byte_length",
+                args.one("--profile-template-bytes"),
+            )?;
             insert_string(&mut map, "viewport", args.one("--viewport"));
             insert_string(
                 &mut map,

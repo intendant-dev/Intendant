@@ -897,6 +897,14 @@ pub struct CreateBrowserWorkspaceParams {
     pub extension_manifest_version: Option<u32>,
     #[serde(default)]
     pub extension_version: Option<String>,
+    /// Owner-surface-only private profile-template ZIP; Linux managed-extension
+    /// owned-display workspaces only. All three identity fields are required.
+    #[serde(default)]
+    pub profile_template_archive_path: Option<String>,
+    #[serde(default)]
+    pub profile_template_archive_sha256: Option<String>,
+    #[serde(default)]
+    pub profile_template_archive_byte_length: Option<u64>,
     /// Exact CSS viewport WIDTHxHEIGHT on a fresh daemon-created Linux display.
     #[serde(default)]
     pub viewport: Option<String>,
