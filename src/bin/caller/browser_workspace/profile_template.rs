@@ -244,17 +244,21 @@ struct PinnedDestination(fs::File);
 impl PinnedDestination {
     fn open(path: &Path) -> Result<Self, BrowserWorkspaceError> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        // Chrome will later launch by path. Third-party writable non-sticky
-        // ancestors could rename an owned child even with its private mode.
+        // Chrome will later launch by path. An ancestor's owner can rename
+        // its children even with 0755 or a sticky bit; trust only root/self.
         for ancestor in path.ancestors().skip(1) {
             let m = fs::symlink_metadata(ancestor)
                 .map_err(|_| invalid("cannot inspect profile destination ancestry"))?;
             if !m.is_dir()
                 || m.file_type().is_symlink()
+                || !trusted_ancestor_owner(
+                    m.uid(),
+                    intendant_platform::platform::unix_effective_uid(),
+                )
                 || (m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0)
             {
                 return Err(invalid(
-                    "profile-template destination requires stable non-writable or sticky ancestors",
+                    "profile-template destination requires trusted-owner stable ancestors",
                 ));
             }
         }
@@ -335,6 +339,11 @@ impl PinnedDestination {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_ancestor_owner(owner: u32, current_uid: u32) -> bool {
+    owner == 0 || owner == current_uid
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -472,5 +481,15 @@ mod tests {
         let error = spec.materialize(&destination).unwrap_err().to_string();
         assert!(error.contains("ancestors"));
         assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn foreign_ancestor_ownership_is_not_made_safe_by_permissions() {
+        // 0755 and sticky directory owners may still rename their children.
+        // Ownership is therefore a separate mandatory predicate from modes.
+        assert!(trusted_ancestor_owner(0, 1000));
+        assert!(trusted_ancestor_owner(1000, 1000));
+        assert!(!trusted_ancestor_owner(1001, 1000));
+        assert!(!trusted_ancestor_owner(1001, 0));
     }
 }
