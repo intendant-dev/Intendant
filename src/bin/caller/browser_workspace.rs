@@ -2565,7 +2565,7 @@ fn extract_browser_extension_archive<R: Read + Seek>(
 
         let output_path = destination.join(&relative);
         if entry.is_dir() {
-            fs::create_dir(&output_path)
+            create_private_archive_directory(&output_path, false)
                 .or_else(|error| {
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         Ok(())
@@ -2582,23 +2582,26 @@ fn extract_browser_extension_archive<R: Read + Seek>(
             continue;
         }
         if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
+            create_private_archive_directory(parent, true).map_err(|error| {
                 BrowserWorkspaceError::Io(format!(
                     "failed to create extension parent {}: {error}",
                     parent.display()
                 ))
             })?;
         }
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-            .map_err(|error| {
-                BrowserWorkspaceError::Io(format!(
-                    "failed to create extension file {}: {error}",
-                    output_path.display()
-                ))
-            })?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&output_path).map_err(|error| {
+            BrowserWorkspaceError::Io(format!(
+                "failed to create extension file {}: {error}",
+                output_path.display()
+            ))
+        })?;
         let copied = std::io::copy(
             &mut entry.by_ref().take(BROWSER_EXTENSION_MAX_ENTRY_BYTES + 1),
             &mut output,
@@ -2623,6 +2626,17 @@ fn extract_browser_extension_archive<R: Read + Seek>(
         }
     }
     Ok(seen)
+}
+
+fn create_private_archive_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn protect_extension_tree(path: &Path) -> Result<(), BrowserWorkspaceError> {

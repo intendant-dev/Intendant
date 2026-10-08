@@ -1,5 +1,6 @@
 //! Explicit owner-surface profile import into a freshly reserved workspace.
 //! A digest is byte identity, not a statement that the profile is safe to use.
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io::Cursor;
 #[cfg(target_os = "linux")]
@@ -109,6 +110,11 @@ impl ProfileTemplate {
         &self,
         destination: &Path,
     ) -> Result<BrowserWorkspaceProfileTemplate, BrowserWorkspaceError> {
+        // Pin the owned empty reservation before reading any private archive
+        // bytes. Extraction resolves through this retained fd, not a pathname
+        // another user can replace beneath a writable parent.
+        #[cfg(target_os = "linux")]
+        let pinned = PinnedDestination::open(destination)?;
         let bytes = self.snapshot()?;
         if bytes.len() as u64 != self.byte_length
             || format!("{:x}", Sha256::digest(&bytes)) != self.sha256
@@ -119,11 +125,15 @@ impl ProfileTemplate {
         }
         // Reuse the bounded ZIP extractor: exact/case-folded duplicates,
         // traversal, links, devices, oversized entries and expansion refuse.
-        let paths = super::extract_browser_extension_archive(Cursor::new(bytes), destination)?;
+        #[cfg(target_os = "linux")]
+        let extraction_root = pinned.fd_path();
+        #[cfg(not(target_os = "linux"))]
+        let extraction_root = destination.to_path_buf();
+        let paths = super::extract_browser_extension_archive(Cursor::new(bytes), &extraction_root)?;
         if !paths.contains("Local State") || !paths.contains("Default/Preferences") {
             return Err(invalid("profile template must contain exact Chrome Local State and Default/Preferences files"));
         }
-        for path in paths {
+        for path in &paths {
             if path.split('/').any(|part| part.starts_with("Singleton"))
                 || path
                     .split('/')
@@ -134,7 +144,11 @@ impl ProfileTemplate {
                 ));
             }
         }
-        make_private(destination)?;
+        // The extractor creates every file as 0600 and directory as 0700.
+        // Keep the root fd alive through all validation and refuse launch if
+        // its original path was replaced, even if extraction itself succeeded.
+        #[cfg(target_os = "linux")]
+        pinned.verify_path(destination)?;
         Ok(BrowserWorkspaceProfileTemplate {
             archive_sha256: self.sha256.clone(),
             archive_byte_length: self.byte_length,
@@ -203,37 +217,76 @@ fn invalid(message: &str) -> BrowserWorkspaceError {
     BrowserWorkspaceError::Unsupported(message.to_owned())
 }
 
-fn make_private(path: &Path) -> Result<(), BrowserWorkspaceError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| invalid("cannot inspect imported profile"))?;
-    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
-        return Err(invalid("imported profile contains an unsafe object"));
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path).map_err(|_| invalid("cannot enumerate imported profile"))? {
-            make_private(
-                &entry
-                    .map_err(|_| invalid("cannot inspect imported profile entry"))?
-                    .path(),
-            )?;
+#[cfg(target_os = "linux")]
+struct PinnedDestination(fs::File);
+
+#[cfg(target_os = "linux")]
+impl PinnedDestination {
+    fn open(path: &Path) -> Result<Self, BrowserWorkspaceError> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| invalid("cannot pin profile-template destination"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| invalid("cannot inspect destination fd"))?;
+        if !metadata.is_dir()
+            || metadata.uid() != intendant_platform::platform::unix_effective_uid()
+            || metadata.mode() & 0o7777 != 0o700
+        {
+            return Err(invalid(
+                "profile-template destination must be an owned private directory",
+            ));
         }
+        let pinned = Self(file);
+        pinned.verify_path(path)?;
+        if fs::read_dir(pinned.fd_path())
+            .map_err(|_| invalid("cannot inspect pinned destination entries"))?
+            .next()
+            .is_some()
+        {
+            return Err(invalid("profile-template destination must be empty"));
+        }
+        Ok(pinned)
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(
-            path,
-            fs::Permissions::from_mode(if metadata.is_dir() { 0o700 } else { 0o600 }),
-        )
-        .map_err(|_| invalid("cannot protect imported profile"))?;
+
+    fn fd_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+        PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
     }
-    Ok(())
+
+    fn verify_path(&self, path: &Path) -> Result<(), BrowserWorkspaceError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = self
+            .0
+            .metadata()
+            .map_err(|_| invalid("cannot inspect destination fd"))?;
+        let named =
+            fs::symlink_metadata(path).map_err(|_| invalid("profile destination was removed"))?;
+        if !named.is_dir()
+            || named.file_type().is_symlink()
+            || named.dev() != held.dev()
+            || named.ino() != held.ino()
+            || held.uid() != intendant_platform::platform::unix_effective_uid()
+            || held.mode() & 0o7777 != 0o700
+        {
+            return Err(invalid("profile-template destination identity changed"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    fn fresh(path: &Path) {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
 
     fn fixture(entries: &[(&str, &[u8])]) -> (tempfile::TempDir, ProfileTemplate) {
         let root = tempfile::tempdir().unwrap();
@@ -270,7 +323,7 @@ mod tests {
             ),
         ]);
         let destination = root.path().join("fresh");
-        fs::create_dir(&destination).unwrap();
+        fresh(&destination);
         spec.materialize(&destination).unwrap();
         assert_eq!(
             fs::read(destination.join("Default/Local Extension Settings/example/000001.ldb"))
@@ -285,7 +338,7 @@ mod tests {
         let (root, mut spec) = fixture(&[("Local State", b"{}"), ("Default/Preferences", b"{}")]);
         spec.sha256 = "0".repeat(64);
         let destination = root.path().join("fresh");
-        fs::create_dir(&destination).unwrap();
+        fresh(&destination);
         assert!(spec.materialize(&destination).is_err());
         assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
     }
@@ -303,8 +356,41 @@ mod tests {
                 (forbidden, b"not permitted"),
             ]);
             let destination = root.path().join("fresh");
-            fs::create_dir(&destination).unwrap();
+            fresh(&destination);
             assert!(spec.materialize(&destination).is_err());
         }
+    }
+
+    #[test]
+    fn replaced_destination_cannot_redirect_private_extraction() {
+        use std::os::unix::fs::symlink;
+        let (root, spec) = fixture(&[
+            ("Local State", b"private-state"),
+            ("Default/Preferences", b"private-prefs"),
+        ]);
+        let destination = root.path().join("fresh");
+        fresh(&destination);
+        let pinned = PinnedDestination::open(&destination).unwrap();
+        let moved = root.path().join("renamed-owned-reservation");
+        fs::rename(&destination, &moved).unwrap();
+        let attacker = root.path().join("attacker");
+        fs::create_dir(&attacker).unwrap();
+        symlink(&attacker, &destination).unwrap();
+        super::super::extract_browser_extension_archive(
+            Cursor::new(spec.snapshot().unwrap()),
+            &pinned.fd_path(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_dir(&attacker).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(moved.join("Local State")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(moved.join("Default")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(pinned.verify_path(&destination).is_err());
+        assert!(spec.materialize(&destination).is_err());
     }
 }
