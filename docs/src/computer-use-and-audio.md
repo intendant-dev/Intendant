@@ -674,6 +674,31 @@ The supervisor's independent HTTP pixel fixture supplies that separate evidence.
 **This smoke has not been run for the controller slice.** Default inline tests use fake owners, transports and
 capture backends; the process fixtures are private shell pipes with no GUI calls.
 
+### Explicit private browser-profile templates (Linux)
+
+An owner-surface caller may provide `profile_template_archive_path`,
+`profile_template_archive_sha256` and `profile_template_archive_byte_length`
+together when creating an owned-display, managed-CDP extension workspace.
+The CLI spellings are `--profile-template-archive`, `--profile-template-sha256`
+and `--profile-template-bytes`. Scoped callers and the legacy control bus cannot
+import a template. Other platforms/providers refuse clearly.
+
+The destination must still be new: an existing browser profile is never adopted.
+Intendant snapshots the exact private, owner-owned ZIP through a retained
+non-following file handle, verifies its length and SHA-256, and extracts into the
+freshly reserved profile before browser launch. The existing bounded ZIP path,
+duplicate, case-collision, link and expansion checks apply. Chrome `Local State`
+and `Default/Preferences` must exist; process locks, DevTools port files and an
+unlock-password sidecar refuse. Files/directories are made private and remain
+owned by the ordinary workspace cleanup guard. The result records only the
+archive hash/length and fresh import, not its private source path.
+
+This is opt-in profile import, not a determination that a profile contains only
+safe state. The caller must verify its contents and intended authority separately.
+An imported wallet profile does not authorize signing or override the startup
+extension allowlist, display access or native input/capture checks. A failed
+import does not launch a browser or fall back to a personal/user profile.
+
 ### CU Readiness Diagnosis (`display_readiness`)
 
 The display grant is **Intendant authority only** — OS-level capability is a

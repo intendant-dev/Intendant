@@ -814,6 +814,7 @@ mod tests {
             owner_only_native: Some(false),
             profile_dir: Some("/tmp/profile".to_string()),
             extension: None,
+            profile_template: None,
             browser_executable: Some("/usr/bin/chromium".to_string()),
             browser_executable_source: Some("managed".to_string()),
             launch_arguments: None,

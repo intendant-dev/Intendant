@@ -81,6 +81,13 @@ impl IntendantServer {
         params: CreateBrowserWorkspaceParams,
         caller: ToolCallerTrust,
     ) -> String {
+        if (params.profile_template_archive_path.is_some()
+            || params.profile_template_archive_sha256.is_some()
+            || params.profile_template_archive_byte_length.is_some())
+            && !matches!(caller, ToolCallerTrust::OwnerSurface)
+        {
+            return "{\"error\":\"profile templates require an owner-surface caller\"}".to_owned();
+        }
         let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
             url: params.url,
             label: params.label,
@@ -95,6 +102,9 @@ impl IntendantServer {
             extension_archive_byte_length: params.extension_archive_byte_length,
             extension_manifest_version: params.extension_manifest_version,
             extension_version: params.extension_version,
+            profile_template_archive_path: params.profile_template_archive_path,
+            profile_template_archive_sha256: params.profile_template_archive_sha256,
+            profile_template_archive_byte_length: params.profile_template_archive_byte_length,
         };
         let authority = if request
             .display_target
@@ -2037,6 +2047,34 @@ mod tests {
         test_session_registry_with_display, test_state, test_state_with_log_dir,
     };
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn scoped_profile_template_requests_refuse_before_workspace_effects() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let server = IntendantServer::new(test_state(), bus);
+        for name in [
+            "profile_template_archive_path",
+            "profile_template_archive_sha256",
+            "profile_template_archive_byte_length",
+        ] {
+            let value = if name.ends_with("byte_length") {
+                serde_json::json!(1)
+            } else {
+                serde_json::json!("private fixture")
+            };
+            let params: CreateBrowserWorkspaceParams =
+                serde_json::from_value(serde_json::json!({name:value})).unwrap();
+            let output = server
+                .create_browser_workspace_as_caller(params, ToolCallerTrust::Scoped)
+                .await;
+            assert!(output.contains("profile templates require an owner-surface caller"));
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     async fn next_virtual_display_create_command(
         rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
