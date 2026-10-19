@@ -952,6 +952,7 @@ impl PtySession {
     /// by profile-less bash, see [`principal_shell_program`]); only
     /// root-lane shells (the owner's own surfaces) inherit and get the
     /// login-style startup.
+    #[cfg(test)]
     fn spawn(
         cols: u16,
         rows: u16,
@@ -1386,11 +1387,40 @@ impl PtySession {
 
     fn write_input_by(&self, data: &[u8], by: &str, via: &str) {
         if let Some(transcript) = &self.transcript {
-            transcript.input(data, by, via);
+            transcript.input(data, by, via, self.reading_secret_input());
         }
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(data);
             let _ = w.flush();
+        }
+    }
+
+    /// Whether the shell is reading input with echo off in canonical mode
+    /// — a password prompt (sudo, ssh/gpg passphrases, `read -s`). Raw-mode
+    /// programs (editors, pagers) also turn echo off but leave canonical
+    /// mode, so their keystrokes stay recorded.
+    #[cfg(unix)]
+    fn reading_secret_input(&self) -> bool {
+        use nix::sys::termios::LocalFlags;
+        let Ok(master) = self.master.lock() else {
+            return false;
+        };
+        master.get_termios().is_some_and(|termios| {
+            !termios.local_flags.contains(LocalFlags::ECHO)
+                && termios.local_flags.contains(LocalFlags::ICANON)
+        })
+    }
+
+    /// ConPTY exposes no echo state: Windows input is recorded verbatim.
+    #[cfg(not(unix))]
+    fn reading_secret_input(&self) -> bool {
+        false
+    }
+
+    /// Record that `actor` closed this shell (the registry's close paths).
+    pub(crate) fn record_close(&self, actor: &TerminalActor) {
+        if let Some(transcript) = &self.transcript {
+            transcript.closed(actor.owner_tag().as_deref().unwrap_or("root"));
         }
     }
 
@@ -1924,9 +1954,7 @@ impl TerminalRegistry {
             return false;
         }
         if let Some(SessionSlot::Live(session)) = guard.remove(key) {
-            if let Some(transcript) = &session.transcript {
-                transcript.closed(actor.owner_tag().as_deref().unwrap_or("root"));
-            }
+            session.record_close(actor);
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
             // cleanly; if it ignores, dropping the final owner invokes
             // the forced-termination fallback and releases the master PTY.
@@ -2071,6 +2099,31 @@ mod tests {
         expect_output(&mut rx, Some("hello_from_pty"), "echo output").await;
     }
 
+    /// The single transcript under `log_root`, once it holds an `exit`
+    /// record (complete lines only — the shell may still be writing).
+    async fn finished_transcript(log_root: &std::path::Path) -> Vec<serde_json::Value> {
+        let dir = log_root.join("terminals");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+            assert_eq!(files.len(), 1, "one transcript per PTY incarnation");
+            let text = std::fs::read_to_string(files[0].path()).unwrap();
+            let records: Vec<serde_json::Value> = text
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if records.iter().any(|r| r["ev"] == "exit") {
+                return records;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no exit record: {records:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn command_log_transcript_records_attributed_input_output_and_close() {
         let log_root = tempfile::tempdir().unwrap();
@@ -2091,14 +2144,7 @@ mod tests {
         expect_output(&mut rx, Some("command_log_probe_4417"), "echo output").await;
         assert!(registry.close_visible(&key, &actor).await);
 
-        let dir = log_root.path().join("terminals");
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(files.len(), 1, "one transcript per PTY incarnation");
-        let records: Vec<serde_json::Value> = std::fs::read_to_string(files[0].path())
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let records = finished_transcript(log_root.path()).await;
         assert_eq!(records[0]["ev"], "open");
         assert_eq!(records[0]["terminal_id"], "logged-0");
         assert_eq!(records[0]["instance_id"], session.instance_id.as_str());
@@ -2124,6 +2170,58 @@ mod tests {
         assert!(records[close..]
             .iter()
             .any(|r| r["ev"] == "input" && r["by"] == "daemon" && r["text"] == "\u{4}"));
+    }
+
+    /// A password prompt (echo off, canonical mode) records only the
+    /// length of what was typed; the shell's own prompt (raw mode under
+    /// its line editor) stays verbatim.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_log_redacts_input_typed_at_a_password_prompt() {
+        let log_root = tempfile::tempdir().unwrap();
+        let registry = TerminalRegistry::new(std::env::temp_dir())
+            .with_command_log(Some(log_root.path().to_path_buf()));
+        let key = TerminalKey::local("logged-secret-0");
+        let (session, _) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, spawn_all())
+            .await
+            .unwrap();
+        let mut rx = session.attach();
+        expect_output(&mut rx, None, "shell startup").await;
+        session.write_input_as(
+            b"read -s CL_SECRET; echo got_${#CL_SECRET}_chars\r",
+            &TerminalActor::Root,
+            "dashboard",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.reading_secret_input() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read -s never put the terminal into a password read"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        session.write_input_as(b"hunter2\r", &TerminalActor::Root, "dashboard");
+        expect_output(&mut rx, Some("got_7_chars"), "secret length echo").await;
+        assert!(registry.close_visible(&key, &TerminalActor::Root).await);
+
+        let records = finished_transcript(log_root.path()).await;
+        let inputs: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["ev"] == "input" && r["via"] == "dashboard")
+            .collect();
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert!(inputs[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("read -s CL_SECRET"));
+        assert_eq!(inputs[1]["redacted"], "echo_off");
+        assert_eq!(inputs[1]["bytes"], 8);
+        let all = serde_json::to_string(&records).unwrap();
+        assert!(
+            !all.contains("hunter2"),
+            "the secret never reaches the file"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -532,13 +532,9 @@ pub(crate) fn mcp_permission_denied_result(
 /// header routing) lands. The stdio transport negotiates separately via rmcp.
 pub(crate) const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2024-11-05"];
 
-/// Spec version negotiation for `initialize`: echo the client's requested
-/// revision when this endpoint implements it; otherwise answer with the
-/// newest implemented revision and let the client decide whether to proceed.
-/// A missing or malformed `protocolVersion` also gets the newest — tolerant
-/// reads beat guessing a caller's era wrong.
 /// Command-log bookkeeping for one `tools/call` (see `command_log.rs`).
-/// Inert — no argument copy, no file access — when the command log is off.
+/// Inert — no argument copy, no queueing — when the command log is off or
+/// the caller is a supervised session.
 struct McpCallLogEntry<'a> {
     root: Option<std::path::PathBuf>,
     principal: &'a str,
@@ -555,7 +551,13 @@ impl<'a> McpCallLogEntry<'a> {
         tool: &'a str,
         args: &serde_json::Value,
     ) -> Self {
-        let root = crate::command_log::default_root();
+        // A supervised session's tool calls are already in its own session
+        // log; recording them here would rotate the rest of the log away.
+        let root = if session.is_some() {
+            None
+        } else {
+            crate::command_log::default_root()
+        };
         let args = root.as_ref().map(|_| args.clone());
         Self {
             root,
@@ -595,6 +597,11 @@ impl<'a> McpCallLogEntry<'a> {
     }
 }
 
+/// Spec version negotiation for `initialize`: echo the client's requested
+/// revision when this endpoint implements it; otherwise answer with the
+/// newest implemented revision and let the client decide whether to proceed.
+/// A missing or malformed `protocolVersion` also gets the newest — tolerant
+/// reads beat guessing a caller's era wrong.
 pub(crate) fn negotiated_mcp_protocol_version(requested: Option<&str>) -> &'static str {
     requested
         .and_then(|req| {

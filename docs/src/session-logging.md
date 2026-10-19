@@ -378,35 +378,53 @@ It lives under `<state root>/command-log/` (default `~/.intendant/command-log/`)
 
 | File | One record per | Contents |
 |---|---|---|
-| `terminals/<opened-at>-<terminal>-<instance>.jsonl` | event of one PTY incarnation | `open` (terminal id, instance id, owner, shared, scoped, cwd, size), `input` (`by`: the acting principal, `root` for owner surfaces, `daemon` for the close-time EOF; `via`: `mcp`, `dashboard` or `dashboard-tunnel`; the text verbatim), `output` (the shell's output chunks, verbatim with control sequences), `output_suppressed`, `close` (`by`), `exit` (`status`, total `output_bytes`) |
-| `mcp-calls.jsonl` | `tools/call` served by the HTTP MCP gateway | `principal`, `session`, `tool`, `args` (as sent; facade calls show their `argv`), `ms`, `result_bytes`, `outcome` (`ok`, `error`, `denied`, `protocol_error`) and an error/refusal `detail` |
+| `terminals/<opened-at>-<terminal>-<instance>.jsonl` | event of one PTY incarnation | `open` (terminal id, instance id, owner, shared, scoped, cwd, size); `input` (`by`: the acting principal, `root` for owner surfaces, `daemon` for the close-time EOF; `via`: `mcp`, `dashboard`, `dashboard-tunnel` or `daemon`; the text verbatim, or `redacted: "echo_off"` with only the length); `output` (the shell's output, verbatim with control sequences); `output_suppressed`; `transcript_full`; `close` (`by`); `exit` (`status`, `output_bytes`) |
+| `mcp-calls.jsonl` | `tools/call` served by the HTTP MCP gateway to a caller that is not a supervised session | `principal`, `session`, `tool`, `args` (as sent; facade calls show their `argv`), `ms`, `result_bytes`, `outcome` (`ok`, `error`, `denied`, `protocol_error`), an error/refusal `detail`, and `dropped_before` when records were dropped ahead of this one |
 
 Every record carries `v` (format version, currently 1) and `at` (UTC,
 RFC 3339 with milliseconds). Terminal input is recorded where the bytes
 enter the PTY, so every surface is covered whichever client typed.
 Shells of the daemon's process-wide registry are logged; a stdio-mode MCP
-server and the Codex Cloud worker's own registry are not.
+server and the Codex Cloud worker's own registry are not. Supervised
+sessions' MCP calls are left out of `mcp-calls.jsonl`: their own session
+logs already hold them, and their volume would rotate the rest away.
 
-Bounds: output is capped at 8 MiB per PTY incarnation (inputs, close and
-exit are always kept, and the exit record reports the true total); one
-record's text is cut at 64 KiB (`truncated: true`); MCP arguments beyond
-4 KiB are kept as a truncated string (`args_truncated`); `mcp-calls.jsonl`
-moves to `mcp-calls.1.jsonl` at 32 MiB; terminal transcripts older than
-30 days are pruned when the daemon starts.
+**Secrets.** On Unix, input typed while the terminal has echo off in
+canonical mode — a password prompt such as sudo, an ssh/gpg passphrase or
+`read -s` — is recorded by length only (`redacted: "echo_off"`). Editors
+and pagers also turn echo off but use raw mode, so their keystrokes are
+recorded. Windows (ConPTY) exposes no echo state, so input there is always
+recorded verbatim. Everything else typed into or printed by a logged
+terminal, and MCP arguments up to the cap, are stored as sent, including
+any secret a caller pastes or prints. Files are owner-only (0600 inside
+0700 directories on Unix; inherited profile ACLs on Windows) in the
+owner's state root and are never sent anywhere. A filesystem-scoped
+principal's shell cannot read the state root, so a scoped MCP client
+cannot read the log; the owner can.
 
-**Privacy.** Anything typed into or printed by a logged terminal is stored
-verbatim, like shell history, including any secret a caller pastes.
-Files are created 0600 inside 0700 directories in the owner's state root
-and are never sent anywhere. Recording is best effort: a failed write
-disables that file and never fails or delays the caller's action. Set
-`INTENDANT_COMMAND_LOG=off` to turn both streams off.
+**Bounds.** Output is recorded up to 8 MiB per PTY incarnation and then
+only counted; a transcript file stops at 32 MiB with one `transcript_full`
+mark (the exit record still follows); one record's text is cut at 64 KiB
+(`truncated: true`); MCP arguments beyond 4 KiB become a truncated string
+(`args_truncated`) and caller-supplied names are cut at 256 bytes.
+`mcp-calls.jsonl` is rotated at 32 MiB to a uniquely named
+`mcp-calls.<stamp>-<pid>-<seq>.jsonl`, and the newest two rotated files are
+kept. Terminal transcripts older than 30 days are pruned at daemon start
+and at most hourly afterwards. A UTF-8 character split across two output
+reads is recorded whole. On Windows the exit can be observed before the
+last output, so its `output_bytes` may undercount.
+
+**Cost.** Recording never fails or noticeably delays the caller: a failed
+write disables that file, and MCP records are bounded on the request path
+and written by a background thread (dropped and counted when it falls
+behind). Set `INTENDANT_COMMAND_LOG=off` to turn both streams off.
 
 Reading it:
 
 ```bash
 # Every command an MCP client typed today, oldest first
 cat ~/.intendant/command-log/terminals/$(date -u +%Y%m%d)*.jsonl \
-  | jq -r 'select(.ev == "input" and .via == "mcp") | "\(.at) \(.by): \(.text)"'
+  | jq -r 'select(.ev == "input" and .via == "mcp") | "\(.at) \(.by): \(.text // "[redacted]")"'
 # The last 20 MCP tool calls and how they ended
 tail -n 20 ~/.intendant/command-log/mcp-calls.jsonl | jq -c '{at, tool, args, outcome, ms}'
 ```

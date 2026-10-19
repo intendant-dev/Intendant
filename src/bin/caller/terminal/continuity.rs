@@ -199,6 +199,7 @@ impl TerminalRegistry {
             };
         }
         if let Some(SessionSlot::Live(session)) = guard.remove(&key) {
+            session.record_close(actor);
             session.write_input(&[0x04]);
         }
         Ok(true)

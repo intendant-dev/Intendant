@@ -175,6 +175,12 @@ rand = "0.8"
 # `OffsetDateTime`; we set them via `OffsetDateTime::now_utc()` + `Duration`.
 time = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+# The same nix 0.28 portable-pty already builds (with "term"): the command
+# log reads the PTY's termios through portable-pty's safe `get_termios` to
+# record password-prompt input (echo off, canonical) by length only.
+nix = { version = "0.28", default-features = false, features = ["term"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 ashpd = { version = "0.11", features = ["tokio"] }

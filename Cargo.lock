@@ -2943,6 +2943,7 @@ dependencies = [
  "intendant-platform",
  "landlock",
  "libc",
+ "nix 0.28.0",
  "notify",
  "owner-plane-core",
  "owner-plane-reducer",

@@ -236,8 +236,8 @@ instructions. Existing local reports are not deleted.
 What a ChatGPT/Codex session actually did survives the session: every
 terminal command it typed, the shell's output, and every tool call the
 gateway served are in the daemon's [command log](./session-logging.md#the-command-log)
-(`~/.intendant/command-log/`). A new session can read its predecessor's
-work there.
+(`~/.intendant/command-log/`, owner-only). Read it there to see what a
+session did after its context is gone.
 
 Run the secret-free local tests:
 
