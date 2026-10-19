@@ -133,7 +133,7 @@ impl TerminalActor {
 /// Windows (see win_sandbox.rs). `None` scope = a filesystem-unrestricted
 /// shell; environment secrecy is a separate axis the spawn derives from
 /// the ACTOR, not from the scope — every principal-owned shell gets a
-/// cleared, secret-free environment (see [`PtySession::spawn`]).
+/// cleared, secret-free environment (see [`PtySession::spawn_with_log`]).
 #[derive(Debug, Clone, Default)]
 pub struct ShellSpawnPolicy {
     pub may_spawn: bool,
@@ -216,7 +216,7 @@ fn scoped_shell_cwd(
 /// principal shell CAN read its dotfiles, but letting profiles run would
 /// repopulate the cleared environment the moment they execute (API keys
 /// exported in `~/.zshrc` are routine) — the profile skip is what makes
-/// the env clearing in [`PtySession::spawn`] stick.
+/// the env clearing in [`PtySession::spawn_with_log`] stick.
 ///
 /// The empty fallback for unrecognized shells is safe only under a
 /// filesystem sandbox (the rc files are unreadable there); an

@@ -21,10 +21,14 @@
 //! conversation ends, and nothing outside that context recorded what it
 //! ran. With this log the owner can see what happened.
 //!
-//! Input typed while the terminal has echo off in canonical mode (password
-//! prompts: sudo, ssh/gpg passphrases, `read -s`) is recorded by length
-//! only, on Unix; everything else typed into or printed by a logged
-//! terminal is stored verbatim. Files are created owner-only (0600 inside
+//! Input typed while the local terminal has echo off in canonical mode (a
+//! local password prompt: sudo, ssh's own passphrase prompt, `read -s`) is
+//! recorded by length only, on Unix. That check cannot see prompts behind
+//! another layer that keeps the local PTY in raw mode (a remote sudo inside
+//! ssh, `docker exec`, tmux, pinentry-curses, masked prompts of TUI tools),
+//! nor a password sent in the same write as the command that prompts for
+//! it; everything else typed into or printed by a logged terminal is
+//! stored verbatim. Files are created owner-only (0600 inside
 //! 0700 directories on Unix; inherited profile ACLs on Windows) in the
 //! owner's state root. Sizes are bounded: output per PTY incarnation, the
 //! whole transcript file, each record's text, MCP arguments and names; the
@@ -995,7 +999,14 @@ mod tests {
         );
         let path = root.path().join(MCP_LOG_FILE);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !path.exists() && std::time::Instant::now() < deadline {
+        // Wait for a complete line, not just the file: the writer creates
+        // the file before it writes.
+        let complete = || {
+            std::fs::read_to_string(&path)
+                .map(|text| text.ends_with('\n'))
+                .unwrap_or(false)
+        };
+        while !complete() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(read_records(&path)[0]["detail"], "queued");
