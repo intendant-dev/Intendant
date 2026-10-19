@@ -36,6 +36,7 @@ mod cutover_absence;
 mod kimi_auth_ceremony;
 pub(crate) use intendant_core::conversation;
 mod cli_descriptor;
+mod command_log;
 mod credential_audit;
 mod credential_egress;
 mod credential_leases;

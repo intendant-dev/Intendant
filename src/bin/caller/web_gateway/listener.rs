@@ -1079,7 +1079,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
         crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        })),
+        }))
+        .with_command_log(crate::command_log::default_root()),
     );
     if let Some(runtime) = mcp_server
         .as_ref()

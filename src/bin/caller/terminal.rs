@@ -933,6 +933,9 @@ pub struct PtySession {
     /// `TMPDIR`, replacing the shared same-account `/tmp` trees).
     /// Removed on Drop.
     scoped_scratch: Option<std::path::PathBuf>,
+    /// The command-log transcript of this incarnation (`None` when the
+    /// registry has no command-log root or the file could not be made).
+    transcript: Option<crate::command_log::TerminalTranscript>,
 }
 
 impl PtySession {
@@ -956,6 +959,21 @@ impl PtySession {
         owner: Option<String>,
         shared: bool,
         scope: Option<&crate::peer::access_policy::FilesystemAccessPolicy>,
+    ) -> Result<Arc<Self>, String> {
+        Self::spawn_with_log(cols, rows, cwd, owner, shared, scope, None)
+    }
+
+    /// [`Self::spawn`], recording a command-log transcript when `log`
+    /// names a command-log root and the terminal id. The transcript is
+    /// created before the reader thread starts, so it sees all output.
+    fn spawn_with_log(
+        cols: u16,
+        rows: u16,
+        cwd: Option<std::path::PathBuf>,
+        owner: Option<String>,
+        shared: bool,
+        scope: Option<&crate::peer::access_policy::FilesystemAccessPolicy>,
+        log: Option<(&std::path::Path, &str)>,
     ) -> Result<Arc<Self>, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -1090,8 +1108,24 @@ impl PtySession {
             format!("take writer: {e}")
         })?;
 
+        let instance_id = uuid::Uuid::new_v4().simple().to_string();
+        let transcript = log.and_then(|(root, terminal_id)| {
+            crate::command_log::TerminalTranscript::create(
+                root,
+                &crate::command_log::TranscriptOpen {
+                    terminal_id,
+                    instance_id: &instance_id,
+                    owner: owner.as_deref(),
+                    shared,
+                    scoped: scope.is_some(),
+                    cwd: cwd.as_deref(),
+                    cols,
+                    rows,
+                },
+            )
+        });
         let session = Arc::new(Self {
-            instance_id: uuid::Uuid::new_v4().simple().to_string(),
+            instance_id,
             master: StdMutex::new(pair.master),
             writer: StdMutex::new(writer),
             child_killer: StdMutex::new(child_killer),
@@ -1104,6 +1138,7 @@ impl PtySession {
             shared: std::sync::atomic::AtomicBool::new(shared),
             spawn_scope: scope.cloned(),
             scoped_scratch,
+            transcript,
         });
 
         // portable_pty's reader and child wait are both blocking. On Windows,
@@ -1312,6 +1347,10 @@ impl PtySession {
                     // snapshot+register (see [`OutputHub`]).
                     let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
                     hub.fan_out(chunk);
+                    drop(hub);
+                    if let Some(transcript) = &session.transcript {
+                        transcript.output(chunk);
+                    }
                 }
                 Err(_) => break,
             }
@@ -1330,9 +1369,25 @@ impl PtySession {
         }
     }
 
-    /// Write bytes to the PTY stdin. Silently drops if the writer has
-    /// been closed (shell already exited).
+    /// Write bytes to the PTY stdin on the daemon's own behalf (the
+    /// close-time EOF). Silently drops if the writer has been closed
+    /// (shell already exited). Caller input goes through
+    /// [`Self::write_input_as`], which attributes it in the command log.
     pub fn write_input(&self, data: &[u8]) {
+        self.write_input_by(data, "daemon", "daemon");
+    }
+
+    /// Write a caller's bytes to the PTY stdin, recording them in the
+    /// command log as `actor`'s input through the `via` surface.
+    pub fn write_input_as(&self, data: &[u8], actor: &TerminalActor, via: &str) {
+        let by = actor.owner_tag();
+        self.write_input_by(data, by.as_deref().unwrap_or("root"), via);
+    }
+
+    fn write_input_by(&self, data: &[u8], by: &str, via: &str) {
+        if let Some(transcript) = &self.transcript {
+            transcript.input(data, by, via);
+        }
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(data);
             let _ = w.flush();
@@ -1389,6 +1444,9 @@ impl PtySession {
         if transitioned {
             if let Ok(mut retained) = self.exit_status.lock() {
                 *retained = Some(status);
+            }
+            if let Some(transcript) = &self.transcript {
+                transcript.exit(status);
             }
             let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
             hub.fan_out_exit(status);
@@ -1566,6 +1624,9 @@ pub struct TerminalRegistry {
     spawn_closed: AtomicBool,
     sessions: RwLock<HashMap<TerminalKey, SessionSlot>>,
     project_root: std::path::PathBuf,
+    /// Where new shells write their command-log transcripts (see
+    /// `command_log.rs`); `None` records nothing.
+    command_log_root: Option<std::path::PathBuf>,
 }
 
 impl TerminalRegistry {
@@ -1576,7 +1637,15 @@ impl TerminalRegistry {
             handover: std::sync::OnceLock::new(),
             spawn_closed: AtomicBool::new(false),
             project_root,
+            command_log_root: None,
         }
+    }
+
+    /// Record every shell this registry spawns from now on under `root`
+    /// (`None` keeps the registry unlogged).
+    pub fn with_command_log(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.command_log_root = root;
+        self
     }
 
     /// Returns the session for `key` — attaching when it exists and is
@@ -1610,14 +1679,17 @@ impl TerminalRegistry {
         let owner = actor.owner_tag();
         let shared = policy.shared;
         let scope = policy.scope.clone();
+        let log_root = self.command_log_root.clone();
+        let terminal_id = key.terminal_id.clone();
         self.open_or_attach_with(key, actor, policy.may_spawn, move || {
-            PtySession::spawn(
+            PtySession::spawn_with_log(
                 cols,
                 rows,
                 Some(project_root),
                 owner,
                 shared,
                 scope.as_ref(),
+                log_root.as_deref().map(|root| (root, terminal_id.as_str())),
             )
         })
         .await
@@ -1852,6 +1924,9 @@ impl TerminalRegistry {
             return false;
         }
         if let Some(SessionSlot::Live(session)) = guard.remove(key) {
+            if let Some(transcript) = &session.transcript {
+                transcript.closed(actor.owner_tag().as_deref().unwrap_or("root"));
+            }
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
             // cleanly; if it ignores, dropping the final owner invokes
             // the forced-termination fallback and releases the master PTY.
@@ -1994,6 +2069,77 @@ mod tests {
         session.write_input(b"echo hello_from_pty\r");
 
         expect_output(&mut rx, Some("hello_from_pty"), "echo output").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_log_transcript_records_attributed_input_output_and_close() {
+        let log_root = tempfile::tempdir().unwrap();
+        let registry = TerminalRegistry::new(std::env::temp_dir())
+            .with_command_log(Some(log_root.path().to_path_buf()));
+        let key = TerminalKey::local("logged-0");
+        let actor = TerminalActor::Principal("principal:test-agent".to_string());
+        let (session, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &actor, spawn_all())
+            .await
+            .unwrap();
+        assert!(created);
+        let mut rx = session.attach();
+        // Wait for the prompt before typing (startup can flush pending
+        // input — see open_attach_write_and_receive_output).
+        expect_output(&mut rx, None, "shell startup").await;
+        session.write_input_as(b"echo command_log_probe_4417\r", &actor, "mcp");
+        expect_output(&mut rx, Some("command_log_probe_4417"), "echo output").await;
+        assert!(registry.close_visible(&key, &actor).await);
+
+        let dir = log_root.path().join("terminals");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "one transcript per PTY incarnation");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(files[0].path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["ev"], "open");
+        assert_eq!(records[0]["terminal_id"], "logged-0");
+        assert_eq!(records[0]["instance_id"], session.instance_id.as_str());
+        assert_eq!(records[0]["owner"], "principal:test-agent");
+        let input = records
+            .iter()
+            .find(|r| r["ev"] == "input" && r["via"] == "mcp")
+            .expect("attributed input record");
+        assert_eq!(input["by"], "principal:test-agent");
+        assert_eq!(input["text"], "echo command_log_probe_4417\r");
+        let output: String = records
+            .iter()
+            .filter(|r| r["ev"] == "output")
+            .filter_map(|r| r["text"].as_str())
+            .collect();
+        assert!(output.contains("command_log_probe_4417"), "{output:?}");
+        let close = records
+            .iter()
+            .position(|r| r["ev"] == "close")
+            .expect("close record");
+        assert_eq!(records[close]["by"], "principal:test-agent");
+        // The close-time EOF is the daemon's own input, after the close.
+        assert!(records[close..]
+            .iter()
+            .any(|r| r["ev"] == "input" && r["by"] == "daemon" && r["text"] == "\u{4}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registries_without_a_command_log_write_nothing() {
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let (session, _) = registry
+            .open_or_attach(
+                TerminalKey::local("unlogged-0"),
+                80,
+                24,
+                &TerminalActor::Root,
+                spawn_all(),
+            )
+            .await
+            .unwrap();
+        assert!(session.transcript.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

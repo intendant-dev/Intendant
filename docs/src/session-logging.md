@@ -366,6 +366,51 @@ buffered, and shutdown gives the drain a bounded window. A short/failed write or
 final partial line can therefore be absent even when the tee's byte counters
 look balanced.
 
+## The Command Log
+
+Session logs record what Intendant's own sessions did. The command log
+records what **callers** did through the daemon's request/response
+surfaces, including clients that keep no durable record of their own:
+an MCP client such as ChatGPT loses its context when its conversation
+ends, and this log is what remains. Source: `src/bin/caller/command_log.rs`.
+
+It lives under `<state root>/command-log/` (default `~/.intendant/command-log/`):
+
+| File | One record per | Contents |
+|---|---|---|
+| `terminals/<opened-at>-<terminal>-<instance>.jsonl` | event of one PTY incarnation | `open` (terminal id, instance id, owner, shared, scoped, cwd, size), `input` (`by`: the acting principal, `root` for owner surfaces, `daemon` for the close-time EOF; `via`: `mcp`, `dashboard` or `dashboard-tunnel`; the text verbatim), `output` (the shell's output chunks, verbatim with control sequences), `output_suppressed`, `close` (`by`), `exit` (`status`, total `output_bytes`) |
+| `mcp-calls.jsonl` | `tools/call` served by the HTTP MCP gateway | `principal`, `session`, `tool`, `args` (as sent; facade calls show their `argv`), `ms`, `result_bytes`, `outcome` (`ok`, `error`, `denied`, `protocol_error`) and an error/refusal `detail` |
+
+Every record carries `v` (format version, currently 1) and `at` (UTC,
+RFC 3339 with milliseconds). Terminal input is recorded where the bytes
+enter the PTY, so every surface is covered whichever client typed.
+Shells of the daemon's process-wide registry are logged; a stdio-mode MCP
+server and the Codex Cloud worker's own registry are not.
+
+Bounds: output is capped at 8 MiB per PTY incarnation (inputs, close and
+exit are always kept, and the exit record reports the true total); one
+record's text is cut at 64 KiB (`truncated: true`); MCP arguments beyond
+4 KiB are kept as a truncated string (`args_truncated`); `mcp-calls.jsonl`
+moves to `mcp-calls.1.jsonl` at 32 MiB; terminal transcripts older than
+30 days are pruned when the daemon starts.
+
+**Privacy.** Anything typed into or printed by a logged terminal is stored
+verbatim, like shell history, including any secret a caller pastes.
+Files are created 0600 inside 0700 directories in the owner's state root
+and are never sent anywhere. Recording is best effort: a failed write
+disables that file and never fails or delays the caller's action. Set
+`INTENDANT_COMMAND_LOG=off` to turn both streams off.
+
+Reading it:
+
+```bash
+# Every command an MCP client typed today, oldest first
+cat ~/.intendant/command-log/terminals/$(date -u +%Y%m%d)*.jsonl \
+  | jq -r 'select(.ev == "input" and .via == "mcp") | "\(.at) \(.by): \(.text)"'
+# The last 20 MCP tool calls and how they ended
+tail -n 20 ~/.intendant/command-log/mcp-calls.jsonl | jq -c '{at, tool, args, outcome, ms}'
+```
+
 ## How the Dashboard Consumes the Logs
 
 A browser that connects late does not miss history. The web gateway reads
