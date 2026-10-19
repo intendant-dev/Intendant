@@ -2143,11 +2143,16 @@ mod tests {
         session.write_input_as(b"echo command_log_probe_4417\r", &actor, "mcp");
         expect_output(&mut rx, Some("command_log_probe_4417"), "echo output").await;
         assert!(registry.close_visible(&key, &actor).await);
+        // PowerShell ignores the close-time Ctrl-D; dropping the last
+        // owner forces the exit there, as it does for a real close.
+        let instance_id = session.instance_id.clone();
+        drop(rx);
+        drop(session);
 
         let records = finished_transcript(log_root.path()).await;
         assert_eq!(records[0]["ev"], "open");
         assert_eq!(records[0]["terminal_id"], "logged-0");
-        assert_eq!(records[0]["instance_id"], session.instance_id.as_str());
+        assert_eq!(records[0]["instance_id"], instance_id.as_str());
         assert_eq!(records[0]["owner"], "principal:test-agent");
         let input = records
             .iter()
