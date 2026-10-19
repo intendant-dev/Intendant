@@ -2250,7 +2250,7 @@ pub(crate) async fn ws_inbound_task(
                                 .get_visible(&key, &ws_terminal_actor)
                                 .await
                             {
-                                session.write_input(&data);
+                                session.write_input_as(&data, &ws_terminal_actor, "dashboard");
                             }
                         }
                     }

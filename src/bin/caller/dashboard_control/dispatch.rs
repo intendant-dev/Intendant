@@ -1693,7 +1693,7 @@ pub(crate) fn control_terminal_input_frame(
             terminal_id,
         };
         if let Some(session) = registry.get_visible(&key, &actor).await {
-            session.write_input(&data);
+            session.write_input_as(&data, &actor, "dashboard-tunnel");
         }
     });
     None

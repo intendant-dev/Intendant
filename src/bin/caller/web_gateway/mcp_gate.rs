@@ -532,6 +532,71 @@ pub(crate) fn mcp_permission_denied_result(
 /// header routing) lands. The stdio transport negotiates separately via rmcp.
 pub(crate) const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2024-11-05"];
 
+/// Command-log bookkeeping for one `tools/call` (see `command_log.rs`).
+/// Inert — no argument copy, no queueing — when the command log is off or
+/// the caller is a supervised session.
+struct McpCallLogEntry<'a> {
+    root: Option<std::path::PathBuf>,
+    principal: &'a str,
+    session: Option<&'a str>,
+    tool: &'a str,
+    args: Option<serde_json::Value>,
+    started: std::time::Instant,
+}
+
+impl<'a> McpCallLogEntry<'a> {
+    fn start(
+        principal: &'a str,
+        session: Option<&'a str>,
+        tool: &'a str,
+        args: &serde_json::Value,
+    ) -> Self {
+        // A supervised session's tool calls are already in its own session
+        // log; recording them here would rotate the rest of the log away.
+        let root = if session.is_some() {
+            None
+        } else {
+            crate::command_log::default_root()
+        };
+        let args = root.as_ref().map(|_| args.clone());
+        Self {
+            root,
+            principal,
+            session,
+            tool,
+            args,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn record(&self, outcome: crate::command_log::McpCallOutcome<'_>) {
+        if let (Some(root), Some(args)) = (&self.root, &self.args) {
+            crate::command_log::record_mcp_call(
+                root,
+                &crate::command_log::McpCall {
+                    principal: self.principal,
+                    session: self.session,
+                    tool: self.tool,
+                    args,
+                    elapsed: self.started.elapsed(),
+                },
+                outcome,
+            );
+        }
+    }
+
+    fn denied(&self, result: &serde_json::Value) {
+        self.record(crate::command_log::McpCallOutcome::Denied(result));
+    }
+
+    fn finish(&self, outcome: &Result<serde_json::Value, McpHttpError>) {
+        self.record(match outcome {
+            Ok(result) => crate::command_log::McpCallOutcome::Result(result),
+            Err(error) => crate::command_log::McpCallOutcome::Error(&error.message),
+        });
+    }
+}
+
 /// Spec version negotiation for `initialize`: echo the client's requested
 /// revision when this endpoint implements it; otherwise answer with the
 /// newest implemented revision and let the client decide whether to proceed.
@@ -745,6 +810,8 @@ pub(crate) async fn handle_mcp_parsed_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            let call_log =
+                McpCallLogEntry::start(&access.principal.id, gate_session.as_deref(), name, &args);
             // Facade meta-tools authorize as the RESOLVED command's
             // operation (resolve-before-authorize); a parse failure
             // authorizes at the read floor and surfaces from dispatch,
@@ -754,14 +821,12 @@ pub(crate) async fn handle_mcp_parsed_request(
                 None => access.decision(crate::mcp::mcp_tool_operation(name)),
             };
             if !decision.allowed {
+                let denied = mcp_permission_denied_result(name, &access.principal, &decision);
+                call_log.denied(&denied);
                 return McpHttpOutcome::Response(McpHttpResponse {
                     jsonrpc: "2.0".into(),
                     id: request.id,
-                    result: Some(mcp_permission_denied_result(
-                        name,
-                        &access.principal,
-                        &decision,
-                    )),
+                    result: Some(denied),
                     error: None,
                 });
             }
@@ -772,14 +837,12 @@ pub(crate) async fn handle_mcp_parsed_request(
                 ] {
                     let extra = access.decision(operation);
                     if !extra.allowed {
+                        let denied = mcp_permission_denied_result(name, &access.principal, &extra);
+                        call_log.denied(&denied);
                         return McpHttpOutcome::Response(McpHttpResponse {
                             jsonrpc: "2.0".into(),
                             id: request.id,
-                            result: Some(mcp_permission_denied_result(
-                                name,
-                                &access.principal,
-                                &extra,
-                            )),
+                            result: Some(denied),
                             error: None,
                         });
                     }
@@ -797,7 +860,7 @@ pub(crate) async fn handle_mcp_parsed_request(
                         matches!(params, crate::mcp::RemoteCommandParams::Start { .. })
                     })
             });
-            if let (Some(task_session), Some(params)) = (task_session, task_start) {
+            let outcome = if let (Some(task_session), Some(params)) = (task_session, task_start) {
                 if let Some(preflight) = server
                     .remote_command_task_preflight(session_id, codex_managed_context)
                     .await
@@ -848,7 +911,9 @@ pub(crate) async fn handle_mcp_parsed_request(
                         message: e,
                     }),
                 }
-            }
+            };
+            call_log.finish(&outcome);
+            outcome
         }
         "tasks/get" => (|| -> Result<serde_json::Value, McpHttpError> {
             let task_session = task_session.ok_or_else(|| McpHttpError {

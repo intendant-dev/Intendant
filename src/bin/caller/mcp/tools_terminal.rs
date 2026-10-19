@@ -421,7 +421,7 @@ impl IntendantServer {
             // (ICRNL), so CR is the correct submit byte everywhere.
             input.push(b'\r');
         }
-        session.write_input(&input);
+        session.write_input_as(&input, &acting, "mcp");
         serde_json::json!({
             "ok": true,
             "wrote_bytes": input.len(),
