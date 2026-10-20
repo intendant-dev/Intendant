@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 
 use crate::event::{AppEvent, EventBus};
 use crate::external_agent::AgentBackend;
+use crate::project::ClaudeAuthMode;
 use crate::session_config::SessionAgentConfig;
 use crate::session_vitals::{GitVitalsTargets, SessionVitalsHub};
 use crate::types::{
@@ -68,6 +69,10 @@ pub struct RecoveredSessionFacts {
     /// membership key that lets a restored session inherit the account's
     /// persisted rate-limit windows.
     pub source: Option<String>,
+    /// Persisted Claude billing choice, used only until a live process
+    /// announces its actual authority. Legacy Claude records default to
+    /// subscription; API-key sessions never inherit subscription quotas.
+    pub claude_auth_mode: Option<ClaudeAuthMode>,
     /// Config-section facts; absent fields claim nothing. Recovered
     /// stamps ride the fields themselves.
     pub config: SessionConfigVitals,
@@ -85,6 +90,7 @@ impl RecoveredSessionFacts {
     /// Nothing to state: the hydrator skips the emission entirely.
     pub fn is_empty(&self) -> bool {
         self.source.is_none()
+            && self.claude_auth_mode.is_none()
             && self.config == SessionConfigVitals::default()
             && self.cache.is_none()
             && self.context.is_none()
@@ -109,6 +115,7 @@ impl SessionVitalsHub {
         }
         let RecoveredSessionFacts {
             source,
+            claude_auth_mode,
             config,
             cache,
             context,
@@ -149,10 +156,14 @@ impl SessionVitalsHub {
         if let Some(source) = source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let canonical = self.resolve(session_id);
             if !canonical.is_empty() {
-                self.record_membership(&canonical, source);
-                // An empty report re-mirrors the era's known windows into
-                // the newly joined member (the `link_identity` pattern).
-                self.apply_rate_limit_windows(session_id, Vec::new());
+                if source == "claude-code" {
+                    self.recover_claude_auth_mode(&canonical, claude_auth_mode.unwrap_or_default());
+                } else {
+                    self.record_membership(&canonical, source);
+                    // An empty report re-mirrors the era's known windows into
+                    // the newly joined member (the `link_identity` pattern).
+                    self.apply_rate_limit_windows(session_id, Vec::new());
+                }
             }
         }
     }
@@ -734,6 +745,12 @@ pub(crate) fn recovered_facts_from_layers(
 
     RecoveredSessionFacts {
         source: Some(backend_source_name(backend).to_string()),
+        claude_auth_mode: (*backend == AgentBackend::ClaudeCode).then(|| {
+            launch_config
+                .and_then(|config| config.claude_auth_mode.as_deref())
+                .and_then(|mode| ClaudeAuthMode::parse(mode).ok())
+                .unwrap_or_default()
+        }),
         config,
         cache,
         context,
@@ -1380,6 +1397,7 @@ mod tests {
     fn recovered_cc_facts(as_of: u64) -> RecoveredSessionFacts {
         RecoveredSessionFacts {
             source: Some("claude-code".into()),
+            claude_auth_mode: Some(ClaudeAuthMode::Subscription),
             config: SessionConfigVitals {
                 model: Some("claude-fable-5".into()),
                 effort: Some("xhigh".into()),
@@ -1821,6 +1839,47 @@ mod tests {
             .cloned()
             .expect("restored entry");
         assert_eq!(vitals.limits, vec![window]);
+    }
+
+    #[test]
+    fn persisted_api_billing_excludes_restored_subscription_quotas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-rate-limits.json");
+        let window = SessionLimitWindow {
+            label: "5h".into(),
+            status: Some("rejected".into()),
+            resets_at_epoch: Some(FUTURE_RESET),
+            observed_at_epoch: Some(1_000),
+            ..Default::default()
+        };
+        let mut eras = crate::session_vitals::SourceLimitEras::new();
+        eras.entry(None)
+            .or_default()
+            .insert("5h".into(), window.clone());
+        let accounts = HashMap::from([("claude-code".to_string(), eras)]);
+        persist_account_limit_store(&path, &accounts, &HashMap::new(), 0).unwrap();
+        let hub = SessionVitalsHub::with_limit_store(EventBus::new(), Some(path));
+
+        for mode in [ClaudeAuthMode::ApiKey, ClaudeAuthMode::Subscription] {
+            let launch = SessionAgentConfig {
+                source: Some("claude-code".into()),
+                claude_auth_mode: Some(mode.as_str().into()),
+                ..Default::default()
+            };
+            let facts = recovered_facts_from_layers(
+                &AgentBackend::ClaudeCode,
+                Some(&launch),
+                Some(2_000),
+                None,
+            );
+            assert_eq!(facts.claude_auth_mode, Some(mode));
+            hub.apply_recovered_facts(mode.as_str(), facts);
+        }
+        let sessions = hub.sessions.lock().unwrap();
+        assert!(sessions["api-key"].limits.is_empty());
+        assert_eq!(sessions["subscription"].limits, vec![window]);
+        let legacy = recovered_facts_from_layers(&AgentBackend::ClaudeCode, None, None, None);
+        assert_eq!(legacy.claude_auth_mode, Some(ClaudeAuthMode::Subscription));
     }
 
     /// Boot restore: both lanes (git-target registration and vitals

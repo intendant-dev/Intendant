@@ -696,6 +696,14 @@ pub enum AppEvent {
         session_id: Option<String>,
         windows: Vec<crate::types::SessionLimitWindow>,
     },
+    /// Billing authority of a successfully created Claude Code process.
+    /// Hub-internal: saved-but-unapplied settings cannot change a running
+    /// session's quota scope. Only the resulting SessionVitals is published.
+    SessionClaudeAuthMode {
+        session_id: String,
+        backend_session_id: Option<String>,
+        auth_mode: crate::project::ClaudeAuthMode,
+    },
     /// Partial session-config facts (model / effort / permission mode)
     /// from a backend's protocol seams — launch config, init echoes,
     /// mid-session switches. Hub-internal like `SessionActivity`: the
@@ -3623,6 +3631,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // which is the outbound (and session-logged) carrier.
         AppEvent::SessionActivity { .. } => None,
         AppEvent::SessionRateLimits { .. } => None,
+        AppEvent::SessionClaudeAuthMode { .. } => None,
         AppEvent::SessionConfigFacts { .. } => None,
         AppEvent::SessionRecoveredFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {

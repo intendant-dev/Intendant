@@ -258,6 +258,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionActivity { .. }
                     | AppEvent::SessionRateLimits { .. }
+                    | AppEvent::SessionClaudeAuthMode { .. }
                     | AppEvent::SessionConfigFacts { .. }
                     | AppEvent::SessionRecoveredFacts { .. }
                     | AppEvent::SessionRenameResult { .. }

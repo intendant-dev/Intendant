@@ -37,14 +37,14 @@
 //!   only to sessions that happen to make a model call, so per-session
 //!   tracking left every other live session's chip claiming a stale
 //!   "allowed" through a warned span (observed live 2026-07-19). The hub
-//!   therefore keeps one window store per backend source ("claude-code",
-//!   "codex" — one authenticated account per backend per daemon, the
-//!   auth-ceremony model), folds every report into it freshest-first (per
+//!   therefore keeps one window store per subscription backend source
+//!   ("claude-code", "codex", with credential-era attribution), folds
+//!   every report into it freshest-first (per
 //!   label, by `observed_at_epoch`), and mirrors the merged account view
 //!   into every session of that source — including sessions that start
-//!   after the report. Native sessions have no backend source and keep
-//!   per-session windows (their per-minute API-key headers churn too fast
-//!   to be worth sharing).
+//!   after the report. Claude Code running with API-key billing and
+//!   native sessions keep per-session windows: subscription quotas do not
+//!   describe their API authority, whose key may differ per session.
 //!
 //! The producers arrive keyed by different members of an external
 //! session's identity group (git = wrapper/log id, usage = backend-native
@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::event::{AppEvent, EventBus};
 use crate::frontend::ModelUsageSnapshot;
+use crate::project::ClaudeAuthMode;
 use crate::types::{
     SessionCacheVitals, SessionConfigVitals, SessionGitVitals, SessionLimitWindow, SessionVitals,
 };
@@ -679,6 +680,10 @@ pub(crate) struct SessionVitalsHub {
     /// reload respawns re-key here). Membership key for the era-scoped
     /// limits fold; native sessions never appear here.
     pub(crate) session_sources: Mutex<HashMap<String, SessionAccountMembership>>,
+    /// Claude's effective billing authority. A live process announcement
+    /// outranks recovered settings, which may have been saved without a
+    /// restart. API-key sessions do not join subscription account stores.
+    claude_auth_modes: Mutex<HashMap<String, ClaudeAuthMembership>>,
     /// Per backend source, per credential era: the era's latest known
     /// rate-limit windows, by label, freshest report per window
     /// (`observed_at_epoch`). The provider wire carries no account
@@ -719,6 +724,12 @@ pub(crate) type SourceLimitEras =
 pub(crate) struct SessionAccountMembership {
     pub(crate) source: String,
     pub(crate) account: AccountEra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeAuthMembership {
+    mode: ClaudeAuthMode,
+    live: bool,
 }
 
 /// Whether an era label is a minted nonce (`era-N`) rather than an
@@ -770,6 +781,7 @@ impl SessionVitalsHub {
             sessions: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
             session_sources: Mutex::new(HashMap::new()),
+            claude_auth_modes: Mutex::new(HashMap::new()),
             account_limits: Mutex::new(restored.limits),
             backend_accounts: Mutex::new(BackendAccountEras {
                 current: restored.current,
@@ -812,20 +824,77 @@ impl SessionVitalsHub {
                 }
             }
         }
+        let (orphan_mode, canonical_mode, adopt_orphan_authority) = {
+            let mut modes = self.claude_auth_modes.lock().expect("vitals billing lock");
+            let orphan = modes.remove(alias);
+            let mut adopted = false;
+            if let Some(orphan) = orphan {
+                if modes
+                    .get(&canonical)
+                    .is_none_or(|current| orphan.live && !current.live)
+                {
+                    modes.insert(canonical.clone(), orphan);
+                    adopted = true;
+                }
+            }
+            (orphan, modes.get(&canonical).copied(), adopted)
+        };
+        // Hydration can precede identity under the native id. Retire its
+        // separate membership too, otherwise an account mirror can still
+        // reach a session that has left subscription billing via the alias.
+        let canonical_is_api =
+            canonical_mode.is_some_and(|mode| mode.mode == ClaudeAuthMode::ApiKey);
+        let (orphan_membership, displaced_membership) = {
+            let mut sources = self.session_sources.lock().expect("vitals source lock");
+            let orphan = sources.remove(alias);
+            let displaced = if canonical_is_api {
+                sources.remove(&canonical)
+            } else if adopt_orphan_authority {
+                // An orphan's live authority also carries its credential
+                // era. A recovered wrapper must not keep its old membership.
+                match orphan.as_ref() {
+                    Some(member) => sources.insert(canonical.clone(), member.clone()),
+                    None => sources.remove(&canonical),
+                }
+            } else {
+                if let Some(orphan) = orphan.as_ref() {
+                    sources
+                        .entry(canonical.clone())
+                        .or_insert_with(|| orphan.clone());
+                }
+                None
+            };
+            (orphan, displaced)
+        };
+        let different_billing = orphan_mode
+            .zip(canonical_mode)
+            .is_some_and(|(orphan, canonical)| orphan.mode != canonical.mode);
+        let subscription_alias_to_api = canonical_is_api
+            && orphan_membership
+                .as_ref()
+                .is_some_and(|member| member.source == "claude-code");
+        let replace_limits =
+            adopt_orphan_authority || (canonical_is_api && displaced_membership.is_some());
         let orphan = self
             .sessions
             .lock()
             .expect("vitals state lock")
             .remove(alias);
-        if let Some(orphan) = orphan {
+        if orphan.is_some() || replace_limits {
             self.apply(&canonical, |vitals| {
+                if replace_limits {
+                    vitals.limits.clear();
+                }
+                let Some(orphan) = orphan else {
+                    return;
+                };
                 if vitals.git.is_none() {
                     vitals.git = orphan.git;
                 }
                 if vitals.cache.is_none() {
                     vitals.cache = orphan.cache;
                 }
-                if vitals.limits.is_empty() {
+                if vitals.limits.is_empty() && !different_billing && !subscription_alias_to_api {
                     vitals.limits = orphan.limits;
                 }
                 if vitals.activity.is_none() {
@@ -838,6 +907,23 @@ impl SessionVitalsHub {
                     vitals.context = orphan.context;
                 }
             });
+        }
+        let mut retired = false;
+        let mut affected_sources = BTreeSet::new();
+        for member in [orphan_membership, displaced_membership]
+            .into_iter()
+            .flatten()
+        {
+            if self.retire_era_if_orphaned(&member.source, &member.account) {
+                retired = true;
+            }
+            affected_sources.insert(member.source);
+        }
+        if retired {
+            self.persist_account_limits();
+        }
+        for source in affected_sources {
+            self.remirror_source(&source);
         }
     }
 
@@ -860,6 +946,24 @@ impl SessionVitalsHub {
         if canonical.is_empty() {
             return;
         }
+        if source == "claude-code" {
+            if self
+                .claude_auth_modes
+                .lock()
+                .expect("vitals billing lock")
+                .contains_key(&canonical)
+            {
+                // The billing announcement already assigned this process
+                // its scope. Generic identity must not re-key it (or a
+                // same-process child) to a newer daemon credential era.
+                return;
+            }
+        } else {
+            self.claude_auth_modes
+                .lock()
+                .expect("vitals billing lock")
+                .remove(&canonical);
+        }
         let previous = self.record_membership(&canonical, source);
         let pre_identity = if previous.is_some() {
             Vec::new()
@@ -872,6 +976,140 @@ impl SessionVitalsHub {
                 .unwrap_or_default()
         };
         self.apply_rate_limit_windows(&canonical, pre_identity);
+    }
+
+    fn observe_claude_auth_mode(
+        &self,
+        session_id: &str,
+        backend_session_id: Option<&str>,
+        mode: ClaudeAuthMode,
+    ) {
+        self.set_claude_auth_mode(session_id, mode, true, None);
+        if let Some(alias) = backend_session_id {
+            self.link_alias(alias, session_id);
+        }
+    }
+
+    pub(crate) fn recover_claude_auth_mode(&self, session_id: &str, mode: ClaudeAuthMode) {
+        self.set_claude_auth_mode(session_id, mode, false, None);
+    }
+
+    fn set_claude_auth_mode(
+        &self,
+        session_id: &str,
+        mode: ClaudeAuthMode,
+        live: bool,
+        inherited_membership: Option<SessionAccountMembership>,
+    ) {
+        let canonical = self.resolve(session_id);
+        if canonical.is_empty() {
+            return;
+        }
+        let previous = {
+            let mut modes = self.claude_auth_modes.lock().expect("vitals billing lock");
+            // Recovery fills an absent authority only. In particular, a
+            // late hydrate must not apply newly saved settings to a live
+            // process or move that process to a newer credential era.
+            if !live && modes.contains_key(&canonical) {
+                return;
+            }
+            modes.insert(canonical.clone(), ClaudeAuthMembership { mode, live })
+        };
+        let changed = previous.is_none_or(|previous| previous.mode != mode);
+        if mode == ClaudeAuthMode::ApiKey {
+            let previous_member = self
+                .session_sources
+                .lock()
+                .expect("vitals source lock")
+                .remove(&canonical);
+            if changed || previous_member.is_some() {
+                self.clear_limit_snapshot(&canonical);
+            }
+            if let Some(member) = previous_member {
+                if self.retire_era_if_orphaned(&member.source, &member.account) {
+                    self.persist_account_limits();
+                }
+                self.remirror_source(&member.source);
+            }
+        } else {
+            let previous_member = match inherited_membership {
+                Some(membership) => self.record_account_membership(&canonical, membership),
+                None => self.record_membership(&canonical, "claude-code"),
+            };
+            let pre_identity = if previous.is_none() && previous_member.is_none() {
+                self.sessions
+                    .lock()
+                    .expect("vitals state lock")
+                    .get(&canonical)
+                    .map(|vitals| vitals.limits.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.apply_rate_limit_windows(&canonical, pre_identity);
+            if changed
+                && self
+                    .sessions
+                    .lock()
+                    .expect("vitals state lock")
+                    .get(&canonical)
+                    .is_none_or(|vitals| vitals.limits.is_empty())
+            {
+                self.clear_limit_snapshot(&canonical);
+            }
+        }
+    }
+
+    /// A restart removes the old hub entry before the replacement starts,
+    /// while frontends may still hold its last snapshot. Emit an explicit
+    /// clear even when this hub entry is already empty.
+    fn clear_limit_snapshot(&self, session_id: &str) {
+        let vitals = {
+            let mut sessions = self.sessions.lock().expect("vitals state lock");
+            let entry = sessions.entry(session_id.to_string()).or_default();
+            entry.limits.clear();
+            entry.clone()
+        };
+        self.bus.send(AppEvent::SessionVitals {
+            session_id: session_id.to_string(),
+            vitals,
+        });
+    }
+
+    fn inherit_claude_auth_mode(&self, parent: &str, child: &str) {
+        let parent = self.resolve(parent);
+        let child = self.resolve(child);
+        let inherited = {
+            let modes = self.claude_auth_modes.lock().expect("vitals billing lock");
+            if modes.get(&child).is_some_and(|mode| mode.live) {
+                return;
+            }
+            // Supervisor-created native/other-backend children share the
+            // relationship vocabulary, but have independent processes.
+            // In-process Claude children announce identity before this edge.
+            if !modes.contains_key(&child)
+                && !self
+                    .session_sources
+                    .lock()
+                    .expect("vitals source lock")
+                    .get(&child)
+                    .is_some_and(|member| member.source == "claude-code")
+            {
+                return;
+            }
+            modes.get(&parent).copied()
+        };
+        if let Some(inherited) = inherited {
+            // These children share the parent's process and credentials,
+            // including a prior subscription account after a new sign-in.
+            let membership = self
+                .session_sources
+                .lock()
+                .expect("vitals source lock")
+                .get(&parent)
+                .cloned();
+            self.set_claude_auth_mode(&child, inherited.mode, inherited.live, membership);
+        }
     }
 
     /// The era a `source`'s new members join right now.
@@ -902,6 +1140,14 @@ impl SessionVitalsHub {
             source: source.to_string(),
             account: self.current_era(source),
         };
+        self.record_account_membership(canonical, membership)
+    }
+
+    fn record_account_membership(
+        &self,
+        canonical: &str,
+        membership: SessionAccountMembership,
+    ) -> Option<SessionAccountMembership> {
         let previous = self
             .session_sources
             .lock()
@@ -1054,8 +1300,8 @@ impl SessionVitalsHub {
     /// session's era, since the wire itself carries no identity — merges
     /// into that era's window store (per label, freshest
     /// `observed_at_epoch` wins) and every member session of the source
-    /// then receives its own era's view. Sourceless (native) sessions
-    /// keep per-session windows. An empty report still re-mirrors — that
+    /// then receives its own era's view. Native sessions and Claude Code
+    /// API-key sessions keep per-session windows. An empty report still re-mirrors — that
     /// is how a newly linked session inherits known state.
     pub(crate) fn apply_rate_limit_windows(
         &self,
@@ -1071,7 +1317,29 @@ impl SessionVitalsHub {
             .cloned();
         let Some(SessionAccountMembership { source, account }) = membership else {
             if !windows.is_empty() {
-                self.apply(&session_id, |vitals| vitals.limits = windows);
+                let claude_api = self
+                    .claude_auth_modes
+                    .lock()
+                    .expect("vitals billing lock")
+                    .get(&session_id)
+                    .is_some_and(|mode| mode.mode == ClaudeAuthMode::ApiKey);
+                self.apply(&session_id, |vitals| {
+                    if claude_api {
+                        // Claude reports one window per event. Preserve
+                        // unrelated API throttles and reject older reports,
+                        // just as the subscription fold does, without any
+                        // account sharing or persisted subscription store.
+                        let mut local = vitals
+                            .limits
+                            .iter()
+                            .map(|window| (window.label.clone(), window.clone()))
+                            .collect();
+                        fold_limit_windows(&mut local, &windows);
+                        vitals.limits = local.into_values().collect();
+                    } else {
+                        vitals.limits = windows;
+                    }
+                });
             }
             return;
         };
@@ -1181,6 +1449,11 @@ impl SessionVitalsHub {
 
     fn remove(&self, session_id: &str) {
         let canonical = self.resolve(session_id);
+        {
+            let mut modes = self.claude_auth_modes.lock().expect("vitals billing lock");
+            modes.remove(session_id.trim());
+            modes.remove(&canonical);
+        }
         {
             let mut sessions = self.sessions.lock().expect("vitals state lock");
             sessions.remove(session_id.trim());
@@ -1372,6 +1645,15 @@ pub(crate) fn spawn_cache_vitals_listener(
                 }) => {
                     hub.apply_rate_limit_windows(&session_id, windows);
                 }
+                Ok(AppEvent::SessionClaudeAuthMode {
+                    session_id,
+                    backend_session_id,
+                    auth_mode,
+                }) => hub.observe_claude_auth_mode(
+                    &session_id,
+                    backend_session_id.as_deref(),
+                    auth_mode,
+                ),
                 Ok(AppEvent::SessionActivity {
                     session_id: Some(session_id),
                     activity,
@@ -1420,6 +1702,14 @@ pub(crate) fn spawn_cache_vitals_listener(
                     backend_session_id,
                     source,
                 }) => hub.link_identity(&backend_session_id, &session_id, &source),
+                Ok(AppEvent::SessionRelationship {
+                    parent_session_id,
+                    child_session_id,
+                    relationship,
+                    ..
+                }) if matches!(relationship.as_str(), "side" | "subagent") => {
+                    hub.inherit_claude_auth_mode(&parent_session_id, &child_session_id);
+                }
                 // A sign-in ceremony completed: open the backend's new
                 // credential era (spawns/reloads from here on report
                 // under it; running sessions keep their birth era).
@@ -4111,6 +4401,307 @@ mod tests {
             .get(session_id)
             .map(|vitals| vitals.limits.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn claude_api_limits_are_local_and_switches_restore_subscription_scope() {
+        let hub = SessionVitalsHub::new(EventBus::new());
+        hub.observe_claude_auth_mode(
+            "subscription",
+            Some("sub-native"),
+            ClaudeAuthMode::Subscription,
+        );
+        let exhausted = SessionLimitWindow {
+            status: Some("rejected".into()),
+            ..warn_window(1_000)
+        };
+        hub.apply_rate_limit_windows("sub-native", vec![exhausted.clone()]);
+
+        for (wrapper, native) in [("api-a", "api-native-a"), ("api-b", "api-native-b")] {
+            hub.observe_claude_auth_mode(wrapper, Some(native), ClaudeAuthMode::ApiKey);
+            hub.link_identity(native, wrapper, "claude-code");
+            assert!(
+                limits_of(&hub, wrapper).is_empty(),
+                "new API session inherited subscription quota"
+            );
+        }
+        let api_limit = SessionLimitWindow {
+            label: "req/min".into(),
+            status: Some("rejected".into()),
+            ..warn_window(2_000)
+        };
+        hub.apply_rate_limit_windows("api-native-a", vec![api_limit.clone()]);
+        assert_eq!(limits_of(&hub, "api-a"), vec![api_limit.clone()]);
+        assert!(
+            limits_of(&hub, "api-b").is_empty(),
+            "different API keys cannot share a quota bucket"
+        );
+        assert_eq!(limits_of(&hub, "subscription"), vec![exhausted.clone()]);
+
+        let token_limit = SessionLimitWindow {
+            label: "tokens/min".into(),
+            status: Some("rejected".into()),
+            ..warn_window(3_000)
+        };
+        hub.apply_rate_limit_windows("api-native-a", vec![token_limit.clone()]);
+        hub.apply_rate_limit_windows(
+            "api-native-a",
+            vec![SessionLimitWindow {
+                label: "req/min".into(),
+                status: Some("allowed".into()),
+                ..warn_window(1_000)
+            }],
+        );
+        assert_eq!(
+            limits_of(&hub, "api-a"),
+            vec![api_limit.clone(), token_limit],
+            "one-window reports retain other API throttles and newer observations"
+        );
+
+        // Switching back rejoins the subscription's existing account view,
+        // without folding API throttles into that account store.
+        hub.observe_claude_auth_mode("api-a", Some("api-native-a"), ClaudeAuthMode::Subscription);
+        assert_eq!(limits_of(&hub, "api-a"), vec![exhausted.clone()]);
+        assert_eq!(limits_of(&hub, "subscription"), vec![exhausted.clone()]);
+        hub.observe_claude_auth_mode("api-a", Some("api-native-a"), ClaudeAuthMode::ApiKey);
+        assert!(limits_of(&hub, "api-a").is_empty());
+
+        // Actual backend recovery still updates the API session normally.
+        let recovered = SessionLimitWindow {
+            status: Some("allowed".into()),
+            ..api_limit
+        };
+        hub.apply_rate_limit_windows("api-native-a", vec![recovered.clone()]);
+        assert_eq!(limits_of(&hub, "api-a"), vec![recovered]);
+        assert_eq!(limits_of(&hub, "subscription"), vec![exhausted]);
+    }
+
+    #[test]
+    fn claude_api_restart_clears_frontend_snapshot_and_retires_subscription_alias() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        hub.observe_claude_auth_mode("wrapper", Some("native"), ClaudeAuthMode::Subscription);
+        hub.apply_rate_limit_windows("native", vec![warn_window(1_000)]);
+        hub.remove("wrapper");
+
+        // A boot/resume hydrate can race the replacement under its native id.
+        hub.apply_recovered_facts(
+            "native",
+            crate::session_vitals_restore::RecoveredSessionFacts {
+                source: Some("claude-code".into()),
+                claude_auth_mode: Some(ClaudeAuthMode::Subscription),
+                ..Default::default()
+            },
+        );
+        let mut rx = bus.subscribe();
+        hub.observe_claude_auth_mode("wrapper", Some("native"), ClaudeAuthMode::ApiKey);
+        assert!(limits_of(&hub, "wrapper").is_empty());
+        assert!(
+            hub.session_sources.lock().unwrap().is_empty(),
+            "native alias retained subscription membership"
+        );
+        hub.remirror_source("claude-code");
+        assert!(limits_of(&hub, "wrapper").is_empty());
+        let mut last_wire = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "wrapper");
+                assert!(vitals.limits.is_empty(), "no interim subscription warning");
+                last_wire = Some(serde_json::to_value(vitals).unwrap());
+            }
+        }
+        assert_eq!(last_wire.unwrap()["limits"], serde_json::json!([]));
+
+        // Even when the hub has no old row left, the browser may have one.
+        hub.remove("wrapper");
+        let mut rx = bus.subscribe();
+        hub.observe_claude_auth_mode("wrapper", Some("native"), ClaudeAuthMode::ApiKey);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::SessionVitals { vitals, .. }) if vitals.limits.is_empty())
+        );
+    }
+
+    #[test]
+    fn live_native_billing_replaces_conflicting_recovered_wrapper_scope() {
+        for live_mode in [ClaudeAuthMode::ApiKey, ClaudeAuthMode::Subscription] {
+            let hub = SessionVitalsHub::new(EventBus::new());
+            hub.observe_claude_auth_mode("account", None, ClaudeAuthMode::Subscription);
+            let subscription_limit = warn_window(1_000);
+            hub.apply_rate_limit_windows("account", vec![subscription_limit.clone()]);
+            let recovered_mode = match live_mode {
+                ClaudeAuthMode::ApiKey => ClaudeAuthMode::Subscription,
+                ClaudeAuthMode::Subscription => ClaudeAuthMode::ApiKey,
+            };
+            hub.recover_claude_auth_mode("wrapper", recovered_mode);
+            hub.observe_claude_auth_mode("native", None, live_mode);
+            let api_limit = SessionLimitWindow {
+                label: "req/min".into(),
+                ..warn_window(2_000)
+            };
+            if live_mode == ClaudeAuthMode::ApiKey {
+                hub.apply_rate_limit_windows("native", vec![api_limit.clone()]);
+            }
+            hub.link_identity("native", "wrapper", "claude-code");
+            hub.remirror_source("claude-code");
+            assert_eq!(
+                hub.claude_auth_modes.lock().unwrap()["wrapper"],
+                ClaudeAuthMembership {
+                    mode: live_mode,
+                    live: true,
+                }
+            );
+            assert!(!hub.session_sources.lock().unwrap().contains_key("native"));
+            match live_mode {
+                ClaudeAuthMode::ApiKey => {
+                    assert!(!hub.session_sources.lock().unwrap().contains_key("wrapper"));
+                    assert_eq!(limits_of(&hub, "wrapper"), vec![api_limit]);
+                }
+                ClaudeAuthMode::Subscription => {
+                    assert!(hub.session_sources.lock().unwrap().contains_key("wrapper"));
+                    assert_eq!(limits_of(&hub, "wrapper"), vec![subscription_limit]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_billing_cannot_change_live_authority_or_credential_era() {
+        let hub = SessionVitalsHub::new(EventBus::new());
+        hub.observe_backend_account("claude-code", Some("first@example.invalid".into()));
+        hub.observe_claude_auth_mode("live-sub", None, ClaudeAuthMode::Subscription);
+        hub.apply_rate_limit_windows("live-sub", vec![warn_window(1_000)]);
+        hub.observe_backend_account("claude-code", Some("second@example.invalid".into()));
+
+        let saved_api = crate::session_vitals_restore::RecoveredSessionFacts {
+            source: Some("claude-code".into()),
+            claude_auth_mode: Some(ClaudeAuthMode::ApiKey),
+            ..Default::default()
+        };
+        hub.apply_recovered_facts("live-sub", saved_api);
+        let membership = hub.session_sources.lock().unwrap()["live-sub"].clone();
+        assert_eq!(membership.account.as_deref(), Some("first@example.invalid"));
+        assert_eq!(
+            limits_of(&hub, "live-sub")[0].status.as_deref(),
+            Some("allowed_warning")
+        );
+
+        hub.observe_claude_auth_mode("live-api", None, ClaudeAuthMode::ApiKey);
+        let api_limit = SessionLimitWindow {
+            label: "req/min".into(),
+            ..warn_window(2_000)
+        };
+        hub.apply_rate_limit_windows("live-api", vec![api_limit.clone()]);
+        hub.apply_recovered_facts(
+            "live-api",
+            crate::session_vitals_restore::RecoveredSessionFacts {
+                source: Some("claude-code".into()),
+                claude_auth_mode: Some(ClaudeAuthMode::Subscription),
+                ..Default::default()
+            },
+        );
+        hub.link_identity("api-native", "live-api", "claude-code");
+        assert_eq!(limits_of(&hub, "live-api"), vec![api_limit]);
+        assert!(!hub.session_sources.lock().unwrap().contains_key("live-api"));
+    }
+
+    #[tokio::test]
+    async fn live_billing_event_scopes_claude_children_without_suppressing_their_limits() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        hub.link_identity("sub-native", "subscription", "claude-code");
+        hub.apply_rate_limit_windows("subscription", vec![warn_window(1_000)]);
+        let listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+        let mut rx = bus.subscribe();
+        bus.send(AppEvent::SessionClaudeAuthMode {
+            session_id: "api-parent".into(),
+            backend_session_id: Some("api-native".into()),
+            auth_mode: ClaudeAuthMode::ApiKey,
+        });
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "api-child".into(),
+            source: "claude-code".into(),
+            backend_session_id: "child-native".into(),
+        });
+        bus.send(AppEvent::SessionRelationship {
+            parent_session_id: "api-native".into(),
+            child_session_id: "api-child".into(),
+            relationship: "subagent".into(),
+            ephemeral: false,
+        });
+        let api_limit = SessionLimitWindow {
+            label: "req/min".into(),
+            ..warn_window(2_000)
+        };
+        bus.send(AppEvent::SessionRateLimits {
+            session_id: Some("child-native".into()),
+            windows: vec![api_limit.clone()],
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "api-child" && vitals.limits == vec![api_limit.clone()] {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("child API limit reaches the wire");
+        assert!(limits_of(&hub, "api-parent").is_empty());
+        assert_eq!(limits_of(&hub, "subscription"), vec![warn_window(1_000)]);
+        listener.abort();
+    }
+
+    #[test]
+    fn subscription_children_keep_the_parent_process_credential_era() {
+        let hub = SessionVitalsHub::new(EventBus::new());
+        hub.observe_backend_account("claude-code", Some("parent@example.invalid".into()));
+        hub.observe_claude_auth_mode(
+            "parent",
+            Some("parent-native"),
+            ClaudeAuthMode::Subscription,
+        );
+        hub.apply_rate_limit_windows("parent", vec![warn_window(1_000)]);
+        hub.observe_backend_account("claude-code", Some("current@example.invalid".into()));
+        hub.observe_claude_auth_mode("current", None, ClaudeAuthMode::Subscription);
+        hub.apply_rate_limit_windows("current", vec![warn_window(2_000)]);
+
+        hub.link_identity("child-native", "child", "claude-code");
+        hub.inherit_claude_auth_mode("parent-native", "child");
+        // A later identity echo must not move a same-process child to the
+        // daemon's newly signed-in account either.
+        hub.link_identity("child-native", "child", "claude-code");
+        assert_eq!(
+            hub.session_sources.lock().unwrap()["child"]
+                .account
+                .as_deref(),
+            Some("parent@example.invalid")
+        );
+        hub.apply_rate_limit_windows("child-native", vec![warn_window(3_000)]);
+        assert_eq!(limits_of(&hub, "child"), limits_of(&hub, "parent"));
+        assert_eq!(limits_of(&hub, "parent")[0].observed_at_epoch, Some(3_000));
+        assert_eq!(limits_of(&hub, "current")[0].observed_at_epoch, Some(2_000));
+
+        // An independently supervised child has its own process authority.
+        hub.observe_claude_auth_mode("own-process", None, ClaudeAuthMode::Subscription);
+        hub.inherit_claude_auth_mode("parent", "own-process");
+        assert_eq!(
+            hub.session_sources.lock().unwrap()["own-process"]
+                .account
+                .as_deref(),
+            Some("current@example.invalid")
+        );
+
+        hub.link_identity("codex-native", "codex-child", "codex");
+        hub.inherit_claude_auth_mode("parent", "codex-child");
+        hub.inherit_claude_auth_mode("parent", "native-child");
+        assert_eq!(
+            hub.session_sources.lock().unwrap()["codex-child"].source,
+            "codex"
+        );
+        let modes = hub.claude_auth_modes.lock().unwrap();
+        assert!(!modes.contains_key("codex-child"));
+        assert!(!modes.contains_key("native-child"));
     }
 
     /// The minted-nonce matcher recognizes exactly the shape

@@ -941,6 +941,12 @@ mode unchanged, with the error shown in the dialog. Selecting a different option
 alone does not change the saved mode. There is no automatic fallback between
 subscription and API billing.
 
+Usage-limit indicators follow the running Claude Code process's billing mode.
+Subscription sessions share the quota reported for their signed-in account;
+API-key sessions show their own reported limits. Switching billing clears the
+previous mode's warnings, including queued notifications and visible limit
+toasts. Actual API rate-limit warnings still appear when Claude reports them.
+
 Older sessions without a billing pin show **Current project/default**, since
 their project may have a different default from the dashboard's daemon. Leaving
 that value selected preserves the session's existing billing settings. Choosing

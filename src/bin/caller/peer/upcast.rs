@@ -585,6 +585,7 @@ impl AppEventUpcaster {
             // Hub-internal: peers see the folded SessionVitals instead.
             | AppEvent::SessionActivity { .. }
             | AppEvent::SessionRateLimits { .. }
+            | AppEvent::SessionClaudeAuthMode { .. }
             | AppEvent::SessionConfigFacts { .. }
             | AppEvent::SessionRecoveredFacts { .. }
             | AppEvent::ContextSnapshot { .. }

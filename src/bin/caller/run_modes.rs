@@ -3036,6 +3036,7 @@ pub(crate) async fn run_with_presence(
                     backend,
                     &proj,
                     &session_log,
+                    &bus,
                     web_port,
                     startup_resume,
                     session_log_id(&session_log),
