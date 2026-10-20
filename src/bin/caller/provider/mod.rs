@@ -409,7 +409,7 @@ impl ProjectEnvKeys {
         }
     }
 
-    fn get(&self, name: &str) -> Option<String> {
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
         self.keys.get(name).cloned()
     }
 

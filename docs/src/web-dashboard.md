@@ -873,7 +873,14 @@ directory is safe to delete; it rebuilds on the next scan.
   when a selected model cannot inherit the global effort, the picker explicitly
   selects that model's advertised default. Model and effort pins persist across
   attach/resume. The external-agent options sit in a fold
-  that opens when an external backend is selected. Claude Code sessions get per-launch
+  that opens when an external backend is selected. Claude Code sessions get a
+  **Billing** picker next to **Agent**, with **Subscription** and **API key**
+  available at any time. Subscription uses the signed-in Claude account;
+  API key uses the Anthropic key saved in Settings → API Keys. The choice is
+  explicit and independent of subscription quota. The project/default
+  `[agent.claude_code].auth_mode` seeds new sessions (default: `subscription`),
+  and the submitted choice persists with that session. The browser sends only
+  the billing mode; it never retrieves the saved key. Claude also gets per-launch
   dropdowns for the model (version-safe aliases — `fable`, `opus`, `sonnet`,
   `haiku` — that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
@@ -913,14 +920,32 @@ under that session on the model's behalf. The parent is notified with a
 follow-up and collects the result with its `wait_sub_agents` tool; see
 [Native Multi-Agent Orchestration](./multi-agent.md#delegating-from-the-dashboard).
 
-External-agent session cards and Activity windows also expose **Launch config**
-for per-session binary and managed-context settings. Use **Save** to update the
+External-agent session cards offer **Configure** (**Billing & config** for Claude
+Code), and Activity windows offer **Launch config: billing, model, permissions…**
+for per-session agent settings. Use **Save** to update the
 next attach/resume, or **Save & restart** to apply the new binary/mode
 immediately to that external backend. These settings are stored with the
 Intendant wrapper session and, for canonical backend session IDs, in an
 external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
-Claude Code sessions get four pinnable rows: model (the same version-safe
+
+Claude Code's **Billing** row shows the saved **Subscription** or **API key**
+mode and lets you choose either mode at any time. A changed choice turns
+**Save** into **Switch billing & restart**. The daemon checks API key availability
+before saving an API-key choice; after it confirms the save, the dashboard restarts
+Claude Code and resumes the same backend conversation under the selected billing
+mode. A missing API key or save failure leaves the running session and its saved
+mode unchanged, with the error shown in the dialog. Selecting a different option
+alone does not change the saved mode. There is no automatic fallback between
+subscription and API billing.
+
+Older sessions without a billing pin show **Current project/default**, since
+their project may have a different default from the dashboard's daemon. Leaving
+that value selected preserves the session's existing billing settings. Choosing
+**Subscription** or **API key** pins the explicit mode and restarts/resumes the
+conversation, including when the choice matches the daemon's default.
+
+Claude Code also gets four pinnable rows: model (the same version-safe
 aliases as New Session, plus a Custom-id escape), permission mode, allowed
 tools (comma-separated rules; `all` pins the explicitly-unrestricted empty
 list so a session can escape a restrictive global list), and reasoning

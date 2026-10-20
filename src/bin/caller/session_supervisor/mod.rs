@@ -1362,6 +1362,7 @@ mod tests {
             )),
             shared_claude_config: Arc::new(tokio::sync::RwLock::new(
                 control_plane::ClaudeRuntimeConfig {
+                    auth_mode: crate::project::ClaudeAuthMode::Subscription,
                     model: None,
                     effort: None,
                     permission_mode: "default".to_string(),

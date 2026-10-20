@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use tokio::sync::mpsc;
 
+pub(crate) mod claude_auth;
 pub mod claude_code;
 pub mod codex;
 pub mod kimi_code;

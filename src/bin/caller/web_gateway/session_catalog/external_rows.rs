@@ -199,6 +199,7 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
         ("claude_permission_mode", "claude_permission_mode"),
         ("claude_allowed_tools", "claude_allowed_tools"),
         ("claude_effort", "claude_effort"),
+        ("claude_auth_mode", "claude_auth_mode"),
         // Kimi's live profile is persisted on the wrapper too. Preserve it
         // when the wrapper collapses into Kimi's native session row, just as
         // we do for Claude, so forks and resumed sessions remain editable

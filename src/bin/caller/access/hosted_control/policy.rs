@@ -394,6 +394,7 @@ pub fn hosted_control_msg_allowed(
             claude_model,
             claude_permission_mode,
             claude_effort,
+            claude_auth_mode,
             kimi_model,
             kimi_thinking,
             kimi_permission_mode,
@@ -429,6 +430,7 @@ pub fn hosted_control_msg_allowed(
                 && claude_model.is_none()
                 && claude_permission_mode.is_none()
                 && claude_effort.is_none()
+                && claude_auth_mode.is_none()
                 && kimi_model.is_none()
                 && kimi_thinking.is_none()
                 && kimi_permission_mode.is_none()
@@ -551,6 +553,7 @@ pub fn hosted_control_msg_allowed(
             claude_permission_mode,
             claude_allowed_tools,
             claude_effort,
+            claude_auth_mode,
             kimi_model,
             kimi_thinking,
             kimi_permission_mode,
@@ -577,6 +580,7 @@ pub fn hosted_control_msg_allowed(
                 && claude_permission_mode.is_none()
                 && claude_allowed_tools.is_none()
                 && claude_effort.is_none()
+                && claude_auth_mode.is_none()
                 && kimi_model.is_none()
                 && kimi_thinking.is_none()
                 && kimi_permission_mode.is_none()
@@ -1179,6 +1183,7 @@ mod tests {
         for (key, value) in [
             ("agent", serde_json::json!("claude-code")),
             ("claude_effort", serde_json::json!("max")),
+            ("claude_auth_mode", serde_json::json!("api-key")),
             ("claude_model", serde_json::json!("haiku")),
             ("codex_reasoning_effort", serde_json::json!("xhigh")),
             ("agent_command", serde_json::json!("/tmp/evil")),

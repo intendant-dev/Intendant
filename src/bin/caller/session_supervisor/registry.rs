@@ -484,6 +484,7 @@ impl SessionSupervisor {
             Some(external_agent::AgentBackend::ClaudeCode) => {
                 let current = self.config.shared_claude_config.read().await.clone();
                 let cfg = &mut project.config.agent.claude_code;
+                cfg.auth_mode = current.auth_mode;
                 cfg.model = current.model;
                 // The daemon-default leg of the effort resolution chain:
                 // explicit per-create `claude_effort` is applied AFTER this

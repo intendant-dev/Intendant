@@ -156,6 +156,7 @@ impl SessionSupervisor {
             claude_model,
             claude_permission_mode,
             claude_effort,
+            claude_auth_mode,
             kimi_model,
             kimi_thinking,
             kimi_permission_mode,
@@ -429,6 +430,30 @@ impl SessionSupervisor {
                 apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
             {
                 self.loop_error(format!("Session create failed: {}", e));
+                return None;
+            }
+        }
+        if let Some(mode) = claude_auth_mode.as_deref() {
+            let Some(backend) = backend.as_ref() else {
+                self.loop_error(
+                    "Session create failed: claude_auth_mode requires Claude Code".to_string(),
+                );
+                return None;
+            };
+            if let Err(error) = apply_session_claude_auth_mode(&mut project, backend, mode) {
+                self.loop_error(format!("Session create failed: {error}"));
+                return None;
+            }
+        }
+        if matches!(
+            backend.as_ref(),
+            Some(external_agent::AgentBackend::ClaudeCode)
+        ) {
+            if let Err(error) = crate::external_agent::claude_auth::validate_auth_mode(
+                project.config.agent.claude_code.auth_mode,
+                &project.root,
+            ) {
+                self.loop_error(format!("Session create failed: {error}"));
                 return None;
             }
         }
@@ -1280,7 +1305,23 @@ impl SessionSupervisor {
                 if let (Some(backend), Some(config)) =
                     (external_backend.as_ref(), session_agent_config.as_ref())
                 {
-                    crate::session_config::apply_to_project(&mut project, backend, config);
+                    if let Err(error) = self
+                        .validate_session_auth_config(backend, config, Some(&project.root))
+                        .await
+                    {
+                        self.clear_external_attach_request(&external_attach_keys)
+                            .await;
+                        self.loop_error(format!("Session resume failed: {error}"));
+                        return;
+                    }
+                    if let Err(error) =
+                        crate::session_config::apply_to_project(&mut project, backend, config)
+                    {
+                        self.clear_external_attach_request(&external_attach_keys)
+                            .await;
+                        self.loop_error(format!("Session resume failed: {error}"));
+                        return;
+                    }
                 }
                 let effective_session_agent_config = external_backend.as_ref().map(|backend| {
                     effective_session_agent_config_from_project(
@@ -1436,7 +1477,19 @@ impl SessionSupervisor {
         if let (Some(backend), Some(config)) =
             (external_backend.as_ref(), session_agent_config.as_ref())
         {
-            crate::session_config::apply_to_project(&mut project, backend, config);
+            if let Err(error) = self
+                .validate_session_auth_config(backend, config, Some(&project.root))
+                .await
+            {
+                self.loop_error(format!("Session resume failed: {error}"));
+                return;
+            }
+            if let Err(error) =
+                crate::session_config::apply_to_project(&mut project, backend, config)
+            {
+                self.loop_error(format!("Session resume failed: {error}"));
+                return;
+            }
         }
         let effective_session_agent_config = external_backend.as_ref().map(|backend| {
             effective_session_agent_config_from_project(

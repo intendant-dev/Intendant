@@ -817,6 +817,8 @@ pub enum OutboundEvent {
     },
     SessionAgentConfigResult {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_session_id: Option<String>,

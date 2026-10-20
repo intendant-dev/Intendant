@@ -275,6 +275,12 @@ pub struct SettingsPayload {
     /// (`crate::project::CLAUDE_EFFORTS`); POST callers may omit it.
     #[serde(default)]
     pub claude_efforts: Vec<String>,
+    /// Read-only daemon default. Sessions select their own billing mode.
+    #[serde(default, skip_deserializing)]
+    pub claude_auth_mode: Option<String>,
+    /// Derived from the billing enum; never accepted as a mutation.
+    #[serde(default, skip_deserializing)]
+    pub claude_auth_modes: Vec<String>,
     #[serde(default)]
     pub claude_permission_mode: Option<String>,
     #[serde(default)]
@@ -452,6 +458,11 @@ pub(crate) fn settings_payload_from_config(
             &config.agent.codex.context_archive,
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
+        claude_auth_mode: Some(config.agent.claude_code.auth_mode.as_str().to_string()),
+        claude_auth_modes: crate::project::ClaudeAuthMode::ALL
+            .iter()
+            .map(|mode| mode.as_str().to_string())
+            .collect(),
         claude_model: config.agent.claude_code.model.clone(),
         claude_effort: crate::project::normalize_claude_effort(
             config.agent.claude_code.effort.as_deref(),
@@ -2397,6 +2408,28 @@ mod tests {
         assert!(saved.contains("model = \"k2.7 coding\""));
         assert!(saved.contains("command = \"/opt/pi/bin/pi\""));
         assert!(saved.contains("model = \"openai-codex/gpt-5.6-sol\""));
+    }
+
+    #[test]
+    fn settings_expose_claude_billing_default_and_vocabulary_without_mutating_them() {
+        let mut config = crate::project::ProjectConfig::default();
+        for mode in crate::project::ClaudeAuthMode::ALL {
+            config.agent.claude_code.auth_mode = mode;
+            let value = serde_json::to_value(settings_payload_from_config(&config)).unwrap();
+            assert_eq!(value["claude_auth_mode"], mode.as_str());
+            assert_eq!(
+                value["claude_auth_modes"],
+                serde_json::json!(["subscription", "api-key"])
+            );
+            let mut submitted = value;
+            submitted["claude_auth_mode"] = serde_json::json!("api-key");
+            submitted["claude_auth_modes"] = serde_json::json!(["auto"]);
+            let payload: SettingsPayload = serde_json::from_value(submitted).unwrap();
+            assert!(payload.claude_auth_mode.is_none());
+            assert!(payload.claude_auth_modes.is_empty());
+            apply_settings_payload(&mut config, &payload);
+            assert_eq!(config.agent.claude_code.auth_mode, mode);
+        }
     }
 
     /// The Claude reasoning daemon default round-trips through the settings

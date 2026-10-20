@@ -51,6 +51,9 @@ pub struct SessionAgentConfig {
     pub claude_allowed_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_effort: Option<String>,
+    /// Explicit billing authority, preserved across restart, resume, and fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_auth_mode: Option<String>,
     /// Kimi launch pins. `None` inherits the current global setting; booleans
     /// use `Some(false)` for an explicit per-session disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +143,23 @@ pub struct SessionAgentConfig {
 }
 
 impl SessionAgentConfig {
+    /// Validate before applying any launch settings. Keeping an invalid raw
+    /// value until this boundary avoids turning it into a billing fallback.
+    pub fn parsed_claude_auth_mode(
+        &self,
+        backend: &AgentBackend,
+    ) -> Result<Option<crate::project::ClaudeAuthMode>, String> {
+        self.claude_auth_mode
+            .as_deref()
+            .map(|mode| {
+                if *backend != AgentBackend::ClaudeCode {
+                    return Err("claude_auth_mode requires Claude Code".to_string());
+                }
+                crate::project::ClaudeAuthMode::parse(mode)
+            })
+            .transpose()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.source.is_none()
             && self.project_root.is_none()
@@ -156,6 +176,7 @@ impl SessionAgentConfig {
             && self.claude_permission_mode.is_none()
             && self.claude_allowed_tools.is_none()
             && self.claude_effort.is_none()
+            && self.claude_auth_mode.is_none()
             && self.kimi_model.is_none()
             && self.kimi_thinking.is_none()
             && self.kimi_permission_mode.is_none()
@@ -244,6 +265,9 @@ impl SessionAgentConfig {
         }
         if self.claude_effort.is_none() {
             self.claude_effort = fallback.claude_effort;
+        }
+        if self.claude_auth_mode.is_none() {
+            self.claude_auth_mode = fallback.claude_auth_mode;
         }
         if self.kimi_model.is_none() {
             self.kimi_model = fallback.kimi_model;
@@ -622,6 +646,7 @@ pub struct WireSessionAgentFields<'a> {
     pub claude_permission_mode: Option<&'a str>,
     pub claude_allowed_tools: Option<&'a str>,
     pub claude_effort: Option<&'a str>,
+    pub claude_auth_mode: Option<&'a str>,
     pub kimi_model: Option<&'a str>,
     pub kimi_thinking: Option<&'a str>,
     pub kimi_permission_mode: Option<&'a str>,
@@ -715,6 +740,7 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         claude_effort: is_claude
             .then(|| normalize_claude_effort(fields.claude_effort))
             .flatten(),
+        claude_auth_mode: fields.claude_auth_mode.map(str::to_string),
         kimi_model: is_kimi
             .then(|| normalize_kimi_model(fields.kimi_model))
             .flatten(),
@@ -780,6 +806,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             claude_permission_mode: None,
             claude_allowed_tools: None,
             claude_effort: None,
+            claude_auth_mode: None,
             kimi_model: None,
             kimi_thinking: None,
             kimi_permission_mode: None,
@@ -824,6 +851,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 )),
                 claude_allowed_tools: Some(claude.allowed_tools.clone()),
                 claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
+                claude_auth_mode: Some(claude.auth_mode.as_str().to_string()),
                 kimi_model: None,
                 kimi_thinking: None,
                 kimi_permission_mode: None,
@@ -864,6 +892,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 claude_permission_mode: None,
                 claude_allowed_tools: None,
                 claude_effort: None,
+                claude_auth_mode: None,
                 kimi_model: normalize_kimi_model(kimi.model.as_deref()),
                 kimi_thinking: normalize_kimi_thinking(kimi.thinking.as_deref()),
                 kimi_permission_mode: Some(crate::project::normalize_kimi_permission_mode(
@@ -910,7 +939,8 @@ pub fn apply_to_project(
     project: &mut Project,
     backend: &AgentBackend,
     config: &SessionAgentConfig,
-) {
+) -> Result<(), String> {
+    let claude_auth_mode = config.parsed_claude_auth_mode(backend)?;
     match backend {
         AgentBackend::Codex => {
             if let Some(command) = config.agent_command.clone() {
@@ -940,6 +970,9 @@ pub fn apply_to_project(
         }
         AgentBackend::ClaudeCode => {
             let claude = &mut project.config.agent.claude_code;
+            if let Some(mode) = claude_auth_mode {
+                claude.auth_mode = mode;
+            }
             if let Some(command) = config.agent_command.clone() {
                 claude.command = command;
             }
@@ -1000,6 +1033,7 @@ pub fn apply_to_project(
             }
         }
     }
+    Ok(())
 }
 
 pub fn write_log_dir_config(log_dir: &Path, config: &SessionAgentConfig) -> Result<(), String> {
@@ -1498,6 +1532,12 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
             Value::String(effort.to_string()),
         );
     }
+    if let Some(mode) = config.claude_auth_mode.as_deref() {
+        obj.insert(
+            "claude_auth_mode".to_string(),
+            Value::String(mode.to_string()),
+        );
+    }
     if let Some(model) = config.kimi_model.as_deref() {
         obj.insert("kimi_model".to_string(), Value::String(model.to_string()));
     }
@@ -1816,6 +1856,7 @@ mod tests {
             claude_model: Some("claude-fable-5".to_string()),
             claude_effort: Some("high".to_string()),
             claude_permission_mode: Some("acceptEdits".to_string()),
+            claude_auth_mode: Some("api-key".to_string()),
             // The parent was itself a fork: its ancestry must not leak
             // into the child's record.
             forked_from: Some("00000000-dead-beef-0000-000000000000".to_string()),
@@ -1837,6 +1878,7 @@ mod tests {
 
         assert_eq!(child.claude_model.as_deref(), Some("claude-fable-5"));
         assert_eq!(child.claude_effort.as_deref(), Some("high"));
+        assert_eq!(child.claude_auth_mode.as_deref(), Some("api-key"));
         assert_eq!(
             child.claude_permission_mode.as_deref(),
             Some("plan"),
@@ -1853,6 +1895,13 @@ mod tests {
             "the parent's fork anchor must never leak into the child"
         );
         assert_eq!(child.fork_relationship.as_deref(), Some("anchor-fork"));
+        child.claude_auth_mode = Some("subscription".to_string());
+        inherit_forked_parent_launch_pins(home.path(), "claude-code", &mut child);
+        assert_eq!(
+            child.claude_auth_mode.as_deref(),
+            Some("subscription"),
+            "the child's explicit billing selection outranks the parent"
+        );
 
         // No parent config resolvable → a no-op, never a panic.
         let mut orphan = SessionAgentConfig {
@@ -2661,6 +2710,104 @@ mod tests {
     }
 
     #[test]
+    fn claude_billing_switch_round_trips_on_the_same_session_and_overrides_defaults() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut project = Project::from_root(root.path().to_path_buf()).unwrap();
+        let backend = AgentBackend::ClaudeCode;
+        for mode in ["api-key", "subscription", "api-key"] {
+            let config = from_wire_fields(WireSessionAgentFields {
+                source: Some("claude-code"),
+                claude_auth_mode: Some(mode),
+                ..Default::default()
+            });
+            write_external_overlay(home.path(), "claude-code", "same-session", &config).unwrap();
+            let saved = load_for_resume(
+                home.path(),
+                "claude-code",
+                "same-session",
+                Some("same-session"),
+            )
+            .unwrap();
+            assert_eq!(saved.claude_auth_mode.as_deref(), Some(mode));
+            apply_to_project(&mut project, &backend, &saved).unwrap();
+            assert_eq!(project.config.agent.claude_code.auth_mode.as_str(), mode);
+            assert_eq!(
+                from_project(&backend, &project).claude_auth_mode.as_deref(),
+                Some(mode)
+            );
+            let mut row = serde_json::json!({"source":"claude-code", "session_id":"same-session"});
+            apply_config_to_session_json(&mut row, &saved);
+            assert_eq!(row["claude_auth_mode"], mode);
+            assert_eq!(row["session_id"], "same-session");
+            // Unrelated partial saves and forks retain the billing choice.
+            write_external_overlay(
+                home.path(),
+                "claude-code",
+                "same-session",
+                &SessionAgentConfig {
+                    source: Some("claude-code".to_string()),
+                    claude_model: Some("sonnet".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let saved =
+                lookup_external_overlay(home.path(), "claude-code", "same-session").unwrap();
+            assert_eq!(
+                saved
+                    .clone()
+                    .into_inheritable_launch_pins()
+                    .claude_auth_mode
+                    .as_deref(),
+                Some(mode)
+            );
+            assert_eq!(saved.claude_auth_mode.as_deref(), Some(mode));
+        }
+    }
+
+    #[test]
+    fn invalid_persisted_or_cross_backend_billing_is_rejected_before_project_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project {
+            root: dir.path().to_path_buf(),
+            config: Default::default(),
+        };
+        for mode in ["future-provider", "", "inherit", "API-KEY"] {
+            let config = SessionAgentConfig {
+                source: Some("claude-code".to_string()),
+                agent_command: Some("/unused/claude".to_string()),
+                claude_auth_mode: Some(mode.to_string()),
+                ..Default::default()
+            };
+            write_log_dir_config(dir.path(), &config).unwrap();
+            let saved = read_log_dir_config(dir.path()).unwrap();
+            assert_eq!(
+                saved.claude_auth_mode.as_deref(),
+                Some(mode),
+                "invalid billing must survive reading so launch can reject it"
+            );
+            assert!(apply_to_project(&mut project, &AgentBackend::ClaudeCode, &saved).is_err());
+            assert_eq!(
+                project.config.agent.claude_code.auth_mode,
+                crate::project::ClaudeAuthMode::Subscription
+            );
+            assert_eq!(project.config.agent.claude_code.command, "claude");
+        }
+        let wrong_backend = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            claude_auth_mode: Some("api-key"),
+            ..Default::default()
+        });
+        assert_eq!(wrong_backend.claude_auth_mode.as_deref(), Some("api-key"));
+        assert!(
+            apply_to_project(&mut project, &AgentBackend::Codex, &wrong_backend)
+                .unwrap_err()
+                .contains("requires Claude Code")
+        );
+    }
+
+    #[test]
     fn claude_wire_fields_normalize_and_gate_on_source() {
         let cfg = from_wire_fields(WireSessionAgentFields {
             source: Some("claude-code"),
@@ -2722,7 +2869,7 @@ mod tests {
 
         std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
         let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
-        apply_to_project(&mut project, &AgentBackend::Codex, &loaded);
+        apply_to_project(&mut project, &AgentBackend::Codex, &loaded).unwrap();
         assert_eq!(
             project.config.agent.codex.reasoning_effort.as_deref(),
             Some("ultra")
@@ -2863,7 +3010,7 @@ mod tests {
             claude_effort: Some("max"),
             ..Default::default()
         });
-        apply_to_project(&mut project, &AgentBackend::ClaudeCode, &cfg);
+        apply_to_project(&mut project, &AgentBackend::ClaudeCode, &cfg).unwrap();
         let claude = &project.config.agent.claude_code;
         assert_eq!(claude.model.as_deref(), Some("opus"));
         assert_eq!(claude.permission_mode, "acceptEdits");
@@ -2926,7 +3073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
         let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
-        apply_to_project(&mut project, &AgentBackend::Kimi, &cfg);
+        apply_to_project(&mut project, &AgentBackend::Kimi, &cfg).unwrap();
         assert_eq!(project.config.agent.kimi.command, "/opt/kimi");
         assert_eq!(
             project.config.agent.kimi.model.as_deref(),
@@ -3050,7 +3197,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             config: crate::project::ProjectConfig::default(),
         };
-        apply_to_project(&mut project, &AgentBackend::Kimi, &loaded);
+        apply_to_project(&mut project, &AgentBackend::Kimi, &loaded).unwrap();
         assert_eq!(project.config.agent.kimi.kimi_fork_rollback_turns, Some(3));
         assert_eq!(
             project

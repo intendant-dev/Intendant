@@ -984,8 +984,10 @@ function buildSessionCard(m, derived, ctx) {
     if (sessionId && configSource && configSource !== 'intendant') {
       const configBtn = document.createElement('button');
       configBtn.className = 'ui-btn sc-rename-btn';
-      configBtn.textContent = 'Configure';
-      configBtn.title = 'Configure binary and managed context for this session';
+      configBtn.textContent = configSource === 'claude-code' ? 'Billing & config' : 'Configure';
+      configBtn.title = configSource === 'claude-code'
+        ? 'Choose Subscription or API key billing, model, permissions, tools, and binary for this Claude Code session'
+        : 'Configure binary and agent settings for this session';
       configBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         openSessionConfigModal(s);

@@ -2444,7 +2444,7 @@ button.wt-session-chip:focus-visible {
 .modal-confirm.secondary { background: var(--green); color: var(--base); }
 .modal-confirm.danger { background: var(--red); color: var(--base); }
 .modal-confirm.hidden { display: none; }
-.modal-cancel:disabled, .modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+.modal-cancel:disabled, .modal-confirm:disabled, .modal-close:disabled { opacity: 0.5; cursor: not-allowed; }
 .fs-picker-dialog {
   width: min(720px, calc(100vw - 32px));
   max-width: 720px;

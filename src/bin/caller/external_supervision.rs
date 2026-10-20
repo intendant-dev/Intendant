@@ -62,7 +62,7 @@ pub(crate) fn apply_startup_external_resume_config(
     project: &mut Project,
     intendant_session_id: Option<&str>,
     resume_session: Option<&str>,
-) -> Option<session_config::SessionAgentConfig> {
+) -> Result<Option<session_config::SessionAgentConfig>, String> {
     apply_startup_external_resume_config_in_home(
         &platform::home_dir(),
         backend,
@@ -84,10 +84,13 @@ pub(crate) fn apply_startup_external_resume_config_in_home(
     intendant_session_id: Option<&str>,
     resume_session: Option<&str>,
     explicit_overrides: session_config::SessionAgentConfig,
-) -> Option<session_config::SessionAgentConfig> {
-    let resume_token = resume_session
+) -> Result<Option<session_config::SessionAgentConfig>, String> {
+    let Some(resume_token) = resume_session
         .map(str::trim)
-        .filter(|token| !token.is_empty())?;
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(None);
+    };
     let session_id = intendant_session_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
@@ -102,10 +105,10 @@ pub(crate) fn apply_startup_external_resume_config_in_home(
         config.merge_missing_from(persisted);
     }
     if config.is_empty() {
-        return None;
+        return Ok(None);
     }
-    session_config::apply_to_project(project, backend, &config);
-    Some(config)
+    session_config::apply_to_project(project, backend, &config)?;
+    Ok(Some(config))
 }
 
 pub(crate) fn emit_external_session_identity(
@@ -359,7 +362,8 @@ pub(crate) fn claude_runtime_config_equal(
     a: &control_plane::ClaudeRuntimeConfig,
     b: &control_plane::ClaudeRuntimeConfig,
 ) -> bool {
-    a.model == b.model
+    a.auth_mode == b.auth_mode
+        && a.model == b.model
         && a.effort == b.effort
         && a.permission_mode == b.permission_mode
         && a.allowed_tools == b.allowed_tools
@@ -903,6 +907,7 @@ pub(crate) async fn create_external_agent(
                     cfg.allowed_tools.clone(),
                     web_port,
                 )
+                .with_auth_mode(cfg.auth_mode)
                 .with_max_budget_usd(cfg.max_budget_usd),
             );
             let config = AgentConfig {
@@ -2603,6 +2608,7 @@ pub(crate) fn shared_claude_config_from_project(
     let cfg = &project.config.agent.claude_code;
     Arc::new(tokio::sync::RwLock::new(
         control_plane::ClaudeRuntimeConfig {
+            auth_mode: cfg.auth_mode,
             model: cfg.model.clone(),
             effort: project::normalize_claude_effort(cfg.effort.as_deref()),
             permission_mode: project::normalize_claude_permission_mode(&cfg.permission_mode),
@@ -3788,6 +3794,84 @@ new file mode 100644
         project
     }
 
+    #[tokio::test]
+    async fn claude_runtime_billing_is_seeded_and_forces_process_rebuild() {
+        let mut project = default_codex_project();
+        let subscription = shared_claude_config_from_project(&project)
+            .read()
+            .await
+            .clone();
+        assert_eq!(
+            subscription.auth_mode,
+            project::ClaudeAuthMode::Subscription
+        );
+        project.config.agent.claude_code.auth_mode = project::ClaudeAuthMode::ApiKey;
+        let api_key = shared_claude_config_from_project(&project)
+            .read()
+            .await
+            .clone();
+        assert_eq!(api_key.auth_mode, project::ClaudeAuthMode::ApiKey);
+        assert!(claude_runtime_config_equal(&subscription, &subscription));
+        assert!(!claude_runtime_config_equal(&subscription, &api_key));
+    }
+
+    #[test]
+    fn claude_startup_resume_keeps_billing_pin_and_rejects_invalid_persisted_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        for mode in ["api-key", "subscription"] {
+            let config = session_config::SessionAgentConfig {
+                source: Some("claude-code".to_string()),
+                claude_auth_mode: Some(mode.to_string()),
+                ..Default::default()
+            };
+            session_config::write_external_overlay(
+                home.path(),
+                "claude-code",
+                "same-session",
+                &config,
+            )
+            .unwrap();
+            let loaded = apply_startup_external_resume_config_in_home(
+                home.path(),
+                &external_agent::AgentBackend::ClaudeCode,
+                &mut project,
+                Some("wrapper-session"),
+                Some("same-session"),
+                Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded.claude_auth_mode.as_deref(), Some(mode));
+            assert_eq!(project.config.agent.claude_code.auth_mode.as_str(), mode);
+        }
+        let invalid = session_config::SessionAgentConfig {
+            source: Some("claude-code".to_string()),
+            claude_auth_mode: Some("auto".to_string()),
+            ..Default::default()
+        };
+        session_config::write_external_overlay(
+            home.path(),
+            "claude-code",
+            "same-session",
+            &invalid,
+        )
+        .unwrap();
+        assert!(apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::ClaudeCode,
+            &mut project,
+            Some("wrapper-session"),
+            Some("same-session"),
+            Default::default(),
+        )
+        .is_err());
+        assert_eq!(
+            project.config.agent.claude_code.auth_mode,
+            project::ClaudeAuthMode::Subscription
+        );
+    }
+
     #[test]
     fn startup_resume_applies_persisted_session_config_over_global_default() {
         let home = tempfile::tempdir().unwrap();
@@ -3813,6 +3897,7 @@ new file mode 100644
             Some("backend-thread"),
             session_config::SessionAgentConfig::default(),
         )
+        .unwrap()
         .expect("persisted overlay should produce startup overrides");
 
         let codex = &project.config.agent.codex;
@@ -3847,6 +3932,7 @@ new file mode 100644
             Some("backend-thread"),
             session_config::SessionAgentConfig::default(),
         )
+        .unwrap()
         .expect("overlay keyed by wrapper id should produce startup overrides");
 
         assert_eq!(project.config.agent.codex.managed_context, "managed");
@@ -3887,6 +3973,7 @@ new file mode 100644
             Some("backend-thread"),
             explicit,
         )
+        .unwrap()
         .expect("explicit overrides should produce startup overrides");
 
         assert_eq!(project.config.agent.codex.managed_context, "vanilla");
@@ -3908,7 +3995,10 @@ new file mode 100644
             session_config::SessionAgentConfig::default(),
         );
 
-        assert!(overrides.is_none(), "no overlay should mean no overrides");
+        assert!(
+            overrides.unwrap().is_none(),
+            "no overlay should mean no overrides"
+        );
         assert_eq!(project.config.agent.codex.managed_context, "vanilla");
         assert_eq!(project.config.agent.codex.command, default_command);
     }
@@ -3931,7 +4021,10 @@ new file mode 100644
             session_config::SessionAgentConfig::default(),
         );
 
-        assert!(overrides.is_none(), "fresh startups must stay untouched");
+        assert!(
+            overrides.unwrap().is_none(),
+            "fresh startups must stay untouched"
+        );
         assert_eq!(project.config.agent.codex.managed_context, "vanilla");
     }
 

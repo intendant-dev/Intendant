@@ -1117,6 +1117,47 @@ impl SessionSupervisor {
                 return;
             }
         }
+        // Preflight before stopping: an unavailable key or invalid billing
+        // choice must leave the current Claude process and its saved mode intact.
+        let backend = external_agent::AgentBackend::from_str_loose(&source_norm)
+            .expect("source was checked above");
+        let mut auth_config = crate::session_config::from_wire_fields(
+            overrides.as_wire_fields(backend.as_short_str()),
+        );
+        if let Some(saved) = crate::session_config::load_for_resume(
+            &self.logs_home(),
+            backend.as_short_str(),
+            &session_id,
+            Some(&resume_token),
+        ) {
+            auth_config.merge_missing_from(saved);
+        }
+        let managed = {
+            let state = self.state.lock().await;
+            state
+                .resolve_session_id(&session_id)
+                .and_then(|id| state.sessions.get(&id))
+                .map(|session| (session.project_root.clone(), session.session_dir.clone()))
+        };
+        if let Some((_, dir)) = managed.as_ref() {
+            if let Some(saved) = crate::session_config::read_log_dir_config(dir) {
+                auth_config.merge_missing_from(saved);
+            }
+        }
+        let requested_root = project_root.as_deref().map(PathBuf::from);
+        if let Err(error) = self
+            .validate_session_auth_config(
+                &backend,
+                &auth_config,
+                requested_root
+                    .as_deref()
+                    .or_else(|| managed.as_ref().map(|(root, _)| root.as_path())),
+            )
+            .await
+        {
+            self.loop_error(format!("Session restart failed: {error}"));
+            return;
+        }
         // Liveness, never phase: a wrapper whose phase chip says "done"
         // but which still holds its follow-up channel is alive and must
         // be superseded, or the restart mints a duplicate beside it.
@@ -4319,6 +4360,55 @@ mod tests {
         config.logs_home_override = Some(home.path().to_path_buf());
         let supervisor = SessionSupervisor::new(config);
         (home, project, supervisor, bus)
+    }
+
+    #[tokio::test]
+    async fn invalid_claude_billing_restart_keeps_the_live_worker_running() {
+        let backend_id = "6d000000-0000-4000-8000-000000000003";
+        let wrapper_id = "eeee0000-0000-4000-8000-000000000003";
+        let (_home, project, supervisor, bus) = lineage_rig(backend_id, wrapper_id);
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut session = managed_session(backend_id, "claude-code");
+        session.project_root = project.path().to_path_buf();
+        session.session_dir = project.path().join("session-log");
+        let persisted = crate::session_config::SessionAgentConfig {
+            source: Some("claude-code".to_string()),
+            claude_auth_mode: Some("auto".to_string()),
+            ..Default::default()
+        };
+        crate::session_config::write_log_dir_config(&session.session_dir, &persisted).unwrap();
+        session.follow_up_tx = tx;
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .insert(backend_id.to_string(), session);
+        let mut events = bus.subscribe();
+        supervisor
+            .restart_session(
+                "claude-code".to_string(),
+                backend_id.to_string(),
+                Some(backend_id.to_string()),
+                None,
+                None,
+                Some(true),
+                Vec::new(),
+                LaunchOverrides::default(),
+            )
+            .await;
+        assert_eq!(supervisor.state.lock().await.sessions.len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid billing must not deliver a stop to the worker"
+        );
+        let mut rejected = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::LoopError(message) = event {
+                rejected |= message.contains("subscription or api-key");
+            }
+        }
+        assert!(rejected, "restart must report the billing error");
     }
 
     /// The commission's pin: a restart (or resume) aimed at a lineage
