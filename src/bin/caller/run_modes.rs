@@ -2988,6 +2988,7 @@ pub(crate) async fn run_with_presence(
                 }
                 if matches!(backend, external_agent::AgentBackend::ClaudeCode) {
                     let cc = &mut proj.config.agent.claude_code;
+                    cc.auth_mode = current_claude_config.auth_mode;
                     cc.model = current_claude_config.model.clone();
                     cc.effort = current_claude_config.effort.clone();
                     cc.permission_mode = current_claude_config.permission_mode.clone();
@@ -3021,7 +3022,15 @@ pub(crate) async fn run_with_presence(
                     None
                 };
                 if let Some(config) = startup_overrides.as_ref() {
-                    session_config::apply_to_project(&mut proj, backend, config);
+                    if let Err(error) = session_config::apply_to_project(&mut proj, backend, config)
+                    {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent configuration error: {error}"),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
                 }
                 let (agent, thread, event_rx) = match create_external_agent(
                     backend,

@@ -587,14 +587,19 @@ pub(crate) async fn run_headless_mode(
     // startup `--resume`/`--continue`, mirroring the daemon resume path in
     // `SessionSupervisor::resume_session`. Applied after the shared runtime
     // configs were seeded above so per-session overrides stay per-session.
-    let startup_external_resume_overrides = agent_backend.as_ref().and_then(|backend| {
-        apply_startup_external_resume_config(
-            backend,
-            &mut project,
-            session_log_id(&session_log).as_deref(),
-            startup_external_resume_session.as_deref(),
-        )
-    });
+    let startup_external_resume_overrides = agent_backend
+        .as_ref()
+        .map(|backend| {
+            apply_startup_external_resume_config(
+                backend,
+                &mut project,
+                session_log_id(&session_log).as_deref(),
+                startup_external_resume_session.as_deref(),
+            )
+        })
+        .transpose()
+        .map_err(CallerError::Config)?
+        .flatten();
 
     let result = if use_presence {
         // Presence mode: the presence layer mediates between user and

@@ -349,7 +349,38 @@ function resetNewSessionCodexFastModeToDefault() {
   newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
 }
 
+function onNewSessionClaudeAuthModeChange() {
+  newSessionClaudeAuthModeTouched = true;
+}
+window.onNewSessionClaudeAuthModeChange = onNewSessionClaudeAuthModeChange;
+
+function setClaudeAuthModeDefaults(settings) {
+  const select = document.getElementById('new-session-claude-auth-mode');
+  const previous = select?.value;
+  claudeAuthModes = Array.isArray(settings.claude_auth_modes)
+    ? [...new Set(settings.claude_auth_modes.map(mode => String(mode || '').trim()).filter(Boolean))]
+    : [];
+  newSessionClaudeAuthMode = String(settings.claude_auth_mode || '').trim() || 'subscription';
+  populateClaudeAuthModeSelect(select,
+    newSessionClaudeAuthModeTouched && claudeAuthModes.includes(previous)
+      ? previous : newSessionClaudeAuthMode);
+  // Settings refreshes must preserve an open form's unsaved choice.
+  if (sessionConfigEditing?.source === 'claude-code' && !sessionConfigSavePending) {
+    const editingSelect = document.getElementById('session-config-claude-auth-mode');
+    const draft = selectedClaudeAuthMode(editingSelect);
+    const changed = sessionConfigClaudeBillingChanged(draft);
+    if (sessionConfigEditing.claudeAuthModeInherited) {
+      sessionConfigEditing.claudeAuthMode = newSessionClaudeAuthMode;
+    }
+    populateClaudeAuthModeSelect(editingSelect,
+      changed ? draft : (sessionConfigEditing.claudeAuthModeInherited ? '' : sessionConfigEditing.claudeAuthMode),
+      { inherit: sessionConfigEditing.claudeAuthModeInherited });
+    onSessionConfigClaudeAuthModeChange();
+  }
+}
+
 function setNewSessionAgentDefaults(settings) {
+  setClaudeAuthModeDefaults(settings);
   newSessionAgentCommands = {
     codex: settings.codex_command || 'codex',
     'claude-code': settings.claude_command || 'claude',
@@ -498,6 +529,9 @@ function renderNewSessionAgentControls(options = {}) {
   const appliesToCodex = effectiveAgent === 'codex';
   const appliesToKimi = effectiveAgent === 'kimi';
   const appliesToPi = effectiveAgent === 'pi';
+  document.getElementById('new-session-claude-auth-mode-wrap')?.classList.toggle('hidden', !appliesToClaude);
+  const claudeBilling = document.getElementById('new-session-claude-auth-mode');
+  if (claudeBilling) claudeBilling.disabled = !appliesToClaude || !claudeAuthModes.length;
   if (codexModelSel) {
     codexModelSel.disabled = !appliesToCodex;
     if (!appliesToCodex) codexModelSel.value = '';
@@ -1151,6 +1185,8 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'claude-code') {
+    const authMode = selectedClaudeAuthMode(document.getElementById('new-session-claude-auth-mode'));
+    if (authMode) msg.claude_auth_mode = authMode;
     const modelChoice = document.getElementById('new-session-claude-model-select')?.value || '';
     const model = modelChoice === '__custom__'
       ? (document.getElementById('new-session-claude-model')?.value.trim() || '')

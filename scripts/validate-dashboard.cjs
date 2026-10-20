@@ -1868,6 +1868,365 @@ this.__helpers = {
   return sandbox.__helpers;
 }
 
+// Exercise the real billing form, wire payloads, and configure-ack/restart
+// path without a daemon, browser, credential store, or model call. Read the
+// authored fragments so this also works before the Rust assembler runs.
+async function runDashboardClaudeBillingSelfTests() {
+  const appDir = path.resolve(__dirname, '..', 'static', 'app');
+  const launch = fs.readFileSync(path.join(appDir, '40-session-launch.js'), 'utf8');
+  const fresh = fs.readFileSync(path.join(appDir, '55b-session-launch.js'), 'utf8');
+  const shell = fs.readFileSync(path.join(appDir, '20-shell.html'), 'utf8');
+  const dialogs = fs.readFileSync(path.join(appDir, '21-access-dialogs.html'), 'utf8');
+  const windowSource = fs.readFileSync(path.join(appDir, '39-session-windows.js'), 'utf8');
+  const lifecycle = fs.readFileSync(path.join(appDir, '54-session-lifecycle.js'), 'utf8');
+  const station = fs.readFileSync(path.join(appDir, '34-station-panes.js'), 'utf8');
+  const peers = fs.readFileSync(path.join(appDir, '51-peer-approvals.js'), 'utf8');
+  assert.ok(shell.indexOf('id="new-session-claude-auth-mode"') < shell.indexOf('id="new-session-external-fold"'),
+    'Billing must be visible beside Agent, outside the advanced external options');
+  assert.ok(shell.includes('for="new-session-claude-auth-mode"'));
+  assert.ok(dialogs.includes('for="session-config-claude-auth-mode"'));
+  assert.ok(dialogs.includes('onchange="onSessionConfigClaudeAuthModeChange()"'));
+
+  const source = [
+    sourceBetween(launch, 'function claudeAuthModeLabel', '// Mirror the just-saved claude pins'),
+    sourceBetween(launch, 'function applyClaudePinsLocal', 'function applyKimiPinsLocal'),
+    sourceBetween(launch, 'function applySessionConfigLocal', '// The Claude launch-config form'),
+    sourceBetween(launch, 'function sessionConfigClaudeFormValues', 'function sessionConfigKimiFormValues'),
+    sourceBetween(launch, 'function saveSessionConfigModal', 'window.openSessionConfigModal'),
+    sourceBetween(launch, 'function restartSessionWindowAction', 'function attachSessionWindowAction'),
+    sourceBetween(fresh, 'function onNewSessionClaudeAuthModeChange', 'function setNewSessionAgentDefaults'),
+    sourceBetween(fresh, 'function commandDefaultForNewSessionAgent', 'function setNewSessionStartButtonPending'),
+    sourceBetween(fresh, 'async function startNewSession', '// Reveal the optional branch-name input'),
+    sourceBetween(windowSource, 'function normalizeSessionWindowMeta', '// Session worktree linkage'),
+    sourceBetween(windowSource, 'function sessionWindowMetadataSignature', '// A backend\'s card'),
+    sourceBetween(windowSource, 'function sessionWindowMetaFromSession', 'function applySessionRelationshipsFromSession'),
+    sourceBetween(windowSource, 'function persistedSessionWindowRecord', '// Trailing-debounced twin'),
+    sourceBetween(lifecycle, 'function onSessionAttached', '// ── Worktree finish card'),
+    sourceBetween(station, 'function stationSessionConfigEditingFor', 'async function stationLoadWorktrees'),
+    sourceBetween(peers, 'function generateSessionId', 'function peerCanShareDisplay'),
+  ].join('\n');
+  const makeElement = () => {
+    const classes = new Set();
+    return {
+      value: '', textContent: '', className: '', disabled: false, style: {}, options: [],
+      classList: {
+        toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+        contains(name) { return classes.has(name); },
+      },
+      replaceChildren() { this.options = []; this.value = ''; },
+      appendChild(option) { this.options.push(option); },
+      querySelector() { return null; },
+    };
+  };
+  const elements = new Map([
+    'new-session-input', 'new-session-agent', 'new-session-agent-command',
+    'new-session-claude-auth-mode', 'new-session-claude-auth-mode-wrap', 'new-session-external-fold',
+    'session-config-modal', 'session-config-save', 'session-config-save-restart',
+    'session-config-close', 'session-config-cancel',
+    'session-config-status', 'session-config-command', 'session-config-claude-auth-mode',
+    'session-config-claude-auth-mode-row', 'session-config-claude-auth-mode-note',
+    'session-config-claude-model', 'session-config-claude-model-row',
+  ].map(id => [id, makeElement()]));
+  const get = id => elements.get(id);
+  const sent = [];
+  const liveActions = [];
+  const restarted = [];
+  const detached = new Map();
+  const timers = new Map();
+  let timerId = 0;
+  const noop = () => {};
+  const fixture = {
+    session_id: 'billing-wrapper', backend_session_id: 'billing-backend',
+    intendant_session_id: 'billing-wrapper', source: 'claude-code', claude_auth_mode: 'subscription',
+  };
+  const sandbox = {
+    window: {}, app: {}, claudeAuthModes: [], newSessionClaudeAuthMode: 'subscription',
+    newSessionClaudeAuthModeTouched: false, sessionConfigEditing: null, sessionConfigSavePending: null,
+    sessionMetadataById: new Map(), sessionWindows: new Map(), _cachedSessions: [fixture],
+    stationSessionConfigDrafts: new Map(), stationSessionConfigResult: null,
+    newSessionConfiguredAgent: '', newSessionAgentCommands: {}, externalAgentAvailability: [],
+    newSessionSpawnPending: false, newSessionCodexLaunchDefaultsLoaded: false, pendingAttachments: [],
+    document: { getElementById: id => elements.get(id) || null, createElement: makeElement },
+    setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: id => timers.delete(id),
+    findCachedSessionByAnyId: id => [fixture.session_id, fixture.backend_session_id].includes(id) ? fixture : null,
+    managedContextNormalizeSessionMeta: meta => meta,
+    sessionConfigSource: meta => meta.source,
+    sessionConfigCommand: meta => meta.agent_command || '',
+    prettyAgentName: source => source === 'claude-code' ? 'Claude Code' : source,
+    normalizeAgentId: value => ['codex', 'claude-code', 'kimi', 'pi'].includes(value) ? value : '',
+    normalizeOptionalCodexSandbox: value => value,
+    normalizeOptionalCodexApprovalPolicy: value => value,
+    normalizeContextArchiveModeOptional: value => value,
+    sessionConfigKimiFormValues: () => ({}), sessionConfigPiFormValues: () => ({}),
+    sessionWindowIsDetached: () => false,
+    dispatchControlMsg: message => {
+      sent.push(JSON.parse(JSON.stringify(message)));
+      if (message.action === 'restart_session') {
+        restarted.push({ id: message.session_id, saved: sandbox.sessionMetadataById.get(message.session_id)?.claudeAuthMode });
+      }
+    },
+    dispatchSessionControlMsg: message => { sent.push(JSON.parse(JSON.stringify(message))); return true; },
+    dispatchCodexThreadAction: (...args) => liveActions.push(args),
+    sessionWindowExternalActionContext: id => ({ session_id: id, source: 'claude-code', task: 'stale task', attachments: ['stale attachment'] }),
+    setSessionWindowDetached: (id, value) => detached.set(id, value),
+    showControlToast: noop, shortSessionId: id => id,
+    scheduleSessionsMetadataRefresh: noop, persistSessionWindowState: noop,
+    updateSessionConfigKimiCustomRow: noop, updateNewSessionCodexCustomModelRow: noop,
+    updateNewSessionClaudeCustomModelRow: noop, updateNewSessionKimiCustomModelRow: noop,
+    applyExternalAgentAvailabilityToNewSessionPicker: noop, updateNewSessionFuelBanner: noop,
+    daemonInternalUnfueled: () => false, newSessionProjectlessBlocked: () => false,
+    beginNewSessionSpawnNotice: noop, ensureNewSessionProjectDirectory: async () => '',
+    failNewSessionSpawnNotice: message => { throw new Error(message); },
+    saveNewSessionAgentPrefs: noop, updateNewSessionSpawnNotice: noop, resetNewSessionCodexFastModeToDefault: noop,
+    compactSessionText: value => String(value || '').trim(), compactPathLabel: value => value,
+    normalizeSessionAgendaEnvelope: () => null, normalizeSessionBootEra: () => null,
+    normalizeSessionWorktreeInfo: () => null, normalizeSessionWorktreeState: () => null,
+    normalizeSessionTerminalFacts: () => null, sessionWindowPersistedSource: () => 'claude-code',
+    sessionGoalSignature: () => '', sessionTerminalFactsSignature: () => '',
+    stationScheduleUpdate: noop, maybeFailPendingNewSessionSpawnNoProject: noop,
+    maybeFailRecentNewSessionSpawn: noop, externalSourceForSessionWindow: () => 'claude-code',
+    clearPendingFollowUpsForSession: noop, updateSessionWindow: noop, updateTaskTargetChip: noop,
+    currentSessionFullId: fixture.session_id, foregroundSessionFullId: fixture.session_id,
+    sessionsLoaded: false, activeActivitySubtab: 'log', setPhase: noop, scheduleSessionRelationshipRender: noop,
+    resolvePromptTargetSessionId: () => fixture.session_id, ensureSessionWindow: noop,
+    attachedSessionPhase: () => 'idle', focusSessionWindowFromLifecycle: noop,
+    flushPendingDetachedCodexThreadActions: noop, resetChangesPane: noop,
+    focusActivityForSessionEvent: noop, refreshChangesList: noop, refreshSessionWindowMetadata: noop,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox, { filename: 'dashboard-claude-billing-self-test' });
+  const modes = { claude_auth_modes: ['subscription', 'api-key'], claude_auth_mode: 'subscription' };
+  const newBilling = get('new-session-claude-auth-mode');
+  const billing = get('session-config-claude-auth-mode');
+  const save = get('session-config-save');
+  const note = get('session-config-claude-auth-mode-note');
+  const status = get('session-config-status');
+  const ack = extra => sandbox.handleSessionConfigResult({
+    session_id: fixture.session_id, success: true,
+    request_id: sandbox.sessionConfigSavePending?.requestId || undefined,
+    persisted_session_ids: [fixture.session_id, fixture.backend_session_id], ...extra,
+  });
+  const saved = () => sandbox.sessionMetadataById.get(fixture.session_id)?.claudeAuthMode || fixture.claude_auth_mode;
+  const choose = value => { billing.value = value; sandbox.onSessionConfigClaudeAuthModeChange(); };
+  sandbox.setClaudeAuthModeDefaults(modes);
+  assert.deepStrictEqual(newBilling.options.map(option => [option.value, option.textContent]), [
+    ['subscription', 'Subscription'], ['api-key', 'API key'],
+  ]);
+  assert.strictEqual(newBilling.value, 'subscription');
+  assert.strictEqual(newBilling.disabled, false);
+  newBilling.value = 'api-key';
+  sandbox.onNewSessionClaudeAuthModeChange();
+  sandbox.setClaudeAuthModeDefaults(modes);
+  assert.strictEqual(newBilling.value, 'api-key', 'a settings refresh preserves a draft billing choice');
+  get('new-session-input').value = 'Run a hermetic launch fixture';
+  for (const agent of ['claude-code', 'codex', 'internal', 'kimi', 'pi']) {
+    get('new-session-agent').value = agent;
+    sandbox.renderNewSessionAgentControls();
+    assert.strictEqual(get('new-session-claude-auth-mode-wrap').classList.contains('hidden'), agent !== 'claude-code');
+    await sandbox.startNewSession();
+    const message = sent.pop();
+    assert.strictEqual(message.action, 'create_session');
+    assert.strictEqual(message.claude_auth_mode, agent === 'claude-code' ? 'api-key' : undefined);
+    assert.ok(Object.keys(message).every(key => !/api_key|secret|token/.test(key)), 'only the mode travels to the daemon');
+  }
+  sandbox.newSessionConfiguredAgent = 'claude-code';
+  get('new-session-agent').value = '';
+  await sandbox.startNewSession();
+  assert.strictEqual(sent.pop().claude_auth_mode, 'api-key', 'the configured Claude default also sends its billing choice');
+
+  // An unpinned legacy session may follow a different project's default.
+  // Never guess its running mode or silently pin it on an unrelated Save.
+  delete fixture.claude_auth_mode;
+  sandbox.openSessionConfigModal(fixture.session_id);
+  sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
+  assert.strictEqual(billing.value, '');
+  assert.strictEqual(save.textContent, 'Save');
+  assert.match(note.textContent, /follows this session's project\/default setting/);
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sent.at(-1).claude_auth_mode, undefined);
+  assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
+  ack({ success: false });
+  choose('api-key');
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
+  assert.strictEqual(sandbox.sessionConfigSavePending.restart, true,
+    'explicitly pinning an inherited mode restarts even if it matches the daemon default');
+  ack({ success: false });
+  choose('subscription');
+  sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
+  assert.strictEqual(billing.value, 'subscription', 'an open draft survives a settings refresh');
+  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  sandbox.closeSessionConfigModal();
+  fixture.claude_auth_mode = 'subscription';
+  sandbox.setClaudeAuthModeDefaults(modes);
+  assert.strictEqual(sandbox.openSessionConfigModal(fixture.session_id), true);
+  assert.strictEqual(billing.value, 'subscription');
+  choose('api-key');
+  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  assert.match(note.textContent, /Saved billing: Subscription\./);
+  assert.strictEqual(saved(), 'subscription');
+  sandbox.closeSessionConfigModal();
+  sandbox.openSessionConfigModal(fixture.session_id);
+  assert.strictEqual(billing.value, 'subscription', 'cancel never marks the draft active');
+
+  choose('api-key');
+  get('session-config-claude-model').value = 'opus';
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
+  assert.ok(sent.at(-1).request_id);
+  assert.strictEqual(sent.at(-1).request_id, sandbox.sessionConfigSavePending.requestId);
+  assert.strictEqual(sandbox.sessionConfigSavePending.restart, true);
+  assert.strictEqual(saved(), 'subscription', 'save submission is not a successful save');
+  assert.strictEqual(restarted.length, 0);
+  assert.strictEqual(liveActions.length, 0, 'billing changes must not mutate the running model before restart');
+  assert.strictEqual(save.disabled, true);
+  assert.strictEqual(get('session-config-close').disabled, true);
+  assert.strictEqual(get('session-config-cancel').disabled, true);
+  const pendingBeforeClose = sandbox.sessionConfigSavePending;
+  sandbox.closeSessionConfigModal();
+  assert.strictEqual(sandbox.sessionConfigSavePending, pendingBeforeClose,
+    'close, backdrop, or Escape must preserve an in-flight billing receipt');
+  assert.strictEqual(get('session-config-modal').style.display, 'flex');
+  assert.strictEqual(sandbox.openSessionConfigModal('another-session'), false,
+    'another config dialog cannot replace the pending session');
+  sandbox.stationSaveSessionConfig(fixture.session_id);
+  assert.strictEqual(sandbox.sessionConfigSavePending, pendingBeforeClose,
+    'a Station save must not overwrite the pending modal receipt');
+  const sendsBeforeDoubleSave = sent.length;
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sent.length, sendsBeforeDoubleSave, 'pending save cannot be submitted twice');
+  ack({ success: false, message: 'No Anthropic API key is configured. Save one in Settings → API Keys.' });
+  assert.strictEqual(saved(), 'subscription');
+  assert.strictEqual(restarted.length, 0);
+  assert.match(status.textContent, /No Anthropic API key/);
+  assert.match(note.textContent, /Saved billing: Subscription\./);
+  assert.strictEqual(get('session-config-modal').style.display, 'flex');
+  assert.strictEqual(save.disabled, false);
+  assert.strictEqual(get('session-config-close').disabled, false);
+  assert.strictEqual(get('session-config-cancel').disabled, false);
+
+  sandbox.saveSessionConfigModal();
+  ack({ success: false, message: 'Cannot persist session config' });
+  assert.strictEqual(saved(), 'subscription');
+  assert.strictEqual(restarted.length, 0);
+  sandbox.saveSessionConfigModal();
+  ack({ persisted_session_ids: [fixture.session_id] });
+  assert.strictEqual(saved(), 'subscription', 'missing backend confirmation must not advance cached mode');
+  assert.strictEqual(restarted.length, 0);
+  assert.match(status.textContent, /backend thread id/);
+
+  sandbox.saveSessionConfigModal();
+  sandbox.handleSessionConfigResult({ session_id: 'unrelated-session', success: true });
+  assert.ok(sandbox.sessionConfigSavePending, 'another session cannot acknowledge this save');
+  timers.get(sandbox.sessionConfigSavePending.timeoutHandle).fn();
+  assert.strictEqual(saved(), 'subscription');
+  assert.strictEqual(restarted.length, 0);
+  assert.match(status.textContent, /timed out/);
+  const dispatch = sandbox.dispatchControlMsg;
+  sandbox.dispatchControlMsg = () => { throw new Error('Disconnected'); };
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(saved(), 'subscription');
+  assert.strictEqual(restarted.length, 0);
+  assert.match(status.textContent, /Disconnected/);
+  sandbox.dispatchControlMsg = dispatch;
+
+  sandbox.saveSessionConfigModal();
+  ack();
+  assert.strictEqual(saved(), 'api-key');
+  assert.strictEqual(fixture.claude_auth_mode, 'api-key');
+  assert.deepStrictEqual(restarted, [{ id: 'billing-wrapper', saved: 'api-key' }],
+    'restart happens only after the saved API mode is confirmed for the same session');
+  assert.notStrictEqual(detached.get(fixture.session_id), true,
+    'a restart request must leave the running worker attached if backend preflight rejects it');
+  assert.strictEqual(sent.at(-1).task, undefined);
+  assert.strictEqual(sent.at(-1).attachments, undefined);
+  sandbox.onSessionEnded(fixture.session_id, 'restarting session');
+  assert.strictEqual(detached.get(fixture.session_id), true, 'the authoritative stop detaches');
+  sandbox.onSessionAttached(fixture.session_id, 'claude-code');
+  assert.strictEqual(detached.get(fixture.session_id), false, 'the resumed worker reattaches');
+  sandbox.openSessionConfigModal(fixture.session_id);
+  assert.strictEqual(billing.value, 'api-key');
+  assert.match(note.textContent, /Saved billing: API key\./);
+  choose('subscription');
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(saved(), 'api-key');
+  ack();
+  assert.deepStrictEqual(restarted.at(-1), { id: 'billing-wrapper', saved: 'subscription' },
+    'the reverse switch is equally available and resumes the same identity');
+  sandbox.openSessionConfigModal(fixture.session_id);
+  assert.strictEqual(save.textContent, 'Save');
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
+  ack();
+  assert.strictEqual(restarted.length, 2, 'unchanged billing preserves ordinary Save behavior');
+
+  // Catalog refresh and persisted window records retain the saved mode.
+  const mapped = sandbox.sessionWindowMetaFromSession({ ...fixture, claude_auth_mode: 'api-key' });
+  assert.strictEqual(mapped.claudeAuthMode, 'api-key');
+  assert.notStrictEqual(sandbox.sessionWindowMetadataSignature(mapped),
+    sandbox.sessionWindowMetadataSignature({ ...mapped, claudeAuthMode: 'subscription' }),
+    'a mode-only metadata update must refresh the session window');
+  sandbox.sessionMetadataById.set(fixture.session_id, mapped);
+  sandbox.sessionMetadataById.set(fixture.backend_session_id, mapped);
+  fixture.claude_auth_mode = 'api-key';
+  const persisted = sandbox.persistedSessionWindowRecord(fixture.session_id);
+  assert.strictEqual(persisted.claude_auth_mode, 'api-key');
+  assert.strictEqual(sandbox.normalizeSessionWindowMeta(persisted).claudeAuthMode, 'api-key');
+
+  sandbox.setClaudeAuthModeDefaults({});
+  sandbox.openSessionConfigModal(fixture.session_id);
+  assert.strictEqual(billing.disabled, true, 'an older daemon cannot offer a switch it would silently ignore');
+  choose('subscription');
+  sandbox.saveSessionConfigModal();
+  assert.strictEqual(sent.at(-1).claude_auth_mode, undefined);
+  assert.strictEqual(sent.at(-1).request_id, undefined, 'older daemons keep generic config compatibility');
+  assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
+  ack({ success: false });
+  get('new-session-agent').value = 'claude-code';
+  await sandbox.startNewSession();
+  assert.strictEqual(sent.pop().claude_auth_mode, undefined);
+  sandbox.closeSessionConfigModal();
+
+  // A delayed API save, or another client's result for this same session,
+  // must not satisfy a later Subscription save and restart with the wrong pin.
+  sandbox.setClaudeAuthModeDefaults(modes);
+  sandbox.openSessionConfigModal(fixture.session_id);
+  choose('api-key');
+  sandbox.saveSessionConfigModal({ restart: true });
+  const oldRequest = sandbox.sessionConfigSavePending.requestId;
+  timers.get(sandbox.sessionConfigSavePending.timeoutHandle).fn();
+  choose('subscription');
+  sandbox.saveSessionConfigModal();
+  const latestPending = sandbox.sessionConfigSavePending;
+  const restartsBeforeLateAck = restarted.length;
+  assert.notStrictEqual(latestPending.requestId, oldRequest);
+  ack({ request_id: oldRequest });
+  ack({ request_id: 'another-clients-request' });
+  ack({ request_id: undefined });
+  assert.strictEqual(sandbox.sessionConfigSavePending, latestPending);
+  assert.strictEqual(saved(), 'api-key');
+  assert.strictEqual(restarted.length, restartsBeforeLateAck);
+  sandbox.closeSessionConfigModal();
+  ack();
+  assert.strictEqual(saved(), 'subscription');
+  assert.strictEqual(restarted.length, restartsBeforeLateAck + 1);
+
+  // Station shares the same pending/ack handler and correlation contract.
+  sandbox.stationSaveSessionConfig(fixture.session_id, { restart: true });
+  const stationPending = sandbox.sessionConfigSavePending;
+  assert.strictEqual(stationPending.station, true);
+  assert.ok(stationPending.requestId);
+  assert.strictEqual(sent.at(-1).request_id, stationPending.requestId);
+  assert.strictEqual(sandbox.openSessionConfigModal(fixture.session_id), false);
+  sandbox.stationSaveSessionConfig(fixture.session_id);
+  assert.strictEqual(sandbox.sessionConfigSavePending, stationPending);
+  ack({ request_id: oldRequest });
+  assert.strictEqual(sandbox.sessionConfigSavePending, stationPending);
+  ack();
+  assert.strictEqual(sandbox.sessionConfigSavePending, null);
+}
+
 function extractInlineJavaScript(html) {
   const scripts = [];
   const scriptTag = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
@@ -7050,6 +7409,7 @@ async function runSelfTest() {
     () => checkModuleSyntax('import x from "./missing.js"; const broken = ;', 'self-test-module-broken'),
     /module inline script syntax check failed.*(SyntaxError|Unexpected token)/,
   );
+  await runDashboardClaudeBillingSelfTests();
   const dashboardHelpers = loadDashboardLogHelperSandbox(path.resolve(__dirname, '..', 'static', 'app.html'));
   const twoDigits = (value) => String(value).padStart(2, '0');
   const dateStamp = (date) => [

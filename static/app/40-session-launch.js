@@ -45,6 +45,62 @@ function sessionLaunchArchiveMode(meta = {}) {
   );
 }
 
+function claudeAuthModeLabel(mode) {
+  return ({ subscription: 'Subscription', 'api-key': 'API key' })[mode] || mode;
+}
+
+function sessionClaudeAuthMode(meta = {}) {
+  return String(meta.claudeAuthMode || meta.claude_auth_mode || '').trim()
+    || newSessionClaudeAuthMode;
+}
+
+function populateClaudeAuthModeSelect(select, selectedMode, { inherit = false } = {}) {
+  if (!select) return;
+  select.replaceChildren();
+  const modes = [
+    ...(inherit ? [''] : []),
+    ...(claudeAuthModes.length ? claudeAuthModes : [selectedMode].filter(Boolean)),
+  ];
+  for (const mode of modes) {
+    const option = document.createElement('option');
+    option.value = mode;
+    option.textContent = mode ? claudeAuthModeLabel(mode) : 'Current project/default';
+    select.appendChild(option);
+  }
+  select.value = modes.includes(selectedMode) ? selectedMode : modes[0];
+  select.disabled = !claudeAuthModes.length;
+}
+
+function selectedClaudeAuthMode(select) {
+  const mode = String(select?.value || '').trim();
+  return claudeAuthModes.includes(mode) ? mode : '';
+}
+
+function sessionConfigClaudeBillingChanged(authMode) {
+  return sessionConfigEditing?.source === 'claude-code'
+    && !!authMode && (sessionConfigEditing.claudeAuthModeInherited
+      || authMode !== sessionConfigEditing.claudeAuthMode);
+}
+
+function onSessionConfigClaudeAuthModeChange() {
+  const select = document.getElementById('session-config-claude-auth-mode');
+  const changed = sessionConfigClaudeBillingChanged(selectedClaudeAuthMode(select));
+  const save = document.getElementById('session-config-save');
+  if (save) save.textContent = changed ? 'Switch billing & restart' : 'Save';
+  const note = document.getElementById('session-config-claude-auth-mode-note');
+  if (note && sessionConfigEditing?.source === 'claude-code') {
+    const saved = claudeAuthModeLabel(sessionConfigEditing.claudeAuthMode);
+    const current = sessionConfigEditing.claudeAuthModeInherited
+      ? "Billing follows this session's project/default setting."
+      : `Saved billing: ${saved}.`;
+    note.textContent = `${current} Changing billing restarts Claude Code and resumes this conversation. API key uses your saved Anthropic key.`;
+    if (!claudeAuthModes.length) {
+      note.textContent += ' Billing selection is unavailable until the daemon provides its billing options.';
+    }
+  }
+}
+window.onSessionConfigClaudeAuthModeChange = onSessionConfigClaudeAuthModeChange;
+
 function sessionConfigMetadata(sessionOrId) {
   const raw = typeof sessionOrId === 'object'
     ? sessionOrId
@@ -75,6 +131,7 @@ function sessionConfigMetadata(sessionOrId) {
 // claude-code session on the codex binary.)
 
 function openSessionConfigModal(sessionOrId) {
+  if (sessionConfigSavePending) return false;
   const meta = sessionConfigMetadata(sessionOrId);
   const sid = String(meta.session_id || meta.sessionId || sessionOrId || '').trim();
   const source = sessionConfigSource(meta);
@@ -87,13 +144,15 @@ function openSessionConfigModal(sessionOrId) {
     source,
     backendSessionId: String(meta.backendSessionId || meta.backend_session_id || '').trim(),
     intendantSessionId: String(meta.intendantSessionId || meta.intendant_session_id || '').trim(),
+    claudeAuthMode: source === 'claude-code' ? sessionClaudeAuthMode(meta) : '',
+    claudeAuthModeInherited: !String(meta.claudeAuthMode || meta.claude_auth_mode || '').trim(),
   };
   setSessionConfigSaving(false);
   const title = document.getElementById('session-config-title');
   if (title) title.textContent = `${prettyAgentName(source)} launch config`;
   const description = document.getElementById('session-config-description');
   if (description) {
-    description.textContent = 'Per-session agent settings — model, reasoning effort, permissions, tools, and binary, depending on the agent. Saved settings apply on the next attach or resume; Save & restart applies them now.';
+    description.textContent = 'Per-session agent settings — billing, model, reasoning effort, permissions, tools, and binary, depending on the agent. Saved settings apply on the next attach or resume; Save & restart applies them now.';
   }
   const sessionInput = document.getElementById('session-config-session');
   if (sessionInput) {
@@ -126,12 +185,18 @@ function openSessionConfigModal(sessionOrId) {
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
   if (archiveSel) archiveSel.value = sessionConfigExplicitArchiveMode(meta);
   const isClaude = source === 'claude-code';
-  for (const rowId of ['session-config-claude-model-row', 'session-config-claude-permission-row',
+  for (const rowId of ['session-config-claude-auth-mode-row', 'session-config-claude-auth-mode-note',
+    'session-config-claude-model-row', 'session-config-claude-permission-row',
     'session-config-claude-tools-row', 'session-config-claude-effort-row']) {
     const row = document.getElementById(rowId);
     if (row) row.style.display = isClaude ? '' : 'none';
   }
   if (isClaude) {
+    populateClaudeAuthModeSelect(
+      document.getElementById('session-config-claude-auth-mode'),
+      sessionConfigEditing.claudeAuthModeInherited ? '' : sessionConfigEditing.claudeAuthMode,
+      { inherit: sessionConfigEditing.claudeAuthModeInherited },
+    );
     // Pins prefill; missing pin = inherit. A pinned model that isn't one
     // of the aliases lands in the Custom row.
     const aliases = ['fable', 'opus', 'sonnet', 'haiku'];
@@ -242,6 +307,7 @@ function openSessionConfigModal(sessionOrId) {
     );
   }
   updateSessionConfigClaudeCustomRow();
+  onSessionConfigClaudeAuthModeChange();
   updateSessionConfigKimiCustomRow();
   const status = document.getElementById('session-config-status');
   if (status) {
@@ -262,10 +328,9 @@ function openSessionConfigModal(sessionOrId) {
 }
 
 function closeSessionConfigModal() {
-  if (sessionConfigSavePending?.timeoutHandle) {
-    clearTimeout(sessionConfigSavePending.timeoutHandle);
-  }
-  sessionConfigSavePending = null;
+  // Closing (including Escape/backdrop) must not discard the receipt that
+  // applies the saved billing choice by restarting after a successful ack.
+  if (sessionConfigSavePending) return;
   setSessionConfigSaving(false);
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'none';
@@ -273,14 +338,24 @@ function closeSessionConfigModal() {
 }
 
 function setSessionConfigSaving(saving) {
-  for (const id of ['session-config-save', 'session-config-save-restart']) {
+  for (const id of ['session-config-save', 'session-config-save-restart',
+    'session-config-close', 'session-config-cancel']) {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = !!saving;
   }
+  const billing = document.getElementById('session-config-claude-auth-mode');
+  if (billing) billing.disabled = !!saving || !claudeAuthModes.length;
+}
+
+function sessionConfigRequestId() {
+  // Billing-capable daemons echo configure request IDs. Keep generic
+  // configuration compatible with older daemons that have no such receipt.
+  return claudeAuthModes.length ? generateSessionId() : '';
 }
 
 function sessionConfigResultMatchesPending(result, pending) {
   if (!result || !pending) return false;
+  if (pending.requestId && result.request_id !== pending.requestId) return false;
   const resultIds = new Set([
     result.session_id,
     result.sessionId,
@@ -347,12 +422,12 @@ function handleSessionConfigResult(result) {
     pending.piForm
   );
   scheduleSessionsMetadataRefresh(200);
-  showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
+  showControlToast('success', pending.restart ? 'Launch config saved; requesting restart' : 'Launch config saved');
   const restartSessionId = pending.meta.sessionId;
   if (pending.station) {
     stationSetSessionConfigResult(
       pending.sessionId,
-      pending.restart ? 'Launch config saved; restarting session.' : 'Launch config saved.',
+      pending.restart ? 'Launch config saved; requesting restart.' : 'Launch config saved.',
       'ok'
     );
   }
@@ -366,8 +441,8 @@ function handleSessionConfigResult(result) {
 function applyClaudePinsLocal(target, claudeForm, { snake }) {
   if (!claudeForm) return;
   const keys = snake
-    ? { model: 'claude_model', mode: 'claude_permission_mode', tools: 'claude_allowed_tools', effort: 'claude_effort' }
-    : { model: 'claudeModel', mode: 'claudePermissionMode', tools: 'claudeAllowedTools', effort: 'claudeEffort' };
+    ? { model: 'claude_model', mode: 'claude_permission_mode', tools: 'claude_allowed_tools', effort: 'claude_effort', authMode: 'claude_auth_mode' }
+    : { model: 'claudeModel', mode: 'claudePermissionMode', tools: 'claudeAllowedTools', effort: 'claudeEffort', authMode: 'claudeAuthMode' };
   const setOrClear = (key, value) => {
     if (value === 'inherit' || value === '') delete target[key];
     else target[key] = value;
@@ -375,6 +450,10 @@ function applyClaudePinsLocal(target, claudeForm, { snake }) {
   setOrClear(keys.model, claudeForm.model);
   setOrClear(keys.mode, claudeForm.permissionMode);
   setOrClear(keys.effort, claudeForm.effort);
+  if (claudeForm.authMode) {
+    target[keys.authMode] = claudeForm.authMode;
+    delete target[snake ? 'claudeAuthMode' : 'claude_auth_mode'];
+  }
   if (claudeForm.allowedTools === 'inherit' || claudeForm.allowedTools === '') {
     delete target[keys.tools];
   } else if (claudeForm.allowedTools === 'all' || claudeForm.allowedTools === '*') {
@@ -529,6 +608,7 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
 
 // The Claude launch-config form, read with the wire's sentinel semantics.
 function sessionConfigClaudeFormValues() {
+  const authMode = selectedClaudeAuthMode(document.getElementById('session-config-claude-auth-mode'));
   const modelChoice = document.getElementById('session-config-claude-model')?.value || 'inherit';
   const custom = document.getElementById('session-config-claude-model-custom')?.value.trim() || '';
   const model = modelChoice === '__custom__' ? (custom || 'inherit') : modelChoice;
@@ -536,7 +616,7 @@ function sessionConfigClaudeFormValues() {
   const toolsRaw = document.getElementById('session-config-claude-allowed-tools')?.value.trim() || '';
   const allowedTools = toolsRaw === '' ? 'inherit' : toolsRaw;
   const effort = document.getElementById('session-config-claude-effort')?.value || 'inherit';
-  return { model, permissionMode, allowedTools, effort };
+  return { authMode, model, permissionMode, allowedTools, effort };
 }
 
 function updateSessionConfigClaudeCustomRow() {
@@ -618,7 +698,7 @@ function onSessionConfigPiToolsModeChange() {
 window.onSessionConfigPiToolsModeChange = onSessionConfigPiToolsModeChange;
 
 function saveSessionConfigModal(options = {}) {
-  if (!sessionConfigEditing || !app) return;
+  if (!sessionConfigEditing || !app || sessionConfigSavePending) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
   const sandboxMode = normalizeOptionalCodexSandbox(
     document.getElementById('session-config-sandbox')?.value || ''
@@ -633,14 +713,18 @@ function saveSessionConfigModal(options = {}) {
   const archiveMode = normalizeContextArchiveModeOptional(
     document.getElementById('session-config-context-archive')?.value || ''
   );
-  // Claude pins reflect the form exactly: every field is sent as a value or
-  // the explicit 'inherit' clear sentinel (a missing field would silently
-  // KEEP an existing pin — see the supervisor's clear-before-merge dance).
+  // Claude model/permission/tool/effort pins reflect the form exactly:
+  // each sends a value or the explicit 'inherit' clear sentinel (a missing
+  // field would silently KEEP an existing pin). Billing is an explicit
+  // daemon-provided choice and never sends an inherit sentinel.
   const claudeForm = sessionConfigClaudeFormValues();
+  const restart = options.restart === true || sessionConfigClaudeBillingChanged(claudeForm.authMode);
+  const requestId = sessionConfigRequestId();
   const kimiForm = sessionConfigKimiFormValues();
   const piForm = sessionConfigPiFormValues();
   const payload = {
     action: 'configure_session_agent',
+    ...(requestId ? { request_id: requestId } : {}),
     session_id: sessionConfigEditing.sessionId,
     source: sessionConfigEditing.source,
     ...(sessionConfigEditing.backendSessionId ? { backend_session_id: sessionConfigEditing.backendSessionId } : {}),
@@ -653,6 +737,7 @@ function saveSessionConfigModal(options = {}) {
       codex_context_archive: archiveMode || 'inherit',
     } : {}),
     ...(sessionConfigEditing.source === 'claude-code' ? {
+      ...(claudeForm.authMode ? { claude_auth_mode: claudeForm.authMode } : {}),
       claude_model: claudeForm.model,
       claude_permission_mode: claudeForm.permissionMode,
       claude_allowed_tools: claudeForm.allowedTools,
@@ -683,6 +768,7 @@ function saveSessionConfigModal(options = {}) {
     ].map(id => String(id || '').trim()).filter(Boolean)));
     sessionConfigSavePending = {
       ids,
+      requestId,
       sessionId: sessionConfigEditing.sessionId,
       backendSessionId: sessionConfigEditing.backendSessionId,
       intendantSessionId: sessionConfigEditing.intendantSessionId,
@@ -695,7 +781,7 @@ function saveSessionConfigModal(options = {}) {
       claudeForm: sessionConfigEditing.source === 'claude-code' ? claudeForm : null,
       kimiForm: sessionConfigEditing.source === 'kimi' ? kimiForm : null,
       piForm: sessionConfigEditing.source === 'pi' ? piForm : null,
-      restart: options.restart === true,
+      restart,
       timeoutHandle: setTimeout(() => {
         const pending = sessionConfigSavePending;
         if (!pending || pending.sessionId !== sessionConfigEditing?.sessionId) return;
@@ -713,7 +799,7 @@ function saveSessionConfigModal(options = {}) {
     const status = document.getElementById('session-config-status');
     if (status) {
       status.className = 'session-config-status';
-      status.textContent = options.restart === true ? 'Saving launch config before restart...' : 'Saving launch config...';
+      status.textContent = restart ? 'Saving launch config before restart...' : 'Saving launch config...';
     }
     dispatchControlMsg(payload);
     // Model & permission pins also apply LIVE to an attached claude session
@@ -721,7 +807,7 @@ function saveSessionConfigModal(options = {}) {
     // restart is coming anyway, which respawns with the saved pins.
     if (
       sessionConfigEditing.source === 'claude-code' &&
-      options.restart !== true &&
+      !restart &&
       !sessionWindowIsDetached(sessionConfigEditing.sessionId)
     ) {
       if (claudeForm.model !== 'inherit') {
@@ -737,7 +823,7 @@ function saveSessionConfigModal(options = {}) {
     }
     if (
       sessionConfigEditing.source === 'kimi' &&
-      options.restart !== true &&
+      !restart &&
       !sessionWindowIsDetached(sessionConfigEditing.sessionId)
     ) {
       const model = kimiForm.model === 'inherit' ? (controlKimiConfig.model || '') : kimiForm.model;
@@ -790,7 +876,7 @@ function saveSessionConfigModal(options = {}) {
     }
     if (
       sessionConfigEditing.source === 'pi' &&
-      options.restart !== true &&
+      !restart &&
       !sessionWindowIsDetached(sessionConfigEditing.sessionId)
     ) {
       // Pi's launch `--model` accepts patterns, while live set_model requires
@@ -915,7 +1001,7 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
   { op: 'delegate-sub-agent', label: 'Delegate...', title: 'Spawn a supervised sub-agent under this session' },
-  { op: 'configure-launch', label: 'Launch config: model, effort, permissions...', title: 'Change this session’s agent settings — model, reasoning effort, permission mode, tools, managed context, or binary (options vary by agent). Saved settings apply on the next attach, resume, or restart.' },
+  { op: 'configure-launch', label: 'Launch config: billing, model, permissions...', title: 'Change this session’s billing (Claude Code), model, reasoning effort, permission mode, tools, managed context, or binary. Changing billing restarts and resumes the same conversation; other saved settings apply on the next attach, resume, or restart.' },
   { op: 'attach-session', label: 'Attach session', title: 'Attach this backend without sending a prompt' },
   { op: 'restart-session', label: 'Restart with saved config', title: 'Stop this backend and resume it with saved launch config' },
   { op: 'stop-session', label: 'Stop session...', title: 'Stop the live backend and remove it from active dashboards', danger: true },
@@ -3256,8 +3342,9 @@ function restartSessionWindowAction(sessionId) {
   delete msg.task;
   delete msg.attachments;
   dispatchControlMsg(msg);
-  setSessionWindowDetached(sid, true, 'restarting session');
-  showControlToast('info', `Restarting session ${shortSessionId(sid)} with saved config`);
+  // Preflight can reject before the worker stops. SessionEnded confirms
+  // detachment; SessionStarted/SessionAttached confirm the resumed worker.
+  showControlToast('info', `Restart requested for session ${shortSessionId(sid)} with saved config`);
 }
 
 function attachSessionWindowAction(sessionId) {

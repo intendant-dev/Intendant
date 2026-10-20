@@ -991,6 +991,8 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (intendantSessionId) out.intendantSessionId = intendantSessionId;
   const agentCommand = compactSessionText(meta.agent_command || meta.agentCommand || meta.codex_command || meta.codexCommand);
   if (agentCommand) out.agentCommand = agentCommand;
+  const claudeAuthMode = compactSessionText(meta.claude_auth_mode || meta.claudeAuthMode);
+  if (claudeAuthMode) out.claudeAuthMode = claudeAuthMode;
   const managedMode = String(meta.codex_managed_context || meta.codexManagedContext || '').trim();
   if (managedMode === 'managed' || managedMode === 'vanilla') out.codexManagedContext = managedMode;
   const archiveMode = String(meta.codex_context_archive || meta.codexContextArchive || '').trim();
@@ -1085,6 +1087,7 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.backendSessionId || '',
     meta.intendantSessionId || '',
     meta.agentCommand || '',
+    meta.claudeAuthMode || '',
     meta.codexManagedContext || '',
     meta.capabilities?.codexCommand || '',
     meta.capabilities?.codexManagedContext || '',
@@ -4655,6 +4658,7 @@ function sessionWindowMetaFromSession(session) {
     backend_session_id: session.backend_session_id,
     intendant_session_id: session.intendant_session_id,
     agent_command: session.agent_command || session.codex_command,
+    claude_auth_mode: session.claude_auth_mode,
     codex_managed_context: session.codex_managed_context,
     codex_context_archive: session.codex_context_archive,
     capabilities: session.capabilities,
@@ -4924,6 +4928,7 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.backendSessionId) record.backend_session_id = meta.backendSessionId;
   if (meta.intendantSessionId) record.intendant_session_id = meta.intendantSessionId;
   if (meta.agentCommand) record.agent_command = meta.agentCommand;
+  if (meta.claudeAuthMode) record.claude_auth_mode = meta.claudeAuthMode;
   if (meta.codexManagedContext) record.codex_managed_context = meta.codexManagedContext;
   if (meta.codexContextArchive) record.codex_context_archive = meta.codexContextArchive;
   if (meta.projectRoot) record.project_root = meta.projectRoot;

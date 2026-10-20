@@ -540,6 +540,7 @@ function stationSetSessionConfigResult(sessionId, text, kind = '') {
 }
 
 function stationSessionConfigPayload(editing, draft) {
+  const requestId = sessionConfigRequestId();
   const command = String(draft.command || '').trim();
   // '' = inherit the global default; only explicit 'managed'/'vanilla' pin.
   const modeValue = String(draft.managed || '').trim();
@@ -550,6 +551,7 @@ function stationSessionConfigPayload(editing, draft) {
   return {
     payload: {
       action: 'configure_session_agent',
+      ...(requestId ? { request_id: requestId } : {}),
       session_id: editing.sessionId,
       source: editing.source,
       ...(editing.backendSessionId ? { backend_session_id: editing.backendSessionId } : {}),
@@ -562,6 +564,7 @@ function stationSessionConfigPayload(editing, draft) {
         codex_context_archive: archiveMode || 'inherit',
       } : {}),
     },
+    requestId,
     command,
     sandboxMode,
     approvalPolicy,
@@ -571,6 +574,7 @@ function stationSessionConfigPayload(editing, draft) {
 }
 
 function stationSaveSessionConfig(sessionOrId, options = {}) {
+  if (sessionConfigSavePending) return;
   const editing = stationSessionConfigEditingFor(sessionOrId);
   if (!editing) {
     showControlToast?.('error', 'Station launch config is only available for external-agent sessions');
@@ -582,7 +586,7 @@ function stationSaveSessionConfig(sessionOrId, options = {}) {
     return;
   }
   const draft = stationSessionConfigDraftFor(editing);
-  const { payload, command, sandboxMode, approvalPolicy, mode, archiveMode } = stationSessionConfigPayload(editing, draft);
+  const { payload, requestId, command, sandboxMode, approvalPolicy, mode, archiveMode } = stationSessionConfigPayload(editing, draft);
   try {
     if (sessionConfigSavePending?.timeoutHandle) {
       clearTimeout(sessionConfigSavePending.timeoutHandle);
@@ -594,6 +598,7 @@ function stationSaveSessionConfig(sessionOrId, options = {}) {
     ].map(id => String(id || '').trim()).filter(Boolean)));
     sessionConfigSavePending = {
       ids,
+      requestId,
       sessionId: editing.sessionId,
       backendSessionId: editing.backendSessionId,
       intendantSessionId: editing.intendantSessionId,

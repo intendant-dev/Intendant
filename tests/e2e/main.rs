@@ -10572,6 +10572,74 @@ fn park_meta_of(rig: &TestRig) -> Option<serde_json::Value> {
     None
 }
 
+/// Answer the supervisor's local auth probe without entering the turn script.
+/// In particular, probes must not consume a first-spawn marker or stdin turn.
+#[cfg(unix)]
+fn write_fake_claude(path: &Path, turn_script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let auth_probe = r#"#!/bin/sh
+previous=
+for argument in "$@"; do
+  if [ "$previous" = auth ] && [ "$argument" = status ]; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
+    exit 0
+  fi
+  previous=$argument
+done
+"#;
+    std::fs::write(path, [auth_probe, turn_script].concat()).expect("write fake claude");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_claude_auth_probe_does_not_consume_turn_state() {
+    let dir = tempfile::tempdir().expect("fake claude fixture");
+    let fake = dir.path().join("fake-claude.sh");
+    let marker = dir.path().join("turn-started");
+    write_fake_claude(
+        &fake,
+        "printf '%s\\n' started > \"$INTENDANT_TEST_TURN_MARKER\"\nread -r _line || exit 1\n",
+    );
+
+    let settings = r#"{"env":{},"apiKeyHelper":""}"#;
+    for args in [
+        vec!["auth", "status"],
+        vec!["--settings", settings, "auth", "status"],
+    ] {
+        let output = std::process::Command::new(&fake)
+            .args(args)
+            .env_clear()
+            .env("INTENDANT_TEST_TURN_MARKER", &marker)
+            .stdin(Stdio::null())
+            .output()
+            .expect("probe fake claude");
+        assert!(output.status.success(), "{}", text_of(&output));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "loggedIn": true,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+            })
+        );
+        assert!(!marker.exists(), "auth probe entered the turn script");
+    }
+
+    // Auth-looking text inside a settings argument is not the subcommand.
+    let output = std::process::Command::new(&fake)
+        .args(["--settings", r#"{"description":"auth status"}"#])
+        .env_clear()
+        .env("INTENDANT_TEST_TURN_MARKER", &marker)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run fake claude turn script");
+    assert!(!output.status.success(), "turn script must read stdin");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "started\n");
+}
+
 /// The park-then-die race end to end (card 01KZ07Q0PX, specimen e883a2db
 /// 2026-08-01): a fake claude binary rejects the first turn on a rate
 /// limit and DIES with the rejection. The armed park must hold the
@@ -10584,8 +10652,6 @@ fn park_meta_of(rig: &TestRig) -> Option<serde_json::Value> {
 #[cfg(unix)]
 #[tokio::test]
 async fn limit_park_survives_backend_death_and_resumes_at_reset() {
-    use std::os::unix::fs::PermissionsExt;
-
     let rig = TestRig::new();
     rig.write_script(&serde_json::json!({ "profiles": [] }));
 
@@ -10600,16 +10666,16 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
     // binaries and no filesystem state, so a platform's extra probe spawn
     // of the command (observed on the Linux leg, where a marker-file
     // discriminator was consumed before the session's real spawn) cannot
-    // desynchronize the runs — a stdin-less probe dies at `read` with
-    // zero side effects. The reset clock starts only after the wrapper is
-    // fully up and delivering, so the 15s window prices in a loaded CI
-    // box: only the wrapper's own line-drain sits between the fake's emit
-    // and the park arming.
+    // desynchronize the runs — auth probes return before the turn script,
+    // and other stdin-less probes die at `read` with zero side effects.
+    // The reset clock starts only after the wrapper is fully up and
+    // delivering, so the 15s window prices in a loaded CI box: only the
+    // wrapper's own line-drain sits between the fake's emit and the park
+    // arming.
     let fake = rig.home.path().join("fake-claude.sh");
-    std::fs::write(
+    write_fake_claude(
         &fake,
         concat!(
-            "#!/bin/sh\n",
             "SID=\"11111111-2222-4333-8444-555555555555\"\n",
             "resumed=0\n",
             "for a in \"$@\"; do\n",
@@ -10626,10 +10692,7 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
             "printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"resumed after the park wake\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
             "while read -r _line; do :; done\n",
         ),
-    )
-    .expect("write fake claude");
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake claude");
+    );
 
     std::fs::write(
         rig.project.path().join("intendant.toml"),
@@ -10728,7 +10791,6 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
 #[tokio::test]
 async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() {
     use futures_util::SinkExt;
-    use std::os::unix::fs::PermissionsExt;
 
     let rig = TestRig::new();
     let script = serde_json::json!({ "profiles": [] });
@@ -10751,11 +10813,10 @@ async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() 
     let fake = rig.home.path().join("fake-claude.sh");
     let go_marker = rig.home.path().join("reload-go");
     let claim = rig.home.path().join("choreography-claim");
-    std::fs::write(
+    write_fake_claude(
         &fake,
-        format!(
+        &format!(
             concat!(
-                "#!/bin/sh\n",
                 "SID=\"21111111-2222-4333-8444-555555555555\"\n",
                 "resumed=0\n",
                 "for a in \"$@\"; do\n",
@@ -10784,10 +10845,7 @@ async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() 
             claim = claim.display(),
             go = go_marker.display(),
         ),
-    )
-    .expect("write fake claude");
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake claude");
+    );
 
     let client = reqwest::Client::new();
     let mut daemon = spawn_daemon_on_rig(&client, rig, &script, false).await;
@@ -11132,7 +11190,7 @@ async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
 }
 
 /// The auth-lapse classification end to end (card 01KZCSD1972XYH1PVKZ9A91WN9,
-/// the 2026-08-07T00:00Z nightly): a fake claude whose only output is an
+/// the 2026-08-07T00:00Z nightly): a fake claude whose turn output is an
 /// auth-shaped failure — a 401 stderr line plus the error result envelope —
 /// must surface the ONE named honest state ("… sign in from the Vault tab",
 /// with the credential-file-missing flavor where the probe can prove
@@ -11144,21 +11202,19 @@ async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
 #[cfg(unix)]
 #[tokio::test]
 async fn backend_auth_failure_classifies_to_the_named_signed_out_state() {
-    use std::os::unix::fs::PermissionsExt;
-
     let rig = TestRig::new();
     rig.write_script(&serde_json::json!({ "profiles": [] }));
 
-    // The fake claude: answer the first turn with a 401 stderr line (the
-    // reconnect-storm shape) and the auth-error result envelope, then
-    // stay alive reading stdin — the round must die on the CLASSIFIED
+    // The fake claude passes the local auth probe, then answers the first
+    // turn with a 401 stderr line (the reconnect-storm shape) and the
+    // auth-error result envelope, then stays alive reading stdin — the
+    // round must die on the CLASSIFIED
     // fatal through the grace path, not on a process-exit terminal
     // racing it.
     let fake = rig.home.path().join("fake-claude.sh");
-    std::fs::write(
+    write_fake_claude(
         &fake,
         concat!(
-            "#!/bin/sh\n",
             "SID=\"21111111-2222-4333-8444-555555555555\"\n",
             "read -r _line || exit 1\n",
             "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
@@ -11166,10 +11222,7 @@ async fn backend_auth_failure_classifies_to_the_named_signed_out_state() {
             "printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
             "while read -r _line; do :; done\n",
         ),
-    )
-    .expect("write fake claude");
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake claude");
+    );
 
     std::fs::write(
         rig.project.path().join("intendant.toml"),

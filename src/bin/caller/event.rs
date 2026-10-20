@@ -1257,6 +1257,9 @@ pub enum AppEvent {
     /// launch-config modal so a failed/partial write cannot look successful.
     SessionAgentConfigResult {
         session_id: String,
+        /// Echo the exact save request so delayed or other-client results
+        /// cannot acknowledge a different billing selection.
+        request_id: Option<String>,
         source: String,
         backend_session_id: Option<String>,
         intendant_session_id: Option<String>,
@@ -1700,6 +1703,14 @@ pub struct AgentLaunchConfig {
     /// Reasoning-effort level (`crate::project::CLAUDE_EFFORTS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_effort: Option<String>,
+    /// Claude Code billing authority: subscription or api-key.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::project::deserialize_optional_claude_auth_mode"
+    )]
+    #[schemars(with = "Option<crate::project::ClaudeAuthMode>")]
+    pub claude_auth_mode: Option<String>,
     /// Kimi launch pins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_model: Option<String>,
@@ -1759,6 +1770,7 @@ impl AgentLaunchConfig {
             claude_model,
             claude_permission_mode,
             claude_effort,
+            claude_auth_mode,
             kimi_model,
             kimi_thinking,
             kimi_permission_mode,
@@ -1782,6 +1794,7 @@ impl AgentLaunchConfig {
             && claude_model.is_none()
             && claude_permission_mode.is_none()
             && claude_effort.is_none()
+            && claude_auth_mode.is_none()
             && kimi_model.is_none()
             && kimi_thinking.is_none()
             && kimi_permission_mode.is_none()
@@ -2031,6 +2044,9 @@ pub enum ControlMsg {
     /// global Settings pane when a historical session is resumed or reattached.
     ConfigureSessionAgent {
         session_id: String,
+        /// Optional client-generated save receipt; echoed on every result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2059,6 +2075,13 @@ pub enum ControlMsg {
         claude_allowed_tools: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        /// Explicit Claude Code billing authority; applies at process spawn.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::project::deserialize_optional_claude_auth_mode"
+        )]
+        claude_auth_mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2144,6 +2167,13 @@ pub enum ControlMsg {
         claude_allowed_tools: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        /// Explicit Claude Code billing authority; applies at process spawn.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::project::deserialize_optional_claude_auth_mode"
+        )]
+        claude_auth_mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2304,6 +2334,13 @@ pub enum ControlMsg {
         /// applies when the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        /// Explicit Claude Code billing authority; applies at process spawn.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::project::deserialize_optional_claude_auth_mode"
+        )]
+        claude_auth_mode: Option<String>,
         /// Optional one-shot Kimi launch settings.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_model: Option<String>,
@@ -3955,6 +3992,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::SessionAgentConfigResult {
             session_id,
+            request_id,
             source,
             backend_session_id,
             intendant_session_id,
@@ -3963,6 +4001,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             message,
         } => Some(OutboundEvent::SessionAgentConfigResult {
             session_id: session_id.clone(),
+            request_id: request_id.clone(),
             source: source.clone(),
             backend_session_id: backend_session_id.clone(),
             intendant_session_id: intendant_session_id.clone(),
@@ -5127,6 +5166,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_config_request_id_round_trips_on_success_and_failure() {
+        let request = serde_json::json!({
+            "action": "configure_session_agent", "session_id": "same-session",
+            "source": "claude-code", "claude_auth_mode": "api-key",
+            "request_id": "billing-save-client-a-2"
+        });
+        let decoded: ControlMsg = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap()["request_id"],
+            request["request_id"]
+        );
+        let ControlMsg::ConfigureSessionAgent { request_id, .. } = decoded else {
+            panic!("wrong variant")
+        };
+        for success in [false, true] {
+            let event = AppEvent::SessionAgentConfigResult {
+                session_id: "same-session".to_string(),
+                request_id: request_id.clone(),
+                source: "claude-code".to_string(),
+                backend_session_id: None,
+                intendant_session_id: None,
+                persisted_session_ids: Vec::new(),
+                success,
+                message: "save result".to_string(),
+            };
+            let value = serde_json::to_value(app_event_to_outbound(&event).unwrap()).unwrap();
+            assert_eq!(value["request_id"], request["request_id"]);
+            assert_eq!(value["success"], success);
+        }
+        let legacy = AppEvent::SessionAgentConfigResult {
+            session_id: "same-session".to_string(),
+            request_id: None,
+            source: "claude-code".to_string(),
+            backend_session_id: None,
+            intendant_session_id: None,
+            persisted_session_ids: Vec::new(),
+            success: true,
+            message: "saved".to_string(),
+        };
+        assert!(
+            serde_json::to_value(app_event_to_outbound(&legacy).unwrap())
+                .unwrap()
+                .get("request_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_billing_wire_is_strict_across_session_control_lanes() {
+        for action in [
+            "create_session",
+            "start_task",
+            "configure_session_agent",
+            "restart_session",
+        ] {
+            let base = serde_json::json!({
+                "action": action,
+                "task": "Continue this session",
+                "source": "claude-code",
+                "agent": "claude-code",
+                "session_id": "same-session"
+            });
+            let legacy: ControlMsg = serde_json::from_value(base.clone()).unwrap();
+            assert!(serde_json::to_value(legacy)
+                .unwrap()
+                .get("claude_auth_mode")
+                .is_none());
+            for mode in ["subscription", "api-key"] {
+                let mut value = base.clone();
+                value["claude_auth_mode"] = serde_json::json!(mode);
+                let message: ControlMsg = serde_json::from_value(value).unwrap();
+                assert_eq!(
+                    serde_json::to_value(message).unwrap()["claude_auth_mode"],
+                    mode
+                );
+            }
+            for invalid in [
+                "", "inherit", "default", "global", "api_key", "API-KEY", "auto",
+            ] {
+                let mut value = base.clone();
+                value["claude_auth_mode"] = serde_json::json!(invalid);
+                assert!(
+                    serde_json::from_value::<ControlMsg>(value).is_err(),
+                    "{action} accepted {invalid:?}"
+                );
+            }
+        }
+        let billing_only = AgentLaunchConfig {
+            claude_auth_mode: Some("subscription".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !billing_only.is_empty(),
+            "explicit subscription is a real launch pin"
+        );
+    }
+
+    #[test]
     fn approval_ids_are_process_wide_monotonic_and_wire_safe() {
         let first = next_approval_id();
         let second = next_approval_id();
@@ -5919,6 +6056,7 @@ mod tests {
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
                 claude_model: None,
                 claude_effort: None,
+                claude_auth_mode: None,
                 claude_permission_mode: None,
                 kimi_model: None,
                 kimi_thinking: None,
@@ -6235,6 +6373,7 @@ mod tests {
                 claude_model,
                 claude_permission_mode,
                 claude_effort,
+                claude_auth_mode,
                 kimi_model,
                 kimi_thinking,
                 kimi_permission_mode,
@@ -6266,6 +6405,7 @@ mod tests {
                 assert!(claude_model.is_none());
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_effort.is_none());
+                assert!(claude_auth_mode.is_none());
                 assert!(kimi_model.is_none());
                 assert!(kimi_thinking.is_none());
                 assert!(kimi_permission_mode.is_none());
@@ -6386,6 +6526,7 @@ mod tests {
         match msg {
             ControlMsg::ConfigureSessionAgent {
                 session_id,
+                request_id,
                 source,
                 backend_session_id,
                 intendant_session_id,
@@ -6398,6 +6539,7 @@ mod tests {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                claude_auth_mode,
                 kimi_model,
                 kimi_thinking,
                 kimi_permission_mode,
@@ -6409,6 +6551,7 @@ mod tests {
                 pi_allowed_tools,
             } => {
                 assert_eq!(session_id, "abc123");
+                assert!(request_id.is_none());
                 assert_eq!(source.as_deref(), Some("codex"));
                 assert_eq!(backend_session_id.as_deref(), Some("thread-1"));
                 assert_eq!(intendant_session_id.as_deref(), Some("wrap-1"));
@@ -6421,6 +6564,7 @@ mod tests {
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_allowed_tools.is_none());
                 assert!(claude_effort.is_none());
+                assert!(claude_auth_mode.is_none());
                 assert!(kimi_model.is_none());
                 assert!(kimi_thinking.is_none());
                 assert!(kimi_permission_mode.is_none());
@@ -6434,7 +6578,7 @@ mod tests {
             _ => panic!("expected ConfigureSessionAgent"),
         }
 
-        let json = r#"{"action":"configure_session_agent","session_id":"cc-1","source":"claude-code","claude_model":"opus","claude_permission_mode":"acceptEdits","claude_allowed_tools":"Read,Bash(cargo test *)","claude_effort":"xhigh"}"#;
+        let json = r#"{"action":"configure_session_agent","session_id":"cc-1","source":"claude-code","claude_model":"opus","claude_permission_mode":"acceptEdits","claude_allowed_tools":"Read,Bash(cargo test *)","claude_effort":"xhigh","claude_auth_mode":"api-key"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ConfigureSessionAgent {
@@ -6442,6 +6586,7 @@ mod tests {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                claude_auth_mode,
                 ..
             } => {
                 assert_eq!(claude_model.as_deref(), Some("opus"));
@@ -6451,6 +6596,7 @@ mod tests {
                     Some("Read,Bash(cargo test *)")
                 );
                 assert_eq!(claude_effort.as_deref(), Some("xhigh"));
+                assert_eq!(claude_auth_mode.as_deref(), Some("api-key"));
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -6570,6 +6716,7 @@ mod tests {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                claude_auth_mode,
                 kimi_model,
                 kimi_thinking,
                 kimi_permission_mode,
@@ -6596,6 +6743,7 @@ mod tests {
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_allowed_tools.is_none());
                 assert!(claude_effort.is_none());
+                assert!(claude_auth_mode.is_none());
                 assert!(kimi_model.is_none());
                 assert!(kimi_thinking.is_none());
                 assert!(kimi_permission_mode.is_none());
@@ -6710,6 +6858,7 @@ mod tests {
             "agent",
             "claude_model",
             "claude_effort",
+            "claude_auth_mode",
             "claude_permission_mode",
             "codex_model",
             "codex_reasoning_effort",

@@ -1829,6 +1829,13 @@
                       <option value="pi">Pi</option>
                     </select>
                   </label>
+                  <label class="sessions-new-session-field hidden" for="new-session-claude-auth-mode" id="new-session-claude-auth-mode-wrap"
+                         title="Claude Code billing for this session. API key uses the Anthropic key saved in Settings.">
+                    Billing
+                    <select id="new-session-claude-auth-mode" class="sessions-agent-select" onchange="onNewSessionClaudeAuthModeChange()" disabled>
+                      <option value="">Loading billing options…</option>
+                    </select>
+                  </label>
                   <label class="sessions-new-session-field" for="new-session-execution" id="new-session-execution-wrap"
                          title="Internal agent only. Auto lets the daemon decide from the task; Orchestrate starts a coordinator that delegates to supervised sub-agents; Direct runs a single agent.">
                     Execution

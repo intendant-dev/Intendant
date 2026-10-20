@@ -2379,9 +2379,9 @@ pub(crate) fn rotate_leased_secret_if_current(
     Ok(rotated)
 }
 
-/// Lease-first key lookup for the native providers: an active leased
-/// credential shadows the environment; with no lease, `.env` (and the
-/// short alias names) keep working exactly as before.
+/// Lease-first key lookup for native providers and explicitly selected
+/// Claude Code API-key billing: an active leased credential shadows the
+/// environment; with no lease, `.env` (and the short alias names) keep working.
 pub fn provider_api_key(env_name: &str) -> Option<String> {
     if let Some(kind) = env_kind(env_name) {
         if let Some(secret) = leased_secret(kind) {

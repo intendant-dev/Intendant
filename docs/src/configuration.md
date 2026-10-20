@@ -510,6 +510,7 @@ preserve Codex's normal user configuration inheritance.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `claude` | Path or command name |
+| `auth_mode` | string | `subscription` | Claude Code billing: `subscription` uses the signed-in Claude account; `api-key` uses Intendant's saved Anthropic API key. The dashboard can override this per session at any time. Changing a session's billing mode restarts Claude Code and resumes the same conversation; there is no quota-triggered fallback |
 | `model` | string | unset | Model override — an alias (`fable`, `opus`, `sonnet`, `haiku`; the CLI resolves it to the latest model) or a full model id |
 | `permission_mode` | string | `default` | `default` (alias `manual`), `acceptEdits`, `plan`, `auto` (classifier-based approvals), `dontAsk` (auto-deny anything that would prompt), `bypassPermissions`. **Semantics change:** before Claude Code 2.1.206 Intendant coerced `auto` to `default`; it now selects the CLI's real auto-approval mode, and the config load warns when it finds `auto` so an old config doesn't escalate silently |
 | `effort` | string | unset | Daemon-default reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max`, `ultracode` (unset omits the flag). Settable live from the Settings tab's "Claude reasoning" row (`SetClaudeEffort`); every launch lane (New Session, `ctl task`, scheduled agenda spawns) resolves explicit per-create pin → this default → the CLI's model default |

@@ -622,11 +622,60 @@ impl Default for CodexConfig {
     }
 }
 
+/// Billing authority for one supervised Claude Code process. Never selects
+/// another authority implicitly when the chosen one is unavailable.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeAuthMode {
+    #[default]
+    Subscription,
+    ApiKey,
+}
+
+impl ClaudeAuthMode {
+    pub const ALL: [Self; 2] = [Self::Subscription, Self::ApiKey];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::ApiKey => "api-key",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "subscription" => Ok(Self::Subscription),
+            "api-key" => Ok(Self::ApiKey),
+            _ => Err("Claude Code billing must be subscription or api-key".to_string()),
+        }
+    }
+}
+
+/// Public wire values are optional but, when present, must name a billing
+/// source exactly. Session overlays retain raw values so corrupted persisted
+/// settings are rejected when applied instead of being discarded on read.
+pub fn deserialize_optional_claude_auth_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| ClaudeAuthMode::parse(&value).map(|mode| mode.as_str().to_string()))
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodeConfig {
     /// Path or command name for the claude binary.
     #[serde(default = "default_claude_code_command")]
     pub command: String,
+    /// Explicit billing authority, latched at process spawn.
+    #[serde(default)]
+    pub auth_mode: ClaudeAuthMode,
     /// Model to use.
     #[serde(default)]
     pub model: Option<String>,
@@ -775,6 +824,7 @@ impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
             command: default_claude_code_command(),
+            auth_mode: ClaudeAuthMode::default(),
             model: None,
             permission_mode: default_claude_code_permission_mode(),
             effort: None,
@@ -2330,6 +2380,47 @@ pub fn root_has_project_marker(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_auth_mode_defaults_to_subscription_and_rejects_unknown_authorities() {
+        assert_eq!(
+            ClaudeCodeConfig::default().auth_mode,
+            ClaudeAuthMode::Subscription
+        );
+        let legacy: ProjectConfig =
+            toml::from_str("[agent.claude_code]\nmodel = \"sonnet\"\n").unwrap();
+        assert_eq!(
+            legacy.agent.claude_code.auth_mode,
+            ClaudeAuthMode::Subscription
+        );
+        for mode in ClaudeAuthMode::ALL {
+            assert_eq!(ClaudeAuthMode::parse(mode.as_str()).unwrap(), mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+            let config: ProjectConfig = toml::from_str(&format!(
+                "[agent.claude_code]\nauth_mode = \"{}\"\n",
+                mode.as_str()
+            ))
+            .unwrap();
+            assert_eq!(config.agent.claude_code.auth_mode, mode);
+        }
+        for invalid in [
+            "",
+            "inherit",
+            "default",
+            "global",
+            "API-KEY",
+            "api_key",
+            " subscription ",
+            "auto",
+        ] {
+            assert!(
+                ClaudeAuthMode::parse(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+            let encoded = serde_json::to_string(invalid).unwrap();
+            assert!(serde_json::from_str::<ClaudeAuthMode>(&encoded).is_err());
+        }
+    }
 
     /// The relay-peer-admission opt-in is default-off, parses from the
     /// `[connect]` table, and — mirroring `hosted_control_enabled` —

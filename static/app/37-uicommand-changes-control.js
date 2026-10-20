@@ -1281,6 +1281,11 @@ let controlCurrentBackend = null;
 let controlBackendActive = false;
 const controlAppliesBaseText = 'changes apply on next task';
 let newSessionConfiguredAgent = '';
+// Billing options come from the daemon. An older/unreachable daemon must
+// never present a switch that its launch protocol cannot honor.
+let claudeAuthModes = [];
+let newSessionClaudeAuthMode = 'subscription';
+let newSessionClaudeAuthModeTouched = false;
 let newSessionAgentCommands = {
   codex: 'codex',
   'claude-code': 'claude',
@@ -1368,6 +1373,7 @@ async function refreshControlPane() {
   }
   try {
     const d = await fetchDashboardSettings();
+    setClaudeAuthModeDefaults(d);
     controlCurrentBackend = normalizeAgentId(d.external_agent);
     controlCodexConfig = {
       command: d.codex_command || 'codex',

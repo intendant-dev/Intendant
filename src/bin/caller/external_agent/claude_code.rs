@@ -3790,6 +3790,7 @@ async fn reader_task(
 
 pub struct ClaudeCodeAgent {
     command: String,
+    auth_mode: crate::project::ClaudeAuthMode,
     model: Option<String>,
     permission_mode: String,
     /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max/
@@ -3851,6 +3852,7 @@ impl ClaudeCodeAgent {
     ) -> Self {
         Self {
             command,
+            auth_mode: crate::project::ClaudeAuthMode::Subscription,
             model,
             permission_mode,
             effort: crate::project::normalize_claude_effort(effort.as_deref()),
@@ -3883,6 +3885,13 @@ impl ClaudeCodeAgent {
     /// `--max-budget-usd 0`, probed 2.1.206).
     pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
         self.max_budget_usd = budget;
+        self
+    }
+
+    /// Billing belongs to this supervised external session. Changing it takes
+    /// effect at the next spawn/resume, never through a global env mutation.
+    pub fn with_auth_mode(mut self, mode: crate::project::ClaudeAuthMode) -> Self {
+        self.auth_mode = mode;
         self
     }
 
@@ -4282,6 +4291,17 @@ impl ExternalAgent for ClaudeCodeAgent {
                  (the claude CLI itself rejects --max-budget-usd 0)"
             )));
         }
+        let auth =
+            super::claude_auth::PreparedClaudeAuth::resolve(self.auth_mode, &config.working_dir)
+                .map_err(CallerError::ExternalAgent)?;
+        auth.verify(
+            &self.command,
+            &config.working_dir,
+            dns_credential_env.as_deref(),
+            dns_credential_store.as_deref(),
+        )
+        .await
+        .map_err(CallerError::ExternalAgent)?;
         self.working_dir = Some(config.working_dir.clone());
         self.resume_session = config
             .resume_session
@@ -4379,6 +4399,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         // `.env()` injections below survive the clear; inherited provider
         // keys and ambient credentials do not.
         super::apply_external_child_env_policy(&mut command);
+        auth.apply(&mut command);
         // `"$INTENDANT" ctl ...` bootstrap env, so the lazy CLI surface works
         // from Claude Code's shell without any PATH or port assumptions.
         if let Some(port) = web_port {
@@ -4389,13 +4410,6 @@ impl ExternalAgent for ClaudeCodeAgent {
                 self.mcp_auth_token.as_deref(),
                 Some(&config.working_dir),
             );
-        }
-        // An active oauth:claude-code lease materializes a synthesized
-        // config dir (.credentials.json + carried-over settings.json);
-        // pointing CLAUDE_CONFIG_DIR at it means this spawn runs on the
-        // vault's leased identity, not whatever auth is on disk.
-        if let Some(dir) = crate::credential_leases::materialized_claude_config_dir() {
-            command.env("CLAUDE_CONFIG_DIR", dir);
         }
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]

@@ -90,6 +90,7 @@ impl SessionSupervisor {
     pub(crate) async fn configure_session_agent(
         &self,
         session_id: String,
+        request_id: Option<String>,
         source: Option<String>,
         backend_session_id: Option<String>,
         intendant_session_id: Option<String>,
@@ -105,13 +106,14 @@ impl SessionSupervisor {
                         session.session_id.clone(),
                         session.source.clone(),
                         session.session_dir.clone(),
+                        session.project_root.clone(),
                     )
                 })
         };
 
         let normalized_source = managed
             .as_ref()
-            .map(|(_, source, _)| source.clone())
+            .map(|(_, source, _, _)| source.clone())
             .or(source)
             .map(|source| crate::session_names::normalize_source(&source))
             .unwrap_or_default();
@@ -119,6 +121,7 @@ impl SessionSupervisor {
             let message = "Session config failed: choose an external agent session".to_string();
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
+                request_id,
                 source: normalized_source,
                 backend_session_id,
                 intendant_session_id,
@@ -151,6 +154,7 @@ impl SessionSupervisor {
                 );
                 self.config.bus.send(AppEvent::SessionAgentConfigResult {
                     session_id,
+                    request_id,
                     source: backend.as_short_str().to_string(),
                     backend_session_id,
                     intendant_session_id,
@@ -229,7 +233,7 @@ impl SessionSupervisor {
         ) {
             config.merge_missing_from(existing);
         }
-        if let Some((_, _, session_dir)) = managed.as_ref() {
+        if let Some((_, _, session_dir, _)) = managed.as_ref() {
             if let Some(existing) = crate::session_config::read_log_dir_config(session_dir) {
                 config.merge_missing_from(existing);
             }
@@ -300,6 +304,32 @@ impl SessionSupervisor {
             let message = "Session config failed: no launch settings supplied".to_string();
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
+                request_id,
+                source: backend.as_short_str().to_string(),
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids: Vec::new(),
+                success: false,
+                message: message.clone(),
+            });
+            self.loop_error(message);
+            return;
+        }
+
+        // Billing changes must be feasible before any overlay is written:
+        // the dashboard restarts only after this success acknowledgement.
+        if let Err(error) = self
+            .validate_session_auth_config(
+                &backend,
+                &config,
+                managed.as_ref().map(|(_, _, _, root)| root.as_path()),
+            )
+            .await
+        {
+            let message = format!("Session config failed: {error}");
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                request_id,
                 source: backend.as_short_str().to_string(),
                 backend_session_id,
                 intendant_session_id,
@@ -319,7 +349,7 @@ impl SessionSupervisor {
                 persisted_session_ids.push(id.to_string());
             }
         };
-        if let Some((managed_id, _, session_dir)) = managed.as_ref() {
+        if let Some((managed_id, _, session_dir, _)) = managed.as_ref() {
             if let Err(e) = crate::session_config::write_log_dir_config(session_dir, &config) {
                 errors.push(e);
             } else {
@@ -345,7 +375,7 @@ impl SessionSupervisor {
             Some(session_id.as_str()),
             managed
                 .as_ref()
-                .map(|(managed_id, _, _)| managed_id.as_str()),
+                .map(|(managed_id, _, _, _)| managed_id.as_str()),
         ];
         let mut wrote_external = false;
         for external_id in external_ids
@@ -375,6 +405,7 @@ impl SessionSupervisor {
             let message = "Session config failed: no persistable session id".to_string();
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
+                request_id,
                 source: backend.as_short_str().to_string(),
                 backend_session_id,
                 intendant_session_id,
@@ -394,6 +425,7 @@ impl SessionSupervisor {
             self.info(&message);
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
+                request_id,
                 source: backend.as_short_str().to_string(),
                 backend_session_id,
                 intendant_session_id,
@@ -405,6 +437,7 @@ impl SessionSupervisor {
             let message = format!("Session config partially failed: {}", errors.join("; "));
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
+                request_id,
                 source: backend.as_short_str().to_string(),
                 backend_session_id,
                 intendant_session_id,
@@ -414,6 +447,38 @@ impl SessionSupervisor {
             });
             self.loop_error(message);
         }
+    }
+
+    /// Resolve only the requested session's billing authority. This runs
+    /// before persisting a switch and before stopping a process for restart;
+    /// the launcher validates again at the actual credential-use boundary.
+    pub(crate) async fn validate_session_auth_config(
+        &self,
+        backend: &external_agent::AgentBackend,
+        config: &crate::session_config::SessionAgentConfig,
+        project_root: Option<&Path>,
+    ) -> Result<(), String> {
+        let mode = config.parsed_claude_auth_mode(backend)?;
+        if *backend != external_agent::AgentBackend::ClaudeCode
+            || mode == Some(crate::project::ClaudeAuthMode::Subscription)
+        {
+            return Ok(());
+        }
+        let root = project_root
+            .map(Path::to_path_buf)
+            .or_else(|| config.project_root.as_deref().map(PathBuf::from))
+            .or_else(|| self.config.project_root.clone())
+            .ok_or_else(|| {
+                "Choose this Claude Code session's project before changing billing".to_string()
+            })?;
+        let project = self
+            .project_with_runtime_config(root, Some(backend))
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::external_agent::claude_auth::validate_auth_mode(
+            mode.unwrap_or(project.config.agent.claude_code.auth_mode),
+            &project.root,
+        )
     }
 
     pub(crate) async fn apply_session_identity(
@@ -586,6 +651,9 @@ pub(crate) fn validate_launch_config(
 ) -> Result<(), String> {
     use external_agent::AgentBackend;
     let selection = SessionAgentSelection::from_wire(config.agent.as_deref())?;
+    if let Some(mode) = config.claude_auth_mode.as_deref() {
+        crate::project::ClaudeAuthMode::parse(mode)?;
+    }
     let pinned = |value: &Option<String>| {
         value
             .as_deref()
@@ -599,9 +667,10 @@ pub(crate) fn validate_launch_config(
             "Claude Code",
             pinned(&config.claude_model)
                 || pinned(&config.claude_permission_mode)
-                || pinned(&config.claude_effort),
+                || pinned(&config.claude_effort)
+                || config.claude_auth_mode.is_some(),
             AgentBackend::ClaudeCode,
-            "claude_model/claude_permission_mode/claude_effort",
+            "claude_model/claude_permission_mode/claude_effort/claude_auth_mode",
         ),
         (
             "Kimi",
@@ -793,6 +862,7 @@ pub(crate) struct LaunchOverrides {
     pub(crate) claude_permission_mode: Option<String>,
     pub(crate) claude_allowed_tools: Option<String>,
     pub(crate) claude_effort: Option<String>,
+    pub(crate) claude_auth_mode: Option<String>,
     pub(crate) kimi_model: Option<String>,
     pub(crate) kimi_thinking: Option<String>,
     pub(crate) kimi_permission_mode: Option<String>,
@@ -846,6 +916,7 @@ impl LaunchOverrides {
             claude_permission_mode: self.claude_permission_mode.as_deref(),
             claude_allowed_tools: self.claude_allowed_tools.as_deref(),
             claude_effort: self.claude_effort.as_deref(),
+            claude_auth_mode: self.claude_auth_mode.as_deref(),
             kimi_model: self.kimi_model.as_deref(),
             kimi_thinking: self.kimi_thinking.as_deref(),
             kimi_permission_mode: self.kimi_permission_mode.as_deref(),
@@ -1006,6 +1077,18 @@ pub(crate) fn apply_session_claude_permission_mode(
         }
         _ => Err("claude_permission_mode requires Claude Code".to_string()),
     }
+}
+
+pub(crate) fn apply_session_claude_auth_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: &str,
+) -> Result<(), String> {
+    if *backend != external_agent::AgentBackend::ClaudeCode {
+        return Err("claude_auth_mode requires Claude Code".to_string());
+    }
+    project.config.agent.claude_code.auth_mode = crate::project::ClaudeAuthMode::parse(mode)?;
+    Ok(())
 }
 
 pub(crate) fn apply_session_claude_effort(
@@ -1335,6 +1418,184 @@ pub(crate) fn persist_external_session_name(
 mod tests {
     use super::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    #[test]
+    fn claude_billing_launch_rejects_mismatch_and_invalid_mode_without_mutation() {
+        let mut project = Project {
+            root: PathBuf::from("/unused/project"),
+            config: Default::default(),
+        };
+        for mode in ["api-key", "subscription"] {
+            apply_session_claude_auth_mode(
+                &mut project,
+                &external_agent::AgentBackend::ClaudeCode,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(project.config.agent.claude_code.auth_mode.as_str(), mode);
+            validate_launch_config(&crate::event::AgentLaunchConfig {
+                agent: Some("claude-code".to_string()),
+                claude_auth_mode: Some(mode.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            for backend in ["internal", "codex", "kimi", "pi"] {
+                assert!(validate_launch_config(&crate::event::AgentLaunchConfig {
+                    agent: Some(backend.to_string()),
+                    claude_auth_mode: Some(mode.to_string()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .contains("require Claude Code"));
+            }
+        }
+        assert!(apply_session_claude_auth_mode(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "api-key"
+        )
+        .is_err());
+        assert!(apply_session_claude_auth_mode(
+            &mut project,
+            &external_agent::AgentBackend::ClaudeCode,
+            "inherit"
+        )
+        .is_err());
+        assert_eq!(
+            project.config.agent.claude_code.auth_mode,
+            crate::project::ClaudeAuthMode::Subscription
+        );
+        assert!(validate_launch_config(&crate::event::AgentLaunchConfig {
+            claude_auth_mode: Some("auto".to_string()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_claude_billing_config_never_overwrites_saved_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let log = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut config =
+            (*test_supervisor(project.path().to_path_buf(), bus.clone()).config).clone();
+        config.logs_home_override = Some(home.path().to_path_buf());
+        let supervisor = SessionSupervisor::new(config);
+        let mut managed = managed_session("same-session", "claude-code");
+        managed.project_root = project.path().to_path_buf();
+        managed.session_dir = log.path().to_path_buf();
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .insert("same-session".to_string(), managed);
+        let saved = crate::session_config::SessionAgentConfig {
+            source: Some("claude-code".to_string()),
+            claude_auth_mode: Some("subscription".to_string()),
+            ..Default::default()
+        };
+        crate::session_config::write_log_dir_config(log.path(), &saved).unwrap();
+        let mut events = bus.subscribe();
+        supervisor
+            .configure_session_agent(
+                "same-session".to_string(),
+                Some("billing-save-invalid".to_string()),
+                Some("claude-code".to_string()),
+                Some("backend-session".to_string()),
+                None,
+                LaunchOverrides {
+                    claude_auth_mode: Some("auto".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let persisted = crate::session_config::read_log_dir_config(log.path()).unwrap();
+        assert_eq!(persisted.claude_auth_mode.as_deref(), Some("subscription"));
+        assert!(crate::session_config::lookup_external_overlay(
+            home.path(),
+            "claude-code",
+            "backend-session"
+        )
+        .is_none());
+        let mut rejected = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::SessionAgentConfigResult {
+                request_id,
+                success,
+                persisted_session_ids,
+                message,
+                ..
+            } = event
+            {
+                assert_eq!(request_id.as_deref(), Some("billing-save-invalid"));
+                assert!(!success);
+                assert!(persisted_session_ids.is_empty());
+                assert!(message.contains("subscription or api-key"));
+                rejected = true;
+            }
+        }
+        assert!(
+            rejected,
+            "the failed save must acknowledge failure before the UI restarts anything"
+        );
+        supervisor
+            .configure_session_agent(
+                "same-session".to_string(),
+                Some("billing-save-valid".to_string()),
+                Some("claude-code".to_string()),
+                None,
+                None,
+                LaunchOverrides {
+                    claude_auth_mode: Some("subscription".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let mut saved = false;
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::SessionAgentConfigResult {
+                request_id,
+                success,
+                ..
+            } = event
+            {
+                assert_eq!(request_id.as_deref(), Some("billing-save-valid"));
+                assert!(success);
+                saved = true;
+            }
+        }
+        assert!(
+            saved,
+            "successful saves must also echo their own request id"
+        );
+    }
+
+    #[tokio::test]
+    async fn selecting_subscription_does_not_require_a_project_or_api_key() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut config = (*test_supervisor(root.path().to_path_buf(), bus).config).clone();
+        config.project_root = None;
+        let supervisor = SessionSupervisor::new(config);
+        let selection = crate::session_config::SessionAgentConfig {
+            claude_auth_mode: Some("subscription".to_string()),
+            ..Default::default()
+        };
+        supervisor
+            .validate_session_auth_config(
+                &external_agent::AgentBackend::ClaudeCode,
+                &selection,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(supervisor
+            .validate_session_auth_config(&external_agent::AgentBackend::Codex, &selection, None)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn effective_config_preserves_fork_lineage_and_kind() {

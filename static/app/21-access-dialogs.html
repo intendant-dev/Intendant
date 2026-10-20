@@ -871,7 +871,7 @@
 
 <div id="session-config-modal" class="modal-backdrop" style="display:none">
   <div class="modal-dialog session-config-dialog">
-    <button class="modal-close" type="button" title="Close" onclick="closeSessionConfigModal()">x</button>
+    <button class="modal-close" id="session-config-close" type="button" title="Close" onclick="closeSessionConfigModal()">x</button>
     <h3 id="session-config-title">Session launch config</h3>
     <p class="modal-description" id="session-config-description">
       These settings are stored on this session and are used when it is next attached or resumed.
@@ -926,6 +926,13 @@
         <option value="off">off</option>
       </select>
     </div>
+    <div class="session-config-row" id="session-config-claude-auth-mode-row">
+      <label for="session-config-claude-auth-mode">Billing</label>
+      <select id="session-config-claude-auth-mode" aria-describedby="session-config-claude-auth-mode-note" onchange="onSessionConfigClaudeAuthModeChange()" disabled>
+        <option value="">Loading billing options…</option>
+      </select>
+    </div>
+    <p class="session-config-status" id="session-config-claude-auth-mode-note"></p>
     <div class="session-config-row" id="session-config-claude-model-row">
       <label for="session-config-claude-model">Model</label>
       <select id="session-config-claude-model" onchange="onSessionConfigClaudeModelChange()">
@@ -1062,7 +1069,7 @@
     </div>
     <div class="session-config-status" id="session-config-status"></div>
     <div class="modal-actions">
-      <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
+      <button class="modal-cancel" id="session-config-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
       <button class="modal-confirm secondary" type="button" id="session-config-save-restart" onclick="saveSessionConfigModal({ restart: true })">Save & restart</button>
       <button class="modal-confirm" type="button" id="session-config-save" onclick="saveSessionConfigModal()">Save</button>
     </div>

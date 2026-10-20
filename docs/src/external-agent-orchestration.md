@@ -311,13 +311,31 @@ the Linux D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` — desktop-keyring
 reach), and `NODE_OPTIONS`. Backends authenticate with their own
 subscription auth under their own homes (`~/.codex`, `~/.claude`,
 `~/.kimi-code`, `~/.pi/agent`) or a vault-leased home injected explicitly at
-spawn; they never see the controller's model keys.
+spawn by default.
+
+Claude Code has an explicit per-session billing choice: **Subscription** or
+**API key** (`[agent.claude_code].auth_mode = "subscription"` or `"api-key"`).
+Subscription keeps provider keys out of the child. In API-key mode, Intendant
+resolves the saved Anthropic key and supplies it only to that Claude Code
+process after the normal environment scrub. The dashboard's **Billing** picker
+is available for new and existing Claude Code sessions regardless of quota;
+switching an existing session checks API key availability when needed, saves the
+choice, then restarts Claude Code and resumes the same conversation. The CLI's
+authentication source is verified on spawn before the task prompt; subscription
+login is not preflighted before saving the choice. No key is returned to
+the dashboard or included in launch arguments, and there is no automatic billing
+fallback. See [the dashboard's session controls](./web-dashboard.md) for the UI.
+
+Explicit billing selection requires Claude Code's `auth status` command and
+per-run settings support. Routing was verified with Claude Code 2.1.304 using
+auth-status probes; no paid model request was used for that validation.
 
 `INTENDANT_ENV_PASSTHROUGH` (comma-separated exact names,
 case-insensitive, set on the controller) deliberately extends the
 allowlist — e.g. `INTENDANT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` for supervised
-sessions that must push over SSH. Provider API keys never pass, even if
-named there. The same variable exempts names from the ambient-credential
+sessions that must push over SSH. Provider API keys never pass through this
+allowlist, even if named there; Claude's explicit API-key mode is resolved
+separately. The same variable exempts names from the ambient-credential
 scrub at the native runtime's spawn boundary. The runtime's own exec/PTY
 shells apply a second defense-in-depth scrub that currently does not consult
 this variable, so classified ambient credentials such as `SSH_AUTH_SOCK` do
@@ -1087,9 +1105,9 @@ private session-scoped `$INTENDANT`/`INTENDANT_MCP_URL` environment and an
 appended system instruction to discover missing platform capabilities with
 `"$INTENDANT" ctl --help`. Computer use, shared displays, peers, Agenda, and
 Memory therefore remain Intendant services above the harness. The scoped URL
-and bearer stay out of argv and out of the model-visible prompt. As with every
-external child, provider API keys and ambient host credentials are removed from
-its environment; Pi authenticates from its own agent home.
+and bearer stay out of argv and out of the model-visible prompt. Provider API
+keys and ambient host credentials are removed from Pi's environment; Pi
+authenticates from its own agent home.
 
 The RPC translation covers user/assistant messages, streaming text and
 thinking, tool start/output/completion, file activity, errors, usage/cache
@@ -1486,6 +1504,7 @@ context_archive = "summary"          # summary | exact | off — context snapsho
 
 [agent.claude_code]
 command         = "claude"
+auth_mode       = "subscription"     # subscription | api-key; also selectable per session in the dashboard
 model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
 permission_mode = "default"           # default (alias manual) | acceptEdits | plan | auto | dontAsk | bypassPermissions
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
@@ -1621,10 +1640,12 @@ shared state (when driven over MCP) → config default → native.
   reach Intendant's display/CU tools while the gateway is up; without a resolved
   `web_port`, the MCP entry still points at the default port but nothing
   answers. Pi uses the same gateway authority through `$INTENDANT ctl`, not MCP.
-- **The external tool brings its own keys.** Intendant supervises the process but
-  the coding CLI authenticates to its own provider with its own credentials —
-  Intendant's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` are for the
-  native agent and presence layer, not the supervised tool.
+- **External credentials are selected explicitly.** Supervised CLIs use their
+  own provider credentials by default. Saving an Anthropic key in Intendant
+  does not switch Claude Code away from its subscription: choose **API key** in
+  that session's **Billing** control. This supplies the saved key only to the
+  selected Claude Code process. Other external agents continue to use their
+  own credentials.
 
 ## See Also
 

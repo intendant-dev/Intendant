@@ -47,6 +47,7 @@ pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
 /// the daemon loop to tear down the persistent agent before the next task.
 #[derive(Debug, Clone)]
 pub struct ClaudeRuntimeConfig {
+    pub auth_mode: crate::project::ClaudeAuthMode,
     pub model: Option<String>,
     /// Daemon-default reasoning effort. Per-create `claude_effort` pins
     /// override it; `None` lets the CLI pick the model default.
@@ -1403,6 +1404,7 @@ mod tests {
 
     fn test_claude_config() -> SharedClaudeConfig {
         Arc::new(RwLock::new(ClaudeRuntimeConfig {
+            auth_mode: crate::project::ClaudeAuthMode::Subscription,
             model: None,
             effort: None,
             permission_mode: "default".to_string(),
