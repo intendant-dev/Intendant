@@ -86,7 +86,9 @@ function onSessionConfigClaudeAuthModeChange() {
   const select = document.getElementById('session-config-claude-auth-mode');
   const changed = sessionConfigClaudeBillingChanged(selectedClaudeAuthMode(select));
   const save = document.getElementById('session-config-save');
-  if (save) save.textContent = changed ? 'Switch billing & restart' : 'Save';
+  // Billing cannot apply without a restart. Keep one restart action and
+  // offer Save separately only when it can preserve the running process.
+  if (save) save.classList.toggle('hidden', changed);
   const note = document.getElementById('session-config-claude-auth-mode-note');
   if (note && sessionConfigEditing?.source === 'claude-code') {
     const saved = claudeAuthModeLabel(sessionConfigEditing.claudeAuthMode);

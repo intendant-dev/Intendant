@@ -1928,6 +1928,26 @@ async function runDashboardClaudeBillingSelfTests() {
     'session-config-claude-model', 'session-config-claude-model-row',
   ].map(id => [id, makeElement()]));
   const get = id => elements.get(id);
+  const configActions = [...dialogs.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)]
+    .map(match => ({
+      id: match[1].match(/\bid="(session-config-(?:save|save-restart))"/)?.[1],
+      label: match[2].trim(),
+      onclick: match[1].match(/\bonclick="([^"]*)"/)?.[1],
+    })).filter(action => action.id);
+  assert.deepStrictEqual(configActions.map(action => [action.id, action.label]), [
+    ['session-config-save', 'Save'], ['session-config-save-restart', 'Save & restart'],
+  ], 'the dialog has one stable restart action beside a distinct save-only action');
+  for (const action of configActions) get(action.id).textContent = action.label;
+  const visibleConfigActions = () => configActions
+    .filter(action => !get(action.id).classList.contains('hidden'))
+    .map(action => get(action.id).textContent);
+  const clickConfigAction = id => {
+    const action = configActions.find(action => action.id === id);
+    assert.ok(action?.onclick, `missing config action ${id}`);
+    assert.strictEqual(get(id).classList.contains('hidden'), false);
+    assert.strictEqual(get(id).disabled, false);
+    vm.runInContext(action.onclick, sandbox);
+  };
   const sent = [];
   const liveActions = [];
   const restarted = [];
@@ -2042,13 +2062,16 @@ async function runDashboardClaudeBillingSelfTests() {
   sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
   assert.strictEqual(billing.value, '');
   assert.strictEqual(save.textContent, 'Save');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
   assert.match(note.textContent, /follows this session's project\/default setting/);
   sandbox.saveSessionConfigModal();
   assert.strictEqual(sent.at(-1).claude_auth_mode, undefined);
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
   ack({ success: false });
   choose('api-key');
-  sandbox.saveSessionConfigModal();
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart'],
+    'pinning inherited billing must not offer a second action that also restarts');
+  clickConfigAction('session-config-save-restart');
   assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, true,
     'explicitly pinning an inherited mode restarts even if it matches the daemon default');
@@ -2056,23 +2079,32 @@ async function runDashboardClaudeBillingSelfTests() {
   choose('subscription');
   sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
   assert.strictEqual(billing.value, 'subscription', 'an open draft survives a settings refresh');
-  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
   sandbox.closeSessionConfigModal();
   fixture.claude_auth_mode = 'subscription';
   sandbox.setClaudeAuthModeDefaults(modes);
   assert.strictEqual(sandbox.openSessionConfigModal(fixture.session_id), true);
   assert.strictEqual(billing.value, 'subscription');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
   choose('api-key');
-  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
+  choose('subscription');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart'],
+    'reverting the draft restores the distinct save-only action');
+  choose('api-key');
   assert.match(note.textContent, /Saved billing: Subscription\./);
   assert.strictEqual(saved(), 'subscription');
+  sandbox.closeSessionConfigModal();
+  sandbox.openSessionConfigModal({ session_id: 'other-codex-session', source: 'codex' });
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart'],
+    'a previous billing draft must not hide Save for other agents');
   sandbox.closeSessionConfigModal();
   sandbox.openSessionConfigModal(fixture.session_id);
   assert.strictEqual(billing.value, 'subscription', 'cancel never marks the draft active');
 
   choose('api-key');
   get('session-config-claude-model').value = 'opus';
-  sandbox.saveSessionConfigModal();
+  clickConfigAction('session-config-save-restart');
   assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
   assert.ok(sent.at(-1).request_id);
   assert.strictEqual(sent.at(-1).request_id, sandbox.sessionConfigSavePending.requestId);
@@ -2081,6 +2113,8 @@ async function runDashboardClaudeBillingSelfTests() {
   assert.strictEqual(restarted.length, 0);
   assert.strictEqual(liveActions.length, 0, 'billing changes must not mutate the running model before restart');
   assert.strictEqual(save.disabled, true);
+  assert.strictEqual(get('session-config-save-restart').disabled, true);
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
   assert.strictEqual(get('session-config-close').disabled, true);
   assert.strictEqual(get('session-config-cancel').disabled, true);
   const pendingBeforeClose = sandbox.sessionConfigSavePending;
@@ -2103,6 +2137,9 @@ async function runDashboardClaudeBillingSelfTests() {
   assert.match(note.textContent, /Saved billing: Subscription\./);
   assert.strictEqual(get('session-config-modal').style.display, 'flex');
   assert.strictEqual(save.disabled, false);
+  assert.strictEqual(get('session-config-save-restart').disabled, false);
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart'],
+    'a failed save keeps the single restart action available for retry');
   assert.strictEqual(get('session-config-close').disabled, false);
   assert.strictEqual(get('session-config-cancel').disabled, false);
 
@@ -2156,8 +2193,12 @@ async function runDashboardClaudeBillingSelfTests() {
     'the reverse switch is equally available and resumes the same identity');
   sandbox.openSessionConfigModal(fixture.session_id);
   assert.strictEqual(save.textContent, 'Save');
-  sandbox.saveSessionConfigModal();
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
+  const liveActionsBeforeSave = liveActions.length;
+  clickConfigAction('session-config-save');
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
+  assert.ok(liveActions.length > liveActionsBeforeSave,
+    'the distinct Save action still applies supported Claude settings live');
   ack();
   assert.strictEqual(restarted.length, 2, 'unchanged billing preserves ordinary Save behavior');
 
