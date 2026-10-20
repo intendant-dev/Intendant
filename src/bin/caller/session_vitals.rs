@@ -1023,7 +1023,7 @@ impl SessionVitalsHub {
                 .expect("vitals source lock")
                 .remove(&canonical);
             if changed || previous_member.is_some() {
-                self.clear_limit_snapshot(&canonical);
+                self.clear_limit_snapshot(&canonical, live);
             }
             if let Some(member) = previous_member {
                 if self.retire_era_if_orphaned(&member.source, &member.account) {
@@ -1055,25 +1055,31 @@ impl SessionVitalsHub {
                     .get(&canonical)
                     .is_none_or(|vitals| vitals.limits.is_empty())
             {
-                self.clear_limit_snapshot(&canonical);
+                self.clear_limit_snapshot(&canonical, live);
             }
         }
     }
 
     /// A restart removes the old hub entry before the replacement starts,
-    /// while frontends may still hold its last snapshot. Emit an explicit
-    /// clear even when this hub entry is already empty.
-    fn clear_limit_snapshot(&self, session_id: &str) {
+    /// while frontends may still hold its last snapshot. Live authority
+    /// forces a clear even when this entry is already empty. Recovery
+    /// emits for an absent entry or changed limits, but must not repeat a
+    /// complete, already-empty snapshot just emitted by recovered facts.
+    fn clear_limit_snapshot(&self, session_id: &str, force: bool) {
         let vitals = {
             let mut sessions = self.sessions.lock().expect("vitals state lock");
+            let absent = !sessions.contains_key(session_id);
             let entry = sessions.entry(session_id.to_string()).or_default();
+            let changed = !entry.limits.is_empty();
             entry.limits.clear();
-            entry.clone()
+            (force || absent || changed).then(|| entry.clone())
         };
-        self.bus.send(AppEvent::SessionVitals {
-            session_id: session_id.to_string(),
-            vitals,
-        });
+        if let Some(vitals) = vitals {
+            self.bus.send(AppEvent::SessionVitals {
+                session_id: session_id.to_string(),
+                vitals,
+            });
+        }
     }
 
     fn inherit_claude_auth_mode(&self, parent: &str, child: &str) {

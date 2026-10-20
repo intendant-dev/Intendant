@@ -1423,6 +1423,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovered_billing_emits_only_one_unchanged_full_snapshot() {
+        for mode in [ClaudeAuthMode::Subscription, ClaudeAuthMode::ApiKey] {
+            let bus = EventBus::new();
+            let hub = SessionVitalsHub::new(bus.clone());
+            let mut rx = bus.subscribe();
+            let mut facts = recovered_cc_facts(1_000_000);
+            facts.claude_auth_mode = Some(mode);
+            hub.apply_recovered_facts("cc-1", facts.clone());
+            let Ok(AppEvent::SessionVitals { vitals, .. }) = rx.try_recv() else {
+                panic!("recovered facts emit a complete snapshot");
+            };
+            assert_eq!(
+                vitals
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.model.as_deref()),
+                Some("claude-fable-5")
+            );
+            assert!(vitals.limits.is_empty());
+            assert!(
+                rx.try_recv().is_err(),
+                "billing recovery duplicated {mode:?} facts"
+            );
+            hub.apply_recovered_facts("cc-1", facts);
+            assert!(rx.try_recv().is_err(), "unchanged recovery remains silent");
+        }
+    }
+
+    #[test]
+    fn source_only_api_recovery_clears_absent_or_nonempty_limits() {
+        for old_limits in [false, true] {
+            let bus = EventBus::new();
+            let hub = SessionVitalsHub::new(bus.clone());
+            if old_limits {
+                hub.apply("cc-1", |vitals| {
+                    vitals.limits = vec![SessionLimitWindow {
+                        label: "5h".into(),
+                        status: Some("rejected".into()),
+                        ..Default::default()
+                    }];
+                });
+            }
+            let mut rx = bus.subscribe();
+            hub.apply_recovered_facts(
+                "cc-1",
+                RecoveredSessionFacts {
+                    source: Some("claude-code".into()),
+                    claude_auth_mode: Some(ClaudeAuthMode::ApiKey),
+                    ..Default::default()
+                },
+            );
+            let Ok(AppEvent::SessionVitals { vitals, .. }) = rx.try_recv() else {
+                panic!("source-only API recovery emits an explicit clear");
+            };
+            assert_eq!(
+                serde_json::to_value(vitals).unwrap(),
+                serde_json::json!({ "limits": [] })
+            );
+            assert!(rx.try_recv().is_err(), "one explicit clear suffices");
+        }
+    }
+
     /// Recovered-then-live: the hydrator fills empty sections (stamped),
     /// and every later live fold overwrites its field and clears the
     /// stamp — the race is harmless in this order.
