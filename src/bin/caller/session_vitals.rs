@@ -1088,12 +1088,12 @@ impl SessionVitalsHub {
             // relationship vocabulary, but have independent processes.
             // In-process Claude children announce identity before this edge.
             if !modes.contains_key(&child)
-                && !self
+                && self
                     .session_sources
                     .lock()
                     .expect("vitals source lock")
                     .get(&child)
-                    .is_some_and(|member| member.source == "claude-code")
+                    .is_none_or(|member| member.source != "claude-code")
             {
                 return;
             }
