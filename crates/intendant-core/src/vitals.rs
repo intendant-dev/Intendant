@@ -389,7 +389,9 @@ pub struct SessionVitals {
     pub git: Option<SessionGitVitals>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<SessionCacheVitals>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Vitals emissions are complete snapshots. An explicit empty list
+    // retires previously reported limits on billing/credential changes.
+    #[serde(default)]
     pub limits: Vec<SessionLimitWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivityVitals>,
@@ -405,6 +407,14 @@ pub struct SessionVitals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_session_vitals_serializes_an_explicit_limit_clear() {
+        let wire = serde_json::to_value(SessionVitals::default()).expect("serializes");
+        assert_eq!(wire, serde_json::json!({ "limits": [] }));
+        let legacy: SessionVitals = serde_json::from_str("{}").expect("legacy empty snapshot");
+        assert_eq!(legacy, SessionVitals::default());
+    }
 
     /// Every known mode maps into the pinned kind vocabulary; unknown
     /// modes map to None (raw passthrough, never a guessed label).

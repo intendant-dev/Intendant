@@ -717,6 +717,7 @@ pub(crate) async fn create_external_agent(
     backend: &external_agent::AgentBackend,
     project: &Project,
     session_log: &SharedSessionLog,
+    bus: &EventBus,
     web_port: Option<u16>,
     resume_session: Option<String>,
     mcp_session_id: Option<String>,
@@ -1153,6 +1154,21 @@ pub(crate) async fn create_external_agent(
     slog(session_log, |l| {
         l.debug(&format!("External agent thread: {}", thread.thread_id))
     });
+
+    // Publish the authority actually used by the successfully initialized
+    // child before callers announce identity or drain any usage. In
+    // particular, a newly saved billing choice alone is not a live switch.
+    if *backend == AgentBackend::ClaudeCode {
+        if let Some(session_id) = mcp_session_id {
+            bus.send(AppEvent::SessionClaudeAuthMode {
+                session_id,
+                backend_session_id: backend
+                    .thread_id_is_canonical(&thread.thread_id)
+                    .then(|| thread.thread_id.clone()),
+                auth_mode: project.config.agent.claude_code.auth_mode,
+            });
+        }
+    }
 
     Ok((agent, thread, event_rx))
 }

@@ -1234,6 +1234,9 @@ const sessionCacheExpiryAlerts = new Map();
 // load); alerts fire only on live escalations. See
 // maybeAlertLimitTransitions (39-session-windows.js).
 const sessionLimitStatusSeen = new Map();
+// Arrival order for explicit limit snapshots. Late identity linkage must
+// not resurrect an older alias's limits over a newer clear.
+let sessionLimitsSnapshotSequence = 0;
 // Escalations awaiting the coalesced limit toast: session id → worst
 // pending entry. Flushed on a debounce so near-simultaneous warnings
 // from many sessions (one account limit hits them together) become ONE
@@ -1241,6 +1244,7 @@ const sessionLimitStatusSeen = new Map();
 const pendingLimitAlerts = new Map();
 let limitAlertFlushTimer = null;
 let lastLimitAlertFlushMs = 0;
+let activeLimitStatusToast = null;
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 // In-memory history behind the render window. Long-running sessions used

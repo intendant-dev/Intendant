@@ -930,14 +930,22 @@ external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
 
 Claude Code's **Billing** row shows the saved **Subscription** or **API key**
-mode and lets you choose either mode at any time. A changed choice turns
-**Save** into **Switch billing & restart**. The daemon checks API key availability
-before saving an API-key choice; after it confirms the save, the dashboard restarts
+mode and lets you choose either mode at any time. When billing changes, the
+dialog offers **Save & restart** as its only save action, since a restart is
+required. Otherwise, **Save** is also available for updates without a restart.
+The daemon checks API key availability before saving an API-key choice; after it
+confirms the save, the dashboard restarts
 Claude Code and resumes the same backend conversation under the selected billing
 mode. A missing API key or save failure leaves the running session and its saved
 mode unchanged, with the error shown in the dialog. Selecting a different option
 alone does not change the saved mode. There is no automatic fallback between
 subscription and API billing.
+
+Usage-limit indicators follow the running Claude Code process's billing mode.
+Subscription sessions share the quota reported for their signed-in account;
+API-key sessions show their own reported limits. Switching billing clears the
+previous mode's warnings, including queued notifications and visible limit
+toasts. Actual API rate-limit warnings still appear when Claude reports them.
 
 Older sessions without a billing pin show **Current project/default**, since
 their project may have a different default from the dashboard's daemon. Leaving

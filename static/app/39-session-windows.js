@@ -4152,18 +4152,32 @@ function vitalsOpenChangesTab(sessionId) {
 function refanSessionVitalsForIdentityGroup(sessionId) {
   const ids = sessionGoalUpdateIds(sessionId);
   let union = null;
-  for (const id of ids) {
-    const cached = sessionMetadataById.get(id)?.vitals;
-    if (cached) union = mergeSessionVitals(cached, union);
-  }
-  if (!union) return;
+  let latestLimits;
+  let limitsSequence = -1;
   for (const id of ids) {
     const meta = sessionMetadataById.get(id) || {};
-    sessionMetadataById.set(id, { ...meta, vitals: union });
+    const cached = meta.vitals;
+    if (cached) union = mergeSessionVitals(cached, union);
+    if (Array.isArray(cached?.limits) && (meta.vitalsLimitsSequence || 0) >= limitsSequence) {
+      latestLimits = cached.limits;
+      limitsSequence = meta.vitalsLimitsSequence || 0;
+    }
+  }
+  if (!union) return;
+  // An explicit clear is a complete limits snapshot, including when it
+  // arrived before the wrapper/native identity relationship was known.
+  if (latestLimits) union.limits = latestLimits;
+  for (const id of ids) {
+    const meta = sessionMetadataById.get(id) || {};
+    sessionMetadataById.set(id, {
+      ...meta, vitals: union,
+      ...(limitsSequence >= 0 ? { vitalsLimitsSequence: limitsSequence } : {}),
+    });
     if (sessionWindows.has(id)) {
       renderSessionWindowVitals(sessionWindows.get(id), union);
     }
   }
+  maybeAlertLimitTransitions(sessionId, latestLimits, { replay: true });
   refreshSessionVitalsTicker();
 }
 
@@ -4363,33 +4377,46 @@ const LIMIT_ALERT_DEBOUNCE_MS = 2000;
 const LIMIT_ALERT_COOLDOWN_MS = 30000;
 
 function maybeAlertLimitTransitions(sid, limits, { replay = false } = {}) {
-  if (!Array.isArray(limits) || !limits.length) return;
-  let seen = sessionLimitStatusSeen.get(sid);
-  const firstObservation = !seen;
-  if (!seen) {
-    seen = new Map();
-    sessionLimitStatusSeen.set(sid, seen);
-    if (sessionLimitStatusSeen.size > 200) {
-      sessionLimitStatusSeen.delete(sessionLimitStatusSeen.keys().next().value);
-    }
-  }
+  if (!Array.isArray(limits)) return;
+  const ids = sessionGoalUpdateIds(sid);
+  const previous = ids.map(id => sessionLimitStatusSeen.get(id)).filter(Boolean);
+  const firstObservation = !previous.length;
+  const seen = new Map();
+  const escalations = [];
   for (const w of limits) {
     const label = String(w?.label || '').trim() || 'window';
     // Same rolled-aware derivation as the chip: a stale pre-reset status
     // neither alerts nor blocks the re-arm, so the toast and the chip can
     // never disagree about a window.
     const severity = effectiveLimitSeverity(w);
-    const prev = seen.get(label) || '';
+    const prevRank = Math.max(0, ...previous.map(state => VITALS_SEVERITY_RANK[state.get(label) || '']));
     seen.set(label, severity);
     if (replay || firstObservation) continue;
-    if (VITALS_SEVERITY_RANK[severity] <= VITALS_SEVERITY_RANK[prev]) continue;
-    queueLimitAlert(sid, {
+    if (VITALS_SEVERITY_RANK[severity] <= prevRank) continue;
+    escalations.push({
       severity,
       label,
       status: String(w?.status || ''),
       resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
     });
   }
+  for (const id of ids) {
+    // Keep an empty map after a clear: the next genuine API limit is a
+    // new escalation, not a silently seeded first observation. Aliases
+    // share this map so switching event IDs cannot duplicate an alert.
+    sessionLimitStatusSeen.set(id, seen);
+    const pending = pendingLimitAlerts.get(id);
+    if (pending && (!seen.has(pending.label)
+      || VITALS_SEVERITY_RANK[seen.get(pending.label)] < VITALS_SEVERITY_RANK[pending.severity])) {
+      pendingLimitAlerts.delete(id);
+    }
+  }
+  while (sessionLimitStatusSeen.size > 200) {
+    sessionLimitStatusSeen.delete(sessionLimitStatusSeen.keys().next().value);
+  }
+  const alertId = ids.find(id => pendingLimitAlerts.has(id)) || sid;
+  for (const entry of escalations) queueLimitAlert(alertId, entry);
+  reconcileLimitStatusToast();
 }
 
 function queueLimitAlert(sid, entry) {
@@ -4405,17 +4432,47 @@ function queueLimitAlert(sid, entry) {
 
 function flushLimitAlerts() {
   limitAlertFlushTimer = null;
-  const entries = [];
-  for (const [sid, entry] of pendingLimitAlerts) {
-    // A session that recovered while the flush waited is stale news.
-    const current = sessionLimitStatusSeen.get(sid)?.get(entry.label) || '';
-    if (VITALS_SEVERITY_RANK[current] >= VITALS_SEVERITY_RANK[entry.severity]) {
-      entries.push({ sid, ...entry });
-    }
-  }
+  const entries = currentLimitAlertEntries(Array.from(pendingLimitAlerts, ([sid, entry]) => ({ sid, ...entry })));
   pendingLimitAlerts.clear();
   if (!entries.length) return;
   lastLimitAlertFlushMs = Date.now();
+  const anyCrit = entries.some((e) => e.severity === 'crit');
+  const text = limitAlertText(entries);
+  showLimitStatusToast(entries, text, anyCrit);
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
+    try { new Notification('Intendant', { body: text }); } catch (_) { /* notification blocked */ }
+  }
+}
+
+// Recheck actual windows at delivery time: the cooldown may span a
+// reset, a billing change, or an identity link that superseded a window.
+function currentLimitAlertEntries(entries) {
+  const current = [];
+  for (const entry of entries) {
+    const limits = sessionMetadataById.get(entry.sid)?.vitals?.limits;
+    const window = Array.isArray(limits)
+      ? limits.find(w => (String(w?.label || '').trim() || 'window') === entry.label)
+      : null;
+    if (!window) continue;
+    const severity = effectiveLimitSeverity(window);
+    if (!VITALS_SEVERITY_RANK[severity]
+      || VITALS_SEVERITY_RANK[severity] < VITALS_SEVERITY_RANK[entry.severity]) continue;
+    current.push({
+      ...entry, severity, status: String(window.status || ''),
+      resetsAtEpoch: Number(window.resetsAtEpoch) || 0,
+    });
+  }
+  current.sort((a, b) => VITALS_SEVERITY_RANK[b.severity] - VITALS_SEVERITY_RANK[a.severity]);
+  const seenIds = new Set();
+  return current.filter(entry => {
+    const ids = sessionGoalUpdateIds(entry.sid);
+    if (ids.some(id => seenIds.has(id))) return false;
+    for (const id of ids) seenIds.add(id);
+    return true;
+  });
+}
+
+function limitAlertText(entries) {
   const anyCrit = entries.some((e) => e.severity === 'crit');
   const lineFor = (e) => {
     const identity = sessionIdentityParts(e.sid);
@@ -4428,12 +4485,22 @@ function flushLimitAlerts() {
       : `${name} is approaching its ${windowName} usage limit${reset ? ` — resets in ~${reset}` : ''}`;
   };
   const glyph = anyCrit ? '⛔' : '⚠';
-  const text = entries.length === 1
+  return entries.length === 1
     ? `${glyph} ${lineFor(entries[0])}`
     : `${glyph} ${entries.length} sessions ${anyCrit ? 'hit or are near' : 'are approaching'} provider usage limits`;
-  showLimitStatusToast(entries, text, anyCrit);
-  if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
-    try { new Notification('Intendant', { body: text }); } catch (_) { /* notification blocked */ }
+}
+
+function reconcileLimitStatusToast() {
+  if (!activeLimitStatusToast?.toast.parentNode) {
+    activeLimitStatusToast = null;
+    return;
+  }
+  const entries = currentLimitAlertEntries(activeLimitStatusToast.entries);
+  if (!entries.length) {
+    activeLimitStatusToast.toast.remove();
+    activeLimitStatusToast = null;
+  } else if (JSON.stringify(entries) !== JSON.stringify(activeLimitStatusToast.entries)) {
+    showLimitStatusToast(entries, limitAlertText(entries), entries.some(e => e.severity === 'crit'));
   }
 }
 
@@ -4445,6 +4512,9 @@ function showLimitStatusToast(entries, text, crit) {
   const controlBody = document.querySelector('#activity-control-pane .control-pane-body');
   const host = controlBody && controlBody.offsetParent !== null ? controlBody : document.body;
   if (!host) return;
+  // The active pane may have changed since the previous limit toast.
+  // Retire that exact element even when its replacement has a new host.
+  activeLimitStatusToast?.toast.remove();
   host.querySelector('.control-toast')?.remove();
   const toast = document.createElement('div');
   toast.className = `control-toast ${crit ? 'error' : 'warn'}`;
@@ -4485,6 +4555,7 @@ function showLimitStatusToast(entries, text, crit) {
     toast.title = entries.map(lineForLimitEntryTitle).join('\n');
   }
   host.appendChild(toast);
+  activeLimitStatusToast = { toast, entries };
   setTimeout(() => { if (toast.parentNode) toast.remove(); }, 14000);
 }
 
@@ -4516,6 +4587,7 @@ function sessionVitalsNeedsTick(vitals) {
 }
 
 function refreshSessionVitalsTicker() {
+  reconcileLimitStatusToast();
   // Pane gate: with the Activity tab parked (another tab active, or the
   // page backgrounded) the countdown repaints wrote textContent into a
   // display:none subtree every second, and each write still ran style
@@ -4564,11 +4636,11 @@ function normalizeSessionVitals(raw) {
   const src = raw.vitals && typeof raw.vitals === 'object' ? raw.vitals : raw;
   const git = src.git && typeof src.git === 'object' ? src.git : null;
   const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
-  const limits = Array.isArray(src.limits) ? src.limits : [];
+  const limits = Array.isArray(src.limits) ? src.limits : undefined;
   const activity = src.activity && typeof src.activity === 'object' ? src.activity : null;
   const config = src.config && typeof src.config === 'object' ? src.config : null;
   const context = src.context && typeof src.context === 'object' ? src.context : null;
-  if (!git && !cache && !limits.length && !activity && !config && !context) return null;
+  if (!git && !cache && !limits && !activity && !config && !context) return null;
   return { git, cache, limits, activity, config, context };
 }
 
@@ -4585,7 +4657,7 @@ function mergeSessionVitals(incoming, existing) {
   return {
     git: incoming.git || existing.git || null,
     cache: incoming.cache || existing.cache || null,
-    limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
+    limits: Array.isArray(incoming.limits) ? incoming.limits : existing.limits,
     activity: incoming.activity || existing.activity || null,
     config: incoming.config || existing.config || null,
     context: incoming.context || existing.context || null,
@@ -4598,10 +4670,14 @@ function applySessionVitals(raw = {}, options = {}) {
   if (!sid) return;
   const vitals = normalizeSessionVitals(data);
   if (!vitals) return;
+  const limitsSequence = Array.isArray(vitals.limits) ? ++sessionLimitsSnapshotSequence : null;
   for (const id of sessionGoalUpdateIds(sid)) {
     const meta = sessionMetadataById.get(id) || {};
     const merged = mergeSessionVitals(vitals, meta.vitals);
-    sessionMetadataById.set(id, { ...meta, vitals: merged });
+    sessionMetadataById.set(id, {
+      ...meta, vitals: merged,
+      ...(limitsSequence !== null ? { vitalsLimitsSequence: limitsSequence } : {}),
+    });
     if (sessionWindows.has(id)) {
       const win = sessionWindows.get(id);
       renderSessionWindowVitals(win, merged);

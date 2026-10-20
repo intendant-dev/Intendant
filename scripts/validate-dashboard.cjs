@@ -340,6 +340,7 @@ Options:
   --app-html PATH            HTML file for --check-static-scripts (default: static/app.html)
   --json                     Print one compact JSON result
   --self-test                Run parser/formatter self-tests; does not launch a browser
+  --self-test-limit-snapshots Run focused session-limit snapshot/alert regressions
 
 If --url/--port are omitted, the script derives the dashboard port from
 INTENDANT_MCP_URL when available. It never defaults to port 8765.
@@ -389,6 +390,7 @@ function parseArgs(argv, env = process.env) {
     noSandbox: true,
     json: false,
     selfTest: false,
+    selfTestLimitSnapshots: false,
     requireCurrentStatic: false,
     requireStationState: false,
     requireAiProviderSession: false,
@@ -420,6 +422,8 @@ function parseArgs(argv, env = process.env) {
       opts.help = true;
     } else if (arg === '--self-test') {
       opts.selfTest = true;
+    } else if (arg === '--self-test-limit-snapshots') {
+      opts.selfTestLimitSnapshots = true;
     } else if (arg === '--url') {
       opts.url = readValue();
       opts.explicitDashboardTarget = true;
@@ -801,6 +805,11 @@ async function main() {
 
   if (opts.selfTest) {
     await runSelfTest();
+    return;
+  }
+  if (opts.selfTestLimitSnapshots) {
+    runDashboardLimitSnapshotSelfTests();
+    console.log('PASS dashboard-limit-snapshot-self-test');
     return;
   }
 
@@ -1928,6 +1937,26 @@ async function runDashboardClaudeBillingSelfTests() {
     'session-config-claude-model', 'session-config-claude-model-row',
   ].map(id => [id, makeElement()]));
   const get = id => elements.get(id);
+  const configActions = [...dialogs.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)]
+    .map(match => ({
+      id: match[1].match(/\bid="(session-config-(?:save|save-restart))"/)?.[1],
+      label: match[2].trim(),
+      onclick: match[1].match(/\bonclick="([^"]*)"/)?.[1],
+    })).filter(action => action.id);
+  assert.deepStrictEqual(configActions.map(action => [action.id, action.label]), [
+    ['session-config-save', 'Save'], ['session-config-save-restart', 'Save & restart'],
+  ], 'the dialog has one stable restart action beside a distinct save-only action');
+  for (const action of configActions) get(action.id).textContent = action.label;
+  const visibleConfigActions = () => configActions
+    .filter(action => !get(action.id).classList.contains('hidden'))
+    .map(action => get(action.id).textContent);
+  const clickConfigAction = id => {
+    const action = configActions.find(action => action.id === id);
+    assert.ok(action?.onclick, `missing config action ${id}`);
+    assert.strictEqual(get(id).classList.contains('hidden'), false);
+    assert.strictEqual(get(id).disabled, false);
+    vm.runInContext(action.onclick, sandbox);
+  };
   const sent = [];
   const liveActions = [];
   const restarted = [];
@@ -2042,13 +2071,16 @@ async function runDashboardClaudeBillingSelfTests() {
   sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
   assert.strictEqual(billing.value, '');
   assert.strictEqual(save.textContent, 'Save');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
   assert.match(note.textContent, /follows this session's project\/default setting/);
   sandbox.saveSessionConfigModal();
   assert.strictEqual(sent.at(-1).claude_auth_mode, undefined);
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
   ack({ success: false });
   choose('api-key');
-  sandbox.saveSessionConfigModal();
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart'],
+    'pinning inherited billing must not offer a second action that also restarts');
+  clickConfigAction('session-config-save-restart');
   assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, true,
     'explicitly pinning an inherited mode restarts even if it matches the daemon default');
@@ -2056,23 +2088,32 @@ async function runDashboardClaudeBillingSelfTests() {
   choose('subscription');
   sandbox.setClaudeAuthModeDefaults({ ...modes, claude_auth_mode: 'api-key' });
   assert.strictEqual(billing.value, 'subscription', 'an open draft survives a settings refresh');
-  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
   sandbox.closeSessionConfigModal();
   fixture.claude_auth_mode = 'subscription';
   sandbox.setClaudeAuthModeDefaults(modes);
   assert.strictEqual(sandbox.openSessionConfigModal(fixture.session_id), true);
   assert.strictEqual(billing.value, 'subscription');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
   choose('api-key');
-  assert.strictEqual(save.textContent, 'Switch billing & restart');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
+  choose('subscription');
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart'],
+    'reverting the draft restores the distinct save-only action');
+  choose('api-key');
   assert.match(note.textContent, /Saved billing: Subscription\./);
   assert.strictEqual(saved(), 'subscription');
+  sandbox.closeSessionConfigModal();
+  sandbox.openSessionConfigModal({ session_id: 'other-codex-session', source: 'codex' });
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart'],
+    'a previous billing draft must not hide Save for other agents');
   sandbox.closeSessionConfigModal();
   sandbox.openSessionConfigModal(fixture.session_id);
   assert.strictEqual(billing.value, 'subscription', 'cancel never marks the draft active');
 
   choose('api-key');
   get('session-config-claude-model').value = 'opus';
-  sandbox.saveSessionConfigModal();
+  clickConfigAction('session-config-save-restart');
   assert.strictEqual(sent.at(-1).claude_auth_mode, 'api-key');
   assert.ok(sent.at(-1).request_id);
   assert.strictEqual(sent.at(-1).request_id, sandbox.sessionConfigSavePending.requestId);
@@ -2081,6 +2122,8 @@ async function runDashboardClaudeBillingSelfTests() {
   assert.strictEqual(restarted.length, 0);
   assert.strictEqual(liveActions.length, 0, 'billing changes must not mutate the running model before restart');
   assert.strictEqual(save.disabled, true);
+  assert.strictEqual(get('session-config-save-restart').disabled, true);
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart']);
   assert.strictEqual(get('session-config-close').disabled, true);
   assert.strictEqual(get('session-config-cancel').disabled, true);
   const pendingBeforeClose = sandbox.sessionConfigSavePending;
@@ -2103,6 +2146,9 @@ async function runDashboardClaudeBillingSelfTests() {
   assert.match(note.textContent, /Saved billing: Subscription\./);
   assert.strictEqual(get('session-config-modal').style.display, 'flex');
   assert.strictEqual(save.disabled, false);
+  assert.strictEqual(get('session-config-save-restart').disabled, false);
+  assert.deepStrictEqual(visibleConfigActions(), ['Save & restart'],
+    'a failed save keeps the single restart action available for retry');
   assert.strictEqual(get('session-config-close').disabled, false);
   assert.strictEqual(get('session-config-cancel').disabled, false);
 
@@ -2156,8 +2202,12 @@ async function runDashboardClaudeBillingSelfTests() {
     'the reverse switch is equally available and resumes the same identity');
   sandbox.openSessionConfigModal(fixture.session_id);
   assert.strictEqual(save.textContent, 'Save');
-  sandbox.saveSessionConfigModal();
+  assert.deepStrictEqual(visibleConfigActions(), ['Save', 'Save & restart']);
+  const liveActionsBeforeSave = liveActions.length;
+  clickConfigAction('session-config-save');
   assert.strictEqual(sandbox.sessionConfigSavePending.restart, false);
+  assert.ok(liveActions.length > liveActionsBeforeSave,
+    'the distinct Save action still applies supported Claude settings live');
   ack();
   assert.strictEqual(restarted.length, 2, 'unchanged billing preserves ordinary Save behavior');
 
@@ -2225,6 +2275,336 @@ async function runDashboardClaudeBillingSelfTests() {
   assert.strictEqual(sandbox.sessionConfigSavePending, stationPending);
   ack();
   assert.strictEqual(sandbox.sessionConfigSavePending, null);
+}
+
+function runDashboardLimitSnapshotSelfTests() {
+  // Evaluate the authored fragments, including the actual toast DOM code.
+  // Only the browser, clock, and unrelated render callbacks are fixtures.
+  const appDir = path.resolve(__dirname, '..', 'static', 'app');
+  const init = fs.readFileSync(path.join(appDir, '31-init-identity-fleet.js'), 'utf8');
+  const windows = fs.readFileSync(path.join(appDir, '39-session-windows.js'), 'utf8');
+  const source = [
+    sourceBetween(init, 'const sessionLimitStatusSeen', 'const SESSION_WINDOW_RENDER_LIMIT'),
+    constAssignmentSource(windows, 'VITALS_SEVERITY_RANK'),
+    sourceBetween(windows, 'function sessionGoalUpdateIds', 'function applySessionGoal'),
+    sourceBetween(windows, 'function vitalsLimitLabelLong', 'function vitalsLimitAccountShort'),
+    sourceBetween(windows, 'function formatLimitReset(', 'function limitStatusWord'),
+    sourceBetween(windows, 'function refanSessionVitalsForIdentityGroup', '// QA readback (window.qa convention)'),
+    sourceBetween(windows, 'const LIMIT_ALERT_DEBOUNCE_MS', '// Cheap per-tick predicate'),
+    sourceBetween(windows, 'function normalizeSessionVitals', 'function sessionWindowMetaFromSession'),
+    'this.__limitState = { seen: sessionLimitStatusSeen, pending: pendingLimitAlerts };',
+  ].join('\n');
+  const initialNow = Date.UTC(2026, 9, 20, 12);
+  const plain = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  const limit = (label = '5h', status = 'rejected', extra = {}) => ({
+    label, status, resetsAtEpoch: initialNow / 1000 + 3600, ...extra,
+  });
+  const fixture = () => {
+    let now = initialNow;
+    let timerId = 0;
+    const timers = new Map();
+    const metadata = new Map();
+    const rendered = new Map();
+    const notifications = [];
+    const element = () => {
+      const node = {
+        children: [], parentNode: null, className: '', textContent: '', style: {},
+        appendChild(child) {
+          child.remove();
+          this.children.push(child);
+          child.parentNode = this;
+          return child;
+        },
+        remove() {
+          if (!this.parentNode) return;
+          const siblings = this.parentNode.children;
+          siblings.splice(siblings.indexOf(this), 1);
+          this.parentNode = null;
+        },
+        querySelector(selector) {
+          return this.children.find(child => child.className.split(/\s+/).includes(selector.slice(1))) || null;
+        },
+        addEventListener() {}, setAttribute() {},
+      };
+      node.classList = { add: (name) => { node.className += ` ${name}`; } };
+      return node;
+    };
+    const controlBody = element();
+    controlBody.offsetParent = null;
+    const document = {
+      body: element(), hidden: true, createElement: element,
+      querySelector: (selector) => selector === '#activity-control-pane .control-pane-body' ? controlBody : null,
+    };
+    class FixtureDate extends Date {
+      constructor(...args) { super(...(args.length ? args : [now])); }
+      static now() { return now; }
+    }
+    class FixtureNotification {
+      static permission = 'granted';
+      constructor(title, options) { notifications.push({ title, ...options }); }
+    }
+    const sandbox = {
+      Date: FixtureDate, Notification: FixtureNotification, document,
+      sessionMetadataById: metadata, sessionWindows: new Map(),
+      setTimeout(fn, ms) {
+        const id = ++timerId;
+        timers.set(id, { fn, due: now + ms });
+        return id;
+      },
+      clearTimeout: (id) => timers.delete(id),
+      sessionIdentityParts: (sid) => ({ name: metadata.get(sid)?.name || sid }),
+      renderSessionWindowVitals: (win, vitals) => rendered.set(win.id, plain(vitals)),
+      refreshSessionVitalsTicker() {},
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(source, sandbox, { filename: 'dashboard-limit-snapshot-self-test' });
+    const setMeta = (sid, patch) => metadata.set(sid, { ...metadata.get(sid), ...patch });
+    return {
+      api: sandbox, metadata, rendered, notifications, document, controlBody,
+      ...sandbox.__limitState,
+      setMeta,
+      apply: (sid, vitals, options) => sandbox.applySessionVitals({ session_id: sid, vitals }, options),
+      limits: (sid) => plain(metadata.get(sid)?.vitals?.limits),
+      open(sid) { sandbox.sessionWindows.set(sid, { id: sid }); },
+      link(wrapper = 'wrapper', backend = 'backend') {
+        setMeta(wrapper, { backendSessionId: backend });
+        setMeta(backend, { intendantSessionId: wrapper });
+      },
+      deliver() {
+        // Run the real scheduled flush at its deadline, without sleeping.
+        const next = Array.from(timers).find(([, timer]) => timer.fn === sandbox.flushLimitAlerts);
+        if (!next) return;
+        timers.delete(next[0]);
+        now = Math.max(now, next[1].due);
+        next[1].fn();
+      },
+      advance: (ms) => { now += ms; },
+      toast: () => document.body.querySelector('.control-toast') || controlBody.querySelector('.control-toast'),
+    };
+  };
+  const check = (name, run) => {
+    try { run(fixture()); } catch (error) {
+      error.message = `limit snapshot: ${name}: ${error.message}`;
+      throw error;
+    }
+  };
+
+  check('omitted sections preserve state; explicit empty limits clear aliases and rendered rows', (f) => {
+    f.link();
+    f.open('wrapper');
+    f.open('backend');
+    f.apply('backend', { limits: [limit()], git: { branch: 'main' } });
+    f.apply('wrapper', { cache: { hitRate: 0.9 } });
+    assert.deepStrictEqual(f.limits('wrapper'), [limit()]);
+    assert.deepStrictEqual(f.limits('backend'), [limit()]);
+    assert.ok(f.api.normalizeSessionVitals({ limits: [] }), 'an empty limits-only event is meaningful');
+    f.apply('wrapper', { limits: [] });
+    f.apply('backend', { context: { usedTokens: 100 } });
+    for (const sid of ['wrapper', 'backend']) {
+      assert.deepStrictEqual(f.limits(sid), []);
+      assert.deepStrictEqual(f.rendered.get(sid).limits, []);
+      assert.strictEqual(f.metadata.get(sid).vitals.git.branch, 'main');
+      assert.strictEqual(f.metadata.get(sid).vitals.cache.hitRate, 0.9);
+      assert.strictEqual(f.metadata.get(sid).vitals.context.usedTokens, 100);
+      assert.ok(f.seen.has(sid), 'a cleared session remains observed');
+      assert.strictEqual(f.seen.get(sid).size, 0);
+    }
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.pending.size, 0);
+  });
+
+  check('clearing subscription state rearms real API limits, including unfamiliar window labels', (f) => {
+    f.link();
+    f.setMeta('wrapper', { source_label: 'Claude', claude_auth_mode: 'subscription' });
+    f.apply('backend', { limits: [limit()] });
+    assert.strictEqual(f.pending.size, 0, 'first observation is silent');
+    f.setMeta('wrapper', { claude_auth_mode: 'api-key' });
+    f.apply('wrapper', { limits: [] });
+    // The frontend has no provider provenance to infer from a label: a
+    // real API warning must survive even if its label happens to be 5h.
+    f.apply('backend', { limits: [limit()] });
+    f.apply('wrapper', { limits: [limit()] });
+    assert.strictEqual(f.pending.size, 1, 'aliases do not queue duplicate escalations');
+    f.deliver();
+    assert.ok(f.toast());
+    assert.match(f.toast().children[0].textContent, /hit its .*5-hour usage limit/);
+    assert.strictEqual(f.notifications.length, 1);
+    assert.strictEqual(f.pending.size, 0);
+    f.apply('wrapper', { limits: [limit()] });
+    assert.strictEqual(f.pending.size, 0, 'unchanged severity does not alert again');
+  });
+
+  check('a clear from either alias cancels pending warnings and leaves no notification', (f) => {
+    f.link();
+    f.apply('wrapper', { limits: [limit('5h', 'allowed')] });
+    f.apply('backend', { limits: [limit()] });
+    assert.strictEqual(f.pending.size, 1);
+    f.apply('wrapper', { limits: [] });
+    assert.strictEqual(f.pending.size, 0);
+    f.deliver();
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 0);
+  });
+
+  check('a replacement snapshot removes absent labels without discarding current API limits', (f) => {
+    f.apply('session', { limits: [] });
+    f.apply('session', { limits: [limit()] });
+    assert.strictEqual(f.pending.size, 1);
+    const apiWindow = limit('requests_per_minute', 'allowed_warning');
+    f.apply('session', { limits: [apiWindow] });
+    assert.deepStrictEqual(Array.from(f.seen.get('session').keys()), ['requests_per_minute']);
+    assert.deepStrictEqual(f.limits('session'), [apiWindow]);
+    f.deliver();
+    assert.match(f.toast().children[0].textContent, /approaching its requests per minute usage limit/);
+    assert.doesNotMatch(f.toast().children[0].textContent, /5-hour/);
+    assert.strictEqual(f.notifications.length, 1);
+  });
+
+  for (const refanId of ['wrapper', 'backend']) {
+    check(`a clear before identity linkage beats older windows when refanning ${refanId}`, (f) => {
+      f.apply('backend', { limits: [] });
+      f.apply('backend', { limits: [limit()], cache: { hitRate: 0.8 } });
+      assert.strictEqual(f.pending.size, 1);
+      f.apply('wrapper', { limits: [], git: { branch: 'api-work' } });
+      // A later sparse update cannot make the older limit snapshot newer.
+      f.apply('backend', { context: { usedTokens: 200 } });
+      f.link();
+      f.api.refanSessionVitalsForIdentityGroup(refanId);
+      for (const sid of ['wrapper', 'backend']) {
+        assert.deepStrictEqual(f.limits(sid), []);
+        assert.strictEqual(f.metadata.get(sid).vitals.git.branch, 'api-work');
+        assert.strictEqual(f.metadata.get(sid).vitals.cache.hitRate, 0.8);
+        assert.strictEqual(f.metadata.get(sid).vitals.context.usedTokens, 200);
+        assert.strictEqual(f.seen.get(sid).size, 0);
+      }
+      assert.strictEqual(f.pending.size, 0);
+      f.apply('backend', { limits: [limit('requests')] });
+      f.deliver();
+      assert.ok(f.toast(), 'linkage preserves the clear as the rearm point');
+    });
+    check(`new API limits beat an older clear when refanning ${refanId}`, (f) => {
+      f.apply('backend', { limits: [] });
+      f.apply('wrapper', { limits: [limit('requests')] });
+      f.apply('backend', { git: { branch: 'main' } });
+      f.link();
+      f.api.refanSessionVitalsForIdentityGroup(refanId);
+      assert.deepStrictEqual(f.limits('wrapper'), [limit('requests')]);
+      assert.deepStrictEqual(f.limits('backend'), [limit('requests')]);
+      assert.strictEqual(f.pending.size, 0, 'identity hydration is silent');
+      f.apply('backend', { limits: [limit('requests')] });
+      assert.strictEqual(f.pending.size, 0, 'alias hydration does not duplicate the warning');
+    });
+  }
+
+  check('replay silently clears, preserves sparse updates, and rearms the next live warning', (f) => {
+    f.link();
+    const replay = (sid, vitals) => ({ event: 'session_vitals', data: { session_id: sid, vitals } });
+    f.api.applySessionVitalsFromReplayEntries([
+      replay('wrapper', { limits: [limit('5h', 'allowed')] }),
+      replay('backend', { limits: [limit()] }),
+      replay('wrapper', { git: { branch: 'replayed' } }),
+    ]);
+    assert.deepStrictEqual(f.limits('wrapper'), [limit()], 'a sparse replay event preserves limits');
+    assert.strictEqual(f.pending.size, 0);
+    f.api.applySessionVitalsFromReplayEntries([
+      replay('wrapper', { limits: [] }),
+      { event: 'some_other_event', data: { session_id: 'wrapper', vitals: { limits: [limit()] } } },
+      replay('backend', { cache: { hitRate: 0.7 } }),
+    ]);
+    assert.deepStrictEqual(f.limits('backend'), []);
+    assert.strictEqual(f.seen.get('wrapper').size, 0);
+    assert.strictEqual(f.seen.get('backend').size, 0);
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 0);
+    f.apply('backend', { limits: [limit('requests')] });
+    f.deliver();
+    assert.ok(f.toast());
+    assert.strictEqual(f.notifications.length, 1);
+  });
+
+  check('replayed recovery cancels an already queued live escalation', (f) => {
+    f.apply('session', { limits: [] });
+    f.apply('session', { limits: [limit()] });
+    f.api.applySessionVitalsFromReplayEntries([
+      { event: 'session_vitals', data: { session_id: 'session', vitals: { limits: [] } } },
+    ]);
+    f.deliver();
+    assert.strictEqual(f.pending.size, 0);
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 0);
+  });
+
+  check('delivery checks current metadata instead of trusting a stale severity cache', (f) => {
+    f.apply('session', { limits: [] });
+    f.apply('session', { limits: [limit()] });
+    // Model a refreshed metadata snapshot arriving before delayed delivery.
+    // Leave transition bookkeeping stale to exercise the delivery guard.
+    f.setMeta('session', { vitals: { limits: [] } });
+    f.deliver();
+    assert.strictEqual(f.pending.size, 0);
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 0);
+  });
+
+  check('a provider reset during debounce cancels a delayed warning', (f) => {
+    f.apply('session', { limits: [] });
+    f.apply('session', { limits: [limit('requests', 'rejected', { resetsAtEpoch: initialNow / 1000 + 1 })] });
+    f.deliver();
+    assert.strictEqual(f.pending.size, 0);
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 0);
+  });
+
+  check('late-linked pending aliases coalesce into one delivered warning', (f) => {
+    for (const sid of ['wrapper', 'backend']) {
+      f.apply(sid, { limits: [] });
+      f.apply(sid, { limits: [limit()] });
+    }
+    f.link();
+    f.api.refanSessionVitalsForIdentityGroup('wrapper');
+    f.deliver();
+    assert.match(f.toast().children[0].textContent, /hit its 5-hour usage limit/);
+    assert.doesNotMatch(f.toast().children[0].textContent, /2 sessions/);
+    assert.strictEqual(f.notifications.length, 1);
+    assert.strictEqual(f.pending.size, 0);
+  });
+
+  check('visible coalesced toasts retain valid API warnings as subscription state clears', (f) => {
+    f.link();
+    f.apply('wrapper', { limits: [] });
+    f.apply('backend', { limits: [limit()] });
+    f.apply('api-session', { limits: [] });
+    f.apply('api-session', { limits: [limit('requests', 'allowed_warning')] });
+    f.deliver();
+    const combined = f.toast();
+    assert.match(combined.children[0].textContent, /2 sessions/);
+    assert.strictEqual(combined.parentNode, f.document.body);
+    // The control pane became visible since the original global toast.
+    // Reconciliation must remove that exact old toast when moving hosts.
+    f.controlBody.offsetParent = {};
+    f.apply('wrapper', { limits: [] });
+    assert.strictEqual(combined.parentNode, null);
+    assert.ok(f.toast(), 'another session still has a valid warning');
+    assert.strictEqual(f.toast().parentNode, f.controlBody);
+    assert.strictEqual(f.document.body.querySelector('.control-toast'), null);
+    assert.match(f.toast().children[0].textContent, /api-session is approaching its requests usage limit/);
+    assert.match(f.toast().className, /\bwarn\b/);
+    assert.doesNotMatch(f.toast().className, /\berror\b/);
+    assert.strictEqual(f.notifications.length, 1, 'reconciling a visible toast does not notify again');
+    f.apply('api-session', { limits: [limit('requests', 'allowed')] });
+    assert.strictEqual(f.toast(), null);
+  });
+
+  check('an already visible warning disappears when its provider reset passes', (f) => {
+    f.apply('session', { limits: [] });
+    f.apply('session', { limits: [limit('requests', 'rejected', { resetsAtEpoch: initialNow / 1000 + 5 })] });
+    f.deliver();
+    assert.ok(f.toast());
+    f.advance(5000);
+    f.api.reconcileLimitStatusToast();
+    assert.strictEqual(f.toast(), null);
+    assert.strictEqual(f.notifications.length, 1);
+  });
 }
 
 function extractInlineJavaScript(html) {
@@ -7410,6 +7790,7 @@ async function runSelfTest() {
     /module inline script syntax check failed.*(SyntaxError|Unexpected token)/,
   );
   await runDashboardClaudeBillingSelfTests();
+  runDashboardLimitSnapshotSelfTests();
   const dashboardHelpers = loadDashboardLogHelperSandbox(path.resolve(__dirname, '..', 'static', 'app.html'));
   const twoDigits = (value) => String(value).padStart(2, '0');
   const dateStamp = (date) => [
