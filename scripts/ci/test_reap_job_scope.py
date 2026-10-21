@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for reap_job_scope.py: python3 -m unittest scripts/ci/test_reap_job_scope.py"""
+import contextlib
 import importlib.util
+import io
 import os
 import signal
 import subprocess
@@ -12,6 +14,15 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location('reap_job_scope', Path(__file__).with_name('reap_job_scope.py'))
 reaper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reaper)
+
+def run_main(argv):
+    """main() with its output captured: the ::warning:: lines it prints
+    would otherwise surface as annotations on every CI run."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = reaper.main(argv)
+    return code, out.getvalue()
+
 
 RUNNER_TEMP = '/srv/runner/_work/_temp'
 SCOPE = RUNNER_TEMP + '/tmp'
@@ -97,7 +108,9 @@ class GuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as base:
             keep = os.path.join(base, 'keep')
             os.makedirs(keep)
-            self.assertEqual(reaper.main(['--scope', base, '--remove']), 0)
+            code, out = run_main(['--scope', base, '--remove'])
+            self.assertEqual(code, 0)
+            self.assertIn('refusing scope', out)
             self.assertTrue(os.path.isdir(keep))
 
     def test_remove_deletes_the_job_dir_only(self):
@@ -126,7 +139,9 @@ class LiveReapTest(unittest.TestCase):
             orphan = int(launcher.stdout.strip())
             try:
                 start = reaper.read_stat(Path('/proc'), orphan)[2]
-                self.assertEqual(reaper.main(['--scope', scope, '--remove', '--grace', '0.5']), 0)
+                code, out = run_main(['--scope', scope, '--remove', '--grace', '0.5'])
+                self.assertEqual(code, 0)
+                self.assertIn(f'stopping leftover process {orphan} (env TMPDIR)', out)
                 self.assertFalse(reaper.same_process(Path('/proc'), orphan, start))
                 self.assertFalse(os.path.exists(scope))
             finally:
