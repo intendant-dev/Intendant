@@ -274,6 +274,28 @@ jobs:
           "CARGO_TARGET_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "cargo target dir: $dir"
 
+      # Job-scoped temp root for the Linux fleet leg. The box's /tmp is a
+      # RAM-backed tmpfs shared by both listeners, the operator and every
+      # earlier job; test and smoke scratch that escaped cleanup (and the
+      # daemons a cancelled job orphaned) piled up there for months —
+      # ~60k dirs and over 40% of its inodes by 2026-10. Every later step's
+      # tempfile/mkdtemp/os.tmpdir() now lands under this listener's
+      # $RUNNER_TEMP instead: the runner wipes that dir at every job start
+      # and end, and the always() janitor at the end of this job removes
+      # it after stopping the processes that still reference it. Kept well
+      # under macOS's TMPDIR length, so Unix-socket paths built under it
+      # stay inside sun_path. Linux fleet only: hosted runners are
+      # ephemeral, and the Mac's job hooks already reap stale temp.
+      - name: Job-scoped temp dir (linux fleet)
+        if: runner.environment != 'github-hosted' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          job_tmp="$RUNNER_TEMP/tmp"
+          rm -rf "$job_tmp"
+          mkdir -m 700 "$job_tmp"
+          echo "TMPDIR=$job_tmp" >> "$GITHUB_ENV"
+          echo "job temp dir: $job_tmp"
+
       # rustup ships preinstalled on the GitHub-hosted runners; just pin the
       # target this job type-checks against.
       - name: Install Rust target
@@ -556,6 +578,10 @@ jobs:
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
 
+      - name: CI job-scope janitor tests
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: python3 -m unittest scripts/ci/test_reap_job_scope.py
+
       - name: MCP terminal continuity regressions
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
         run: |
@@ -740,3 +766,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           overwrite: true
+
+      # Last step, on success, failure AND cancellation: stop whatever this
+      # job left running and delete the job temp dir. A cancelled job's
+      # tree kill SIGKILLs test binaries before their kill_on_drop cleanup
+      # runs, so the daemons they spawned survive, reparented to init (one
+      # ran for 23 days); scrubbed-env acceptance daemons are invisible to
+      # an env-marker sweep. All of them still reference the job temp dir
+      # (the inherited TMPDIR, or a HOME/cwd/profile minted under it),
+      # which lives under this listener's $RUNNER_TEMP — never the other
+      # listener's. scripts/ci/reap_job_scope.py has the rules, never fails
+      # the job, and warns per process it had to stop. Must stay after
+      # every step that uses a job process or the temp dir.
+      - name: Reap job-scoped processes and temp (linux fleet)
+        if: always() && runner.environment != 'github-hosted' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -f scripts/ci/reap_job_scope.py ]; then
+            python3 scripts/ci/reap_job_scope.py --scope "$RUNNER_TEMP/tmp" --remove
+          fi

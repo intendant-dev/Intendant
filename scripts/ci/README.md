@@ -651,12 +651,46 @@ connects time out". Empty port (default) disables it.
   of `com.intendant.ci.sccache` when the Linux hosts get the hooks
   treatment.
 
+## Linux job scope (in-workflow janitor)
+
+The Linux runner accounts have no job hooks yet, and the box's `/tmp`
+is a RAM-backed tmpfs shared by both listeners. Test scratch that
+escaped cleanup, plus the daemons cancelled jobs orphaned, accumulated
+there for months (by 2026-10: ~60k dirs, over 40% of its inodes, and
+three CI daemons up to 23 days old). Since then the Linux fleet leg of
+`windows.yml` scopes every job:
+
+- **"Job-scoped temp dir"** points `TMPDIR` at `$RUNNER_TEMP/tmp`
+  (per listener; the runner itself wipes `$RUNNER_TEMP` at every job
+  start and end).
+- **"Reap job-scoped processes and temp"** is the job's last step,
+  `always()` — so it also runs after a cancellation. `reap_job_scope.py`
+  stops this account's processes that still reference the job temp dir
+  (the inherited `TMPDIR`, or a cwd, argv entry or HOME minted under
+  it), sparing itself, its ancestors and the runner/sccache stack, then
+  deletes the dir. It never fails the job; each process it had to stop
+  shows up as a `::warning::` on the run — a leak signal to chase in the
+  test that spawned it.
+
+The process marker is the job temp dir rather than the process tree or
+`RUNNER_TRACKING_ID`: a cancelled job's tree kill SIGKILLs test
+binaries before their `kill_on_drop` cleanup runs (the children are
+reparented to init), and acceptance scripts launch daemons with a
+scrubbed environment. Residue from before this scoping (pre-2026-10
+`/tmp` dirs and daemons) is not matched and needs a one-time manual
+cleanup. Tests: `python3 -m unittest scripts/ci/test_reap_job_scope.py`.
+
 ## Interlocks
 
 - The workflow cache steps and this watchdog share the cache layout
   contract: per-listener key dirs with a `.last-used` marker. Change
   one, change both (`windows.yml` "External cargo target dir" steps ↔
   `fleet-watchdog.sh` prune/evict).
+- `windows.yml`'s "Job-scoped temp dir" and "Reap job-scoped processes
+  and temp" steps share the `$RUNNER_TEMP/tmp` layout with
+  `reap_job_scope.py`'s scope guard (`--scope` must be a dir directly
+  inside the runner's `<work>/_temp`). The reap step must stay the
+  job's last step: it stops anything still referencing that dir.
 - The in-job preflight floor (20G) is deliberately BELOW `STOP_GB`:
   the watchdog should pause listeners long before any job can see a
   sub-floor disk, leaving the preflight as the backstop for the
