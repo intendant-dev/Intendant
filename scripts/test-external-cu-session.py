@@ -128,6 +128,10 @@ def main():
            'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'LANG': 'C.UTF-8',
            'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE': resolve_browser(args.browser_bin),
            'INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER': '1'}
+    # Keep the daemon's own scratch (Xauthority dirs, Chromium temp) in the
+    # caller's temp root: CI points TMPDIR at a job-scoped dir it wipes.
+    if os.environ.get('TMPDIR'):
+        env['TMPDIR'] = os.environ['TMPDIR']
     require(Path(env['INTENDANT_BROWSER_WORKSPACE_EXECUTABLE']).is_file(), 'native Chromium missing')
     daemon = foreign = server = workspace = display = proof = None
     daemon_log, foreign_log = (out / 'daemon.log').open('wb'), (out / 'foreign.log').open('wb')

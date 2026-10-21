@@ -470,20 +470,13 @@ fn default_access_cert_dir() -> std::path::PathBuf {
 
 /// Unit-test callers historically reached the production wrapper and thereby
 /// read the runner's live access store. Keep those transport tests isolated by
-/// giving every gateway its own process-lifetime temp store. Tests that need a
-/// populated store use `spawn_web_gateway_from_cert_dir` explicitly.
+/// giving every gateway its own temp store, removed when the test that spawned
+/// the gateway finishes (a process-lifetime static never drops, which left one
+/// store per test gateway behind in the temp dir). Tests that need a populated
+/// store use `spawn_web_gateway_from_cert_dir` explicitly.
 #[cfg(test)]
 fn default_access_cert_dir() -> std::path::PathBuf {
-    static TEST_STORES: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::TempDir>>> =
-        std::sync::OnceLock::new();
-    let store = tempfile::tempdir().expect("create isolated gateway access store");
-    let path = store.path().to_path_buf();
-    TEST_STORES
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .push(store);
-    path
+    crate::test_support::thread_scratch_dir("intendant-test-access-store-")
 }
 
 /// The state root the gateway's persisted caches (worktree scan mirror)

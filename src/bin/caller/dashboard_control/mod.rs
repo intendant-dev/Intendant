@@ -4937,15 +4937,9 @@ mod tests {
             ),
             // Per-instance scratch (never the machine's real ~/.intendant):
             // projectless adapters resolve the daemon-global store under
-            // this root. PID+nanos, per the state_paths uniqueness rule.
-            state_root: std::env::temp_dir().join(format!(
-                "intendant-test-state-root-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            )),
+            // this root; removed with the test.
+            state_root: crate::test_support::thread_scratch_dir("intendant-test-state-root-")
+                .join("root"),
         }
     }
 
