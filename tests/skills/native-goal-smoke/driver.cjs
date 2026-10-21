@@ -68,6 +68,27 @@ child.stderr.on('data', (d) => d.toString().split('\n').forEach((l) => { if (l.t
 let exited = false;
 child.on('exit', (code, sig) => { exited = true; log('daemon', `exited code=${code} sig=${sig}`); });
 
+// Stop the daemon, wait for it to exit (it flushes session logs into HOME
+// while shutting down), then remove this run's scratch dirs: CI runs this
+// smoke on every Linux landing, and the dirs used to accumulate in the
+// runner's temp dir. INTENDANT_KEEP_TEST_TMP=1 keeps them after a failure.
+async function finish(code) {
+  if (!exited) {
+    const gone = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGTERM');
+    if (!(await Promise.race([gone.then(() => true), sleep(10000).then(() => false)]))) {
+      child.kill('SIGKILL');
+      await Promise.race([gone, sleep(2000)]);
+    }
+  }
+  if (code !== 0 && process.env.INTENDANT_KEEP_TEST_TMP) {
+    console.log(`scratch kept: ${HOME} ${PROJ}`);
+  } else {
+    for (const dir of [HOME, PROJ]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+  process.exit(code);
+}
+
 const events = [];
 const waiters = [];
 let sock = null;
@@ -192,10 +213,8 @@ const resultEvent = (e) => e.event === 'codex_thread_action_result';
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`);
-  child.kill('SIGTERM');
-  process.exit(failed.length ? 1 : 0);
+  await finish(failed.length ? 1 : 0);
 })().catch((e) => {
   console.error(`SMOKE ERROR: ${e.message}`);
-  child.kill('SIGTERM');
-  process.exit(1);
+  return finish(1);
 });

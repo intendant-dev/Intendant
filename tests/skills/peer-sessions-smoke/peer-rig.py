@@ -36,6 +36,12 @@ WORKTREE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__
 # battery keeps exercising the release artifact by default.
 BIN = os.environ.get("INTENDANT_BIN") or os.path.join(WORKTREE, "target/release/intendant")
 SCRATCH = os.environ.get("PEER_RIG_SCRATCH") or tempfile.mkdtemp(prefix="peer-rig-")
+# A scratch dir the rig minted itself is removed on exit: CI runs this rig
+# on every Linux landing, and each run's two daemon homes, projects and
+# logs (~380 inodes) used to stay behind in the runner's temp dir. An
+# explicit PEER_RIG_SCRATCH, a --browser run (its screenshot lands
+# there), or a failed run with INTENDANT_KEEP_TEST_TMP=1 keeps it.
+OWN_SCRATCH = not os.environ.get("PEER_RIG_SCRATCH")
 # Daemon ports are kernel-assigned (`--web 0`, parsed from the Dashboard
 # log line) so concurrent rig runs on one box — two CI runner instances,
 # or a rig beside a dev daemon — can't collide or cross-talk. The CDP
@@ -81,6 +87,17 @@ def cleanup():
             time.sleep(0.1)
         if p.poll() is None:
             p.kill()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def release_scratch(failed):
+    if not OWN_SCRATCH or BROWSER or (failed and os.environ.get("INTENDANT_KEEP_TEST_TMP")):
+        log(f"scratch kept: {SCRATCH}")
+        return
+    shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
 # Per-daemon loopback admission tokens, keyed by bound port: each boot
@@ -266,6 +283,7 @@ script_b = {"profiles": [{"steps": [
         {"name": "signal_done", "arguments": {"message": "unused"}}]}]}]}
 
 failures = []
+completed = False
 
 
 def check(cond, desc):
@@ -415,9 +433,11 @@ try:
     wait_for("child retirement after stop",
              lambda: True if child_of(peer_sessions()) is None else None, timeout=30)
     check(True, "SessionEnded retired the folded child")
+    completed = True
 
 finally:
     cleanup()
+    release_scratch(failed=not completed or bool(failures))
 
 print()
 if failures:
