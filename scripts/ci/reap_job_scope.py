@@ -56,8 +56,11 @@ def valid_scope(scope):
 
 
 def references(value, root):
-    """True when `value` mentions `root` as a path (or a PATH entry)."""
-    return re.search(re.escape(root) + rb'(?=/|:|$)', value) is not None
+    """True when `value` mentions `root` as a whole path: at the start, or
+    after `=`, `:`, whitespace or a quote (an env value, a PATH entry, a
+    `--flag=` argument), and followed by `/`, `:` or the end."""
+    pattern = rb'(?<![^=:\s\'"])' + re.escape(root) + rb'(?=/|:|$)'
+    return re.search(pattern, value) is not None
 
 
 def read_stat(proc_root, pid):
@@ -183,7 +186,14 @@ def remove_scope(scope):
         return 0
     entries = sum(1 for _ in target.iterdir())
     shutil.rmtree(target, ignore_errors=True)
+    if target.exists():
+        print(f'::warning::job-scope janitor: could not fully remove {annotation(scope)}')
     return entries
+
+
+def annotation(text):
+    """Escape text for a workflow-command message (%, CR, LF)."""
+    return str(text).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 
 
 def main(argv=None):
@@ -194,12 +204,13 @@ def main(argv=None):
     parser.add_argument('--proc-root', type=Path, default=Path('/proc'), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not valid_scope(args.scope):
-        print(f'::warning::job-scope janitor: refusing scope {args.scope!r}')
+        print(f'::warning::job-scope janitor: refusing scope {annotation(repr(args.scope))}')
         return 0
     try:
         residue = find_residue(args.proc_root, args.scope, os.getuid(), os.getpid())
         for pid, _, command, reason in residue:
-            print(f'::warning::job-scope janitor: stopping leftover process {pid} ({reason}): {command}')
+            print(f'::warning::job-scope janitor: stopping leftover process {pid} ({annotation(reason)}): '
+                  f'{annotation(command)}')
         survivors = reap(args.proc_root, residue, args.grace) if residue else []
         for pid in survivors:
             print(f'::warning::job-scope janitor: process {pid} survived SIGKILL')
@@ -207,7 +218,7 @@ def main(argv=None):
         print(f'job-scope janitor: stopped {len(residue) - len(survivors)} leftover process(es); '
               f'removed {removed} temp entr{"y" if removed == 1 else "ies"}')
     except Exception as error:  # noqa: BLE001 -- janitorial: report, never fail the job
-        print(f'::warning::job-scope janitor failed: {error}')
+        print(f'::warning::job-scope janitor failed: {annotation(error)}')
     return 0
 
 

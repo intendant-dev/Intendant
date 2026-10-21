@@ -690,7 +690,10 @@ cleanup. Tests: `python3 -m unittest scripts/ci/test_reap_job_scope.py`.
   and temp" steps share the `$RUNNER_TEMP/tmp` layout with
   `reap_job_scope.py`'s scope guard (`--scope` must be a dir directly
   inside the runner's `<work>/_temp`). The reap step must stay the
-  job's last step: it stops anything still referencing that dir.
+  job's last step: it stops anything still referencing that dir. A
+  server shared across jobs (an on-demand sccache, should the Linux
+  accounts adopt one) must be started with a TMPDIR outside the job
+  dir: the janitor spares sccache by name but still deletes the dir.
 - The in-job preflight floor (20G) is deliberately BELOW `STOP_GB`:
   the watchdog should pause listeners long before any job can see a
   sub-floor disk, leaving the preflight as the backstop for the

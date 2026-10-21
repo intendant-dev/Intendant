@@ -743,10 +743,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Waits for the exit: on the Linux fleet the job's final janitor
+      # would otherwise catch a daemon still shutting down and report it
+      # as a leak.
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
         shell: bash
-        run: kill "${{ steps.daemon.outputs.pid }}" 2>/dev/null || true
+        run: |
+          kill "${{ steps.daemon.outputs.pid }}" 2>/dev/null || true
+          timeout 15 tail --pid="${{ steps.daemon.outputs.pid }}" -f /dev/null || true
 
       # Inline visibility first (the artifact needs a download), then the
       # full daemon log + the smoke's screenshot/error dumps as artifacts.

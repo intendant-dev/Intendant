@@ -91,10 +91,24 @@ class FindResidueTest(unittest.TestCase):
         other = '/srv/runner-b/_work/_temp/tmp'
         self.proc.add(51, 1, ['/cache/intendant'], env=[f'TMPDIR={other}'], cwd=f'{other}/x')
         self.proc.add(52, 1, ['/cache/intendant'], env=[f'HOME={SCOPE}2/h'], cwd=f'{SCOPE}-old')
+        self.proc.add(54, 1, ['/cache/intendant'], env=[f'TMPDIR=/mnt{SCOPE}'], cwd=f'/mnt{SCOPE}/x')
         # Pre-scoping residue: references the runner temp, not the job dir.
         self.proc.add(53, 1, ['/cache/intendant'], env=[f'PATH={RUNNER_TEMP}/pyws/bin:/usr/bin'],
                       cwd='/tmp/intendant-external-cu-y')
         self.assertEqual(self.residue(), {})
+
+
+class ReferencesTest(unittest.TestCase):
+    def test_whole_path_boundaries(self):
+        root = SCOPE.encode()
+        for hit in [root, root + b'/x', b'TMPDIR=' + root, b'PATH=/bin:' + root + b'/v/bin:/usr/bin',
+                    b'--user-data-dir=' + root + b'/p', b"'" + root + b"/q'"]:
+            self.assertTrue(reaper.references(hit, root), hit)
+        for miss in [root + b'2', root + b'-old/x', b'/mnt' + root, b'TMPDIR=/mnt' + root + b'/x']:
+            self.assertFalse(reaper.references(miss, root), miss)
+
+    def test_annotation_escapes_workflow_command_text(self):
+        self.assertEqual(reaper.annotation('a%b\r\nc'), 'a%25b%0D%0Ac')
 
 
 class GuardTest(unittest.TestCase):

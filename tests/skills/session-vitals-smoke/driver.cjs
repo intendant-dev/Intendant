@@ -59,10 +59,15 @@ async function finish(code) {
       await Promise.race([gone, sleep(2000)]);
     }
   }
-  if (code !== 0 && process.env.INTENDANT_KEEP_TEST_TMP) {
+  if (code !== 0 && process.env.INTENDANT_KEEP_TEST_TMP === '1') {
     console.log(`scratch kept: ${HOME} ${PROJ}`);
   } else {
-    for (const dir of [HOME, PROJ]) fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      for (const dir of [HOME, PROJ]) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (err) {
+      // Teardown must never outvote the verdict.
+      console.error(`scratch cleanup failed (ignored): ${err.message}`);
+    }
   }
   process.exit(code);
 }

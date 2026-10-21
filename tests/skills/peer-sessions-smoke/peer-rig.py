@@ -94,7 +94,7 @@ def cleanup():
 
 
 def release_scratch(failed):
-    if not OWN_SCRATCH or BROWSER or (failed and os.environ.get("INTENDANT_KEEP_TEST_TMP")):
+    if not OWN_SCRATCH or BROWSER or (failed and os.environ.get("INTENDANT_KEEP_TEST_TMP") == "1"):
         log(f"scratch kept: {SCRATCH}")
         return
     shutil.rmtree(SCRATCH, ignore_errors=True)
