@@ -25,7 +25,7 @@ pub(crate) use continuity::{TerminalHoldout, TerminalReference};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{mpsc, Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, MasterPty, PtySize};
@@ -35,6 +35,12 @@ use tokio::sync::{watch, RwLock};
 /// screens of recent output (full-screen TUI redraws included) on
 /// reconnect without holding a whole terminal history in memory.
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
+
+/// Bounded backlog of pending PTY input writes per session. Interactive input
+/// is tiny, so the writer thread normally keeps this near-empty; it only fills
+/// when a child stops reading its stdin, and the bound then caps memory and
+/// turns that stall into dropped input rather than a blocked caller.
+const PTY_WRITE_QUEUE: usize = 1024;
 
 /// Upper bound on bytes queued for one attached listener. A listener that
 /// stops draining (frozen tab, wedged forwarder) gets its OLDEST output
@@ -902,7 +908,16 @@ pub struct PtySession {
     /// Identity of this exact PTY incarnation, never reused on replacement.
     pub(crate) instance_id: String,
     master: StdMutex<Box<dyn MasterPty + Send>>,
-    writer: StdMutex<Box<dyn Write + Send>>,
+    /// Sends PTY input (stdin) bytes to this session's dedicated writer
+    /// thread. portable_pty's writer fd is blocking: a child that stops
+    /// draining its stdin (a large paste, a canonical-mode line past the tty
+    /// limit, a raw-mode TUI) makes `write_all` block indefinitely. Doing that
+    /// write inline on the async runtime once stalled a tokio worker mid-write
+    /// and orphaned the runtime's IO/time driver, freezing the whole daemon.
+    /// So the blocking write lives on a dedicated thread (symmetric with
+    /// `reader_loop`); callers only enqueue, and a stalled child applies
+    /// backpressure against this bounded channel instead of the runtime.
+    writer_tx: mpsc::SyncSender<Vec<u8>>,
     child_killer: StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     output: StdMutex<OutputHub>,
     alive: StdMutex<bool>,
@@ -1104,10 +1119,24 @@ impl PtySession {
             cleanup_scratch(&scoped_scratch);
             format!("clone reader: {e}")
         })?;
-        let writer = pair.master.take_writer().map_err(|e| {
+        let mut writer = pair.master.take_writer().map_err(|e| {
             cleanup_scratch(&scoped_scratch);
             format!("take writer: {e}")
         })?;
+        // portable_pty's writer is blocking, exactly like its reader. Drain it
+        // on a dedicated thread (mirroring `reader_loop` / `wait_for_child`
+        // below) so a child that stalls its stdin can never block the async
+        // caller or a tokio runtime worker. The thread ends when the last
+        // sender (the session's `writer_tx`) drops or the child goes away.
+        let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE);
+        std::thread::spawn(move || {
+            while let Ok(chunk) = writer_rx.recv() {
+                if writer.write_all(&chunk).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        });
 
         let instance_id = uuid::Uuid::new_v4().simple().to_string();
         let transcript = log.and_then(|(root, terminal_id)| {
@@ -1128,7 +1157,7 @@ impl PtySession {
         let session = Arc::new(Self {
             instance_id,
             master: StdMutex::new(pair.master),
-            writer: StdMutex::new(writer),
+            writer_tx,
             child_killer: StdMutex::new(child_killer),
             output: StdMutex::new(OutputHub::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
@@ -1338,10 +1367,7 @@ impl PtySession {
                         .windows(DSR_CPR_QUERY.len())
                         .any(|w| w == DSR_CPR_QUERY)
                     {
-                        if let Ok(mut w) = session.writer.lock() {
-                            let _ = w.write_all(DSR_CPR_REPLY);
-                            let _ = w.flush();
-                        }
+                        let _ = session.writer_tx.try_send(DSR_CPR_REPLY.to_vec());
                     }
                     // Scrollback push + listener fan-out under the ONE
                     // output-hub lock, atomic against `attach`'s
@@ -1389,9 +1415,20 @@ impl PtySession {
         if let Some(transcript) = &self.transcript {
             transcript.input(data, by, via, self.reading_secret_input());
         }
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(data);
-            let _ = w.flush();
+        // Hand the bytes to the writer thread; never block the caller on the
+        // PTY. A full queue means the child has stopped draining its stdin —
+        // the one case where the write could not land anyway — so dropping is
+        // the safe outcome. A disconnected channel means the shell already
+        // exited; drop silently.
+        match self.writer_tx.try_send(data.to_vec()) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!(
+                    "[terminal] dropped {} bytes of PTY input: shell is not draining its stdin",
+                    data.len()
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
         }
     }
 
