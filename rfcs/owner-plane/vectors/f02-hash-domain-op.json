@@ -1,0 +1,17 @@
+{
+  "case_kind": "hash-domain",
+  "expected": {
+    "bytes": "3dfb9daf64c5f3b4bc35bf3d5521cbb7e93425328264d824de1ca07c5a956fcc"
+  },
+  "family": 2,
+  "inputs": {
+    "preimage": "616263",
+    "tag": "op"
+  },
+  "name": "hash-domain-op",
+  "source": "2.2",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

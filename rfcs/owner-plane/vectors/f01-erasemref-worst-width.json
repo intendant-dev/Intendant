@@ -1,0 +1,21 @@
+{
+  "case_kind": "cap-fit",
+  "expected": {
+    "result": {
+      "fits": true,
+      "sizes": {
+        "erasemref": 132
+      }
+    }
+  },
+  "family": 1,
+  "inputs": {
+    "template": "erasemref-worst"
+  },
+  "name": "erasemref-worst-width",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "case_kind": "canonical-reject",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "non-canonical"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "a2616201616102"
+  },
+  "name": "unsorted-map-keys",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
