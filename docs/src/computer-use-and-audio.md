@@ -1436,3 +1436,14 @@ The bound-window foreground fallback and keyboard receiver path may reread
 input, accept missing focus, or relax retained-receiver/foreground checks.
 Other errors, malformed replies, persistent failure and expired budgets refuse.
 See `docs/design/macos-focus-reread.md` for the exact recovery boundary.
+
+
+### Offscreen extensions on macOS (implementation candidate)
+
+Extension-enabled task-browser work uses the explicit `headless_extension` backend,
+not generic input on a macOS virtual monitor. It keeps the approved extension's real
+popup and notification pages off the visible desktop. The agent uses task-browser
+screenshots and view-local input; it does not borrow the personal Chrome profile.
+The exact startup extension policy still must approve the archive before use.
+This candidate uses ephemeral profiles and is not a persistent wallet/signing
+solution. See [the implementation and acceptance contract](../design/macos-task-browser-extensions.md).

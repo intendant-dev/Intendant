@@ -1,0 +1,33 @@
+{
+  "schema": "intendant-headless-extension-fixture-v1",
+  "status": "passed",
+  "scope": "synthetic_extension_popup_and_notification",
+  "source_head": "987d9baa30f066a51191b04e4b90d6483435cad4",
+  "tracked_source_clean": true,
+  "binary_version": "intendant 0.2.0-alpha.7 (commit 987d9baa-dirty, built 2026-09-30T03:51:57Z, aarch64-apple-darwin)",
+  "binary_sha256": "bc427b946d72f5569d2f9592b2393bc6d9e7a33bc86c888a68fc8252ab2dce24",
+  "harness_sha256": "204445672589400cc4dc81935ce40d37704a6ada4c97d67128a0e8ff6aed3052",
+  "raw_report_sha256": "89191a3838fc247969fe8349b76c4e226827d4f046cbbc3f7c9fabd8e1b158c3",
+  "build_note": "The version suffix includes preserved untracked scratch files; tracked source matched the published commit. No clean-whole-worktree claim.",
+  "checks": {
+    "actual_popup_has_original_tab_context": true,
+    "popup_keyboard_and_worker_effects": true,
+    "foreign_view_refused": true,
+    "duplicate_click_not_replayed": true,
+    "extension_created_notification_clicked": true,
+    "other_session_refused": true,
+    "task_stop_profile_removed": true,
+    "daemon_reaped": true
+  },
+  "request_count": 19,
+  "ordinary_session_credentials": true,
+  "owner_input_requests": 0,
+  "foreground_endpoints_unchanged": true,
+  "continuous_foreground_observation": false,
+  "physical_human_input_overlap_verified": false,
+  "third_party_application_acceptance": false,
+  "credentials_used": false,
+  "financial_actions": 0,
+  "installed_daemon_changed": false,
+  "reviewer_removed_test_rig": true
+}
