@@ -1392,26 +1392,13 @@ mod tests {
             // a box with live session history (a dev box, the peer-testing
             // Dell) can otherwise match a test's hardcoded wrapper id. The
             // dir is never created unless a test writes through it.
-            // PID alone is not unique across runs (recycled PIDs inherit a
-            // previous run's scratch — the state_paths precedent); a nanos
-            // component makes the scratch per process INSTANCE, and the
-            // atomic counter makes it per SUPERVISOR (macOS SystemTime has
-            // microsecond granularity, so two supervisors minted by
-            // concurrently running tests could otherwise share a home —
-            // observed as a launched-session scan flake). Sub-agent and
-            // rename flows WRITE through this home, not just read.
-            logs_home_override: Some(std::env::temp_dir().join(format!(
-                "intendant-test-logs-home-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
-                {
-                    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                }
-            ))),
+            // Unique per SUPERVISOR (two supervisors minted by concurrent
+            // tests once shared a home — a launched-session scan flake)
+            // and removed with the test: sub-agent and rename flows WRITE
+            // through this home, not just read.
+            logs_home_override: Some(
+                crate::test_support::thread_scratch_dir("intendant-test-logs-home-").join("home"),
+            ),
             git_vitals_targets: None,
             hosted_control_cert_dir: None,
             launch_gate_for_tests: None,

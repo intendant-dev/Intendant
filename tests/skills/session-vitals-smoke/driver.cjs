@@ -45,6 +45,32 @@ child.stderr.on('data', () => {});
 child.stdout.on('data', () => {});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Stop the daemon, wait for it to exit (it flushes session logs into HOME
+// while shutting down), then remove this run's scratch dirs: CI runs this
+// smoke on every Linux landing, and the dirs used to accumulate in the
+// runner's temp dir. INTENDANT_KEEP_TEST_TMP=1 keeps them after a failure.
+async function finish(code) {
+  if (!exited) {
+    const gone = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGTERM');
+    if (!(await Promise.race([gone.then(() => true), sleep(10000).then(() => false)]))) {
+      child.kill('SIGKILL');
+      await Promise.race([gone, sleep(2000)]);
+    }
+  }
+  if (code !== 0 && process.env.INTENDANT_KEEP_TEST_TMP === '1') {
+    console.log(`scratch kept: ${HOME} ${PROJ}`);
+  } else {
+    try {
+      for (const dir of [HOME, PROJ]) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (err) {
+      // Teardown must never outvote the verdict.
+      console.error(`scratch cleanup failed (ignored): ${err.message}`);
+    }
+  }
+  process.exit(code);
+}
 (async () => {
   const socketPath = `/tmp/intendant-${child.pid}.sock`;
   const deadline = Date.now() + 30000;
@@ -109,6 +135,5 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   if (!cacheOk) console.log('cache segment mismatch');
   if (!limitsOk) console.log('limits segment mismatch');
   console.log(ok ? 'VITALS SMOKE PASS' : 'VITALS SMOKE FAIL');
-  child.kill('SIGTERM');
-  process.exit(ok ? 0 : 1);
-})().catch((err) => { console.error('SMOKE ERROR: ' + err.message); child.kill('SIGTERM'); process.exit(1); });
+  await finish(ok ? 0 : 1);
+})().catch((err) => { console.error('SMOKE ERROR: ' + err.message); return finish(1); });

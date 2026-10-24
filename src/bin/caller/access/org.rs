@@ -1879,11 +1879,9 @@ mod tests {
     use super::*;
 
     fn org_identity() -> DaemonIdentity {
+        // The identity holds its key in memory; the key file's dir can go.
         let dir = tempfile::tempdir().unwrap();
-        let identity = load_or_create_org_identity(dir.path(), "acme").unwrap();
-        // Keep the tempdir alive long enough by leaking it; tests are short.
-        std::mem::forget(dir);
-        identity
+        load_or_create_org_identity(dir.path(), "acme").unwrap()
     }
 
     fn org_identity_with_dir() -> (tempfile::TempDir, DaemonIdentity) {
@@ -2154,12 +2152,7 @@ mod tests {
             .contains("expired"));
 
         // Wrong key for a trusted handle: refused.
-        let other = {
-            let dir = tempfile::tempdir().unwrap();
-            let identity = load_or_create_org_identity(dir.path(), "acme").unwrap();
-            std::mem::forget(dir);
-            identity
-        };
+        let other = org_identity();
         let forged = issue(&other, &state, "role:observer");
         let err = materialize_org_grant(&mut state, &forged, &ids, test_now()).unwrap_err();
         assert!(err.to_string().contains("does not trust org acme"));
