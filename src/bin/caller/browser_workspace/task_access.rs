@@ -11,6 +11,10 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+#[cfg(any(target_os = "macos", test))]
+mod extension_ui;
+#[cfg(target_os = "macos")]
+mod headless_extension;
 mod lifecycle;
 pub(crate) use lifecycle::{execute, Request, Response};
 
@@ -200,6 +204,10 @@ struct Resources {
     page: Option<String>,
     window: Option<crate::macos_monitor::placement::Observation>,
     ready: bool,
+    requested_extension: Option<super::task_extension::TaskExtension>,
+    extension: Option<BrowserWorkspaceExtension>,
+    #[cfg(target_os = "macos")]
+    headless: Option<Arc<headless_extension::Workspace>>,
 }
 struct Allocation {
     key: SessionKey,

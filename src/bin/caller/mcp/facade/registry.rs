@@ -1122,7 +1122,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         path: &["browser", "task-open"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"open"}"#,
-        positionals: &[p_str("URL", "url", true, false)], flags: &[],
+        positionals: &[p_str("URL", "url", true, false)], flags: &[flag!("extension", "extension", Json, "startup-approved pinned extension archive JSON")],
         help: "Automatically open/reuse this supervised session's own background browser",
     },
     CommandSpec {
@@ -1131,12 +1131,40 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         path: &["browser", "task-screenshot"], lane: RiskLane::Inspect, tool: "inspect_task_browser", seed: r#"{"op":"screenshot"}"#,
-        positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[], help: "Capture only your assigned task monitor, in memory",
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[flag!("view", "view_id", Str, "retained extension page handle; omit for website")], help: "Capture only your task monitor or offscreen extension page, in memory",
     },
     CommandSpec {
         path: &["browser", "task-keyboard"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"keyboard"}"#,
-        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false), p_json("ACTION_JSON", "action", true)], flags: &[],
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false), p_json("ACTION_JSON", "action", true)], flags: &[flag!("view", "view_id", Str, "retained extension page handle; omit for website")],
         help: "Type or use page keys in your own task browser, without an owner credential",
+    },
+    CommandSpec {
+        path: &["browser", "task-click"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"click"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false),p_json("X", "x", true),p_json("Y", "y", true)],
+        flags: &[flag!("view", "view_id", Str, "retained extension view handle; omit for website")],
+        help: "One bounded coordinate click in your task browser; use screenshot coordinate metadata",
+    },
+    CommandSpec {
+        path: &["browser", "task-scroll"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"scroll"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false),p_json("X", "x", true),p_json("Y", "y", true),p_json("DELTA_Y", "delta_y", true)],
+        flags: &[flag!("view", "view_id", Str, "retained extension view handle; omit for website")],
+        help: "One bounded vertical scroll in your task browser (signed integer pixels, absolute value <=600)",
+    },
+    CommandSpec {
+        path: &["browser", "task-extension-popup"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"extension_popup"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false)], flags: &[],
+        help: "Request the actual toolbar action in your headless extension browser; never activates the user desktop",
+    },
+    CommandSpec {
+        path: &["browser", "task-extension-views"], lane: RiskLane::Inspect, tool: "inspect_task_browser", seed: r#"{"op":"extension_views"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false)], flags: &[],
+        help: "Discover current extension popup/notification view handles for this task only",
+    },
+    CommandSpec {
+        path: &["browser", "task-extension-page"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"extension_page"}"#,
+        positionals: &[p_str("WORKSPACE", "workspace_id", true, false), p_str("REQUEST_ID", "request_id", true, false)],
+        flags: &[flag!("path", "path", Str, "explicit relative extension UI resource; use task-extension-popup for the real toolbar action")],
+        help: "Open an assigned extension UI document in a background tab, not a native toolbar popup",
     },
     CommandSpec {
         path: &["browser", "task-navigate"], lane: RiskLane::Act, tool: "task_browser", seed: r#"{"op":"navigate"}"#,
