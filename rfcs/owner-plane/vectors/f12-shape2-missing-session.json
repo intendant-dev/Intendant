@@ -1,0 +1,74 @@
+{
+  "case_kind": "edge-admission",
+  "expected": {
+    "disposition": "edge-deny",
+    "outcome": "no-session"
+  },
+  "family": 12,
+  "inputs": {
+    "context": {
+      "devices": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "quota": {
+        "4": {
+          "memory.search": 0
+        }
+      },
+      "revoked": [
+        "cccccccccccccccccccccccccccccccc"
+      ],
+      "sessions": [
+        {
+          "device": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "id": "s-live",
+          "live": true
+        },
+        {
+          "device": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "id": "s-ended",
+          "live": false
+        }
+      ],
+      "tokens": [
+        {
+          "revoked": false,
+          "scope": [
+            "memory.read",
+            "memory.search"
+          ],
+          "session": "s-live",
+          "token": "t-good"
+        },
+        {
+          "revoked": true,
+          "scope": [
+            "memory.read"
+          ],
+          "session": "s-live",
+          "token": "t-revoked"
+        },
+        {
+          "revoked": false,
+          "scope": [
+            "memory.read"
+          ],
+          "session": "s-ended",
+          "token": "t-orphan"
+        }
+      ]
+    },
+    "request": {
+      "device": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "op": "memory.read",
+      "session": "s-nope",
+      "shape": 2
+    }
+  },
+  "name": "shape2-missing-session",
+  "source": "10.1",
+  "surfaces": [
+    "core"
+  ]
+}

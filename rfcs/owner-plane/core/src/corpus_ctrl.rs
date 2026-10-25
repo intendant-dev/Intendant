@@ -1,0 +1,1057 @@
+//! Corpus family 7 control-fold walkthroughs, first battery: the
+//! hosted-plane ceiling (§7.5) and drill acceptance (§7.1 `c.drill`).
+//!
+//! - `walkthrough-hosted-solo-boot`: a HOSTED genesis boots
+//!   (hosted-browser first certificate, the §7.5 safe verb set on
+//!   the genesis grant) and a `propose` claim admits under it;
+//!   probes pin the recorded provenance and the un-lifted ceiling.
+//! - `hosted-ceiling-grant-verb-excluded`: an enroll compound whose
+//!   `grants[]` carries `judge.full` — never grantable under the
+//!   ceiling (§7.5 (b)) — rejects `(hosted-ceiling,
+//!   reject-permanent)`.
+//! - `hosted-ceiling-zone-policy-inadmissible`: `c.zone_policy` is
+//!   outside §7.5 (c) ("hosted planes remain on the genesis budgets
+//!   posture until re-root", D-43) — the SAME bytes a trusted plane
+//!   would admit reject `(hosted-ceiling, reject-permanent)`.
+//! - `drill-acceptance`: a trusted plane's `c.drill` — recovery-arm
+//!   signature against the CURRENT commitment at the CURRENT repoch
+//!   (a proof, not a succession) — admits.
+//!
+//! Probe values are canonical CBOR (register #17):
+//! `plane.provenance` = the genesis descriptor's provenance text;
+//! `ceiling.lifted` = whether a recovery succession has been
+//! accepted (the §7.5/D-42 lift predicate); `ctrl.head` = the
+//! control chain head hash.
+
+use crate::cbor::{self, Value};
+use crate::domains::{h_tag, Tag};
+use crate::shapes::control::{AdminKey, Cgrant, Crecovsucc};
+use crate::shapes::envelope::{seal_op, ActorKind, OpSigner, Signedop};
+use crate::shapes::identity::Authproof;
+use crate::shapes::memory::Merasereq;
+use crate::shapes::{
+    DeadlineFallback, Erasemref, Frontierclose, Head, Sigalg, Strictness, TimeWitness, ToValue,
+    Verb, Zonepolicy,
+};
+use crate::suite;
+use crate::tranche::{items, PlaneRig};
+use crate::vector::{Expected, Vector};
+use serde_json::{json, Map as JsonMap, Value as Json};
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn probe(name: &str, value: &Value) -> Json {
+    json!({ "name": name, "value": hex(&cbor::encode(value).expect("probe encodes")) })
+}
+
+/// A family-7 fold-or-walkthrough vector over two delivery orders.
+/// Append one of the 2026-07-15 verification review's R1 regression
+/// orders to a built vector's deliveries.
+fn push_review_order(v: &mut Vector, order: &[&str]) {
+    v.inputs
+        .get_mut("deliveries")
+        .and_then(|d| d.as_array_mut())
+        .expect("deliveries array")
+        .push(serde_json::json!(order));
+}
+
+fn ctrl_vector(
+    name: &str,
+    case_kind: &str,
+    source: &str,
+    rig: PlaneRig,
+    item_list: &[(&str, &Signedop)],
+    per_item: Json,
+    probes: Option<Json>,
+) -> Vector {
+    let mut inputs = JsonMap::new();
+    inputs.insert("items".into(), items(item_list));
+    let forward: Vec<&str> = item_list.iter().map(|(n, _)| *n).collect();
+    let mut reversed = forward.clone();
+    reversed.reverse();
+    inputs.insert("deliveries".into(), json!([forward, reversed]));
+    let mut result = JsonMap::new();
+    result.insert("per_item".into(), per_item);
+    result.insert("converge".into(), json!(true));
+    if let Some(p) = probes {
+        result.insert("state_probes".into(), p);
+    }
+    Vector {
+        family: 7,
+        name: name.into(),
+        case_kind: case_kind.into(),
+        source: source.into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(Json::Object(result)),
+    }
+}
+
+/// Hosted genesis boots; a safe-verb claim admits; the ceiling
+/// stands un-lifted.
+pub fn f7_hosted_solo_boot() -> Vector {
+    let name = "f7-hosted-solo-boot";
+    let mut rig = PlaneRig::new_hosted(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let i = rig.claim(&d1, &g1, "i", "the hosted diary opens", 1, None);
+    let c1 = rig.genesis_op.clone();
+    let head = c1.op_hash();
+    ctrl_vector(
+        "walkthrough-hosted-solo-boot",
+        "walkthrough",
+        "7.5",
+        rig,
+        &[("c1", &c1), ("i", &i)],
+        json!([{ "item": "c1" }, { "item": "i" }]),
+        Some(json!([
+            probe("plane.provenance", &Value::Text("hosted".into())),
+            probe("ceiling.lifted", &Value::Bool(false)),
+            probe("ctrl.head", &Value::Bytes(head.to_vec())),
+        ])),
+    )
+}
+
+/// An enroll compound minting `judge.full` under the ceiling.
+pub fn f7_hosted_grant_verb_excluded() -> Vector {
+    let name = "f7-hosted-grant-verb";
+    let mut rig = PlaneRig::new_hosted(name);
+    let d2 = rig.mint_device("dev2");
+    let gj = rig.simple_grant("grantjf", &d2, vec![Verb::Propose, Verb::JudgeFull]);
+    let c2 = rig.enroll_new(&d2, vec![gj], "wrap.dev2.eph");
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "hosted-ceiling-grant-verb-excluded",
+        "fold",
+        "7.5",
+        rig,
+        &[("c1", &c1), ("c2", &c2)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2", "outcome": "hosted-ceiling", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// `c.zone_policy` under the ceiling — bytes a trusted plane would
+/// admit (witness install with full strict coverage). The enroll is
+/// LEGAL here (its grant carries only `propose`, inside the safe
+/// set); only the policy install rejects.
+pub fn f7_hosted_zone_policy_inadmissible() -> Vector {
+    let name = "f7-hosted-zone-policy";
+    let mut rig = PlaneRig::new_hosted(name);
+    let d1 = rig.dev1.clone();
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let policy = Zonepolicy {
+        zone_id: rig.zone_id,
+        strictness: Strictness::Strict,
+        deadline_fallback: DeadlineFallback::Budgets,
+        require_cert_deadlines: false,
+        grant_epoch_slack: None,
+        time_witnesses: Some(vec![TimeWitness::Device(d2.device_id)]),
+        connect_service_key: None,
+    };
+    let closes = [d1.lineage, d2.lineage]
+        .iter()
+        .map(|l| Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: *l,
+            heads: vec![],
+        })
+        .collect();
+    let c3 = rig.zone_policy_op(policy, closes);
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "hosted-ceiling-zone-policy-inadmissible",
+        "fold",
+        "7.5",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("c3", &c3)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "c3", "outcome": "hosted-ceiling", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// `c.drill` on a trusted plane: recovery-arm proof at the current
+/// repoch, chain advances.
+pub fn f7_drill_acceptance() -> Vector {
+    let name = "f7-drill";
+    let mut rig = PlaneRig::new(name);
+    let c2 = rig.drill_op(0);
+    let c1 = rig.genesis_op.clone();
+    let head = c2.op_hash();
+    ctrl_vector(
+        "walkthrough-drill-acceptance",
+        "walkthrough",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2)],
+        json!([{ "item": "c1" }, { "item": "c2" }]),
+        Some(json!([
+            probe("ceiling.lifted", &Value::Bool(false)),
+            probe("ctrl.head", &Value::Bytes(head.to_vec())),
+        ])),
+    )
+}
+
+/// C2: two DIFFERENT control ops at one position freeze BOTH
+/// branches (§7.4 — "no further control ops on either branch");
+/// tenant writes citing UNCONTESTED authority continue. Both
+/// delivery orders converge on the freeze-both state — whichever op
+/// admitted first is re-classified when the fork is discovered.
+pub fn f7_c2_freeze_both() -> Vector {
+    let name = "f7-c2-freeze";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    // x2: a legal epoch bump occupying position 2 WITHOUT advancing
+    // the rig chain (coverage = dev1's lineage, the only live one at
+    // that point).
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    // e2: the enrollment holding the SAME position on the rig chain.
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    // i: a claim under the UNCONTESTED genesis authority — tenant
+    // writes continue under the last uncontested frontier.
+    let i = rig.claim(
+        &d1,
+        &g1,
+        "i",
+        "the harbor light holds through the fork",
+        1,
+        None,
+    );
+    let c1 = rig.genesis_op.clone();
+    let head = c1.op_hash();
+    ctrl_vector(
+        "walkthrough-c2-freeze-both",
+        "walkthrough",
+        "7.4",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("i", &i)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "i" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        Some(json!([
+            probe("ctrl.frozen", &Value::Bool(true)),
+            probe("ctrl.head", &Value::Bytes(head.to_vec())),
+        ])),
+    )
+}
+
+/// C3′ below the head: the recovery bases at the genesis, cutting
+/// the enrollment above it — the cut control op re-classifies
+/// `(cutoff, quarantine-reproposal)` (the D-140 recover-boundary
+/// reading; the spec names no pair for a cut CONTROL op — register/
+/// audit item), and the cut branch's tenant write re-pends on its
+/// dissolved citations (D-138/D-199). Empty `tenant_cutoffs` = the
+/// pure revivable omission blanket. The reversed order exercises the
+/// §7.4 precedence exception: the enrollment arriving AFTER the
+/// accepted recovery classifies as cut-branch material at the
+/// recovery's own position, never C2.
+pub fn f7_c3_branch_cut_below_head() -> Vector {
+    let name = "f7-c3-branch-cut";
+    let mut rig = PlaneRig::new(name);
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2.clone()], "wrap.dev2.eph");
+    let i2 = rig.claim(&d2, &g2, "i2", "the cut branch wrote this", 1, None);
+    let c1 = rig.genesis_op.clone();
+    let admin2_seed = rig.rng.draw32("admin2.sig_seed");
+    let (_a2_sk, a2_pk) = suite::ed25519::keypair(&admin2_seed);
+    let recovery2_seed = rig.rng.draw32("recovery2.sig_seed");
+    let (_r2_sk, r2_pk) = suite::ed25519::keypair(&recovery2_seed);
+    let r = rig.recovery_op_tagged(
+        "r",
+        Crecovsucc {
+            base_seq: 1,
+            base_op: c1.op_hash(),
+            epoch: 2,
+            repoch: 1,
+            new_admin: AdminKey {
+                alg: Sigalg::Ed25519,
+                pk: a2_pk.to_vec(),
+            },
+            new_recovery_commitment: h_tag(Tag::Drill, &r2_pk),
+            tenant_cutoffs: vec![],
+            adopted_renewals: None,
+            retired_keys: None,
+            adopted_rotations: vec![],
+        },
+    );
+    let r_hash = r.op_hash();
+    ctrl_vector(
+        "walkthrough-c3-branch-cut-below-head",
+        "walkthrough",
+        "7.4",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("i2", &i2), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
+            { "item": "i2", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
+            { "item": "r" },
+        ]),
+        Some(json!([
+            probe("repoch", &Value::Uint(1)),
+            probe("ctrl.frozen", &Value::Bool(false)),
+            probe("ctrl.head", &Value::Bytes(r_hash.to_vec())),
+        ])),
+    )
+}
+
+/// The C2 freeze rig plus one post-freeze operation `g4`, optionally
+/// signature-tampered.
+fn post_freeze_fixture(
+    name: &'static str,
+    tamper: bool,
+) -> (PlaneRig, Vec<(&'static str, Signedop)>) {
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4g = rig.simple_grant("grant4", &d1, vec![Verb::Assert]);
+    let mut g4 = rig.grant_op(g4g);
+    if tamper {
+        g4.signature[0] ^= 1;
+    }
+    let c1 = rig.genesis_op.clone();
+    (rig, vec![("c1", c1), ("e2", c2), ("x2", x2), ("g4", g4)])
+}
+
+/// D4 (a): an otherwise-VALID control operation arriving on the
+/// frozen plane classifies (ctrl-fork, freeze-control) — only
+/// recovery resolves C2.
+pub fn f7_post_freeze_valid_op_frozen() -> Vector {
+    let (rig, ops) = post_freeze_fixture("f7-post-freeze-valid", false);
+    let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-valid-op-frozen",
+        "fold",
+        "7.4",
+        rig,
+        &refs,
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// D4 (b): a SIGNATURE-INVALID post-freeze operation keeps its
+/// signature outcome — a forgery is never fork evidence and the
+/// signature stage precedes the frozen-plane classification (D-76).
+pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
+    let (rig, ops) = post_freeze_fixture("f7-post-freeze-sig", true);
+    let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-sig-invalid-kept",
+        "fold",
+        "7.4",
+        rig,
+        &refs,
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "sig-invalid", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// D4 (c), the criterion-12 F1 trace: a validly signed, hash-valid
+/// post-freeze `c.grant` whose body violates the arm's CDDL
+/// (`{bogus: 1}` — no `grant` member) keeps its BODY outcome.
+/// Complete body validity — hash, registry row, CDDL — precedes the
+/// C2 classification (§10.2 `admit_ctrl`, D-99), so the frozen plane
+/// never converts a body-invalid operation into fork evidence — the
+/// D4 pair's third leg: the valid op freezes, the forged op keeps
+/// `sig-invalid`, the CDDL-invalid op keeps `body-invariant`.
+pub fn f7_post_freeze_cddl_invalid_kept() -> Vector {
+    let name = "f7-post-freeze-cddl";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4 = rig.seal_ctrl_candidate(
+        "g4bogus",
+        Cgrant::OP_TYPE,
+        Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: c2.op_hash(),
+        },
+        Value::Map(vec![(Value::Text("bogus".into()), Value::Uint(1))]),
+    );
+    let c1 = rig.genesis_op.clone();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-cddl-invalid-kept",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("g4", &g4)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "body-invariant", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// D4 (d), the ff23f1cd review's F2 trace: a validly signed,
+/// hash-valid post-freeze `c.grant` whose body carries a VALID grant
+/// PLUS one unknown top-level field (`{grant: …, bogus: 1}`) keeps
+/// its BODY outcome — the registry body is closed CDDL (O3: unknown
+/// fields reject exactly as in headers), enforced in the intrinsic
+/// stage before replay and placement, so the frozen plane never
+/// converts an extra-field body into fork evidence.
+pub fn f7_post_freeze_extra_field_kept() -> Vector {
+    let name = "f7-post-freeze-extra";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4g = rig.simple_grant("grant4", &d1, vec![Verb::Assert]);
+    let body = {
+        let Value::Map(mut entries) = (Cgrant { grant: g4g }).to_value() else {
+            unreachable!("cgrant body is a map")
+        };
+        entries.push((Value::Text("bogus".into()), Value::Uint(1)));
+        Value::Map(entries)
+    };
+    let g4 = rig.seal_ctrl_candidate(
+        "g4extra",
+        Cgrant::OP_TYPE,
+        Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: c2.op_hash(),
+        },
+        body,
+    );
+    let c1 = rig.genesis_op.clone();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-extra-field-kept",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("g4", &g4)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "body-invariant", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// The ff23f1cd review's F3 trace: the registry is keyed by
+/// (tenant, operation_type, operation_version) — a validly signed,
+/// hash-valid `c.grant` re-sealed with `operation_version = 2`
+/// rejects `(unknown-version, reject-permanent)` at the registry-row
+/// consult, before the arm's CDDL, replay, or placement. Distinct
+/// from `f07-header-unknown-version-rejects`, which mutates the
+/// header's own `v` (the PROTOCOL version, rejected at parse).
+pub fn f7_operation_version_unknown() -> Vector {
+    let name = "f7-op-version";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let c2 = rig.enroll_new(&dev2, vec![], "wrap.dev2.eph");
+    let grant_x = rig.simple_grant("grant-x", &dev2, vec![Verb::Propose]);
+    let body = (Cgrant { grant: grant_x }).to_value();
+    let x = {
+        let template = rig.seal_ctrl_candidate(
+            "xv2",
+            Cgrant::OP_TYPE,
+            Authproof::Admin {
+                epoch: 1,
+                ctrl_frontier: c2.op_hash(),
+            },
+            body.clone(),
+        );
+        let mut header = template.header;
+        header.operation_version = 2;
+        let resealed = seal_op(header, body, &OpSigner::Ed25519(&rig.root_sk));
+        assert!(resealed.verify(&rig.root_pk), "re-sealed op must verify");
+        resealed
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "operation-version-unknown-rejects",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("x", &x)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "x", "outcome": "unknown-version", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// The §5.4 manifest-admission face (D-203 ratified the P1 profile;
+/// this is its first implement-before-Gate-A mechanism): a rotation
+/// whose typed `erase_manifest` cites an ACCEPTED `m.erase_request`
+/// with `target_op` in its `targets` ADMITS. The reversed order
+/// delivers the rotation before the request — it pends
+/// `ref-unresolved` and admits at the fixpoint (the citation is
+/// verifiable-when-held). The `item_addr` is author-attested (§5.6
+/// index territory), opaque to admission.
+pub fn f7_kek_rotate_manifest_admits() -> Vector {
+    let name = "f7-kek-rotate-manifest";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(
+        &dev2,
+        &grant2,
+        "i",
+        "the ledger holds a stray entry",
+        1,
+        None,
+    );
+    let e = rig.tenant_op_as(
+        ActorKind::Human,
+        &d1,
+        &g1,
+        "e",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![i.op_hash()],
+        }
+        .to_value(),
+        1,
+        None,
+    );
+    let k = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        let entry = Erasemref {
+            item_addr: rig.rng.draw32("erase.item_addr"),
+            erase_op: e.op_hash(),
+            target_op: i.op_hash(),
+        };
+        rig.kek_rotate_erasing(2, vec![w], vec![entry])
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "kek-rotate-manifest-admits",
+        "fold",
+        "5.4",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("e", &e), ("k", &k)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "e" },
+            { "item": "k" },
+        ]),
+        None,
+    )
+}
+
+/// The §5.4 membership negative: the manifest entry's `target_op` is
+/// a held, in-scope claim that the cited erase request does NOT
+/// list — `(body-invariant, reject-permanent)` on the rotation
+/// (portably checkable at admission, D-66).
+pub fn f7_kek_rotate_manifest_target_outside() -> Vector {
+    let name = "f7-kek-rotate-manifest-outside";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the requested target", 1, None);
+    let i2 = rig.claim(
+        &dev2,
+        &grant2,
+        "i2",
+        "the unrequested neighbor",
+        2,
+        Some(i.op_hash()),
+    );
+    let e = rig.tenant_op_as(
+        ActorKind::Human,
+        &d1,
+        &g1,
+        "e",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![i.op_hash()],
+        }
+        .to_value(),
+        1,
+        None,
+    );
+    let k = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        let entry = Erasemref {
+            item_addr: rig.rng.draw32("erase.item_addr"),
+            erase_op: e.op_hash(),
+            target_op: i2.op_hash(),
+        };
+        rig.kek_rotate_erasing(2, vec![w], vec![entry])
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "kek-rotate-manifest-target-outside-rejects",
+        "fold",
+        "5.4",
+        rig,
+        &[
+            ("c1", &c1),
+            ("c2", &c2),
+            ("i", &i),
+            ("i2", &i2),
+            ("e", &e),
+            ("k", &k),
+        ],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "i2" },
+            { "item": "e" },
+            { "item": "k", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// D-71 typed linkage, the valid arm (D-203-ratified C.1 item): the
+/// exclude compound cites k1 — an accepted rotation excluding dev2,
+/// accepted strictly after dev2's last wrap (the enroll) — and
+/// completes. In the reversed order the compound arrives before its
+/// reference and pends `ref-unresolved` until k1 lands
+/// (verifiable-when-held).
+pub fn f7_revoke_refs_valid_exclusion() -> Vector {
+    let name = "f7-revoke-refs-valid";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude_with_refs(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+        vec![k1.op_hash()],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-refs-post-wrap-exclusion-completes",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "k1" },
+            { "item": "r" },
+        ]),
+        None,
+    )
+}
+
+/// D-71 typed linkage, the stale arm: k2 re-admits dev2 at epoch 3
+/// AFTER k1's exclusion, so dev2's last accepted wrap postdates k1 —
+/// a compound citing k1 is held-invalid: `(body-invariant,
+/// reject-permanent)` ("a stale rotation preceding a re-wrap
+/// excludes nothing").
+pub fn f7_revoke_refs_stale_rotation() -> Vector {
+    let name = "f7-revoke-refs-stale";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let k2 = {
+        let kek_e3 = rig.rng.draw32("kek.zone.e3");
+        let (id1, pk1) = (d1.device_id, d1.kem_pk);
+        let w1 = rig.wrap_at(id1, &pk1, 3, &kek_e3, "wrap.dev1.e3.eph");
+        let (id2, pk2) = (dev2.device_id, dev2.kem_pk);
+        let w2 = rig.wrap_at(id2, &pk2, 3, &kek_e3, "wrap.dev2.e3.eph");
+        rig.kek_rotate(3, vec![w1, w2])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude_with_refs(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+        vec![k1.op_hash()],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-refs-stale-rotation-rejects",
+        "fold",
+        "7.1",
+        rig,
+        &[
+            ("c1", &c1),
+            ("c2", &c2),
+            ("k1", &k1),
+            ("k2", &k2),
+            ("r", &r),
+        ],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "k1" },
+            { "item": "k2" },
+            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// D-143 exactness, the valid arm: the compound's cutoff CARRIES
+/// dev2's live head (gen 1, seq 1 = the claim) — the carried head
+/// validates against the held chain (D-93) and the compound
+/// completes. The reversed order delivers the compound before the
+/// claim: the carried head is unheld and the compound pends
+/// `ref-unresolved` until it lands. The head's beyond-boundary
+/// retirement effect on tenant history is Gate-B saga territory
+/// (D-203-recorded deferral) — this pair pins the commitment
+/// validation.
+pub fn f7_revoke_cutoff_carried_head() -> Vector {
+    let name = "f7-revoke-carried-head";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the boundary head names me", 1, None);
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![Head {
+                lineage: dev2.lineage,
+                gen: 1,
+                seq: 1,
+                op: i.op_hash(),
+            }],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-carried-head-completes",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "k1" },
+            { "item": "r" },
+        ]),
+        None,
+    )
+}
+
+/// The §7.1 referenced-Head lifecycle under the exact-reference rule
+/// (the criterion-12 F2 repair): the carried head names the held
+/// coordinate (gen 1, seq 1) with an op hash whose BYTES are not
+/// held anywhere — that is a pending reference, `(ref-unresolved,
+/// pending-dependency)` until the exact bytes arrive, NOT a D-130
+/// selection (selection is over the coordinate's genuinely held
+/// byte-variants). The held `i` stays admitted, and later control
+/// operations pass the pending reference (only the referencing
+/// operation waits). History: v0.5.9 rejected this `body-invariant`
+/// (superseded — D-93's rider); the prior tranche over-rotated to
+/// admit-and-select against a randomly drawn hash, which the
+/// criterion-12 review's F2 refuted with the fixture's own bytes.
+/// Full two-variant fork-selection stays honestly deferred (the
+/// `fork-selection` coverage row; the selected-variant revival arm
+/// remains an Unimplemented marker).
+pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
+    let name = "f7-revoke-head-mismatch";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the head will misname me", 1, None);
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let wrong = rig.rng.draw32("wrong.head.op");
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![Head {
+                lineage: dev2.lineage,
+                gen: 1,
+                seq: 1,
+                op: wrong,
+            }],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-unheld-head-pends",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "k1" },
+            { "item": "r", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
+        ]),
+        None,
+    )
+}
+
+/// D-143 exactness, the omission arm: dev2 HAS accepted history but
+/// the compound's cutoff carries EMPTY heads — the boundary is
+/// uncommitted: `(body-invariant, reject-permanent)`.
+pub fn f7_revoke_cutoff_empty_heads_history() -> Vector {
+    let name = "f7-revoke-empty-heads";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "history the close ignores", 1, None);
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-empty-heads-with-history-rejects",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// The §10.4 parse-row `unknown-version` (D-203 cheap-gap batch): a
+/// grant op whose header `v` is 2 — the version check precedes every
+/// other stage, so the (now-unverifiable) signature never matters.
+/// The surgery flips the canonical header's leading `"v": 1` entry
+/// (the 1-byte key sorts first) to 2, keeping the bytes canonical.
+pub fn f7_header_unknown_version() -> Vector {
+    let name = "f7-unknown-version";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let g = rig.grant_op(grant2);
+    let mut bytes = g.encode();
+    // map(20) ‖ text(1) "v" ‖ uint 1 — the header map's first entry.
+    let pat: [u8; 4] = [0xb4, 0x61, 0x76, 0x01];
+    let at = bytes
+        .windows(4)
+        .position(|w| w == pat)
+        .expect("the canonical header opens with v: 1");
+    bytes[at + 3] = 0x02;
+    let c1 = rig.genesis_op.clone();
+    let c1_bytes = c1.encode();
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        crate::tranche::items_raw(&[("c1", &c1_bytes), ("x", &bytes)]),
+    );
+    inputs.insert("deliveries".into(), json!([["c1", "x"], ["x", "c1"]]));
+    let mut result = JsonMap::new();
+    result.insert(
+        "per_item".into(),
+        json!([
+            { "item": "c1" },
+            { "item": "x", "outcome": "unknown-version", "disposition": "reject-permanent" },
+        ]),
+    );
+    result.insert("converge".into(), json!(true));
+    Vector {
+        family: 7,
+        name: "header-unknown-version-rejects".into(),
+        case_kind: "fold".into(),
+        source: "4.5".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(Json::Object(result)),
+    }
+}
+
+pub fn corpus_ctrl() -> Vec<Vector> {
+    vec![
+        f7_hosted_solo_boot(),
+        f7_hosted_grant_verb_excluded(),
+        f7_hosted_zone_policy_inadmissible(),
+        f7_drill_acceptance(),
+        f7_c2_freeze_both(),
+        f7_c3_branch_cut_below_head(),
+        f7_post_freeze_valid_op_frozen(),
+        f7_post_freeze_sig_invalid_kept(),
+        f7_post_freeze_cddl_invalid_kept(),
+        f7_post_freeze_extra_field_kept(),
+        f7_operation_version_unknown(),
+        f7_kek_rotate_manifest_admits(),
+        f7_kek_rotate_manifest_target_outside(),
+        f7_revoke_refs_valid_exclusion(),
+        f7_revoke_refs_stale_rotation(),
+        f7_revoke_cutoff_carried_head(),
+        f7_revoke_cutoff_head_mismatch(),
+        f7_revoke_cutoff_empty_heads_history(),
+        f7_header_unknown_version(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_ctrl_corpus_matches_builders() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("vectors");
+        for v in corpus_ctrl() {
+            let path = dir.join(format!("f{:02}-{}.json", v.family, v.name));
+            let committed = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("{} not minted", path.display()));
+            assert_eq!(
+                committed,
+                v.to_file_string(),
+                "{} drifted from its builder",
+                v.name
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_corpus_checks_clean() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let companion: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("d0a-vector-cases.v1.json")).unwrap(),
+        )
+        .unwrap();
+        for v in corpus_ctrl() {
+            crate::vector::check(&v.to_json(), &companion)
+                .unwrap_or_else(|e| panic!("{}: {e}", v.name));
+        }
+    }
+}
